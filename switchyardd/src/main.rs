@@ -63,7 +63,11 @@ fn main() {
             }
         }
         tokio::spawn(engine::pump(daemon.clone()));
-        tokio::spawn(admin::serve(daemon.clone(), data_dir.join("admin.sock")));
+        let admin_sock = data_dir.join("admin.sock");
+        let _ = std::fs::remove_file(&admin_sock);
+        let admin_listener =
+            tokio::net::UnixListener::bind(&admin_sock).expect("bind admin socket");
+        tokio::spawn(admin::serve(daemon.clone(), admin_listener));
         tracing::info!(node = daemon.cfg.node.name, "switchyardd running");
         tokio::signal::ctrl_c().await.expect("ctrl_c");
         tracing::info!("shutting down");

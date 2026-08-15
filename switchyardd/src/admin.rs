@@ -7,7 +7,6 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -22,9 +21,9 @@ pub fn router(d: Arc<Daemon>) -> Router {
         .with_state(d)
 }
 
-pub async fn serve(d: Arc<Daemon>, socket: PathBuf) {
-    let _ = std::fs::remove_file(&socket);
-    let listener = tokio::net::UnixListener::bind(&socket).expect("bind admin socket");
+/// Takes an already-bound listener (bind failures must fail startup loudly in
+/// `main`, not silently kill only this background task — see `plugins.sock`).
+pub async fn serve(d: Arc<Daemon>, listener: tokio::net::UnixListener) {
     axum::serve(listener, router(d)).await.expect("admin serve");
 }
 
