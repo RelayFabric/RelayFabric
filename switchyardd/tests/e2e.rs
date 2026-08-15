@@ -129,6 +129,22 @@ async fn admin_get(sock: &Path, path: &str) -> String {
     raw.split_once("\r\n\r\n").map(|x| x.1.to_string()).unwrap_or_default()
 }
 
+/// Polls an admin endpoint every 100ms (up to ~5s) until the response body
+/// contains `needle`. Used in place of a fixed settle-sleep: the pump loop
+/// and delivery-state writes are async, so a positive assertion must poll
+/// for readiness rather than guess a sleep duration.
+async fn poll_until_contains(sock: &Path, path: &str, needle: &str) -> String {
+    let mut last = String::new();
+    for _ in 0..50 {
+        last = admin_get(sock, path).await;
+        if last.contains(needle) {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("timed out waiting for {path} to contain {needle:?}; last body: {last}");
+}
+
 #[tokio::test]
 async fn bridges_dedups_and_suppresses_echo() {
     let d = start_daemon(tempfile::tempdir().unwrap());
@@ -182,8 +198,7 @@ async fn queues_for_offline_plugin_and_survives_restart() {
 
     // B is not connected: delivery must queue
     inbound(&mut wa, "chan", "!abcd1234", "parked message", chrono::Utc::now()).await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let queue = admin_get(&d.admin_sock(), "/v1/queue").await;
+    let queue = poll_until_contains(&d.admin_sock(), "/v1/queue", "\"pending\":1").await;
     assert!(queue.contains("\"pending\":1"), "queue was: {queue}");
 
     // hard-kill the daemon and restart on the same data_dir
