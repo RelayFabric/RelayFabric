@@ -142,26 +142,73 @@ impl Store {
         Ok(())
     }
 
+    /// Guarded to only fire from 'attempting': a delivery only ever reaches
+    /// 'delivered' after `mark_attempting` put it there for a Send in
+    /// flight. Without this guard a late/duplicate DeliveryResult (e.g. a
+    /// stray plugin ack that arrives after `reclaim_stale` or a retry has
+    /// already moved the row on) could flip an already-terminal or
+    /// not-yet-attempted row straight to 'delivered', producing a
+    /// duplicate-looking or premature delivery. The invariant this and the
+    /// other `mark_*` guards enforce: once a row lands in a terminal state
+    /// ('delivered', 'failed', 'expired', 'dead_letter') it is never
+    /// modified again.
     pub fn mark_delivered(&self, id: i64) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE deliveries SET state = 'delivered' WHERE id = ?1", params![id])?;
+            "UPDATE deliveries SET state = 'delivered'
+             WHERE id = ?1 AND state = 'attempting'",
+            params![id])?;
         Ok(())
     }
 
+    /// Guarded to 'pending' or 'attempting': called both before
+    /// `mark_attempting` runs (the plugin-offline nudge in `process_due`,
+    /// row still 'pending') and after it (the try_send-full backpressure
+    /// path and delivery-failed retries in `handle_result`, row
+    /// 'attempting'). Either way, a row already in a terminal state must not
+    /// be reopened by a late retry signal.
     pub fn mark_retry(&self, id: i64, next_attempt: DateTime<Utc>) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE deliveries SET state = 'pending', next_attempt = ?2 WHERE id = ?1",
+            "UPDATE deliveries SET state = 'pending', next_attempt = ?2
+             WHERE id = ?1 AND state IN ('pending', 'attempting')",
             params![id, ts(next_attempt)],
         )?;
         Ok(())
     }
 
+    /// Guarded to 'pending' or 'attempting' for the same reason as
+    /// `mark_retry`: called on fresh 'pending' rows (TTL expiry, policy
+    /// denial, missing-message) as well as 'attempting' rows (retry
+    /// exhaustion in `handle_result`), but never on a row already terminal.
     pub fn mark_terminal(&self, id: i64, state: &str, reason: &str) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE deliveries SET state = ?2, reason = ?3 WHERE id = ?1",
+            "UPDATE deliveries SET state = ?2, reason = ?3
+             WHERE id = ?1 AND state IN ('pending', 'attempting')",
             params![id, state, reason],
         )?;
         Ok(())
+    }
+
+    /// Deletes terminal deliveries (spec §45 disk limits) that reached their
+    /// terminal state before `older_than`, plus any message left with no
+    /// deliveries at all as a result. `next_attempt` is used as the recency
+    /// signal rather than `attempted_at`: every terminal row has a
+    /// `next_attempt` (it's NOT NULL from insert), whereas `attempted_at` is
+    /// only ever set by `mark_attempting` and stays NULL for rows that went
+    /// straight to a terminal state without an attempt (e.g. TTL_EXPIRED,
+    /// POLICY_DENIED, DESTINATION_UNKNOWN), which would otherwise never be
+    /// purged.
+    pub fn purge_terminal(&self, older_than: DateTime<Utc>) -> rusqlite::Result<usize> {
+        let deleted = self.conn.execute(
+            "DELETE FROM deliveries
+             WHERE state IN ('delivered','failed','expired','dead_letter')
+               AND next_attempt < ?1",
+            params![ts(older_than)],
+        )?;
+        self.conn.execute(
+            "DELETE FROM messages WHERE id NOT IN (SELECT DISTINCT message_id FROM deliveries)",
+            [],
+        )?;
+        Ok(deleted)
     }
 
     pub fn recover(&self) -> rusqlite::Result<usize> {
@@ -277,10 +324,73 @@ mod tests {
         let d = &s.deliveries_for(e.id).unwrap()[0];
         assert_eq!((d.state.as_str(), d.attempt_count), ("delivered", 2));
 
+        // a delivered row is terminal: a late/duplicate mark_retry or
+        // mark_terminal (e.g. a stray plugin ack, or reclaim_stale racing a
+        // fast delivery) must leave it 'delivered', not resurrect or
+        // dead-letter it.
+        s.mark_retry(id, now + Duration::seconds(30)).unwrap();
+        assert_eq!(s.deliveries_for(e.id).unwrap()[0].state, "delivered");
+        s.mark_terminal(id, "dead_letter", "RETRY_EXHAUSTED").unwrap();
+        assert_eq!(s.deliveries_for(e.id).unwrap()[0].state, "delivered");
+
         let id2 = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at).unwrap();
         s.mark_terminal(id2, "dead_letter", "RETRY_EXHAUSTED").unwrap();
         let d2 = s.deliveries_for(e.id).unwrap().into_iter().find(|d| d.id == id2).unwrap();
         assert_eq!(d2.reason.as_deref(), Some("RETRY_EXHAUSTED"));
+
+        // that same dead-lettered row is also terminal: mark_delivered must
+        // not fire on it either (guarded to 'attempting' only).
+        s.mark_delivered(id2).unwrap();
+        assert_eq!(s.deliveries_for(e.id).unwrap().into_iter()
+            .find(|d| d.id == id2).unwrap().state, "dead_letter");
+    }
+
+    #[test]
+    fn mark_delivered_ignores_rows_not_currently_attempting() {
+        let (_d, s) = store();
+        let e = env();
+        let now = Utc::now();
+        s.insert_message(&e).unwrap();
+        // still 'pending': never entered 'attempting', so a stray delivered
+        // ack must not apply.
+        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at).unwrap();
+        s.mark_delivered(id).unwrap();
+        assert_eq!(s.deliveries_for(e.id).unwrap()[0].state, "pending");
+    }
+
+    #[test]
+    fn purge_terminal_deletes_old_terminal_rows_and_orphaned_messages_only() {
+        let (_d, s) = store();
+        let now = Utc::now();
+
+        // delivered message: delivery and its now-orphaned message must both
+        // be purged.
+        let delivered_msg = env();
+        s.insert_message(&delivered_msg).unwrap();
+        let delivered_id = s.insert_delivery(
+            delivered_msg.id, "general", &dest(), now, delivered_msg.expires_at).unwrap();
+        s.mark_attempting(delivered_id).unwrap();
+        s.mark_delivered(delivered_id).unwrap();
+
+        // pending message: must survive purge untouched.
+        let pending_msg = env();
+        s.insert_message(&pending_msg).unwrap();
+        let pending_id = s.insert_delivery(
+            pending_msg.id, "general", &dest(), now, pending_msg.expires_at).unwrap();
+
+        let purged = s.purge_terminal(now + Duration::hours(1)).unwrap();
+        assert_eq!(purged, 1);
+
+        assert!(s.deliveries_for(delivered_msg.id).unwrap().is_empty());
+        assert!(s.get_message(delivered_msg.id).unwrap().is_none(),
+            "orphaned message must be purged alongside its terminal delivery");
+
+        let remaining = s.deliveries_for(pending_msg.id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, pending_id);
+        assert_eq!(remaining[0].state, "pending");
+        assert!(s.get_message(pending_msg.id).unwrap().is_some(),
+            "message with a live pending delivery must survive purge");
     }
 
     #[test]

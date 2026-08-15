@@ -6,6 +6,7 @@ use chrono::{DateTime, Duration as CDuration, Utc};
 use relay_core::{Capabilities, Endpoint, Envelope, Sender};
 use relay_ipc::DaemonToPlugin;
 use std::collections::HashMap;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -26,9 +27,23 @@ pub struct Daemon {
     pub plugins: Mutex<HashMap<String, PluginHandle>>,
 }
 
+/// Creates `data_dir` (and any missing parents) with owner-only permissions
+/// (0700). Message bodies, the SQLite DB, and the plugin control socket all
+/// live under this directory; a world- or group-readable dir would let any
+/// local user read message content or connect to plugins.sock regardless of
+/// the individual file modes SQLite/UnixListener happen to create (typically
+/// umask-derived 0644/0755). `DirBuilder::mode` only governs freshly-created
+/// directories, so the mode is re-asserted with `set_permissions` afterward
+/// to also tighten a pre-existing dir left with looser permissions (e.g.
+/// from an older install or a manual mkdir).
+fn create_data_dir(data_dir: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(data_dir)?;
+    std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))
+}
+
 impl Daemon {
     pub fn new(cfg: Config, data_dir: &Path) -> std::io::Result<Daemon> {
-        std::fs::create_dir_all(data_dir)?;
+        create_data_dir(data_dir)?;
         let store = Store::open(&data_dir.join("relayfabric.db"))
             .map_err(std::io::Error::other)?;
         let recovered = store.recover().map_err(std::io::Error::other)?;
@@ -130,7 +145,10 @@ pub fn handle_result(d: &Daemon, corr: i64, delivered: bool, detail: Option<Stri
     }
 }
 
+const PURGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 pub async fn pump(d: Arc<Daemon>) {
+    let mut last_purge = Instant::now();
     loop {
         let now = Utc::now();
         let due = {
@@ -140,6 +158,19 @@ pub async fn pump(d: Arc<Daemon>) {
         };
         for del in due {
             process_due(&d, del, now).await;
+        }
+        if last_purge.elapsed() >= PURGE_INTERVAL {
+            last_purge = Instant::now();
+            // ponytail: retention hardcoded to 24h; make retention
+            // configurable is the upgrade path once there's an actual
+            // disk-pressure signal to tune it by.
+            let cutoff = now - CDuration::hours(24);
+            let result = d.store.lock().unwrap().purge_terminal(cutoff);
+            match result {
+                Ok(n) if n > 0 => info!(purged = n, "retention purge removed old deliveries"),
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "retention purge failed"),
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
@@ -213,11 +244,22 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
                 kind: env.kind.clone(),
                 body,
             };
-            if tx.send(send).await.is_err() {
-                // channel closed under us; requeue
+            // try_send, not send().await: this pump task is the single driver
+            // of ALL plugins' deliveries plus reclaim_stale. Awaiting a full
+            // per-plugin channel (e.g. one plugin's process wedged or just
+            // slow) would block delivery to every other plugin indefinitely.
+            // A full or closed channel just means "not right now" — requeue
+            // and let the next pump tick retry.
+            if let Err(e) = tx.try_send(send) {
+                let closed_or_full = match e {
+                    mpsc::error::TrySendError::Full(_) => "full",
+                    mpsc::error::TrySendError::Closed(_) => "closed",
+                };
                 let result = d.store.lock().unwrap()
                     .mark_retry(del.id, now + CDuration::seconds(5));
                 warn_if_mark_failed(del.id, "pending", result);
+                warn!(delivery = del.id, plugin = %del.destination.protocol,
+                      reason = closed_or_full, "plugin channel unavailable, requeued");
             }
         }
     }
@@ -326,5 +368,64 @@ mod tests {
         let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
         assert_eq!(after.state, "failed");
         assert_eq!(after.reason.as_deref(), Some("DESTINATION_UNKNOWN"));
+    }
+
+    #[test]
+    fn data_dir_created_with_owner_only_perms() {
+        let base = tempfile::tempdir().unwrap();
+
+        // freshly created (possibly nested, non-existent) dir: DirBuilder's
+        // mode must land as 0700 regardless of umask.
+        let fresh = base.path().join("nested/data");
+        create_data_dir(&fresh).unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "freshly created data dir must be 0700");
+
+        // pre-existing dir left with looser permissions (e.g. an older
+        // install, or a manual mkdir): must be tightened, not left alone.
+        let loose = base.path().join("loose");
+        std::fs::create_dir_all(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        create_data_dir(&loose).unwrap();
+        let mode = std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "pre-existing loose-permission data dir must be tightened");
+    }
+
+    #[tokio::test]
+    async fn process_due_requeues_instead_of_blocking_when_plugin_channel_is_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None);
+        // sample `now` after handle_inbound (which stamps next_attempt with
+        // its own, slightly later, internal Utc::now()) so due_deliveries
+        // actually finds the row.
+        let now = Utc::now();
+        let delivery_id = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now, 1).unwrap()[0].id
+        };
+
+        // register mockb's handle with a capacity-1 channel and fill its one
+        // slot, so any further try_send hits backpressure.
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(DaemonToPlugin::Shutdown).unwrap();
+        d.plugins.lock().unwrap().insert("mockb".to_string(), PluginHandle {
+            tx, capabilities: Capabilities::default(), connected: true,
+        });
+
+        let del = { let store = d.store.lock().unwrap(); store.deliveries_for_id(delivery_id).unwrap() };
+
+        // Regression guard: process_due used to `.await` a send on this
+        // channel, which would hang forever with the slot held. It must
+        // return promptly and leave the delivery pending for the next tick.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2), process_due(&d, del, now))
+            .await
+            .expect("process_due hung on a full plugin channel");
+
+        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert_eq!(after.state, "pending");
     }
 }
