@@ -117,4 +117,25 @@ mod tests {
         };
         assert_eq!(corr, 42);
     }
+
+    #[tokio::test]
+    async fn canonical_hello_frame_bytes_are_stable() {
+        let mut buf = Vec::new();
+        let msg = PluginToDaemon::Hello {
+            plugin: "lxmf".into(),
+            version: "0.1.0".into(),
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: Capabilities {
+                direct_messages: true,
+                groups: true,
+                ..Capabilities::default()
+            },
+        };
+        write_frame(&mut buf, &msg).await.unwrap();
+        // Wire-format lock: Python plugins reproduce these exact bytes
+        // (test_relay_ipc.py). If this assertion ever fails, the plugin
+        // protocol changed — that is a breaking protocol event, not a test fix.
+        let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "000000a5a561746568656c6c6f66706c7567696e646c786d666776657273696f6e65302e312e307070726f746f636f6c5f76657273696f6e016c6361706162696c6974696573a96474657874f56f6469726563745f6d65737361676573f56667726f757073f56b6174746163686d656e7473f4686c6f636174696f6ef4697265616374696f6e73f4687265636569707473f46870726573656e6365f46b6d61785f7061796c6f6164f6");
+    }
 }
