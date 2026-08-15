@@ -15,11 +15,17 @@ pip install -r plugins/lxmf/requirements.txt
 
 ## Daemon config
 
+The daemon spawns `command` via `sh -c`, so a bare `relayfabric-lxmf` only
+works if it's on `PATH` — and the script's `#!/usr/bin/env python3` shebang
+won't see packages installed in a venv. Point `command` at the venv's
+Python and the script's absolute path instead, after
+`pip install -r plugins/lxmf/requirements.txt` into that venv:
+
 ```yaml
 plugins:
   lxmf:
     enabled: true
-    command: relayfabric-lxmf
+    command: /path/to/RelayFabric/.venv/bin/python /path/to/RelayFabric/plugins/lxmf/relayfabric-lxmf
     config:
       display_name: "RelayFabric Gateway"
       storage: /var/lib/relayfabric/lxmf
