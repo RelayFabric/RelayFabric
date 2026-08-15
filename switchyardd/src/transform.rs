@@ -7,8 +7,19 @@ pub fn render(alias: &str, body: &str, max_payload: Option<usize>) -> String {
     if full.len() <= limit {
         return full;
     }
-    let budget = limit.saturating_sub('…'.len_utf8());
-    let mut cut = budget.min(full.len());
+
+    // For limits < 3 (ellipsis size), truncate without ellipsis
+    if limit < 3 {
+        let mut cut = limit;
+        while cut > 0 && !full.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        return full[..cut].to_string();
+    }
+
+    // Normal case: truncate to limit-3 bytes + ellipsis
+    let budget = limit - 3;
+    let mut cut = budget;
     while cut > 0 && !full.is_char_boundary(cut) {
         cut -= 1;
     }
@@ -35,5 +46,13 @@ mod tests {
     #[test]
     fn no_truncation_when_it_fits() {
         assert_eq!(render("A-0000", "hi", Some(200)), "[A-0000]\nhi");
+    }
+
+    #[test]
+    fn tiny_limits_never_exceed_budget() {
+        for limit in 0..=4 {
+            let out = render("A", "hello world", Some(limit));
+            assert!(out.len() <= limit, "limit {limit} produced {} bytes", out.len());
+        }
     }
 }
