@@ -2552,6 +2552,7 @@ Add:
 * Bitchat
 * Nostr
 * gateway federation
+* RelayFabric Discovery Protocol (RFDP, §111)
 * signed RelayFabric envelopes
 * origin signatures
 
@@ -2848,3 +2849,132 @@ while maintaining explicit policy, provenance, privacy boundaries, and security 
 The defining design principle is:
 
 > **RelayFabric routes communications across networks while preserving the separation of identities, trust domains, and protocol security boundaries by default.**
+
+---
+
+# 111. RelayFabric Discovery Protocol (RFDP)
+
+*Added 2026-08-15 as a first-class future component, pairing with federation (§30, §85–87). Target: groundwork alongside federation (v0.3).*
+
+`switchyardd` SHOULD advertise what protocols and services it supports — but discovery MUST be **capability-based, scoped, and optional**, never a broadcast of full inventory.
+
+## 111.1 Node Advertisement
+
+The useful advertisement describes what this particular gateway can actually do, not merely which protocols it links. A **RelayFabric Node Advertisement** is a signed, expiring capability document:
+
+```json
+{
+  "rf_version": 1,
+  "node_id": "rf:75bc...",
+  "name": "DX.PE Pasadena",
+
+  "services": {
+    "chat": true,
+    "store_forward": true,
+    "telemetry": true
+  },
+
+  "protocols": {
+    "lxmf":       { "rx": true, "tx": true, "text": true, "files": true },
+    "meshtastic": { "rx": true, "tx": true, "text": true, "location": true, "max_payload": 237 },
+    "signal":     { "rx": true, "tx": true, "groups": true, "attachments": true }
+  },
+
+  "security": {
+    "translate": true,
+    "signed": true,
+    "opaque": false
+  },
+
+  "expires": 1786838400
+}
+```
+
+Advertisements SHALL be signed (Ed25519) by the RelayFabric node identity so peers can verify that a capability announcement genuinely came from the advertising node rather than being spoofed.
+
+## 111.2 Services above protocols
+
+Nodes advertise **services** (chat, emergency-messaging, store-and-forward, telemetry, git, …); protocols describe *how those services are reachable*:
+
+```text
+DX.PE Pasadena
+│
+├── chat
+│    ├── LXMF
+│    ├── Meshtastic
+│    └── Signal
+│
+├── telemetry
+│    ├── Meshtastic
+│    └── MQTT
+│
+└── git
+     └── rngit / Reticulum
+```
+
+Another node can then ask "can you deliver chat toward Signal?" without caring how the gateway is implemented.
+
+## 111.3 Reachability
+
+Protocol support alone does not imply route availability. Advertisements SHOULD express reachable service classes:
+
+```yaml
+reachability:
+  chat:
+    via: [lxmf, meshtastic, signal]
+  telemetry:
+    via: [meshtastic, mqtt]
+```
+
+This enables service-layer intermesh routing: a gateway needing Signal delivery discovers a peer advertising `signal/chat available` and routes through it — without knowing the Signal account behind it.
+
+Discovery SHALL NOT initially advertise full route tables (A→B→C→Signal chains). Scope stays limited to node capabilities + directly attached protocols + available services; federation calculates reachable paths.
+
+## 111.4 What MUST NOT be advertised
+
+Discovery leaks infrastructure information. Advertisements SHALL NOT include:
+
+```text
+Signal usernames / phone numbers
+Meshtastic node IDs
+LXMF user identities
+local device paths
+IP addresses / VPN topology
+exact GPS coordinates
+identity mappings
+private route names
+```
+
+A public advertisement is limited to protocol families, service classes, and supported security modes.
+
+## 111.5 Discovery scopes
+
+```yaml
+discovery:
+  mode: federation
+```
+
+| Mode | Behavior |
+|---|---|
+| `disabled` | advertise nothing (sensitive gateways) |
+| `local` | local RelayFabric peers only (LAN / local RNS neighborhood) |
+| `federation` | authenticated RelayFabric peers only — **recommended default** |
+| `public` | deliberately limited service advertisement for community gateways |
+
+## 111.6 Cost metrics (later)
+
+Advertisements MAY later carry broad, coarse cost classes (`bandwidth_class`, `latency_class`, `metered`, `reliability`, `store_forward`) so policy can prefer e.g. direct IP over LoRa over satellite. Exact bandwidth/latency measurements are deliberately excluded initially.
+
+## 111.7 Architecture
+
+```text
+              RelayFabric Node Advertisement
+                         │
+              signed capability document
+                         │
+           ┌─────────────┼─────────────┐
+           │             │             │
+       Protocols      Services      Security
+```
+
+Signed advertisements flowing between `switchyardd` peers give the decentralized intermesh **service discovery without a central directory**.
