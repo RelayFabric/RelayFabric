@@ -87,5 +87,22 @@ class CommandTests(unittest.TestCase):
         self.assertIn("/join", reply)
 
 
+class FanoutTests(unittest.TestCase):
+    def test_delivered_when_any_member_succeeds(self):
+        t = plug.FanoutTracker(corr=7, members=["a", "b", "c"])
+        self.assertIsNone(t.member_done("a", True))
+        self.assertIsNone(t.member_done("b", False))
+        result = t.member_done("c", False)
+        self.assertEqual(result["corr"], 7)
+        self.assertTrue(result["delivered"])
+        self.assertIn("b", result["detail"])
+        self.assertIn("c", result["detail"])
+
+    def test_all_failures_reports_undelivered(self):
+        t = plug.FanoutTracker(corr=8, members=["a"])
+        result = t.member_done("a", False)
+        self.assertFalse(result["delivered"])
+
+
 if __name__ == "__main__":
     unittest.main()
