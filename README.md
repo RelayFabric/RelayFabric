@@ -74,5 +74,5 @@ IPC protocol — is specified in [`docs/SPEC.md`](docs/SPEC.md). Notes on the
 
 ## License
 
-MIT. Dependencies are chosen under a permissive-only policy — no AGPL or
-other copyleft licenses.
+Apache-2.0. Dependencies are chosen under a permissive-only policy — no
+AGPL or other copyleft licenses.

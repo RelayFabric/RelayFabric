@@ -4,7 +4,7 @@ members = ["crates/relay-core", "crates/relay-ipc", "switchyardd", "switchyardct
 
 [workspace.package]
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
