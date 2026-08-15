@@ -224,12 +224,12 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests_support {
     use super::*;
     use crate::config::{Config, NodeConfig, PluginConfig, RouteConfig};
     use std::collections::BTreeMap;
 
-    fn test_daemon(dir: &std::path::Path) -> Daemon {
+    pub fn test_daemon(dir: &std::path::Path) -> Daemon {
         let mut plugins = BTreeMap::new();
         for name in ["mocka", "mockb"] {
             plugins.insert(name.to_string(), PluginConfig {
@@ -251,6 +251,12 @@ mod tests {
         };
         Daemon::new(cfg, dir).unwrap()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tests_support::test_daemon;
 
     #[test]
     fn inbound_routes_to_other_endpoint_and_dedups() {

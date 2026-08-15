@@ -15,13 +15,9 @@ pub struct Delivery {
     pub route: String,
     pub destination: Endpoint,
     pub attempt_count: u32,
-    #[allow(dead_code)] // consumed by the admin API (Task 10); remove allow when used
     pub state: String,
-    #[allow(dead_code)] // consumed by the admin API (Task 10); remove allow when used
     pub reason: Option<String>,
-    #[allow(dead_code)] // consumed by the admin API (Task 10); remove allow when used
     pub next_attempt: DateTime<Utc>,
-    #[allow(dead_code)] // consumed by the admin API (Task 10); remove allow when used
     pub expires_at: DateTime<Utc>,
 }
 
@@ -181,7 +177,6 @@ impl Store {
         )
     }
 
-    #[allow(dead_code)] // consumed by the admin API (Task 10); remove allow when used
     pub fn queue_counts(&self) -> rusqlite::Result<Vec<(String, i64)>> {
         let mut stmt = self
             .conn
@@ -190,7 +185,6 @@ impl Store {
         rows.collect()
     }
 
-    #[allow(dead_code)] // consumed by the admin API (Task 10); remove allow when used
     pub fn deliveries_for(&self, message_id: Uuid) -> rusqlite::Result<Vec<Delivery>> {
         let sql = format!(
             "SELECT {} FROM deliveries WHERE message_id = ?1 ORDER BY id",

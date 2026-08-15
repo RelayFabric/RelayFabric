@@ -1,4 +1,4 @@
-// mod admin; // Task 10
+mod admin;
 mod alias;
 mod config;
 mod dedup;
@@ -63,8 +63,7 @@ fn main() {
             }
         }
         tokio::spawn(engine::pump(daemon.clone()));
-        // admin::serve added in Task 10:
-        // tokio::spawn(admin::serve(daemon.clone(), data_dir.join("admin.sock")));
+        tokio::spawn(admin::serve(daemon.clone(), data_dir.join("admin.sock")));
         tracing::info!(node = daemon.cfg.node.name, "switchyardd running");
         tokio::signal::ctrl_c().await.expect("ctrl_c");
         tracing::info!("shutting down");

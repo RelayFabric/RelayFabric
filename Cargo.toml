@@ -25,5 +25,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rumqttc = "0.24"
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 relay-core = { path = "crates/relay-core" }
 relay-ipc = { path = "crates/relay-ipc" }

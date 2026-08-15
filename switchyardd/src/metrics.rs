@@ -10,7 +10,6 @@ pub fn inc(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
 }
 
-#[allow(dead_code)] // consumed by the admin API (Task 10); remove allow when used
 pub fn render(queue_counts: &[(String, i64)], plugin_up: &[(String, bool)]) -> String {
     let mut out = String::new();
     let counters = [
