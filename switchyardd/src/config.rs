@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // consumed by engine/policy wiring (Tasks 6/9); remove allow when used
 pub struct Config {
     pub node: NodeConfig,
     #[serde(default)]
@@ -24,12 +25,14 @@ fn default_ttl() -> u64 { 86_400 }
 fn default_hop_limit() -> u8 { 8 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // consumed by engine/policy wiring (Tasks 6/9); remove allow when used
 pub struct NodeConfig {
     pub name: String,
     pub data_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // consumed by engine/policy wiring (Tasks 6/9); remove allow when used
 pub struct PluginConfig {
     pub enabled: bool,
     pub command: Option<String>,
@@ -54,6 +57,7 @@ fn endpoints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Endpoint>, D:
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // consumed by engine/policy wiring (Tasks 6/9); remove allow when used
 pub struct Policy {
     pub name: String,
     #[serde(rename = "match")]
@@ -62,12 +66,14 @@ pub struct Policy {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)] // consumed by engine/policy wiring (Tasks 6/9); remove allow when used
 pub struct PolicyMatch {
     #[serde(default)]
     pub destination_protocol: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)] // consumed by engine/policy wiring (Tasks 6/9); remove allow when used
 pub struct PolicyRules {
     #[serde(default)]
     pub max_payload: Option<usize>,
