@@ -33,6 +33,16 @@ fn parse_broker(url: &str) -> Result<(String, u16), String> {
     }
 }
 
+/// Events forwarded from the dedicated eventloop-polling task (spawned in
+/// `main`) to the main select loop. Only what the main loop actually needs
+/// to act on is forwarded — not the raw rumqttc `Event`.
+enum MqttEvent {
+    Inbound { topic: String, body: String },
+    OutgoingPublish(u16),
+    PubAck(u16),
+    Error(String),
+}
+
 /// Correlates locally-enqueued `Send` requests with broker QoS1 PUBACKs, so
 /// `DeliveryResult` reflects broker acknowledgment rather than merely local
 /// eventloop-channel enqueue (spec §70 forbids fabricating delivery
@@ -65,14 +75,22 @@ impl DeliveryTracker {
     /// ponytail: caps `awaiting_ack` at 1024 and evicts an arbitrary entry
     /// (a `HashMap` has no order, so "oldest" isn't cheaply tracked) if
     /// PubAcks never arrive for some entries — e.g. the broker goes down
-    /// indefinitely. Capping bounds memory instead of leaking forever; it
-    /// isn't lost work, because the daemon's `reclaim_stale` (60s) requeues
-    /// the delivery with a fresh corr regardless, so a late ack for an
-    /// evicted pkid is just ignored rather than misattributed to a
-    /// different corr. Pruning on reconnect (`Incoming::ConnAck`) was the
-    /// other option, but it requires reasoning about rumqttc's own
-    /// reconnect/retransmission bookkeeping to avoid dropping entries that
-    /// are still live; the size cap is simpler and doesn't depend on that.
+    /// indefinitely. Capping bounds memory instead of leaking forever. It
+    /// isn't lost work: `corr` is the delivery's stable row id and is reused
+    /// verbatim on every retry — the daemon's `reclaim_stale` (60s) only
+    /// resets the row's state back to 'pending', it never mints a fresh
+    /// corr — so a requeued Send for the same delivery still carries the
+    /// same corr and will earn its own ack via a fresh pkid. If a stray
+    /// late ack for an evicted (or already-acked) pkid ever does slip
+    /// through and map to a corr that's already been reported delivered,
+    /// that's just a duplicate delivered `DeliveryResult` — harmless,
+    /// because the daemon's delivery state machine only accepts a
+    /// delivered/terminal transition once a row leaves 'attempting' and
+    /// ignores further ones after that. Pruning on reconnect
+    /// (`Incoming::ConnAck`) was the other option, but it requires
+    /// reasoning about rumqttc's own reconnect/retransmission bookkeeping
+    /// to avoid dropping entries that are still live; the size cap is
+    /// simpler and doesn't depend on that.
     fn on_outgoing_publish(&mut self, pkid: u16) {
         let Some(corr) = self.pending_pkid.pop_front() else { return };
         self.awaiting_ack.insert(pkid, corr);
@@ -165,14 +183,57 @@ async fn main() {
         }
     });
 
+    // client.publish(...).await (below, in the frames_rx branch) blocks once
+    // rumqttc's internal request channel (cap 64, see AsyncClient::new above)
+    // is full. That channel only drains via eventloop.poll(). If poll() lived
+    // in THIS same select loop, a broker outage with >64 pending publishes
+    // would wedge this loop on the publish await forever — and since poll()
+    // never runs again, the eventloop can't even reconnect once the broker
+    // comes back. The standard rumqttc pattern avoids this: a dedicated task
+    // owns the eventloop and polls it continuously, forwarding just the
+    // events the main loop needs over an mpsc channel. That keeps the
+    // request channel draining (and reconnects retrying) independently of
+    // whatever the main loop happens to be awaiting.
+    let (mqtt_tx, mut mqtt_rx) = mpsc::channel::<MqttEvent>(256);
+    tokio::spawn(async move {
+        loop {
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Incoming::Publish(p))) => {
+                    let topic = String::from_utf8_lossy(&p.topic).into_owned();
+                    let body = String::from_utf8_lossy(&p.payload).into_owned();
+                    if mqtt_tx.send(MqttEvent::Inbound { topic, body }).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(Event::Outgoing(Outgoing::Publish(pkid))) => {
+                    if mqtt_tx.send(MqttEvent::OutgoingPublish(pkid)).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(Event::Incoming(Incoming::PubAck(ack))) => {
+                    if mqtt_tx.send(MqttEvent::PubAck(ack.pkid)).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if mqtt_tx.send(MqttEvent::Error(e.to_string())).await.is_err() {
+                        return;
+                    }
+                    // throttle so a persistent failure (e.g. broker down)
+                    // doesn't hot-loop this task calling poll() repeatedly.
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    });
+
     let mut tracker = DeliveryTracker::new();
 
     loop {
         tokio::select! {
-            event = eventloop.poll() => match event {
-                Ok(Event::Incoming(Incoming::Publish(p))) => {
-                    let topic = String::from_utf8_lossy(&p.topic).into_owned();
-                    let body = String::from_utf8_lossy(&p.payload).into_owned();
+            event = mqtt_rx.recv() => match event {
+                Some(MqttEvent::Inbound { topic, body }) => {
                     let msg = PluginToDaemon::Inbound {
                         endpoint: topic.clone(),
                         sender: topic, // MQTT has no per-message sender identity
@@ -185,9 +246,9 @@ async fn main() {
                         return;
                     }
                 }
-                Ok(Event::Outgoing(Outgoing::Publish(pkid))) => tracker.on_outgoing_publish(pkid),
-                Ok(Event::Incoming(Incoming::PubAck(ack))) => {
-                    if let Some(corr) = tracker.on_puback(ack.pkid) {
+                Some(MqttEvent::OutgoingPublish(pkid)) => tracker.on_outgoing_publish(pkid),
+                Some(MqttEvent::PubAck(pkid)) => {
+                    if let Some(corr) = tracker.on_puback(pkid) {
                         let result = PluginToDaemon::DeliveryResult { corr, delivered: true, detail: None };
                         if write_frame(&mut w, &result).await.is_err() {
                             warn!("daemon connection lost");
@@ -195,10 +256,12 @@ async fn main() {
                         }
                     }
                 }
-                Ok(_) => {}
-                Err(e) => {
+                Some(MqttEvent::Error(e)) => {
                     warn!(error = %e, "mqtt error, reconnecting in 5s");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                None => {
+                    warn!("mqtt eventloop task ended");
+                    return;
                 }
             },
             frame = frames_rx.recv() => match frame {
@@ -206,7 +269,7 @@ async fn main() {
                     match client.publish(endpoint, QoS::AtLeastOnce, false, body.into_bytes()).await {
                         // Not yet delivered: publish() only enqueues onto rumqttc's
                         // eventloop channel. The real DeliveryResult is emitted once
-                        // the broker's PUBACK arrives (see Incoming::PubAck above).
+                        // the broker's PUBACK arrives (see MqttEvent::PubAck above).
                         Ok(()) => tracker.on_enqueued(corr),
                         Err(e) => {
                             let result = PluginToDaemon::DeliveryResult {
