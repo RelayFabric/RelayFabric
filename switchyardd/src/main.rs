@@ -1,5 +1,6 @@
 mod alias;
 mod config;
+mod dedup;
 
 fn main() {
     let mut args = std::env::args().skip(1);
