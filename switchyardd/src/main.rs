@@ -2,7 +2,9 @@ mod alias;
 mod config;
 mod dedup;
 mod policy;
+mod queue;
 mod routes;
+mod storage;
 mod transform;
 
 fn main() {
