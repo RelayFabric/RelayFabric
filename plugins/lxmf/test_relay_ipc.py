@@ -39,6 +39,17 @@ class CodecTests(unittest.TestCase):
         with self.assertRaises(EOFError):
             relay_ipc.read_frame(io.BytesIO(b"\x00\x00\x00\x10short"))
 
+    def test_inbound_bogus_timestamp_falls_back_to_none(self):
+        msg = relay_ipc.inbound("pasadena", "a91d00aa", "hello", 1e300)
+        self.assertIsNone(msg["created_at"])
+        self.assertEqual(msg["body"], "hello")
+        self.assertEqual(msg["endpoint"], "pasadena")
+        self.assertEqual(msg["sender"], "a91d00aa")
+
+    def test_inbound_valid_timestamp_sets_created_at(self):
+        msg = relay_ipc.inbound("pasadena", "a91d00aa", "hello", 0)
+        self.assertEqual(msg["created_at"], "1970-01-01T00:00:00Z")
+
 
 if __name__ == "__main__":
     unittest.main()

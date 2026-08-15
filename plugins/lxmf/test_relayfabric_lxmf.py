@@ -1,3 +1,7 @@
+import os
+import shutil
+import stat
+import tempfile
 import unittest
 
 import relayfabric_lxmf as plug
@@ -102,6 +106,47 @@ class FanoutTests(unittest.TestCase):
         t = plug.FanoutTracker(corr=8, members=["a"])
         result = t.member_done("a", False)
         self.assertFalse(result["delivered"])
+
+    def test_double_fire_reports_result_exactly_once(self):
+        t = plug.FanoutTracker(corr=9, members=["a"])
+        result = t.member_done("a", True)
+        self.assertIsNotNone(result)
+        self.assertTrue(result["delivered"])
+        # a buggy double-fired callback for the same (already-terminal)
+        # member must not produce a second result frame
+        self.assertIsNone(t.member_done("a", True))
+        self.assertIsNone(t.member_done("a", False))
+
+
+class HardenStorageTests(unittest.TestCase):
+    def test_tightens_dir_and_identity_perms(self):
+        storage = tempfile.mkdtemp()
+        try:
+            os.chmod(storage, 0o755)
+            identity_path = os.path.join(storage, "identity")
+            with open(identity_path, "w") as f:
+                f.write("dummy-key-bytes")
+            os.chmod(identity_path, 0o644)
+
+            plug._harden_storage(storage, identity_path)
+
+            self.assertEqual(stat.S_IMODE(os.stat(storage).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.stat(identity_path).st_mode), 0o600)
+        finally:
+            shutil.rmtree(storage)
+
+    def test_missing_identity_file_is_a_noop(self):
+        storage = tempfile.mkdtemp()
+        try:
+            os.chmod(storage, 0o755)
+            identity_path = os.path.join(storage, "identity")
+
+            plug._harden_storage(storage, identity_path)  # must not raise
+
+            self.assertEqual(stat.S_IMODE(os.stat(storage).st_mode), 0o700)
+            self.assertFalse(os.path.exists(identity_path))
+        finally:
+            shutil.rmtree(storage)
 
 
 if __name__ == "__main__":

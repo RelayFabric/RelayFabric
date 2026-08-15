@@ -55,8 +55,13 @@ def hello(plugin, version, caps):
 def inbound(endpoint, sender, body, created_at_epoch=None):
     created = None
     if created_at_epoch is not None:
-        created = (datetime.fromtimestamp(created_at_epoch, timezone.utc)
-                   .isoformat().replace("+00:00", "Z"))
+        try:
+            created = (datetime.fromtimestamp(created_at_epoch, timezone.utc)
+                       .isoformat().replace("+00:00", "Z"))
+        except (OverflowError, OSError, ValueError):
+            # sender-controlled timestamp out of range (e.g. 1e300); bridge
+            # the message anyway and let the daemon stamp receive time.
+            created = None
     return {"t": "inbound", "endpoint": endpoint, "sender": sender,
             "kind": "text", "body": body, "created_at": created}
 

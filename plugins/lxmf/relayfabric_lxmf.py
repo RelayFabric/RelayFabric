@@ -50,6 +50,9 @@ def channel_members(channel, dynamic):
     return channel["members"] + [m for m in joined if m not in channel["members"]]
 
 
+KNOWN_COMMANDS = {"/join", "/leave", "/channels"}
+
+
 def command_reply(cfg, dynamic, sender, text):
     parts = text.split()
     cmd = parts[0].lower()
@@ -97,6 +100,18 @@ def save_members_atomic(path, dynamic):
     os.replace(tmp, path)
 
 
+def _harden_storage(storage, identity_path):
+    """Tighten perms on the storage dir and identity (private key) file.
+
+    `os.makedirs(..., mode=0o700)` only applies the mode on creation, and
+    RNS.Identity.to_file writes the raw private key with umask perms, so
+    both need an explicit chmod regardless of whether they pre-existed.
+    """
+    os.chmod(storage, 0o700)
+    if os.path.isfile(identity_path):
+        os.chmod(identity_path, 0o600)
+
+
 PLUGIN_VERSION = "0.1.0"
 
 
@@ -120,6 +135,7 @@ class FanoutTracker:
         self._done = 0
         self._delivered = 0
         self._failed = []
+        self._reported = False
 
     def member_done(self, member, success):
         import relay_ipc
@@ -130,8 +146,9 @@ class FanoutTracker:
                 self._delivered += 1
             else:
                 self._failed.append(member)
-            if self._done < self.total:
+            if self._done < self.total or self._reported:
                 return None
+            self._reported = True
             detail = "failed: " + ",".join(self._failed) if self._failed else None
             return relay_ipc.delivery_result(self.corr, self._delivered > 0, detail)
 
@@ -182,15 +199,17 @@ class Bridge:
         self.write_lock = threading.Lock()
 
         storage = cfg["storage"]
+        identity_path = os.path.join(storage, "identity")
         os.makedirs(storage, mode=0o700, exist_ok=True)
+        _harden_storage(storage, identity_path)  # tighten pre-existing dir/legacy key
         self.reticulum = RNS.Reticulum(cfg["rns_configdir"])
 
-        identity_path = os.path.join(storage, "identity")
         if os.path.isfile(identity_path):
             self.identity = RNS.Identity.from_file(identity_path)
         else:
             self.identity = RNS.Identity()
             self.identity.to_file(identity_path)
+        _harden_storage(storage, identity_path)  # to_file writes with umask perms
 
         self.router = LXMF.LXMRouter(storagepath=os.path.join(storage, "lxmf"))
         self.stamp_cost = cfg["stamp_cost"]
@@ -276,7 +295,12 @@ class Bridge:
                 reply, changed = command_reply(self.cfg, self.dynamic_members, sender, text)
                 if changed:
                     save_members_atomic(self.members_path, self.dynamic_members)
-            RNS.log(f"Command from {sender}: {text.split()[0]}", RNS.LOG_INFO)
+            # only log the verb for known commands; anything else may be
+            # arbitrary user text (e.g. "/etc/hosts is broken") and must
+            # not be logged
+            verb = text.split()[0].lower() if text.split() else ""
+            logged = verb if verb in KNOWN_COMMANDS else "unknown command"
+            RNS.log(f"Command from {sender}: {logged}", RNS.LOG_INFO)
             self.pool.submit(self.send_lxmf, sender, reply)
             return
 
@@ -320,9 +344,16 @@ class Bridge:
         try:
             method = method or LXMF.LXMessage.DIRECT
             dest_hash = bytes.fromhex(dest_hex)
-            if not RNS.Transport.has_path(dest_hash):
+            # PROPAGATED sends go to the propagation node, whose path is
+            # already known (this is a resubmit after a failed DIRECT
+            # attempt); only Identity.recall below is needed, so skip the
+            # path wait entirely for this method.
+            if method != LXMF.LXMessage.PROPAGATED and not RNS.Transport.has_path(dest_hash):
                 RNS.Transport.request_path(dest_hash)
-                deadline = time.time() + 30
+                # 15s, not 30s: keeps a single stalled fan-out member's
+                # DIRECT attempt inside the daemon's 60s reclaim window for
+                # the overall send.
+                deadline = time.time() + 15
                 while (not RNS.Transport.has_path(dest_hash)
                        and time.time() < deadline):
                     time.sleep(0.25)
