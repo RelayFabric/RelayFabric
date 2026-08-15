@@ -1,6 +1,7 @@
 mod alias;
 mod config;
 mod dedup;
+mod metrics;
 mod policy;
 mod queue;
 mod routes;
