@@ -1,6 +1,5 @@
 /// Render the destination-facing body: origin tag + payload, truncated to
 /// max_payload bytes on a char boundary with a visible marker (spec §17, §83).
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 pub fn render(alias: &str, body: &str, max_payload: Option<usize>) -> String {
     let full = format!("[{alias}]\n{body}");
     let Some(limit) = max_payload else { return full };

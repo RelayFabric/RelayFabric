@@ -2,13 +2,11 @@ use crate::config::Policy;
 use relay_core::{Endpoint, Envelope};
 
 #[derive(Debug)]
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 pub enum Decision<'a> {
     Allow { max_payload: Option<usize> },
     Deny { policy: &'a str },
 }
 
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 pub fn evaluate<'a>(
     policies: &'a [Policy],
     env: &Envelope,

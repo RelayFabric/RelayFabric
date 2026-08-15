@@ -1,12 +1,17 @@
+// mod admin; // Task 10
 mod alias;
 mod config;
 mod dedup;
+mod engine;
 mod metrics;
+mod plugins;
 mod policy;
 mod queue;
 mod routes;
 mod storage;
 mod transform;
+
+use std::sync::Arc;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -34,5 +39,34 @@ fn main() {
                  cfg.routes.len(), cfg.plugins.len());
         return;
     }
-    let _ = cfg; // daemon startup arrives in Task 9
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+    let data_dir = cfg.node.data_dir.clone();
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async move {
+        let daemon = Arc::new(engine::Daemon::new(cfg, &data_dir).expect("daemon init"));
+        let plugin_sock = data_dir.join("plugins.sock");
+        let _ = std::fs::remove_file(&plugin_sock);
+        let listener = tokio::net::UnixListener::bind(&plugin_sock).expect("bind plugin socket");
+        tokio::spawn(plugins::listen(daemon.clone(), listener));
+        for (name, pc) in &daemon.cfg.plugins {
+            if pc.enabled {
+                if let Some(cmd) = &pc.command {
+                    tokio::spawn(plugins::supervise(
+                        daemon.clone(), name.clone(), cmd.clone(), plugin_sock.clone()));
+                }
+            }
+        }
+        tokio::spawn(engine::pump(daemon.clone()));
+        // admin::serve added in Task 10:
+        // tokio::spawn(admin::serve(daemon.clone(), data_dir.join("admin.sock")));
+        tracing::info!(node = daemon.cfg.node.name, "switchyardd running");
+        tokio::signal::ctrl_c().await.expect("ctrl_c");
+        tracing::info!("shutting down");
+    });
 }

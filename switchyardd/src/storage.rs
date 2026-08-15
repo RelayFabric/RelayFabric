@@ -4,26 +4,27 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use uuid::Uuid;
 
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 pub struct Store {
     conn: Connection,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 pub struct Delivery {
     pub id: i64,
     pub message_id: Uuid,
     pub route: String,
     pub destination: Endpoint,
     pub attempt_count: u32,
+    #[allow(dead_code)] // consumed by the admin API (Task 10); remove allow when used
     pub state: String,
+    #[allow(dead_code)] // consumed by the admin API (Task 10); remove allow when used
     pub reason: Option<String>,
+    #[allow(dead_code)] // consumed by the admin API (Task 10); remove allow when used
     pub next_attempt: DateTime<Utc>,
+    #[allow(dead_code)] // consumed by the admin API (Task 10); remove allow when used
     pub expires_at: DateTime<Utc>,
 }
 
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
@@ -46,17 +47,14 @@ CREATE TABLE IF NOT EXISTS deliveries (
 CREATE INDEX IF NOT EXISTS idx_deliveries_due ON deliveries(state, next_attempt);
 ";
 
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 fn ts(t: DateTime<Utc>) -> String {
     t.to_rfc3339()
 }
 
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 fn parse_ts(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).map(|t| t.with_timezone(&Utc)).unwrap_or_default()
 }
 
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
         let conn = Connection::open(path)?;
@@ -183,6 +181,7 @@ impl Store {
         )
     }
 
+    #[allow(dead_code)] // consumed by the admin API (Task 10); remove allow when used
     pub fn queue_counts(&self) -> rusqlite::Result<Vec<(String, i64)>> {
         let mut stmt = self
             .conn
@@ -191,6 +190,7 @@ impl Store {
         rows.collect()
     }
 
+    #[allow(dead_code)] // consumed by the admin API (Task 10); remove allow when used
     pub fn deliveries_for(&self, message_id: Uuid) -> rusqlite::Result<Vec<Delivery>> {
         let sql = format!(
             "SELECT {} FROM deliveries WHERE message_id = ?1 ORDER BY id",
@@ -199,6 +199,15 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![message_id.to_string()], Self::delivery_from_row)?;
         rows.collect()
+    }
+
+    pub fn deliveries_for_id(&self, id: i64) -> Option<Delivery> {
+        let sql = format!("SELECT {} FROM deliveries WHERE id = ?1", Self::DELIVERY_COLS);
+        self.conn
+            .prepare(&sql)
+            .ok()?
+            .query_row(params![id], Self::delivery_from_row)
+            .ok()
     }
 }
 

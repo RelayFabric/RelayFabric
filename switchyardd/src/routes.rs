@@ -3,7 +3,6 @@ use relay_core::Endpoint;
 
 /// Deny by default: only explicitly routed (source → destinations) pairs
 /// flow, and the ingress endpoint never echoes back to itself (spec §24, §38).
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 pub fn route<'a>(
     routes: &'a [RouteConfig],
     source: &Endpoint,

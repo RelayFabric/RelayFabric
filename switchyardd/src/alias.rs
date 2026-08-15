@@ -3,12 +3,10 @@ use sha2::Sha256;
 use std::io;
 use std::path::Path;
 
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 pub struct Aliaser {
     pub(crate) key: [u8; 32],
 }
 
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 impl Aliaser {
     pub fn load_or_create(path: &Path) -> io::Result<Aliaser> {
         if !path.exists() {

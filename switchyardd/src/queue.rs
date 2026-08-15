@@ -1,10 +1,8 @@
 use std::time::Duration;
 
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 pub const MAX_ATTEMPTS: u32 = 8;
 
 /// Exponential-ish backoff per spec §42: 5s, 30s, 2m, 10m, then 1h forever.
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 pub fn backoff(attempt: u32) -> Duration {
     Duration::from_secs(match attempt {
         0 | 1 => 5,

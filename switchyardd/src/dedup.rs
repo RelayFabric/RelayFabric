@@ -3,7 +3,6 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 pub fn key(
     protocol: &str,
     sender: &str,
@@ -17,13 +16,11 @@ pub fn key(
     ))
 }
 
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 pub struct Dedup {
     ttl: Duration,
     seen: HashMap<String, Instant>,
 }
 
-#[allow(dead_code)] // consumed by engine wiring (Task 9); remove allow when used
 impl Dedup {
     pub fn new(ttl: Duration) -> Dedup {
         Dedup { ttl, seen: HashMap::new() }
