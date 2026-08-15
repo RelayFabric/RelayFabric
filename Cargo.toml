@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/relay-core", "crates/relay-ipc", "switchyardd"]
-# members = ["switchyardctl", "plugins/mqtt"]
+members = ["crates/relay-core", "crates/relay-ipc", "switchyardd", "switchyardctl"]
+# members = ["plugins/mqtt"]
 
 [workspace.package]
 edition = "2021"
