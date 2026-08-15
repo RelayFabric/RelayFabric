@@ -95,11 +95,21 @@ pub fn handle_inbound(
     info!(id = %env.id, source = %env.source, targets = targets.len(), "message accepted");
 }
 
+/// Delivery-state writes are best-effort from the caller's point of view (the
+/// pump will simply reconsider the row on its next pass), but a failure must
+/// never be silent: log it with the delivery id and the state we tried to
+/// write so a stuck row is diagnosable.
+fn warn_if_mark_failed(delivery: i64, state: &str, result: rusqlite::Result<()>) {
+    if let Err(e) = result {
+        warn!(delivery, state, error = %e, "failed to persist delivery state change");
+    }
+}
+
 pub fn handle_result(d: &Daemon, corr: i64, delivered: bool, detail: Option<String>) {
     let store = d.store.lock().unwrap();
     if delivered {
         metrics::inc(&metrics::EGRESS);
-        let _ = store.mark_delivered(corr);
+        warn_if_mark_failed(corr, "delivered", store.mark_delivered(corr));
         info!(delivery = corr, "delivered");
         return;
     }
@@ -109,12 +119,13 @@ pub fn handle_result(d: &Daemon, corr: i64, delivered: bool, detail: Option<Stri
         .map(|del| del.attempt_count)
         .unwrap_or(queue::MAX_ATTEMPTS);
     if attempts >= queue::MAX_ATTEMPTS {
-        let _ = store.mark_terminal(corr, "dead_letter", "RETRY_EXHAUSTED");
+        warn_if_mark_failed(corr, "dead_letter",
+            store.mark_terminal(corr, "dead_letter", "RETRY_EXHAUSTED"));
         warn!(delivery = corr, detail = detail.as_deref().unwrap_or(""), "dead-lettered");
     } else {
         let next = Utc::now()
             + CDuration::from_std(queue::backoff(attempts)).unwrap_or(CDuration::seconds(5));
-        let _ = store.mark_retry(corr, next);
+        warn_if_mark_failed(corr, "pending", store.mark_retry(corr, next));
         info!(delivery = corr, attempts, "delivery failed, will retry");
     }
 }
@@ -135,23 +146,37 @@ pub async fn pump(d: Arc<Daemon>) {
 }
 
 async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>) {
-    let env = match d.store.lock().unwrap().get_message(del.message_id) {
+    // Look up the message with its own short-lived lock, then drop the guard
+    // before matching: the `_` arm below needs to take the lock again to
+    // mark the row, and std::sync::Mutex is not reentrant — holding the
+    // guard as the match scrutinee while re-locking in an arm deadlocks.
+    let msg = {
+        let store = d.store.lock().unwrap();
+        store.get_message(del.message_id)
+    };
+    let env = match msg {
         Ok(Some(e)) => e,
-        _ => {
-            let _ = d.store.lock().unwrap()
+        other => {
+            if let Err(e) = &other {
+                warn!(delivery = del.id, error = %e, "failed to load message for delivery");
+            }
+            let result = d.store.lock().unwrap()
                 .mark_terminal(del.id, "failed", "DESTINATION_UNKNOWN");
+            warn_if_mark_failed(del.id, "failed", result);
             return;
         }
     };
     if env.is_expired(now) {
-        let _ = d.store.lock().unwrap().mark_terminal(del.id, "expired", "TTL_EXPIRED");
+        let result = d.store.lock().unwrap().mark_terminal(del.id, "expired", "TTL_EXPIRED");
+        warn_if_mark_failed(del.id, "expired", result);
         return;
     }
     match policy::evaluate(&d.cfg.policies, &env, &del.destination) {
         policy::Decision::Deny { policy } => {
             metrics::inc(&metrics::POLICY_DENIALS);
-            let _ = d.store.lock().unwrap()
+            let result = d.store.lock().unwrap()
                 .mark_terminal(del.id, "dead_letter", "POLICY_DENIED");
+            warn_if_mark_failed(del.id, "dead_letter", result);
             info!(delivery = del.id, policy, "policy denied");
         }
         policy::Decision::Allow { max_payload } => {
@@ -168,8 +193,9 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             };
             let Some(tx) = tx else {
                 // plugin not connected: nudge next_attempt forward, stay pending
-                let _ = d.store.lock().unwrap()
+                let result = d.store.lock().unwrap()
                     .mark_retry(del.id, now + CDuration::seconds(5));
+                warn_if_mark_failed(del.id, "pending", result);
                 return;
             };
             let limit = match (max_payload, cap_limit) {
@@ -179,7 +205,8 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             let alias = d.aliaser.alias(
                 &env.source.protocol, &env.sender.native_ref, &del.route);
             let body = transform::render(&alias, &env.body, limit);
-            let _ = d.store.lock().unwrap().mark_attempting(del.id);
+            let result = d.store.lock().unwrap().mark_attempting(del.id);
+            warn_if_mark_failed(del.id, "attempting", result);
             let send = DaemonToPlugin::Send {
                 corr: del.id,
                 endpoint: del.destination.endpoint.clone(),
@@ -188,8 +215,9 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             };
             if tx.send(send).await.is_err() {
                 // channel closed under us; requeue
-                let _ = d.store.lock().unwrap()
+                let result = d.store.lock().unwrap()
                     .mark_retry(del.id, now + CDuration::seconds(5));
+                warn_if_mark_failed(del.id, "pending", result);
             }
         }
     }
@@ -247,5 +275,50 @@ mod tests {
                        "hi".into(), None);
         assert_eq!(d.store.lock().unwrap().queue_counts().unwrap(),
                    vec![("pending".to_string(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn process_due_marks_failed_when_message_missing_without_deadlocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("relayfabric.db");
+        let d = Arc::new(test_daemon(dir.path()));
+        let now = Utc::now();
+        let dest: Endpoint = "mockb:chan".parse().unwrap();
+
+        // get_message() swallows envelope deserialize failures into Ok(None)
+        // (storage.rs get_message), which is the realistic way a delivery row
+        // sees a "missing" message while still satisfying the messages(id)
+        // foreign key: the row exists but its envelope JSON is unreadable.
+        // Insert such a row directly, bypassing Store::insert_message (which
+        // can only ever write valid JSON).
+        let ghost_id = uuid::Uuid::now_v7();
+        {
+            let raw = rusqlite::Connection::open(&db_path).unwrap();
+            raw.execute(
+                "INSERT INTO messages (id, envelope, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![ghost_id.to_string(), "not valid json", now.to_rfc3339()],
+            ).unwrap();
+        }
+        let delivery_id = {
+            let store = d.store.lock().unwrap();
+            store
+                .insert_delivery(ghost_id, "general", &dest, now, now + CDuration::hours(1))
+                .unwrap()
+        };
+        let del = {
+            let store = d.store.lock().unwrap();
+            store.deliveries_for_id(delivery_id).unwrap()
+        };
+
+        // Regression guard for the self-deadlock: process_due's message-missing
+        // fallback used to re-lock d.store while still holding the guard from
+        // the match scrutinee, hanging forever. It must complete promptly.
+        tokio::time::timeout(std::time::Duration::from_secs(2), process_due(&d, del, now))
+            .await
+            .expect("process_due hung instead of completing (self-deadlock)");
+
+        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert_eq!(after.state, "failed");
+        assert_eq!(after.reason.as_deref(), Some("DESTINATION_UNKNOWN"));
     }
 }
