@@ -1,6 +1,9 @@
 mod alias;
 mod config;
 mod dedup;
+mod policy;
+mod routes;
+mod transform;
 
 fn main() {
     let mut args = std::env::args().skip(1);
