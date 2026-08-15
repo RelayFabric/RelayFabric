@@ -1,3 +1,4 @@
+mod alias;
 mod config;
 
 fn main() {
