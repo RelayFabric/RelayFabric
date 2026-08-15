@@ -1,0 +1,20 @@
+[package]
+name = "relayfabric-mqtt"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "relayfabric-mqtt"
+path = "src/main.rs"
+
+[dependencies]
+relay-core.workspace = true
+relay-ipc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+rumqttc.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
