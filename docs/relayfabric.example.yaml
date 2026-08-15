@@ -1,0 +1,33 @@
+# RelayFabric example configuration. Deny by default: nothing is bridged
+# unless a route says so (spec §38). Validate with: switchyardd --check-config
+node:
+  name: example-gateway
+  data_dir: /var/lib/relayfabric
+
+plugins:
+  mqtt:
+    enabled: true
+    # Managed by switchyardd; omit `command` to run the plugin yourself
+    # (it connects to <data_dir>/plugins.sock using RELAYFABRIC_SOCKET).
+    command: relayfabric-mqtt
+    config:
+      broker: mqtt://127.0.0.1:1883
+      topics: [chat/a, chat/b]
+
+routes:
+  - name: demo
+    sources: ["mqtt:chat/a", "mqtt:chat/b"]
+    destinations: ["mqtt:chat/a", "mqtt:chat/b"]
+
+policies:
+  - name: small-payloads
+    match:
+      destination_protocol: [mqtt]
+    rules:
+      max_payload: 4096
+      drop_kinds: [location]   # location never crosses by default (spec §74)
+
+# TTLs and limits (seconds)
+ttl_default_secs: 86400
+dedup_ttl_secs: 86400
+hop_limit: 8
