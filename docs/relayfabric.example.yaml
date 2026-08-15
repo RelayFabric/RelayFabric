@@ -14,10 +14,29 @@ plugins:
       broker: mqtt://127.0.0.1:1883
       topics: [chat/a, chat/b]
 
+  # lxmf:
+  #   enabled: true
+  #   command: relayfabric-lxmf
+  #   config:
+  #     display_name: "RelayFabric Gateway"
+  #     storage: /var/lib/relayfabric/lxmf
+  #     rns_configdir: null          # null = default ~/.reticulum
+  #     announce_interval: 3600
+  #     stamp_cost: null             # set to require inbound proof-of-work
+  #     propagation_node: "auto"     # "auto" | explicit dest hash hex | null
+  #     channels:
+  #       - name: pasadena
+  #         members: ["a91d00aa..."] # lowercase LXMF destination hashes
+  #         open: false              # closed: operator-managed membership only
+
 routes:
   - name: demo
     sources: ["mqtt:chat/a", "mqtt:chat/b"]
     destinations: ["mqtt:chat/a", "mqtt:chat/b"]
+
+  # - name: lxmf_mqtt_bridge
+  #   sources: ["lxmf:pasadena", "mqtt:lxmf_bridge"]
+  #   destinations: ["lxmf:pasadena", "mqtt:lxmf_bridge"]
 
 policies:
   - name: small-payloads
