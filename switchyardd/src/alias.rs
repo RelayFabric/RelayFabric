@@ -13,11 +13,14 @@ impl Aliaser {
     pub fn load_or_create(path: &Path) -> io::Result<Aliaser> {
         if !path.exists() {
             let key: [u8; 32] = rand::random();
-            std::fs::write(path, hex::encode(key))?;
-            let mut perms = std::fs::metadata(path)?.permissions();
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o600);
-            std::fs::set_permissions(path, perms)?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?;
+            f.write_all(hex::encode(key).as_bytes())?;
         }
         let raw = std::fs::read_to_string(path)?;
         let bytes = hex::decode(raw.trim()).map_err(io::Error::other)?;
