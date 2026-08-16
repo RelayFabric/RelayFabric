@@ -1,18 +1,16 @@
 """RelayFabric LXMF plugin: bridges Reticulum/LXMF channels over Plugin Protocol v1.
 
-Module top level is stdlib-only (json/mimetypes/os/socket/sys/threading/
-time/concurrent.futures) plus media (itself stdlib-only at import time; see
+Module top level is stdlib-only (json/mimetypes/os/threading/time/
+concurrent.futures) plus media (itself stdlib-only at import time; see
 media.py) so the config/channel/command/attachment helpers above stay
-importable without rns, lxmf, or even cbor2 installed. relayfabric_sdk.ipc
-and RNS/LXMF are imported lazily inside the functions/methods that need
-them (see Bridge and main()).
+importable without rns, lxmf, or even cbor2 installed. relayfabric_sdk
+(ipc, run_plugin) and RNS/LXMF are imported lazily inside the functions/
+methods that need them (see Bridge and main()).
 """
 
 import json
 import mimetypes
 import os
-import socket
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -583,45 +581,37 @@ class Bridge:
             time.sleep(interval)
 
 
-def main():
-    sock_path = os.environ["RELAYFABRIC_SOCKET"]
-    plugin_name = os.environ.get("RELAYFABRIC_PLUGIN_NAME", "lxmf")
-    raw_cfg = json.loads(os.environ.get("RELAYFABRIC_PLUGIN_CONFIG", "{}"))
+class _RunnerBridge:
+    """Adapts Bridge's positional-arg methods to relayfabric_sdk.run_plugin's
+    frame-dict dispatch contract, without changing Bridge's own (tested)
+    method signatures.
+    """
+
+    def __init__(self, bridge):
+        self.bridge = bridge
+
+    def handle_send(self, frame):
+        self.bridge.handle_send(frame["corr"], frame["endpoint"], frame["body"],
+                                 frame.get("attachments"))
+
+    def handle_send_direct(self, frame):
+        self.bridge.handle_send_direct(frame["corr"], frame["native_ref"], frame["body"])
+
+    def start(self):
+        threading.Thread(target=self.bridge.announce_loop, daemon=True).start()
+
+
+def _make_bridge(raw_cfg, sock):
     cfg = load_config(raw_cfg)
+    return _RunnerBridge(Bridge(cfg, sock))
+
+
+def main():
+    plugin_name = os.environ.get("RELAYFABRIC_PLUGIN_NAME", "lxmf")
 
     from relayfabric_sdk import ipc as relay_ipc
-
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(sock_path)
-    rfile = sock.makefile("rb")
-    wfile = sock.makefile("wb")
+    from relayfabric_sdk import run_plugin
 
     caps = relay_ipc.capabilities(direct_messages=True, groups=True, attachments=True)
-    relay_ipc.write_frame(wfile, relay_ipc.hello(plugin_name, PLUGIN_VERSION, caps))
-    ack = relay_ipc.read_frame(rfile)
-    if ack.get("t") != "hello_ack" or ack.get("error"):
-        print(f"relayfabric-lxmf: hello rejected: {ack.get('error')}", file=sys.stderr)
-        sys.exit(1)
-
-    bridge = Bridge(cfg, wfile)
-    threading.Thread(target=bridge.announce_loop, daemon=True).start()
-
-    import RNS
-
-    while True:
-        try:
-            frame = relay_ipc.read_frame(rfile)
-        except (EOFError, OSError, ValueError) as e:
-            # ValueError: oversize/corrupt frame (relay_ipc.read_frame's own
-            # MAX_FRAME check). The stream is desynced at that point, so exit
-            # rather than continue -- there is no way to resume mid-frame.
-            RNS.log(f"Daemon connection lost, exiting: {e}", RNS.LOG_ERROR)
-            sys.exit(1)
-        kind = frame.get("t")
-        if kind == "send":
-            bridge.handle_send(frame["corr"], frame["endpoint"], frame["body"],
-                               frame.get("attachments"))
-        elif kind == "send_direct":
-            bridge.handle_send_direct(frame["corr"], frame["native_ref"], frame["body"])
-        elif kind == "shutdown":
-            sys.exit(0)
+    run_plugin(plugin_name, PLUGIN_VERSION, _make_bridge, caps,
+               config_env="RELAYFABRIC_PLUGIN_CONFIG")

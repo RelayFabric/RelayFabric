@@ -16,5 +16,7 @@ The names below are the flat re-export surface for everything else.
 from .cache import SentCache
 from .harness import FakeSock
 from .ipc import PROTOCOL_VERSION, read_frame, write_frame
+from .runner import run_plugin
 
-__all__ = ["PROTOCOL_VERSION", "FakeSock", "SentCache", "read_frame", "write_frame"]
+__all__ = ["PROTOCOL_VERSION", "FakeSock", "SentCache", "read_frame", "run_plugin",
+           "write_frame"]

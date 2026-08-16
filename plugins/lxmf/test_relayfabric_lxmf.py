@@ -507,5 +507,63 @@ class SendDirectTests(unittest.TestCase):
         self.assertFalse(self.sock.frames()[-1]["delivered"])
 
 
+class RunnerBridgeTests(unittest.TestCase):
+    """_RunnerBridge adapts run_plugin's frame-dict dispatch to Bridge's own
+    (unchanged, separately tested) positional-arg handle_send/
+    handle_send_direct/announce_loop.
+    """
+
+    def test_handle_send_unpacks_frame_positionally(self):
+        calls = []
+        stub = types.SimpleNamespace(
+            handle_send=lambda corr, endpoint, body, attachments=None:
+                calls.append((corr, endpoint, body, attachments)))
+        adapter = plug._RunnerBridge(stub)
+
+        adapter.handle_send({"t": "send", "corr": 1, "endpoint": "pasadena",
+                              "body": "hi", "attachments": [{"filename": "a"}]})
+
+        self.assertEqual(calls, [(1, "pasadena", "hi", [{"filename": "a"}])])
+
+    def test_handle_send_defaults_missing_attachments_to_none(self):
+        calls = []
+        stub = types.SimpleNamespace(
+            handle_send=lambda corr, endpoint, body, attachments=None:
+                calls.append(attachments))
+        adapter = plug._RunnerBridge(stub)
+
+        adapter.handle_send({"t": "send", "corr": 1, "endpoint": "pasadena", "body": "hi"})
+
+        self.assertEqual(calls, [None])
+
+    def test_handle_send_direct_unpacks_frame_positionally(self):
+        calls = []
+        stub = types.SimpleNamespace(
+            handle_send_direct=lambda corr, native_ref, body: calls.append((corr, native_ref, body)))
+        adapter = plug._RunnerBridge(stub)
+
+        adapter.handle_send_direct({"t": "send_direct", "corr": 2,
+                                     "native_ref": "a91d00aa", "body": "code"})
+
+        self.assertEqual(calls, [(2, "a91d00aa", "code")])
+
+    def test_start_launches_announce_loop_on_a_daemon_thread(self):
+        started = threading.Event()
+        stub = types.SimpleNamespace(announce_loop=started.set)
+        adapter = plug._RunnerBridge(stub)
+
+        adapter.start()
+
+        self.assertTrue(started.wait(timeout=2))
+
+
+class MakeBridgeTests(unittest.TestCase):
+    def test_validates_config_before_touching_rns(self):
+        # load_config({}) raises before Bridge() (and its real RNS/LXMF
+        # storage setup) is ever constructed.
+        with self.assertRaises(ValueError):
+            plug._make_bridge({}, FakeSock())
+
+
 if __name__ == "__main__":
     unittest.main()

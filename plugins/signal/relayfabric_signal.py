@@ -1,20 +1,17 @@
 """RelayFabric Signal plugin: bridges Signal groups over Plugin Protocol v1
 via a signal-cli JSON-RPC/SSE daemon.
 
-Module top level is stdlib-only (json/logging/os/shutil/socket/sys/
-tempfile/threading/time/urllib.request) so the config/parser/backend
-helpers stay importable without cbor2 or rns. relayfabric_sdk (ipc and
-SentCache) is imported lazily inside the methods/functions that need it
-(see Bridge and main()). Attachment bytes are never logged, only
-names/sizes/counts.
+Module top level is stdlib-only (json/logging/os/shutil/tempfile/threading/
+time/urllib.request) so the config/parser/backend helpers stay importable
+without cbor2 or rns. relayfabric_sdk (ipc, SentCache, run_plugin) is
+imported lazily inside the methods/functions that need it (see Bridge and
+main()). Attachment bytes are never logged, only names/sizes/counts.
 """
 
 import json
 import logging
 import os
 import shutil
-import socket
-import sys
 import tempfile
 import threading
 import time
@@ -226,6 +223,16 @@ class Bridge:
         with self.write_lock:
             relay_ipc.write_frame(self.sock_file, obj)
 
+    def start(self):
+        threading.Thread(target=self._sse_loop, daemon=True).start()
+
+    def _sse_loop(self):
+        for ev in self.backend.events():
+            try:
+                self.handle_event(ev)
+            except Exception as e:  # noqa: BLE001 - one bad event must not kill the reader
+                log.error(f"Signal event handler error: {e}")
+
     # ----- inbound (Signal -> daemon); called from the SSE thread -----
 
     def handle_event(self, event):
@@ -322,53 +329,21 @@ class Bridge:
                  f"({len(text)} chars, {len(paths)} attachment(s))")
 
 
+def _make_bridge(raw_cfg, sock):
+    cfg = load_config(raw_cfg)
+    backend = SignalCliBackend(cfg["rpc_url"], cfg["account"])
+    return Bridge(cfg, backend, sock)
+
+
 def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
 
-    sock_path = os.environ["RELAYFABRIC_SOCKET"]
     plugin_name = os.environ.get("RELAYFABRIC_PLUGIN_NAME", "signal")
-    raw_cfg = json.loads(os.environ.get("RELAYFABRIC_PLUGIN_CONFIG", "{}"))
-    cfg = load_config(raw_cfg)
 
     from relayfabric_sdk import ipc as relay_ipc
-
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(sock_path)
-    rfile = sock.makefile("rb")
-    wfile = sock.makefile("wb")
+    from relayfabric_sdk import run_plugin
 
     caps = relay_ipc.capabilities(groups=True, attachments=True)
-    relay_ipc.write_frame(wfile, relay_ipc.hello(plugin_name, PLUGIN_VERSION, caps))
-    ack = relay_ipc.read_frame(rfile)
-    if ack.get("t") != "hello_ack" or ack.get("error"):
-        print(f"relayfabric-signal: hello rejected: {ack.get('error')}",
-             file=sys.stderr)
-        sys.exit(1)
-
-    backend = SignalCliBackend(cfg["rpc_url"], cfg["account"])
-    bridge = Bridge(cfg, backend, wfile)
-
-    def sse_loop():
-        for ev in backend.events():
-            try:
-                bridge.handle_event(ev)
-            except Exception as e:  # noqa: BLE001 - one bad event must not kill the reader
-                log.error(f"Signal event handler error: {e}")
-
-    threading.Thread(target=sse_loop, daemon=True).start()
-
-    while True:
-        try:
-            frame = relay_ipc.read_frame(rfile)
-        except (EOFError, OSError, ValueError) as e:
-            # ValueError: oversize/corrupt frame (relay_ipc.read_frame's own
-            # MAX_FRAME check). The stream is desynced at that point, so exit
-            # rather than continue -- there is no way to resume mid-frame.
-            log.error(f"Daemon connection lost, exiting: {e}")
-            sys.exit(1)
-        kind = frame.get("t")
-        if kind == "send":
-            bridge.handle_send(frame)
-        elif kind == "shutdown":
-            sys.exit(0)
+    run_plugin(plugin_name, PLUGIN_VERSION, _make_bridge, caps,
+               config_env="RELAYFABRIC_PLUGIN_CONFIG")

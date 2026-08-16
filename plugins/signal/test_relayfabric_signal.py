@@ -2,6 +2,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -438,6 +439,59 @@ class BridgeEgressAttachmentTests(unittest.TestCase):
         self.bridge.handle_send(frame)
         _, _, captured = self.backend.sent[0]
         self.assertEqual(captured, [])
+
+
+class StartTests(unittest.TestCase):
+    """Bridge.start(): the run_plugin-adopted replacement for main()'s old
+    inline sse_loop()/Thread wiring -- same handle_event dispatch, same
+    one-bad-event-does-not-kill-the-reader behavior, now owned by Bridge.
+    """
+
+    def test_start_drains_backend_events_into_handle_event(self):
+        cfg = plug.load_config({"account": OWN, "groups": {"pas": "GRP=="}})
+        backend = FakeBackend()
+        backend.events = lambda: iter([data_event()])
+        sock = FakeSock()
+        bridge = plug.Bridge(cfg, backend, sock)
+
+        bridge.start()
+
+        deadline = time.time() + 2
+        while not sock.frames() and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(sock.frames()), 1)
+        self.assertEqual(sock.frames()[0]["t"], "inbound")
+
+    def test_start_survives_a_bad_event_and_keeps_draining(self):
+        cfg = plug.load_config({"account": OWN, "groups": {"pas": "GRP=="}})
+        backend = FakeBackend()
+        # a malformed event (not a dict, so parse_signal_event's
+        # event.get("envelope") raises AttributeError) must not kill the
+        # reader thread before the good event right after it
+        backend.events = lambda: iter([None, data_event()])
+        sock = FakeSock()
+        bridge = plug.Bridge(cfg, backend, sock)
+
+        bridge.start()
+
+        deadline = time.time() + 2
+        while not sock.frames() and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(sock.frames()), 1)
+        self.assertEqual(sock.frames()[0]["t"], "inbound")
+
+
+class MakeBridgeTests(unittest.TestCase):
+    def test_wires_backend_and_bridge_from_raw_config(self):
+        sock = FakeSock()
+        bridge = plug._make_bridge({"account": OWN, "groups": {"pas": "GRP=="}}, sock)
+        self.assertIsInstance(bridge, plug.Bridge)
+        self.assertIsInstance(bridge.backend, plug.SignalCliBackend)
+        self.assertEqual(bridge.backend.account, OWN)
+
+    def test_invalid_config_raises_before_backend_construction(self):
+        with self.assertRaises(ValueError):
+            plug._make_bridge({}, FakeSock())
 
 
 if __name__ == "__main__":
