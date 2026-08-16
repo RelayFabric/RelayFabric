@@ -28,6 +28,9 @@ plugins:
   #     announce_interval: 3600
   #     stamp_cost: null             # set to require inbound proof-of-work
   #     propagation_node: "auto"     # "auto" | explicit dest hash hex | null
+  #     max_attachment_bytes: 1000000  # per-attachment cap, applied both ways
+  #     image_max_bytes: null        # null = falls back to max_attachment_bytes
+  #     voice_to_codec2: null        # e.g. 1200 = transcode outbound voice to codec2
   #     channels:
   #       - name: pasadena
   #         members: ["a91d00aa..."] # lowercase LXMF destination hashes
@@ -46,6 +49,8 @@ plugins:
   #     groups:
   #       pasadena: "GRP=="          # channel: group_id (from listGroups)
   #     allowed_users: null          # null = all members; list UUIDs to restrict
+  #     attachment_dir: ~/.local/share/signal-cli/attachments  # signal-cli's download dir
+  #     max_attachment_bytes: 8000000  # per-attachment cap, applied both ways
 
 routes:
   - name: demo

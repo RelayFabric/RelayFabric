@@ -5,7 +5,8 @@ RelayFabric as a Plugin Protocol v1 plugin. Each configured channel maps
 to a set of LXMF destination hashes ("members"): messages from a member
 land on the channel, and messages sent to the channel fan out as direct
 LXMF messages to every member, falling back to a propagation node
-(store-and-forward) if direct delivery fails. Text only.
+(store-and-forward) if direct delivery fails. Text and attachments (see
+[Attachments](#attachments)).
 
 ## Install
 
@@ -33,6 +34,9 @@ plugins:
       announce_interval: 3600
       stamp_cost: null             # set to require inbound proof-of-work
       propagation_node: "auto"     # "auto" | explicit dest hash hex | null
+      max_attachment_bytes: 1000000  # per-attachment cap, applied both ways
+      image_max_bytes: null        # null = falls back to max_attachment_bytes
+      voice_to_codec2: null        # e.g. 1200 = transcode outbound voice to codec2
       channels:
         - name: pasadena
           members: ["a91d00aa..."] # lowercase LXMF destination hashes
@@ -54,6 +58,37 @@ Sent as LXMF message text to the gateway address:
 
 `open: false` channel membership is operator-managed via
 `config.channels[].members`; dynamic joins persist to `<storage>/members.json`.
+
+## Attachments
+
+Files, an inline image, and voice messages bridge as LXMF fields
+(`FIELD_FILE_ATTACHMENTS`/`FIELD_IMAGE`/`FIELD_AUDIO`); everything else
+crosses as plain text.
+
+- `max_attachment_bytes` (default 1,000,000): applied in both directions —
+  any attachment over this size is dropped, appending a `[dropped <name>:
+  N B over M B limit]` note to the message body instead of failing the send.
+- `image_max_bytes` (default `null`, falling back to `max_attachment_bytes`):
+  the size budget for the first image attachment, which becomes the inline
+  `FIELD_IMAGE`.
+- `voice_to_codec2` (default `null`): a codec2 bitrate (e.g. `1200`) to
+  transcode the first outbound audio attachment into LXMF's tiny,
+  LoRa-friendly `FIELD_AUDIO`.
+
+Optional dependencies and what degrades without them:
+
+- **Pillow** — recompresses/downscales an oversize image to fit
+  `image_max_bytes`. Without it, an oversize image is dropped with a note
+  instead of being shrunk.
+- **ffmpeg** and **pycodec2** (which needs the `libcodec2` C library) —
+  encode outbound voice to codec2 and decode inbound codec2 voice back to
+  WAV. Without either, `voice_to_codec2` is a no-op and voice crosses as a
+  plain file attachment instead of `FIELD_AUDIO`; without `pycodec2` alone,
+  inbound codec2 voice is forwarded raw as `voice.c2` instead of being
+  decoded to `voice.wav`.
+
+None of these are required to install — `pip install -r
+plugins/lxmf/requirements.txt` covers text and generic file attachments.
 
 ## Manual e2e smoke test
 
