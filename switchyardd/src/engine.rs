@@ -776,20 +776,50 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
 /// `capabilities.direct_messages` on the destination plugin (an ordinary
 /// `Send` never checks this) since `SendDirect` is only ever handled by
 /// direct-capable plugins.
+///
+/// Finding 2 (whole-branch review): only the TARGET's capability is checked
+/// up front, at `initiate_link` — the REQUESTER-side confirmation notice
+/// `confirm_link` enqueues is never capability-checked before it lands here,
+/// and today only LXMF is direct-capable, so "requester's plugin is
+/// connected but not direct-capable" is the common case, not an edge case.
+/// A plugin that's connected but lacks the capability is never going to
+/// grow it by reconnecting, so that case dead-letters promptly with
+/// `NOT_DIRECT_CAPABLE` instead of retrying every 5s until the delivery's
+/// TTL (24h by default, ~17k attempts of pure churn). A genuinely
+/// disconnected plugin MAY reconnect before the TTL, so that case keeps the
+/// existing retry posture.
 async fn process_due_identity(
     d: &Arc<Daemon>, del: storage::Delivery, env: Envelope, now: DateTime<Utc>,
 ) {
-    let tx = {
+    enum Readiness {
+        Ready(mpsc::Sender<DaemonToPlugin>),
+        Disconnected,
+        NotDirectCapable,
+    }
+    let readiness = {
         let plugins = d.plugins.lock().unwrap();
-        plugins.get(&del.destination.protocol)
-            .filter(|h| h.connected && h.capabilities.direct_messages)
-            .map(|h| h.tx.clone())
+        match plugins.get(&del.destination.protocol) {
+            Some(h) if h.connected && h.capabilities.direct_messages => Readiness::Ready(h.tx.clone()),
+            Some(h) if h.connected => Readiness::NotDirectCapable,
+            _ => Readiness::Disconnected,
+        }
     };
-    let Some(tx) = tx else {
-        let result = d.store.lock().unwrap()
-            .mark_retry(del.id, now + CDuration::seconds(5));
-        warn_if_mark_failed(del.id, "pending", result);
-        return;
+    let tx = match readiness {
+        Readiness::Ready(tx) => tx,
+        Readiness::NotDirectCapable => {
+            let result = d.store.lock().unwrap()
+                .mark_terminal(del.id, "dead_letter", "NOT_DIRECT_CAPABLE");
+            warn_if_mark_failed(del.id, "dead_letter", result);
+            warn!(delivery = del.id, plugin = %del.destination.protocol,
+                  "identity delivery dead-lettered: plugin connected but not direct-capable");
+            return;
+        }
+        Readiness::Disconnected => {
+            let result = d.store.lock().unwrap()
+                .mark_retry(del.id, now + CDuration::seconds(5));
+            warn_if_mark_failed(del.id, "pending", result);
+            return;
+        }
     };
 
     if del.priority > 0 {
@@ -2069,8 +2099,14 @@ mod tests {
         assert!(store.link_for_identity("mockb", "!req").unwrap().is_some());
     }
 
+    /// Finding 2 (whole-branch review): a plugin that is CONNECTED but
+    /// lacks `capabilities.direct_messages` is never going to become
+    /// direct-capable by reconnecting — unlike a disconnected plugin, there
+    /// is nothing to wait for. Retrying every 5s for up to the TTL (24h by
+    /// default, ~17k attempts) is pure churn, so this must dead-letter
+    /// promptly with a reason an operator can act on, not mark_retry.
     #[tokio::test]
-    async fn process_due_identity_requires_direct_messages_capability_not_just_connectivity() {
+    async fn process_due_identity_dead_letters_promptly_when_plugin_connected_but_not_direct_capable() {
         let dir = tempfile::tempdir().unwrap();
         let d = Arc::new(test_daemon(dir.path()));
         let _rx = register_plugin(&d, "mockb", false); // connected, but NOT direct-capable
@@ -2089,8 +2125,81 @@ mod tests {
         process_due(&d, del, now).await;
 
         let after = d.store.lock().unwrap().deliveries_for_id(del_id).unwrap();
+        assert_eq!(after.state, "dead_letter",
+            "a connected-but-not-direct-capable plugin must dead-letter promptly, not churn retries");
+        assert_eq!(after.reason.as_deref(), Some("NOT_DIRECT_CAPABLE"));
+    }
+
+    /// The disconnected case is different: the plugin MAY reconnect (and
+    /// become usable) before the delivery's TTL expires, so the existing
+    /// retry posture must be preserved there — only the "connected but
+    /// incapable" case above gets the prompt dead-letter treatment.
+    #[tokio::test]
+    async fn process_due_identity_still_retries_when_plugin_is_not_connected_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        // "mockb" is never registered at all -- not connected.
+
+        let target: Endpoint = "mockb:!target".parse().unwrap();
+        let now = Utc::now();
+        let env = Envelope::new(
+            "identity:system".parse().unwrap(), Sender { native_ref: "@identity".into() },
+            "notice".into(), "code".into(), now, now + CDuration::minutes(15), 8,
+        );
+        d.store.lock().unwrap().insert_message(&env).unwrap();
+        let del_id = d.store.lock().unwrap()
+            .insert_delivery(env.id, IDENTITY_ROUTE, &target, now, env.expires_at, 2).unwrap();
+        let del = d.store.lock().unwrap().deliveries_for_id(del_id).unwrap();
+
+        process_due(&d, del, now).await;
+
+        let after = d.store.lock().unwrap().deliveries_for_id(del_id).unwrap();
         assert_eq!(after.state, "pending",
-            "must requeue rather than attempt when the connected plugin lacks direct_messages");
+            "a disconnected plugin may still reconnect, so this must keep retrying, not dead-letter");
+        assert!(after.next_attempt > now, "retry must be scheduled in the future");
+    }
+
+    /// End-to-end through `confirm_link` (design §Lifecycle step 2): today
+    /// only LXMF is direct-capable, so the common case is a requester whose
+    /// plugin is connected but not direct-capable (e.g. signal/mocka-style
+    /// chat plugins) receiving the confirmation notice. That notice must
+    /// dead-letter promptly instead of retrying for 24h, while the
+    /// target-side notice (whose plugin IS direct-capable, checked at
+    /// initiate) still gets attempted, and the link row exists regardless of
+    /// either notice's fate.
+    #[tokio::test]
+    async fn confirm_link_dead_letters_requester_notice_when_requester_plugin_lacks_direct_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let mut target_rx = register_direct_plugin(&d, "mockb"); // target: direct-capable
+        let _requester_rx = register_plugin(&d, "mocka", false); // requester: connected, NOT direct-capable
+
+        let now = Utc::now();
+        seed_challenge(&d, ("mockb", "!target"), ("mocka", "!req"), "424242", "Jascha", now, 15);
+
+        handle_inbound(&d, "mockb", "chan".into(), "!target".into(), "text".into(),
+                       "424242".into(), None, vec![], None);
+
+        // link exists regardless of either notice's fate
+        assert!(d.store.lock().unwrap().link_for_identity("mockb", "!target").unwrap().is_some(),
+            "the link must be confirmed even though the requester's plugin can't take the notice");
+
+        let due = d.store.lock().unwrap().due_deliveries(Utc::now(), 10).unwrap();
+        assert_eq!(due.len(), 2, "one confirmation notice per party: {due:?}");
+        let target_del = due.iter().find(|de| de.destination.protocol == "mockb").unwrap().clone();
+        let requester_del = due.iter().find(|de| de.destination.protocol == "mocka").unwrap().clone();
+
+        process_due(&d, requester_del.clone(), now).await;
+        let after_requester = d.store.lock().unwrap().deliveries_for_id(requester_del.id).unwrap();
+        assert_eq!(after_requester.state, "dead_letter",
+            "the requester-side notice must dead-letter promptly, not retry for 24h");
+        assert_eq!(after_requester.reason.as_deref(), Some("NOT_DIRECT_CAPABLE"));
+
+        process_due(&d, target_del, now).await;
+        let DaemonToPlugin::SendDirect { native_ref, .. } = recv_send(&mut target_rx).await else {
+            panic!("expected SendDirect");
+        };
+        assert_eq!(native_ref, "!target", "the target-side notice must still be attempted");
     }
 
     // ---- identity linking: rendering ---------------------------------------

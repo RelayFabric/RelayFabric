@@ -22,7 +22,7 @@ pub struct Delivery {
     pub expires_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Challenge {
     pub id: i64,
     // Deliberately unread outside the SQL match in find_active_challenge:
@@ -42,6 +42,28 @@ pub struct Challenge {
     #[allow(dead_code)]
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+}
+
+/// Finding 3 (whole-branch review): a derived `Debug` would render `code`
+/// verbatim, so any future `{:?}` in a log line (or a debug-formatted panic
+/// message, `dbg!`, etc.) would leak it — codes must never be exposed
+/// anywhere outside the challenge lifecycle (design §Security invariants).
+/// This manual impl keeps every other field visible for diagnosability and
+/// redacts only `code`.
+impl std::fmt::Debug for Challenge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Challenge")
+            .field("id", &self.id)
+            .field("code", &"<redacted>")
+            .field("target_protocol", &self.target_protocol)
+            .field("target_ref", &self.target_ref)
+            .field("requester_protocol", &self.requester_protocol)
+            .field("requester_ref", &self.requester_ref)
+            .field("display_name", &self.display_name)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1060,6 +1082,30 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         assert_eq!(c.requester_protocol, "lxmf");
         assert_eq!(c.requester_ref, "abc123");
         assert_eq!(c.display_name, "Jascha");
+    }
+
+    /// Finding 3 (whole-branch review, structural): `Challenge` derived
+    /// `Debug`, so a future `{:?}` in any log line would leak the code —
+    /// the field is meant to round-trip through SQL only (design §Security
+    /// invariants: codes never leave the challenge lifecycle). The manual
+    /// `Debug` impl must redact it while still rendering every other field.
+    #[test]
+    fn challenge_debug_redacts_code_but_keeps_other_fields() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        let expires = now + Duration::minutes(15);
+        // 999888 is chosen to NOT be a substring of any other field below
+        // (target_ref "+1234567890" would coincidentally contain "123456").
+        s.create_challenge("999888", "signal", "+1234567890", "lxmf", "abc123", "Jascha", now, expires)
+            .unwrap();
+        let c = s.find_active_challenge("signal", "+1234567890", "999888", now).unwrap().unwrap();
+
+        let debug = format!("{c:?}");
+        assert!(!debug.contains("999888"), "the code must never appear in Debug output: {debug}");
+        assert!(debug.contains("<redacted>"), "Debug output must show a redaction marker: {debug}");
+        assert!(debug.contains("+1234567890"), "other fields must still render: {debug}");
+        assert!(debug.contains("signal"), "other fields must still render: {debug}");
+        assert!(debug.contains("Jascha"), "other fields must still render: {debug}");
     }
 
     #[test]

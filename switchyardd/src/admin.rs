@@ -1,3 +1,4 @@
+use crate::config::IDENTITY_ROUTE;
 use crate::engine::{self, Daemon};
 use crate::identity_links;
 use crate::metrics;
@@ -138,17 +139,32 @@ async fn trace(
     let Ok(Some(env)) = store.get_message(id) else {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown message"})));
     };
+    // spec §Security invariants: refs masked in every API response, full
+    // refs never in GET responses. Ordinary routes' `destination` is a route
+    // endpoint (e.g. "mockb:chan"), not an identity ref, so it renders in
+    // full as before; `@identity` deliveries carry the target's RAW native
+    // ref verbatim in `dest_endpoint` (see `enqueue_identity_send`), so those
+    // must use the same masked "protocol:masked_ref" compound form (RULING
+    // 2) as `/v1/identities` and `/v1/identities/challenges`.
     let deliveries: Vec<_> = store.deliveries_for(id).unwrap_or_default().iter()
-        .map(|del| json!({
-            "route": del.route,
-            "destination": del.destination.to_string(),
-            "priority": del.priority,
-            "state": del.state,
-            "attempts": del.attempt_count,
-            "reason": del.reason,
-            "next_attempt": del.next_attempt,
-            "expires_at": del.expires_at,
-        }))
+        .map(|del| {
+            let destination = if del.route == IDENTITY_ROUTE {
+                format!("{}:{}", del.destination.protocol,
+                    identity_links::mask_ref(&del.destination.endpoint))
+            } else {
+                del.destination.to_string()
+            };
+            json!({
+                "route": del.route,
+                "destination": destination,
+                "priority": del.priority,
+                "state": del.state,
+                "attempts": del.attempt_count,
+                "reason": del.reason,
+                "next_attempt": del.next_attempt,
+                "expires_at": del.expires_at,
+            })
+        })
         .collect();
     // spec §90: trace without content — body is summarized, never included
     (StatusCode::OK, Json(json!({
@@ -423,6 +439,51 @@ mod tests {
         let (code, body) = get(router(d), &format!("/v1/messages/{id}")).await;
         assert_eq!(code, 200);
         assert!(body.contains("\"priority\":1"), "body was: {body}");
+    }
+
+    /// Finding 1 (whole-branch review, blocker): deliveries on the reserved
+    /// `@identity` route carry the target's RAW native ref in
+    /// `del.destination.endpoint` (`enqueue_identity_send` stores it verbatim
+    /// so `process_due_identity`'s `SendDirect` has something to deliver to)
+    /// — the trace handler must mask that ref with the same compound
+    /// "protocol:masked_ref" convention used everywhere else (RULING 2)
+    /// rather than rendering `del.destination.to_string()` unmasked. Ordinary
+    /// routes are unaffected: their destination is a route endpoint, not an
+    /// identity ref, and must keep rendering in full.
+    #[tokio::test]
+    async fn trace_masks_identity_route_destination_but_renders_ordinary_route_destination_in_full() {
+        let d = daemon();
+        let _rx = crate::engine::tests_support::register_direct_plugin(&d, "mockb");
+        let requester: Endpoint = "mocka:!alice-secret".parse().unwrap();
+        let target: Endpoint = "mockb:+14155551234".parse().unwrap();
+        engine::initiate_link(&d, requester, target, "Jascha").unwrap();
+
+        let identity_message_id = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(Utc::now(), 10).unwrap().into_iter()
+                .find(|de| de.route == crate::config::IDENTITY_ROUTE)
+                .expect("challenge delivery must be queued on the @identity route")
+                .message_id
+        };
+        let (code, body) = get(router(d.clone()), &format!("/v1/messages/{identity_message_id}")).await;
+        assert_eq!(code, 200);
+        assert!(!body.contains("+14155551234"), "full target ref leaked in trace: {body}");
+        assert!(body.contains("\"destination\":\"mockb:+1****1234\""),
+            "masked destination missing: {body}");
+
+        // an ordinary route's destination is a route endpoint, not an
+        // identity ref, and must still render in full (existing behavior).
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+        let ordinary_message_id = d.store.lock().unwrap()
+            .due_deliveries(Utc::now(), 10).unwrap().into_iter()
+            .find(|de| de.route != crate::config::IDENTITY_ROUTE)
+            .expect("ordinary delivery must exist")
+            .message_id;
+        let (code2, body2) = get(router(d), &format!("/v1/messages/{ordinary_message_id}")).await;
+        assert_eq!(code2, 200);
+        assert!(body2.contains("\"destination\":\"mockb:chan\""),
+            "ordinary route destination must still render in full: {body2}");
     }
 
     #[tokio::test]
