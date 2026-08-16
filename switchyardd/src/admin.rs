@@ -3,7 +3,7 @@ use crate::engine::{self, Daemon};
 use crate::identity_links;
 use crate::metrics;
 use axum::body::Bytes;
-use axum::extract::{Path as AxPath, State};
+use axum::extract::{FromRef, Path as AxPath, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
@@ -13,16 +13,46 @@ use relay_core::Endpoint;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tracing::warn;
 use uuid::Uuid;
 
-pub fn router(d: Arc<Daemon>) -> Router {
+/// Admin router state (design §3): grows beyond a bare `Arc<Daemon>` because
+/// `PUT /v1/config`/`POST /v1/config/rollback` need to know the daemon's
+/// config file PATH, which `main.rs` only otherwise holds transiently as a
+/// local var. `Arc<Daemon>` is reachable from any handler via axum's
+/// `FromRef` below, so every pre-existing handler (`State(d): State<Arc<
+/// Daemon>>`) keeps compiling completely unchanged.
+#[derive(Clone)]
+pub struct AdminState {
+    daemon: Arc<Daemon>,
+    config_path: PathBuf,
+    /// Serializes `PUT /v1/config` and `POST /v1/config/rollback` against
+    /// EACH OTHER end-to-end — file renames plus the `apply_config` call
+    /// that follows — so two overlapping requests can never interleave
+    /// their renames of the same `<path>`/`<path>.prev` pair.
+    /// `Daemon::apply_config`'s own `apply_lock` (engine.rs) only covers
+    /// `apply_config`'s body; the file I/O that happens before it is
+    /// admin.rs's concern, not the daemon's, hence a separate lock here.
+    write_lock: Arc<Mutex<()>>,
+}
+
+impl FromRef<AdminState> for Arc<Daemon> {
+    fn from_ref(state: &AdminState) -> Arc<Daemon> {
+        state.daemon.clone()
+    }
+}
+
+pub fn router(d: Arc<Daemon>, config_path: PathBuf) -> Router {
+    let state = AdminState { daemon: d, config_path, write_lock: Arc::new(Mutex::new(())) };
     Router::new()
         .route("/v1/status", get(status))
         .route("/v1/plugins", get(plugins))
         .route("/v1/routes", get(routes))
-        .route("/v1/config", get(config_yaml))
+        .route("/v1/config", get(config_yaml).put(config_put))
+        .route("/v1/config/validate", post(config_validate))
+        .route("/v1/config/rollback", post(config_rollback))
         .route("/v1/queue", get(queue))
         .route("/v1/messages/{id}", get(trace))
         .route("/v1/public", get(public))
@@ -32,13 +62,13 @@ pub fn router(d: Arc<Daemon>) -> Router {
         .route("/v1/identities/link/{id}", delete(delete_link))
         .route("/v1/identities/challenges", get(challenges))
         .route("/metrics", get(metrics_text))
-        .with_state(d)
+        .with_state(state)
 }
 
 /// Takes an already-bound listener (bind failures must fail startup loudly in
 /// `main`, not silently kill only this background task — see `plugins.sock`).
-pub async fn serve(d: Arc<Daemon>, listener: tokio::net::UnixListener) {
-    axum::serve(listener, router(d)).await.expect("admin serve");
+pub async fn serve(d: Arc<Daemon>, config_path: PathBuf, listener: tokio::net::UnixListener) {
+    axum::serve(listener, router(d, config_path)).await.expect("admin serve");
 }
 
 fn queue_map(d: &Daemon) -> BTreeMap<String, i64> {
@@ -220,6 +250,208 @@ async fn config_yaml(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/yaml")], yaml)
 }
 
+/// `<path>.prev` — the single-revision history slot `PUT`/`rollback` swap
+/// into and out of (design §3: "one-revision history", not a stack).
+fn prev_path_for(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".prev");
+    PathBuf::from(s)
+}
+
+/// Scratch name used to make both file operations below crash-safe: never
+/// the target of a reader, only ever a rename source/destination within a
+/// single call.
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
+
+/// `PUT /v1/config`'s file half (design §3): writes `new_text` to a tmp
+/// file FIRST (mode 0600 via `OpenOptionsExt`, `alias.rs`'s key-file
+/// precedent) — the one genuinely I/O-heavy step, the one that can fail
+/// partway (ENOSPC, permissions, …) — and only once that has fully
+/// succeeded does it touch `path`/`.prev` at all: renames whatever is
+/// currently at `path` to `<path>.prev` (overwriting any older `.prev` —
+/// one revision, not a stack), then renames the tmp file into place at
+/// `path`. A failure during the write leaves `path` and `.prev`
+/// byte-identical to before the call (a stray `.tmp` is harmless — the
+/// next attempt overwrites it); a failure during either rename is
+/// vanishingly unlikely (same-filesystem directory-entry operations, no
+/// data movement). This ordering fixes a real gap in the previous
+/// rename-then-write ordering: a failure during the write used to leave
+/// NEITHER a `path` NOR a self-recoverable `.prev` (rollback renames
+/// `path` first, so it can't recover from `path` already being absent).
+/// `rename()` preserves the SOURCE file's mode, not the destination's — so
+/// without the explicit `set_permissions` calls below, `.prev` (and, after
+/// a later rollback, the live config at `path`) would silently inherit
+/// whatever mode the operator's original file had (commonly 644) forever.
+/// Caller (`config_put`) is responsible for having already validated
+/// `new_text` via `config::load_from_str`; this function only ever moves
+/// bytes around.
+fn write_config_replacing_current(path: &Path, new_text: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp_path = tmp_path_for(path);
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(new_text.as_bytes())?;
+    }
+    // Both renames run back-to-back with nothing fallible between them, so
+    // the only crash window where `path` is transiently absent is the gap
+    // between two same-directory rename() calls. The chmods run after both
+    // renames: a chmod failure then leaves complete files at final names.
+    let had_prev = path.exists();
+    let prev_path = prev_path_for(path);
+    if had_prev {
+        std::fs::rename(path, &prev_path)?;
+    }
+    std::fs::rename(&tmp_path, path)?;
+    if had_prev {
+        std::fs::set_permissions(&prev_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// `POST /v1/config/rollback`'s file half (design §3): swaps `path` and
+/// `<path>.prev` via a temporary third name — `path` -> tmp, `.prev` ->
+/// `path`, tmp -> `.prev` — so "current becomes `.prev`" and "`.prev`
+/// becomes current" happen together. Each individual rename is atomic
+/// (same filesystem), but the three-step sequence as a whole is not a
+/// single atomic operation — a crash between steps could leave `.prev`
+/// transiently missing with its content sitting in the tmp name — the
+/// same limitation any `rename()`-based swap has. `rename()` preserves the
+/// SOURCE's mode, not the destination's, so BOTH files landing in a new
+/// location get their mode force-set back to 0600 once all renames are
+/// done — without this, a rollback would leave the live config at
+/// `path` carrying whatever mode the file previously at `.prev` happened
+/// to have (which, before Task 3's PUT/rollback ever touched it, could be
+/// the operator's original 644). Caller (`config_rollback`) re-validates
+/// `.prev`'s content BEFORE calling this, so the file that ends up live at
+/// `path` is already known-good.
+fn swap_with_prev(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let prev_path = prev_path_for(path);
+    let swap_tmp = tmp_path_for(path);
+    // All three renames run back-to-back (no fallible call between them);
+    // both chmods happen only once every file sits at its final name.
+    std::fs::rename(path, &swap_tmp)?;
+    std::fs::rename(&prev_path, path)?;
+    std::fs::rename(&swap_tmp, &prev_path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::set_permissions(&prev_path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// Shared by `config_validate`/`config_put`: both take a raw YAML body and
+/// must reject non-UTF-8 bytes the exact same way (422, same shape as any
+/// other validation failure) before doing anything else with it.
+fn decode_body_or_422(body: &Bytes) -> Result<&str, (StatusCode, Json<serde_json::Value>)> {
+    std::str::from_utf8(body).map_err(|_| (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({"valid": false, "errors": ["request body is not valid UTF-8"]})),
+    ))
+}
+
+/// `POST /v1/config/validate` (design §3): runs the exact same parse +
+/// `config::validate` + secret-reference-resolution pipeline `PUT`/startup
+/// use (`config::load_from_str`) against the POSTed YAML text, discards the
+/// resolved `Config` on success, and returns only a boolean. Resolution
+/// happens against the DAEMON's own environment (this handler runs
+/// in-process, same env the daemon itself resolves `${env:...}` against) —
+/// that's intentional: the point of validating is knowing whether applying
+/// this text would actually succeed HERE, not on whatever machine `ctl` is
+/// running on. 422 error strings come straight from `load_from_str`/
+/// `secrets::resolve`, which name only the `${...}` reference form, never a
+/// resolved value (design §2's redaction invariant, upheld here too) — and
+/// `load_from_str` runs `validate` BEFORE `resolve_secrets`, so a config
+/// that fails validation for an unrelated reason never resolves ANY secret
+/// reference in the first place, regardless of whether it would have
+/// resolved fine (see `config_validate_returns_422_with_neither_the_
+/// sentinel_nor_a_resolved_value_when_validation_fails_for_an_unrelated_
+/// reason` below).
+async fn config_validate(body: Bytes) -> impl IntoResponse {
+    let text = match decode_body_or_422(&body) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    match crate::config::load_from_str(text) {
+        Ok(_) => (StatusCode::OK, Json(json!({"valid": true}))),
+        Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"valid": false, "errors": [e]}))),
+    }
+}
+
+/// `PUT /v1/config` (design §3): validates the POSTed YAML text first (422,
+/// zero filesystem changes, on failure — same pipeline as
+/// `config_validate`), then, holding `write_lock` for the rest of the
+/// handler (serialized against a racing `config_rollback`), replaces the
+/// on-disk config file (`write_config_replacing_current`) and calls
+/// `apply_config` (which itself serializes against ANY other `apply_config`
+/// caller via its own `apply_lock` — see that method's doc comment).
+async fn config_put(State(state): State<AdminState>, body: Bytes) -> impl IntoResponse {
+    let text = match decode_body_or_422(&body) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    let new_cfg = match crate::config::load_from_str(text) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return (StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"valid": false, "errors": [e]})));
+        }
+    };
+    let _write_guard = state.write_lock.lock().unwrap();
+    if let Err(e) = write_config_replacing_current(&state.config_path, text) {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("failed to write config file: {e}")})));
+    }
+    let outcome = state.daemon.apply_config(new_cfg);
+    (StatusCode::OK, Json(json!({"applied": true, "restart_required": outcome.restart_required})))
+}
+
+/// `POST /v1/config/rollback` (design §3): 404 if no `<path>.prev` exists.
+/// Re-validates `.prev`'s content via `config::load_from_str` BEFORE
+/// touching any file — unlike a "swap first, validate second, undo on
+/// failure" sequence, validating first means an invalid `.prev` (env
+/// drift: a secret reference that resolved fine when the file was written
+/// no longer does) can never even transiently become the live config file,
+/// and "files restored to pre-call state" on the 409 is then true by
+/// construction — nothing was ever touched — rather than by an undo step.
+/// On success, swaps `path`/`.prev` (`swap_with_prev`: current becomes
+/// `.prev`, matching `PUT`'s one-revision-history rule) and applies.
+async fn config_rollback(State(state): State<AdminState>) -> impl IntoResponse {
+    let prev_path = prev_path_for(&state.config_path);
+    let _write_guard = state.write_lock.lock().unwrap();
+    if !prev_path.exists() {
+        return (StatusCode::NOT_FOUND,
+            Json(json!({"error": "no previous config to roll back to"})));
+    }
+    let prev_text = match std::fs::read_to_string(&prev_path) {
+        Ok(t) => t,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("failed to read previous config: {e}")})));
+        }
+    };
+    let new_cfg = match crate::config::load_from_str(&prev_text) {
+        Ok(cfg) => cfg,
+        Err(e) => return (StatusCode::CONFLICT, Json(json!({"errors": [e]}))),
+    };
+    if let Err(e) = swap_with_prev(&state.config_path) {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("failed to swap config files: {e}")})));
+    }
+    let outcome = state.daemon.apply_config(new_cfg);
+    (StatusCode::OK, Json(json!({"applied": true, "restart_required": outcome.restart_required})))
+}
+
 async fn queue(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     Json(queue_map(&d))
 }
@@ -369,6 +601,16 @@ mod tests {
     use http_body_util::BodyExt;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    /// Shadows `super::router` (now `fn(Arc<Daemon>, PathBuf) -> Router`)
+    /// for the pre-Task-3 call sites in this module, none of which exercise
+    /// a config_path-reading endpoint — a path that's guaranteed not to
+    /// exist is fine for them. Tests that DO exercise `PUT /v1/config` /
+    /// `POST /v1/config/{validate,rollback}` call `super::router` directly
+    /// with a real path from `daemon_with_config_file`.
+    fn router(d: Arc<Daemon>) -> axum::Router {
+        super::router(d, PathBuf::from("/nonexistent/relayfabric-admin-test.yaml"))
+    }
 
     async fn get(router: axum::Router, path: &str) -> (u16, String) {
         let resp = router
@@ -955,5 +1197,590 @@ routes:
             assert_eq!(code, 200, "path {path} status");
             assert!(!body.contains(sentinel), "resolved secret leaked from {path}: {body}");
         }
+    }
+
+    // ---- config validate / apply / rollback (design §3) -------------------
+
+    /// Builds a REAL on-disk config file (unlike `daemon()`'s hand-built
+    /// `Config` literal, which has no backing file at all) plus a daemon
+    /// loaded from it via the real `config::load` pipeline — the fixture
+    /// every `config_{validate,put,rollback}` test needs, since those
+    /// endpoints read/write `state.config_path` on disk. Deliberately
+    /// force-set to 644 (rather than trusting whatever `std::fs::write` +
+    /// the test runner's umask happens to produce) so every test built on
+    /// this fixture starts from a mode `write_config_replacing_current`/
+    /// `swap_with_prev` must actively CORRECT, not one that coincidentally
+    /// already looks like 0600.
+    fn daemon_with_config_file() -> (Arc<Daemon>, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let cfg_path = dir.path().join("relayfabric.yaml");
+        let yaml = format!(
+            r#"
+node:
+  name: t
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#,
+            data_dir.display()
+        );
+        std::fs::write(&cfg_path, &yaml).unwrap();
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let cfg = crate::config::load(&cfg_path).unwrap();
+        let d = Daemon::new(cfg, &data_dir).unwrap();
+        std::mem::forget(dir);
+        (Arc::new(d), cfg_path)
+    }
+
+    #[tokio::test]
+    async fn config_validate_returns_200_valid_true_for_good_yaml() {
+        let (d, cfg_path) = daemon_with_config_file();
+        let good_yaml = std::fs::read_to_string(&cfg_path).unwrap();
+        let (code, body) =
+            req(super::router(d, cfg_path), "POST", "/v1/config/validate", Some(&good_yaml)).await;
+        assert_eq!(code, 200, "body was: {body}");
+        assert_eq!(body, "{\"valid\":true}", "body was: {body}");
+    }
+
+    #[tokio::test]
+    async fn config_validate_returns_422_with_errors_for_unparsable_yaml() {
+        let (d, cfg_path) = daemon_with_config_file();
+        let bad_yaml = "node: [unterminated";
+        let (code, body) =
+            req(super::router(d, cfg_path), "POST", "/v1/config/validate", Some(bad_yaml)).await;
+        assert_eq!(code, 422, "body was: {body}");
+        assert!(body.contains("\"valid\":false"), "body was: {body}");
+        assert!(body.contains("\"errors\""), "body was: {body}");
+    }
+
+    /// Exercises `config::validate`'s own business-rule layer specifically
+    /// (not just the parse layer above) — a route destination naming a
+    /// plugin that was never declared under `plugins:` at all.
+    #[tokio::test]
+    async fn config_validate_returns_422_for_a_config_validate_rule_violation() {
+        let (d, cfg_path) = daemon_with_config_file();
+        let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
+        let yaml = format!(
+            r#"
+node:
+  name: t
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan"]
+    destinations: ["mockb:chan"]
+"#,
+            data_dir.display()
+        );
+        let (code, body) =
+            req(super::router(d, cfg_path), "POST", "/v1/config/validate", Some(&yaml)).await;
+        assert_eq!(code, 422, "body was: {body}");
+        assert!(body.contains("unknown plugin"), "body was: {body}");
+        assert!(body.contains("mockb"), "body was: {body}");
+    }
+
+    /// Exercises the secret-reference-resolution layer specifically: a
+    /// syntactically valid, `config::validate`-clean config whose
+    /// `${env:...}` reference can't resolve (the var is unset) must still
+    /// 422 — this is the "resolution CHECK" half of validate's pipeline
+    /// (design §3), and the error must name only the reference FORM.
+    #[tokio::test]
+    async fn config_validate_returns_422_when_a_secret_reference_is_unresolvable() {
+        std::env::remove_var("RF_ADMIN_TEST_VALIDATE_UNSET_VAR"); // ensure genuinely unset
+        let (d, cfg_path) = daemon_with_config_file();
+        let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
+        let yaml = format!(
+            r#"
+node:
+  name: t
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+    config:
+      token: "${{env:RF_ADMIN_TEST_VALIDATE_UNSET_VAR}}"
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#,
+            data_dir.display()
+        );
+        let (code, body) =
+            req(super::router(d, cfg_path), "POST", "/v1/config/validate", Some(&yaml)).await;
+        assert_eq!(code, 422, "body was: {body}");
+        assert!(body.contains("env:RF_ADMIN_TEST_VALIDATE_UNSET_VAR"),
+            "error must name the reference form: {body}");
+    }
+
+    /// Fix round 1 (Important) — regression sentinel pinning
+    /// `config::load_from_str`'s validate-before-resolve ordering: a config
+    /// whose secret reference WOULD resolve (the env var is set to a
+    /// sentinel) but that fails `config::validate` for an unrelated reason
+    /// (the reserved `@identity` route name) must 422 with neither the
+    /// sentinel NOR the reference form itself anywhere in the body. This
+    /// holds today because `load_from_str` calls `validate` BEFORE
+    /// `resolve_secrets`, so a config this broken never gets far enough to
+    /// resolve anything at all -- this test exists to catch a future
+    /// reordering that would change that.
+    #[tokio::test]
+    async fn config_validate_returns_422_with_neither_sentinel_nor_resolved_value_when_validation_fails_for_an_unrelated_reason() {
+        let var = "RF_ADMIN_TEST_VALIDATE_BEFORE_RESOLVE";
+        let sentinel = "sentinel-validate-before-resolve-6e2a";
+        std::env::set_var(var, sentinel);
+        let (d, cfg_path) = daemon_with_config_file();
+        let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
+        let yaml = format!(
+            r#"
+node:
+  name: t
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+    config:
+      token: "${{env:{var}}}"
+  mockb:
+    enabled: true
+routes:
+  - name: "@identity"
+    sources: ["mocka:chan"]
+    destinations: ["mockb:chan"]
+"#,
+            data_dir.display()
+        );
+
+        let (code, body) =
+            req(super::router(d, cfg_path), "POST", "/v1/config/validate", Some(&yaml)).await;
+        std::env::remove_var(var);
+
+        assert_eq!(code, 422, "body was: {body}");
+        assert!(body.contains("\"valid\":false"), "body was: {body}");
+        assert!(body.contains("reserved"), "error must name the actual validate()-level cause: {body}");
+        assert!(!body.contains(sentinel),
+            "resolved secret leaked despite an unrelated validate() failure: {body}");
+        assert!(!body.contains(&format!("env:{var}")),
+            "the secret reference form must not even appear -- resolve_secrets must never have run: {body}");
+    }
+
+    #[tokio::test]
+    async fn config_put_happy_path_writes_file_renames_prev_and_applies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (d, cfg_path) = daemon_with_config_file();
+        let original_text = std::fs::read_to_string(&cfg_path).unwrap();
+        let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
+        // adds an unused "mockc" plugin so restart_required is nonempty --
+        // exercises the response shape beyond the bare {"applied":true}.
+        let new_yaml = format!(
+            r#"
+node:
+  name: t
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+  mockc:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#,
+            data_dir.display()
+        );
+
+        let (code, body) =
+            req(super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&new_yaml)).await;
+        assert_eq!(code, 200, "body was: {body}");
+        assert!(body.contains("\"applied\":true"), "body was: {body}");
+        assert!(body.contains("\"mockc\""), "restart_required must name the added plugin: {body}");
+
+        // file-state matrix: current holds the new content verbatim, .prev
+        // holds the pre-PUT content verbatim, no leftover tmp artifact.
+        let current = std::fs::read_to_string(&cfg_path).unwrap();
+        assert_eq!(current, new_yaml, "current config file must hold the new content verbatim");
+        let prev = std::fs::read_to_string(super::prev_path_for(&cfg_path)).unwrap();
+        assert_eq!(prev, original_text, ".prev must hold the pre-PUT content verbatim");
+        assert!(!super::tmp_path_for(&cfg_path).exists(),
+            "no tmp artifact must remain after a successful PUT");
+
+        // 0600 on the newly-written current file (design §3 / alias.rs precedent).
+        let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "current config file must be 0600");
+
+        // Fix round 1 (Critical): `.prev` must ALSO be forced to 0600, not
+        // left at whatever mode the pre-PUT file had (`daemon_with_config_file`
+        // deliberately starts it at 644 so this assertion actually exercises
+        // the fix rather than passing by coincidence).
+        let prev_mode = std::fs::metadata(super::prev_path_for(&cfg_path)).unwrap().permissions().mode();
+        assert_eq!(prev_mode & 0o777, 0o600, ".prev must be 0600, not inherited from the 644 original");
+
+        // daemon state actually applied: GET /v1/config would now serve the new text.
+        assert_eq!(d.cfg_snapshot(|c| c.raw_yaml.clone()), new_yaml);
+    }
+
+    #[tokio::test]
+    async fn config_put_returns_422_and_makes_no_changes_for_invalid_yaml() {
+        let (d, cfg_path) = daemon_with_config_file();
+        let original_text = std::fs::read_to_string(&cfg_path).unwrap();
+        let bad_yaml = "node: [unterminated";
+
+        let (code, body) =
+            req(super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(bad_yaml)).await;
+        assert_eq!(code, 422, "body was: {body}");
+        assert!(body.contains("\"valid\":false"), "body was: {body}");
+
+        let current = std::fs::read_to_string(&cfg_path).unwrap();
+        assert_eq!(current, original_text, "an invalid PUT must not touch the config file");
+        assert!(!super::prev_path_for(&cfg_path).exists(),
+            "an invalid PUT must not create .prev");
+    }
+
+    /// Fix round 1 (Important): before the fix, `write_config_replacing_
+    /// current` renamed `path` -> `.prev` FIRST and only wrote the tmp file
+    /// second, so a failure during the (I/O-heavy) write left `path`
+    /// missing with no automatic way back (`swap_with_prev` can't recover
+    /// either -- it renames `path` first too). The fix writes the tmp file
+    /// BEFORE touching `path`/`.prev` at all, so a write failure must leave
+    /// both byte-identical to their pre-call state.
+    ///
+    /// Forces the failure by pre-creating `<path>.tmp` as a file this
+    /// process cannot write to (mode 0o400) -- `OpenOptions::open` then
+    /// fails at the open-for-write step specifically, WITHOUT touching
+    /// directory permissions (a directory-permission-based fault would fail
+    /// the rename() calls too, which would make this pass regardless of
+    /// which order the rename/write steps run in -- it wouldn't actually
+    /// distinguish the fixed ordering from the bug it replaces). Verified
+    /// against the pre-fix ordering (rename-before-write): with that order
+    /// restored, this same fault leaves `path` renamed away with nothing to
+    /// replace it, and the assertions below fail exactly as the finding
+    /// described.
+    #[tokio::test]
+    async fn config_put_returns_500_and_makes_no_changes_when_the_tmp_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (d, cfg_path) = daemon_with_config_file();
+        let original_text = std::fs::read_to_string(&cfg_path).unwrap();
+        let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
+        let new_yaml = format!(
+            r#"
+node:
+  name: t
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#,
+            data_dir.display()
+        );
+
+        let tmp_path = super::tmp_path_for(&cfg_path);
+        std::fs::write(&tmp_path, "pre-existing, unwritable").unwrap();
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let (code, body) =
+            req(super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&new_yaml)).await;
+
+        assert_eq!(code, 500, "body was: {body}");
+        let current = std::fs::read_to_string(&cfg_path).unwrap();
+        assert_eq!(current, original_text, "a write failure must leave the config file untouched");
+        assert!(!super::prev_path_for(&cfg_path).exists(), "a write failure must never create .prev");
+    }
+
+    /// Fix round 1 (Minor) — admin-layer restart_required matrix: proves
+    /// `apply_config`'s diff behaves correctly THROUGH the real `PUT
+    /// /v1/config` handler, not just via engine.rs's own unit tests that
+    /// call `apply_config` directly. (a) a plugin config-block-only change
+    /// must name that plugin, and only that plugin. (b) from that new
+    /// baseline, a route-only change (render knobs) must report an EMPTY
+    /// restart_required.
+    #[tokio::test]
+    async fn config_put_restart_required_names_a_plugin_config_change_and_is_empty_for_a_route_only_change() {
+        let (d, cfg_path) = daemon_with_config_file();
+        let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
+
+        // (a) plugin config-block-only change.
+        let plugin_config_changed = format!(
+            r#"
+node:
+  name: t
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+    config:
+      token: "hello"
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#,
+            data_dir.display()
+        );
+        let (code1, body1) = req(
+            super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&plugin_config_changed),
+        ).await;
+        assert_eq!(code1, 200, "body was: {body1}");
+        assert_eq!(body1, "{\"applied\":true,\"restart_required\":[\"mocka\"]}",
+            "only the plugin whose config block changed must be named: {body1}");
+
+        // (b) route-only change from THIS new baseline -- everything else
+        // (node, plugins) held identical to `plugin_config_changed`.
+        let route_only_changed = format!(
+            r#"
+node:
+  name: t
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+    config:
+      token: "hello"
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+    render:
+      tag: none
+      max_chars: 0
+"#,
+            data_dir.display()
+        );
+        let (code2, body2) = req(
+            super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&route_only_changed),
+        ).await;
+        assert_eq!(code2, 200, "body was: {body2}");
+        assert_eq!(body2, "{\"applied\":true,\"restart_required\":[]}",
+            "a route-only change must never require a restart: {body2}");
+    }
+
+    #[tokio::test]
+    async fn config_rollback_returns_404_when_no_prev_exists() {
+        let (d, cfg_path) = daemon_with_config_file();
+        let (code, body) =
+            req(super::router(d, cfg_path), "POST", "/v1/config/rollback", None).await;
+        assert_eq!(code, 404, "body was: {body}");
+    }
+
+    #[tokio::test]
+    async fn config_rollback_happy_path_swaps_files_and_applies_the_previous_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (d, cfg_path) = daemon_with_config_file();
+        let original_text = std::fs::read_to_string(&cfg_path).unwrap();
+        let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
+        let new_yaml = format!(
+            r#"
+node:
+  name: t
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+    render:
+      tag: none
+      max_chars: 0
+"#,
+            data_dir.display()
+        );
+
+        let (put_code, put_body) =
+            req(super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&new_yaml)).await;
+        assert_eq!(put_code, 200, "seeding PUT failed: {put_body}");
+
+        // Fix round 1 (Critical): force `.prev` back to 644 right before the
+        // rollback -- simulating a `.prev` that landed at a non-0600 mode by
+        // some other path (an older daemon, a manual copy, ...) -- so the
+        // post-rollback 0600 assertion below actually exercises
+        // `swap_with_prev`'s chmod rather than passing because the file
+        // happened to already be 0600 from the seeding PUT.
+        std::fs::set_permissions(super::prev_path_for(&cfg_path), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+
+        let (code, body) =
+            req(super::router(d.clone(), cfg_path.clone()), "POST", "/v1/config/rollback", None).await;
+        assert_eq!(code, 200, "body was: {body}");
+        assert!(body.contains("\"applied\":true"), "body was: {body}");
+
+        let current = std::fs::read_to_string(&cfg_path).unwrap();
+        assert_eq!(current, original_text, "current file must hold the rolled-back content");
+        let prev = std::fs::read_to_string(super::prev_path_for(&cfg_path)).unwrap();
+        assert_eq!(prev, new_yaml, ".prev must now hold what was current before the rollback");
+
+        // Fix round 1 (Critical): the live config path after a rollback must
+        // be 0600, even though the `.prev` it was just swapped in from was
+        // deliberately left at 644 above.
+        let live_mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode();
+        assert_eq!(live_mode & 0o777, 0o600,
+            "live config path must be 0600 after rollback, not inherited from .prev's 644");
+
+        assert_eq!(d.cfg_snapshot(|c| c.raw_yaml.clone()), original_text);
+    }
+
+    /// Design §3's rollback safety net: `.prev` was valid when it was
+    /// written, but the environment can drift afterward (an env-backed
+    /// secret vanishes) -- re-validation must catch this and 409, leaving
+    /// BOTH files exactly as they were before the call (validated before
+    /// any swap happens, so there's nothing to undo).
+    #[tokio::test]
+    async fn config_rollback_returns_409_on_env_drift_with_files_untouched() {
+        let var = "RF_ADMIN_TEST_ROLLBACK_DRIFT";
+        std::env::set_var(var, "sentinel-rollback-drift-value");
+        let (d, cfg_path) = daemon_with_config_file();
+        let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
+
+        // First PUT (var set): puts a config referencing the env var into
+        // CURRENT, pushing the fixture's plain original into `.prev`.
+        let secret_yaml = format!(
+            r#"
+node:
+  name: t
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+    config:
+      token: "${{env:{var}}}"
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#,
+            data_dir.display()
+        );
+        let (seed1_code, seed1_body) =
+            req(super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&secret_yaml)).await;
+        assert_eq!(seed1_code, 200, "seeding PUT 1 failed: {seed1_body}");
+
+        // Second PUT (still var set, so `secret_yaml` re-validates fine):
+        // pushes `secret_yaml` (now current) into `.prev`, and this new
+        // plain config becomes current -- `.prev` is now what rollback will
+        // try to restore, and it's the one that references the env var.
+        let plain_yaml = format!(
+            r#"
+node:
+  name: t
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#,
+            data_dir.display()
+        );
+        let (seed2_code, seed2_body) =
+            req(super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&plain_yaml)).await;
+        assert_eq!(seed2_code, 200, "seeding PUT 2 failed: {seed2_body}");
+
+        let current_before = std::fs::read_to_string(&cfg_path).unwrap();
+        let prev_before = std::fs::read_to_string(super::prev_path_for(&cfg_path)).unwrap();
+        assert_eq!(current_before, plain_yaml, "test fixture sanity: current must be plain_yaml");
+        assert_eq!(prev_before, secret_yaml, "test fixture sanity: .prev must be secret_yaml");
+
+        std::env::remove_var(var);
+
+        let (code, body) =
+            req(super::router(d.clone(), cfg_path.clone()), "POST", "/v1/config/rollback", None).await;
+        assert_eq!(code, 409, "body was: {body}");
+        assert!(body.contains("\"errors\""), "body was: {body}");
+        assert!(body.contains(&format!("env:{var}")), "error must name the reference form: {body}");
+        assert!(!body.contains("sentinel-rollback-drift-value"), "resolved secret leaked: {body}");
+
+        let current_after = std::fs::read_to_string(&cfg_path).unwrap();
+        assert_eq!(current_after, current_before, "current file must be untouched after a 409");
+        let prev_after = std::fs::read_to_string(super::prev_path_for(&cfg_path)).unwrap();
+        assert_eq!(prev_after, prev_before, ".prev must be untouched after a 409");
+    }
+
+    /// Design §3's redaction invariant, extended to the three mutation
+    /// endpoints (the read-surface half is `admin_responses_never_contain_
+    /// a_resolved_secret_value` above): a resolved secret value must never
+    /// appear in a validate/PUT/rollback response body.
+    #[tokio::test]
+    async fn config_mutation_responses_never_contain_a_resolved_secret_value() {
+        let var = "RF_ADMIN_TEST_MUTATION_SECRET";
+        let sentinel = "sentinel-mutation-secret-4c1d";
+        std::env::set_var(var, sentinel);
+        let (d, cfg_path) = daemon_with_config_file();
+        let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
+        let secret_yaml = format!(
+            r#"
+node:
+  name: t
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+    config:
+      token: "${{env:{var}}}"
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#,
+            data_dir.display()
+        );
+
+        let (vcode, vbody) = req(
+            super::router(d.clone(), cfg_path.clone()), "POST", "/v1/config/validate", Some(&secret_yaml),
+        ).await;
+        assert_eq!(vcode, 200, "body was: {vbody}");
+        assert!(!vbody.contains(sentinel), "validate leaked secret: {vbody}");
+
+        let (pcode, pbody) = req(
+            super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&secret_yaml),
+        ).await;
+        assert_eq!(pcode, 200, "body was: {pbody}");
+        assert!(!pbody.contains(sentinel), "PUT leaked secret: {pbody}");
+
+        let (rcode, rbody) =
+            req(super::router(d.clone(), cfg_path.clone()), "POST", "/v1/config/rollback", None).await;
+        assert_eq!(rcode, 200, "body was: {rbody}");
+        assert!(!rbody.contains(sentinel), "rollback leaked secret: {rbody}");
+
+        std::env::remove_var(var);
     }
 }

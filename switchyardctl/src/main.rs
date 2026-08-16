@@ -5,9 +5,15 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
-/// Maps CLI args to an HTTP method, path, and (for POST) a JSON body.
+/// Maps CLI args to an HTTP method, path, and (for POST/PUT) a body.
 /// `display_name` for `link` may contain spaces — everything after
-/// `<requester> <target>` is joined with a single space.
+/// `<requester> <target>` is joined with a single space. `config validate`/
+/// `config apply` read their `<file>` argument from THIS machine's
+/// filesystem and POST/PUT its raw text as the body — the daemon resolves
+/// any `${env:...}` secret references against ITS OWN environment when it
+/// receives that text (see `admin.rs::config_validate`'s doc comment), which
+/// is exactly the check an operator wants: "would this apply cleanly on the
+/// running daemon," not "on my workstation."
 fn request_for(args: &[String]) -> Result<(&'static str, String, Option<String>), String> {
     match args.first().map(String::as_str) {
         Some("status") => Ok(("GET", "/v1/status".into(), None)),
@@ -37,19 +43,40 @@ fn request_for(args: &[String]) -> Result<(&'static str, String, Option<String>)
             Some(id) => Ok(("DELETE", format!("/v1/identities/link/{id}"), None)),
             None => Err("usage: switchyardctl unlink <id>".into()),
         },
+        Some("config") => match args.get(1).map(String::as_str) {
+            Some("show") => Ok(("GET", "/v1/config".into(), None)),
+            Some("validate") => match args.get(2) {
+                Some(file) => Ok(("POST", "/v1/config/validate".into(), Some(read_config_file(file)?))),
+                None => Err("usage: switchyardctl config validate <file>".into()),
+            },
+            Some("apply") => match args.get(2) {
+                Some(file) => Ok(("PUT", "/v1/config".into(), Some(read_config_file(file)?))),
+                None => Err("usage: switchyardctl config apply <file>".into()),
+            },
+            Some("rollback") => Ok(("POST", "/v1/config/rollback".into(), None)),
+            _ => Err("usage: switchyardctl config show|validate <file>|apply <file>|rollback".into()),
+        },
         _ => Err("usage: switchyardctl [--socket <path>] \
                   status|plugins|routes|queue|trace <id>|identities|\
-                  link <requester> <target> <display_name...>|unlink <id>".into()),
+                  link <requester> <target> <display_name...>|unlink <id>|\
+                  config show|validate <file>|apply <file>|rollback".into()),
     }
 }
 
-/// The status a successful response is expected to carry for each method —
-/// `GET` always 200, a link `POST` 202 (accepted, see admin.rs), an `unlink`
-/// `DELETE` 204 (no content). Anything else is an error, body included.
-fn expected_status(method: &str) -> &'static str {
-    match method {
-        "POST" => "202",
-        "DELETE" => "204",
+fn read_config_file(path: &str) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))
+}
+
+/// The status a successful response is expected to carry — keyed by
+/// (method, path) rather than method alone, since `POST` alone now covers
+/// three different success codes: a link `POST` is 202 (accepted, see
+/// admin.rs), `config validate`/`config rollback` are both 200. `GET`/`PUT`
+/// are always 200, `DELETE` always 204 (no content). Anything else is an
+/// error, body included.
+fn expected_status(method: &str, path: &str) -> &'static str {
+    match (method, path) {
+        ("POST", "/v1/identities/link") => "202",
+        ("DELETE", _) => "204",
         _ => "200",
     }
 }
@@ -63,9 +90,19 @@ fn body_of(raw: &str, expected: &str) -> Result<String, String> {
     Ok(body.to_string())
 }
 
+/// The two config-mutation endpoints take raw YAML text, not JSON —
+/// everything else in this CLI sends JSON (or no body at all).
+fn content_type_for(path: &str) -> &'static str {
+    match path {
+        "/v1/config" | "/v1/config/validate" => "text/yaml",
+        _ => "application/json",
+    }
+}
+
 /// Sends `method path HTTP/1.0` over the admin socket, with `body` (if any)
-/// framed via `Content-Length`/`Content-Type: application/json`, and returns
-/// the parsed response body on `expected_status`, or an error otherwise.
+/// framed via `Content-Length`/`Content-Type` (`content_type_for`), and
+/// returns the parsed response body on `expected_status`, or an error
+/// otherwise.
 fn fetch(
     socket: &str, method: &str, path: &str, body: Option<&str>, expected: &str,
 ) -> Result<String, String> {
@@ -75,7 +112,8 @@ fn fetch(
     match body {
         Some(b) => {
             head.push_str(&format!(
-                "content-type: application/json\r\ncontent-length: {}\r\n\r\n{b}", b.len(),
+                "content-type: {}\r\ncontent-length: {}\r\n\r\n{b}",
+                content_type_for(path), b.len(),
             ));
         }
         None => head.push_str("\r\n"),
@@ -100,7 +138,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    match fetch(&socket, method, &path, body.as_deref(), expected_status(method)) {
+    match fetch(&socket, method, &path, body.as_deref(), expected_status(method, &path)) {
         Ok(body) if body.trim().is_empty() => println!("ok"),
         Ok(body) => {
             let pretty = serde_json::from_str::<serde_json::Value>(&body)
@@ -166,10 +204,78 @@ mod tests {
     }
 
     #[test]
-    fn expected_status_by_method() {
-        assert_eq!(expected_status("GET"), "200");
-        assert_eq!(expected_status("POST"), "202");
-        assert_eq!(expected_status("DELETE"), "204");
+    fn expected_status_by_method_and_path() {
+        assert_eq!(expected_status("GET", "/v1/status"), "200");
+        assert_eq!(expected_status("POST", "/v1/identities/link"), "202");
+        assert_eq!(expected_status("DELETE", "/v1/identities/link/1"), "204");
+        assert_eq!(expected_status("GET", "/v1/config"), "200");
+        assert_eq!(expected_status("PUT", "/v1/config"), "200");
+        assert_eq!(expected_status("POST", "/v1/config/validate"), "200");
+        assert_eq!(expected_status("POST", "/v1/config/rollback"), "200");
+    }
+
+    #[test]
+    fn content_type_by_path() {
+        assert_eq!(content_type_for("/v1/config"), "text/yaml");
+        assert_eq!(content_type_for("/v1/config/validate"), "text/yaml");
+        assert_eq!(content_type_for("/v1/identities/link"), "application/json");
+        assert_eq!(content_type_for("/v1/config/rollback"), "application/json");
+    }
+
+    #[test]
+    fn config_show_builds_a_get_with_no_body() {
+        assert_eq!(request_for(&["config".into(), "show".into()]).unwrap(),
+            ("GET", "/v1/config".into(), None));
+    }
+
+    #[test]
+    fn config_validate_reads_the_local_file_and_posts_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("candidate.yaml");
+        std::fs::write(&file, "node:\n  name: t\n  data_dir: /tmp/x\n").unwrap();
+
+        let (method, path, body) =
+            request_for(&["config".into(), "validate".into(), file.display().to_string()]).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/v1/config/validate");
+        assert_eq!(body.unwrap(), "node:\n  name: t\n  data_dir: /tmp/x\n");
+    }
+
+    #[test]
+    fn config_validate_requires_a_file_argument_and_errors_on_a_missing_file() {
+        assert!(request_for(&["config".into(), "validate".into()]).is_err());
+        assert!(request_for(&["config".into(), "validate".into(),
+            "/nonexistent/relayfabric-ctl-test.yaml".into()]).is_err());
+    }
+
+    #[test]
+    fn config_apply_reads_the_local_file_and_puts_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("candidate.yaml");
+        std::fs::write(&file, "node:\n  name: applied\n  data_dir: /tmp/y\n").unwrap();
+
+        let (method, path, body) =
+            request_for(&["config".into(), "apply".into(), file.display().to_string()]).unwrap();
+        assert_eq!(method, "PUT");
+        assert_eq!(path, "/v1/config");
+        assert_eq!(body.unwrap(), "node:\n  name: applied\n  data_dir: /tmp/y\n");
+    }
+
+    #[test]
+    fn config_apply_requires_a_file_argument() {
+        assert!(request_for(&["config".into(), "apply".into()]).is_err());
+    }
+
+    #[test]
+    fn config_rollback_builds_a_post_with_no_body() {
+        assert_eq!(request_for(&["config".into(), "rollback".into()]).unwrap(),
+            ("POST", "/v1/config/rollback".into(), None));
+    }
+
+    #[test]
+    fn config_with_unknown_subcommand_or_none_is_a_usage_error() {
+        assert!(request_for(&["config".into()]).is_err());
+        assert!(request_for(&["config".into(), "bogus".into()]).is_err());
     }
 
     #[test]

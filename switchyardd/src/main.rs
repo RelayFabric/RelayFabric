@@ -73,7 +73,8 @@ fn main() {
         let _ = std::fs::remove_file(&admin_sock);
         let admin_listener =
             tokio::net::UnixListener::bind(&admin_sock).expect("bind admin socket");
-        tokio::spawn(admin::serve(daemon.clone(), admin_listener));
+        tokio::spawn(admin::serve(
+            daemon.clone(), std::path::PathBuf::from(config_path), admin_listener));
         tracing::info!(node = daemon.cfg_snapshot(|c| c.node.name.clone()), "switchyardd running");
         tokio::signal::ctrl_c().await.expect("ctrl_c");
         tracing::info!("shutting down");

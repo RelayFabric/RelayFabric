@@ -33,9 +33,6 @@ pub struct PluginHandle {
 /// act on), plus the `"daemon"` pseudo-entry when a restart-only field
 /// (`node.*` / the data-dir-derived socket paths) changed. Empty when
 /// nothing in `new` requires a restart to take effect.
-#[allow(dead_code)]
-// consumed by admin `PUT /v1/config` / `POST /v1/config/rollback` (Task 3);
-// remove allow once those handlers call `apply_config` and return this.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ApplyOutcome {
     pub restart_required: Vec<String>,
@@ -66,6 +63,20 @@ pub struct Daemon {
     pub sender_limiter: Mutex<SenderLimiter>,
     pub budget_limiter: Mutex<BudgetLimiter>,
     pub gauges: metrics::PluginGauges,
+    /// Serializes `apply_config`'s ENTIRE body end-to-end (design §1 review
+    /// finding, Task 1 -> Task 3): the cfg swap happens under `cfg`'s write
+    /// lock, but the limiter rebuilds that follow it happen OUTSIDE that
+    /// lock (by design -- see `apply_config`'s doc comment on why cfg is
+    /// never held across another lock acquisition). Without this mutex, two
+    /// overlapping `apply_config` calls can interleave: both swap `cfg` (in
+    /// some order), then both rebuild the limiters (in a DIFFERENT,
+    /// independent order), so the config left in `cfg` and the numbers
+    /// baked into `sender_limiter`/`budget_limiter` can end up from two
+    /// different calls. Holding this for the whole function guarantees
+    /// whichever call finishes last leaves `cfg` and the limiters mutually
+    /// consistent with EACH OTHER, regardless of which call that turns out
+    /// to be.
+    apply_lock: Mutex<()>,
 }
 
 /// Creates `data_dir` (and any missing parents) with owner-only permissions
@@ -112,6 +123,7 @@ impl Daemon {
             sender_limiter: Mutex::new(sender_limiter),
             budget_limiter: Mutex::new(BudgetLimiter::new()),
             gauges: metrics::PluginGauges::new(),
+            apply_lock: Mutex::new(()),
         })
     }
 
@@ -153,10 +165,28 @@ impl Daemon {
     /// values on their very next call. Callers are responsible for having
     /// already validated `new` (see `config::validate`) -- this method
     /// trusts it as-is and never fails.
-    #[allow(dead_code)]
-    // consumed by admin `PUT /v1/config` / `POST /v1/config/rollback`
-    // (Task 3); remove allow once those handlers call this.
+    ///
+    /// CALLERS MUST CONSTRUCT `new` VIA `config::load_from_str`, never a
+    /// bare parse: the restart-required diff below compares `cfg.plugins`
+    /// (always resolved -- it's whatever the daemon is running with) against
+    /// `new.plugins` field-by-field, including each plugin's `config:`
+    /// block. `load_from_str` runs `resolve_secrets` before returning, so
+    /// `new.plugins[_].config` is resolved too, and a config re-applied with
+    /// unchanged secret-yielding env vars compares equal. Skip that pipeline
+    /// (e.g. `serde_yaml::from_str` + `validate` by hand) and `new.plugins[_]
+    /// .config` still holds the unresolved `${...}` reference string, which
+    /// will never equal the resolved value in `cfg` -- a false-positive
+    /// restart_required entry every single time that plugin's config block
+    /// contains any secret reference at all, resolved or not.
+    ///
+    /// Serialized end-to-end by `apply_lock` (see its doc comment) -- this
+    /// is the ONE Daemon method that acquires two of its own locks in
+    /// sequence (`apply_lock` then, inside, `cfg`'s write lock) rather than
+    /// just one; that's safe specifically because `apply_lock` is never
+    /// acquired from anywhere else, so there's no second call site that
+    /// could ever try to take them in the opposite order.
     pub fn apply_config(&self, new: Config) -> ApplyOutcome {
+        let _apply_guard = self.apply_lock.lock().unwrap();
         let mut restart_required = Vec::new();
         let (dedup_ttl_secs, sender_mm, sender_bph) = {
             let mut cfg = self.cfg.write().unwrap();
@@ -2912,5 +2942,96 @@ mod tests {
         d.apply_config(new_cfg);
 
         assert_eq!(d.cfg.read().unwrap().raw_yaml, "node:\n  name: applied\n");
+    }
+
+    /// Carried fix (Task 1 review, Minor -> Task 3): the restart-required
+    /// diff compares `cfg.plugins[_].config` (always resolved) against
+    /// `new.plugins[_].config`, so `new` MUST come from `config::load_from_str`
+    /// (which resolves secrets before returning) rather than a bare parse --
+    /// otherwise a plugin config block with a `${env:...}` reference would
+    /// always look "changed" (resolved value vs. still-a-reference-string),
+    /// even when the env var resolves to the exact same value both times.
+    /// Both the daemon's initial config and `new` here go through
+    /// `load_from_str`, exactly as the real PUT/rollback handlers do (per
+    /// `apply_config`'s doc comment).
+    #[test]
+    fn apply_config_reapplying_the_same_resolved_secret_reports_no_restart_required() {
+        std::env::set_var("RF_ENGINE_TEST_APPLY_SECRET", "sentinel-apply-secret-7f3a");
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let yaml = format!(
+            r#"
+node:
+  name: t
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+    config:
+      token: "${{env:RF_ENGINE_TEST_APPLY_SECRET}}"
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#,
+            data_dir.display()
+        );
+
+        let cfg1 = crate::config::load_from_str(&yaml).unwrap();
+        let d = Daemon::new(cfg1, &data_dir).unwrap();
+        let cfg2 = crate::config::load_from_str(&yaml).unwrap();
+        let outcome = d.apply_config(cfg2);
+        std::env::remove_var("RF_ENGINE_TEST_APPLY_SECRET");
+
+        assert!(outcome.restart_required.is_empty(),
+            "re-applying an unchanged config (secret resolved via the same \
+             env var both times) must not report a false-positive restart: \
+             {outcome:?}");
+    }
+
+    /// Carried fix (Task 1 review, Important -> Task 3): `apply_config` must
+    /// serialize end-to-end so two overlapping callers (PUT and rollback
+    /// racing, or two PUTs racing) never leave `cfg` holding one config's
+    /// values while `sender_limiter` holds the OTHER config's numbers. This
+    /// can't assert "config A always wins" (thread scheduling decides which
+    /// of the two finishes last, and that's legitimately nondeterministic)
+    /// -- what must hold, every run, is that whichever config `cfg` ends up
+    /// with is the SAME config the limiter's live behavior reflects.
+    #[test]
+    fn apply_config_concurrent_calls_serialize_so_cfg_and_limiter_never_disagree() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path())); // Limits::default(): unlimited
+
+        let mut cfg_tight = d.cfg.read().unwrap().clone();
+        cfg_tight.limits.per_sender.messages_per_minute = 1;
+        let mut cfg_loose = d.cfg.read().unwrap().clone();
+        cfg_loose.limits.per_sender.messages_per_minute = 1000;
+
+        let (d1, d2) = (d.clone(), d.clone());
+        let t1 = std::thread::spawn(move || d1.apply_config(cfg_tight));
+        let t2 = std::thread::spawn(move || d2.apply_config(cfg_loose));
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let final_limit = d.cfg_snapshot(|c| c.limits.per_sender.messages_per_minute);
+        assert!(final_limit == 1 || final_limit == 1000, "unexpected limit: {final_limit}");
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "one".into(), None, vec![], None);
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "two".into(), None, vec![], None);
+        let pending = d.store.lock().unwrap().queue_counts().unwrap()
+            .into_iter().find(|(state, _)| state == "pending")
+            .map(|(_, n)| n).unwrap_or(0);
+
+        if final_limit == 1 {
+            assert_eq!(pending, 1,
+                "cfg ended up with the tight limit but the limiter let both messages through");
+        } else {
+            assert_eq!(pending, 2,
+                "cfg ended up with the loose limit but the limiter rate-limited the second message");
+        }
     }
 }
