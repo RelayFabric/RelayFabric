@@ -402,10 +402,11 @@ class FakeBackend:
     """Captures downlinks published via publish_downlink; events() replays a
     scripted list of (topic, event) tuples supplied by the test."""
 
-    def __init__(self, scripted_events=None):
+    def __init__(self, scripted_events=None, depth=0):
         self.published = []
         self.fail_with = None
         self._scripted = scripted_events or []
+        self._depth = depth
 
     def publish_downlink(self, obj):
         if self.fail_with:
@@ -414,6 +415,9 @@ class FakeBackend:
 
     def events(self):
         yield from self._scripted
+
+    def queue_depth(self):
+        return self._depth
 
 
 class BridgeTests(unittest.TestCase):
@@ -512,6 +516,55 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.backend.published, [])
 
 
+class BridgeGaugesTests(unittest.TestCase):
+    """design §3: best-effort Gauges emission, rate-limited to at most one
+    frame per GAUGES_INTERVAL_SECS, driven off handle_event -- rssi/snr when
+    the MQTT JSON envelope carries them, else backend queue depth."""
+
+    def setUp(self):
+        self.cfg = base_cfg()
+        self.backend = FakeBackend(depth=7)
+        self.sock = FakeSock()
+        self.bridge = plug.Bridge(self.cfg, self.backend, self.sock)
+
+    def test_fresh_bridge_does_not_emit_on_its_first_event(self):
+        # _last_gauges_at baselines to Bridge construction time, not 0/never
+        # -- a real event arriving well within GAUGES_INTERVAL_SECS of
+        # startup must not trigger an emission (this is also what keeps
+        # every ordinary BridgeTests case above at exactly one frame).
+        self.bridge.handle_event("msh/2/json/ch-0/!12345678", text_event())
+        frames = self.sock.frames()
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["t"], "inbound")
+
+    def test_emits_rssi_and_snr_when_present_once_rate_limit_elapses(self):
+        self.bridge._last_gauges_at = 0  # force the rate limit open
+        ev = text_event()
+        ev["rssi"] = -91
+        ev["snr"] = 7.25
+        self.bridge.handle_event("msh/2/json/ch-0/!12345678", ev)
+        frames = self.sock.frames()
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[0], {"t": "gauges", "gauges": {"rssi": -91.0, "snr": 7.25}})
+        self.assertEqual(frames[1]["t"], "inbound")
+
+    def test_falls_back_to_queue_depth_when_rssi_snr_absent(self):
+        self.bridge._last_gauges_at = 0
+        self.bridge.handle_event("msh/2/json/ch-0/!12345678", text_event())
+        frames = self.sock.frames()
+        self.assertEqual(frames[0], {"t": "gauges", "gauges": {"queue_depth": 7.0}})
+
+    def test_second_event_within_the_window_does_not_re_emit(self):
+        self.bridge._last_gauges_at = 0
+        self.bridge.handle_event("msh/2/json/ch-0/!12345678", text_event())
+        self.assertEqual(self.sock.frames()[0]["t"], "gauges")
+
+        self.bridge.handle_event("msh/2/json/ch-0/!12345678", text_event(text="again"))
+        frames = self.sock.frames()
+        # only the second inbound was added; no second gauges frame.
+        self.assertEqual([f["t"] for f in frames], ["gauges", "inbound", "inbound"])
+
+
 class MqttJsonBackendTests(unittest.TestCase):
     def test_parse_broker_default_port(self):
         backend = plug.MqttJsonBackend("mqtt://broker.local", "msh")
@@ -522,6 +575,11 @@ class MqttJsonBackendTests(unittest.TestCase):
         backend = plug.MqttJsonBackend("mqtt://10.0.0.5:1884", "msh")
         self.assertEqual(backend._host, "10.0.0.5")
         self.assertEqual(backend._port, 1884)
+
+    def test_queue_depth_reflects_qsize(self):
+        backend = plug.MqttJsonBackend("mqtt://broker.local", "msh")
+        backend._queue.put(("t", {}))
+        self.assertEqual(backend.queue_depth(), 1)
 
     def test_parse_broker_rejects_non_mqtt_scheme(self):
         with self.assertRaises(ValueError):

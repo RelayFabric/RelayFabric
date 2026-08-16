@@ -467,6 +467,11 @@ class MeshCoreBackendTests(unittest.TestCase):
         backend = plug.MeshCoreBackend("serial:///dev/ttyUSB0")
         self.assertEqual(backend._queue.maxsize, 256)
 
+    def test_queue_depth_reflects_qsize(self):
+        backend = plug.MeshCoreBackend("serial:///dev/ttyUSB0")
+        backend._queue.put({"kind": "channel_msg"})
+        self.assertEqual(backend.queue_depth(), 1)
+
     def test_on_disconnected_exits_process(self):
         # auto_reconnect is off, so a dropped radio connection is permanent;
         # os._exit(1), not sys.exit, because this callback runs on the
@@ -563,10 +568,11 @@ class FakeBackend:
     already-normalized event dicts, the shape MeshCoreBackend.events() would
     yield after channel_event_to_dict()."""
 
-    def __init__(self, scripted_events=None):
+    def __init__(self, scripted_events=None, depth=0):
         self.sent = []
         self.fail_with = None
         self._scripted = scripted_events or []
+        self._depth = depth
 
     def send_channel(self, idx, text):
         if self.fail_with:
@@ -575,6 +581,9 @@ class FakeBackend:
 
     def events(self):
         yield from self._scripted
+
+    def queue_depth(self):
+        return self._depth
 
 
 class BridgeTests(unittest.TestCase):
@@ -669,6 +678,43 @@ class BridgeTests(unittest.TestCase):
         self.assertFalse(frames[-1]["delivered"])
         self.assertIsNotNone(frames[-1]["detail"])
         self.assertEqual(self.backend.sent, [])
+
+
+class BridgeGaugesTests(unittest.TestCase):
+    """design §3: best-effort Gauges emission, rate-limited to at most one
+    frame per GAUGES_INTERVAL_SECS, driven off handle_event. MeshCore
+    channel packets never carry RSSI/SNR (see channel_event_to_dict), so
+    this is always the queue-depth fallback."""
+
+    def setUp(self):
+        self.cfg = base_cfg()
+        self.backend = FakeBackend(depth=4)
+        self.sock = FakeSock()
+        self.bridge = plug.Bridge(self.cfg, self.backend, self.sock)
+
+    def test_fresh_bridge_does_not_emit_on_its_first_event(self):
+        # _last_gauges_at baselines to Bridge construction time, not 0/never
+        # -- keeps every ordinary BridgeTests case above at exactly one
+        # frame per handle_event call.
+        self.bridge.handle_event(channel_event())
+        self.assertEqual(len(self.sock.frames()), 1)
+
+    def test_emits_queue_depth_once_rate_limit_elapses(self):
+        self.bridge._last_gauges_at = 0  # force the rate limit open
+        self.bridge.handle_event(channel_event())
+        frames = self.sock.frames()
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[0], {"t": "gauges", "gauges": {"queue_depth": 4.0}})
+        self.assertEqual(frames[1]["t"], "inbound")
+
+    def test_second_event_within_the_window_does_not_re_emit(self):
+        self.bridge._last_gauges_at = 0
+        self.bridge.handle_event(channel_event())
+        self.assertEqual(self.sock.frames()[0]["t"], "gauges")
+
+        self.bridge.handle_event(channel_event(text="again"))
+        frames = self.sock.frames()
+        self.assertEqual([f["t"] for f in frames], ["gauges", "inbound", "inbound"])
 
 
 if __name__ == "__main__":

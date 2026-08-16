@@ -181,7 +181,7 @@ async fn trace(
 
 async fn metrics_text(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let q = d.store.lock().unwrap().queue_counts().unwrap_or_default();
-    metrics::render(&q, &plugin_state(&d))
+    metrics::render(&q, &plugin_state(&d), &d.gauges)
 }
 
 /// `GET /v1/identities` (design §Admin API / webui-notes): masked refs in

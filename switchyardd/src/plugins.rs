@@ -74,6 +74,9 @@ async fn handle_conn(
             Ok(PluginToDaemon::DeliveryResult { corr, delivered, detail }) => {
                 engine::handle_result(&d, corr, delivered, detail);
             }
+            Ok(PluginToDaemon::Gauges { gauges }) => {
+                d.gauges.record(&plugin, gauges);
+            }
             Ok(PluginToDaemon::Hello { .. }) => {} // ignore repeat hello
             Err(e) => break e,
         }
@@ -113,5 +116,74 @@ pub async fn supervise(d: Arc<Daemon>, name: String, command: String, socket: Pa
         strikes += 1;
         warn!(plugin = name, delay, "plugin exited; restarting after backoff");
         tokio::time::sleep(Duration::from_secs(delay)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::tests_support::test_daemon;
+    use relay_core::Capabilities;
+    use std::collections::BTreeMap;
+    use tokio::net::UnixStream;
+
+    /// End-to-end (minus process spawn): a plugin's Gauges frame, sent over
+    /// a real `handle_conn` connection after Hello/HelloAck, lands in
+    /// `Daemon::gauges` sanitized and ready to render — the daemon-side half
+    /// of design §3's Gauges frame handling.
+    #[tokio::test]
+    async fn gauges_frame_is_recorded_into_daemon_gauges_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let (plugin_side, daemon_side) = UnixStream::pair().unwrap();
+
+        let conn = tokio::spawn(handle_conn(d.clone(), daemon_side));
+
+        let (mut r, mut w) = plugin_side.into_split();
+        write_frame(&mut w, &PluginToDaemon::Hello {
+            plugin: "mocka".into(),
+            version: "0.1.0".into(),
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: Capabilities::default(),
+        }).await.unwrap();
+        let ack: DaemonToPlugin = read_frame(&mut r).await.unwrap();
+        assert!(matches!(ack, DaemonToPlugin::HelloAck { error: None, .. }),
+            "hello must be accepted: {ack:?}");
+
+        let mut gauges = BTreeMap::new();
+        gauges.insert("RSSI".to_string(), -71.0);
+        write_frame(&mut w, &PluginToDaemon::Gauges { gauges }).await.unwrap();
+
+        // Dropping both halves closes the plugin side of the socket, so
+        // handle_conn's next read hits EOF and the spawned task returns —
+        // a deterministic completion signal instead of a sleep-based poll.
+        drop(w);
+        drop(r);
+        let _ = conn.await;
+
+        let rendered = d.gauges.render(std::time::Instant::now());
+        assert_eq!(rendered, "relayfabric_plugin_gauge{plugin=\"mocka\",name=\"rssi\"} -71\n",
+            "name must be sanitized (lowercased) and the value preserved");
+    }
+
+    #[tokio::test]
+    async fn hello_from_unknown_plugin_is_rejected_before_any_gauges_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let (plugin_side, daemon_side) = UnixStream::pair().unwrap();
+
+        let conn = tokio::spawn(handle_conn(d.clone(), daemon_side));
+
+        let (mut r, mut w) = plugin_side.into_split();
+        write_frame(&mut w, &PluginToDaemon::Hello {
+            plugin: "not-configured".into(),
+            version: "0.1.0".into(),
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: Capabilities::default(),
+        }).await.unwrap();
+        let ack: DaemonToPlugin = read_frame(&mut r).await.unwrap();
+        assert!(matches!(&ack, DaemonToPlugin::HelloAck { error: Some(e), .. } if e == "unknown plugin"),
+            "an unconfigured plugin name must be rejected: {ack:?}");
+        let _ = conn.await;
     }
 }

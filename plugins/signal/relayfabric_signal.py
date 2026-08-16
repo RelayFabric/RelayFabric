@@ -345,5 +345,4 @@ def main():
     from relayfabric_sdk import run_plugin
 
     caps = relay_ipc.capabilities(groups=True, attachments=True)
-    run_plugin(plugin_name, PLUGIN_VERSION, _make_bridge, caps,
-               config_env="RELAYFABRIC_PLUGIN_CONFIG")
+    run_plugin(plugin_name, PLUGIN_VERSION, _make_bridge, caps)

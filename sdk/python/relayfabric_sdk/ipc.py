@@ -88,3 +88,17 @@ def inbound(endpoint, sender, body, created_at_epoch=None, *, attachments=None, 
 def delivery_result(corr, delivered, detail=None):
     return {"t": "delivery_result", "corr": corr, "delivered": delivered,
             "detail": detail}
+
+
+def gauges(values):
+    """Create a Gauges frame (design §3, cycle D) from a dict of gauge name
+    -> numeric value.
+
+    Mirrors the Rust side's `PluginToDaemon::Gauges { gauges: BTreeMap<String,
+    f64> }`: keys are sorted here too, so a frame built from the same
+    name/value set on either side of the wire encodes identically. Values are
+    coerced to float (BTreeMap<String, f64> on the Rust side has no integer
+    variant). Name sanitization and the 32-gauge cap are enforced daemon-side
+    on receipt, not here.
+    """
+    return {"t": "gauges", "gauges": {k: float(values[k]) for k in sorted(values)}}

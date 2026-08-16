@@ -15,10 +15,15 @@ import queue
 import socket
 import sys
 import threading
+import time
 
 log = logging.getLogger(__name__)
 
 PLUGIN_VERSION = "0.1.0"
+
+# design §3 (cycle D): plugin-side rate limit on Gauges frame emission -- at
+# most one per this many seconds, regardless of how many events arrive.
+GAUGES_INTERVAL_SECS = 30
 
 # Hard ceiling on advertised Hello capabilities.max_payload, independent of
 # cfg["max_text_bytes"] (see main()'s use of it): a practical cap for
@@ -243,6 +248,11 @@ class MqttJsonBackend:
         while True:
             yield self._queue.get()
 
+    def queue_depth(self):
+        """Current backlog of not-yet-bridged inbound events -- the gauges
+        fallback (design §3) for an uplink whose JSON carries no rssi/snr."""
+        return self._queue.qsize()
+
     def publish_downlink(self, obj):
         payload = json.dumps(obj)
         info = self._client.publish(self._pub_topic, payload, qos=1)
@@ -280,6 +290,10 @@ class Bridge:
         # swallow one genuine identical-text message (see README).
         self.sent_cache = SentCache(ttl_secs=3600)
         self.by_index = channels_by_index(cfg)
+        # baseline to "now", not 0/never: a fresh Bridge must not emit a
+        # gauges frame on its very first handled event (see
+        # _maybe_emit_gauges), only after GAUGES_INTERVAL_SECS has elapsed.
+        self._last_gauges_at = time.monotonic()
 
     def _send_frame(self, obj):
         from relayfabric_sdk import ipc as relay_ipc
@@ -287,9 +301,35 @@ class Bridge:
         with self.write_lock:
             relay_ipc.write_frame(self.sock_file, obj)
 
+    def _maybe_emit_gauges(self, event):
+        """Best-effort gauge snapshot (design §3), rate-limited to at most
+        once every GAUGES_INTERVAL_SECS. Uses rssi/snr straight off the MQTT
+        JSON gateway envelope when the gateway included them (data already
+        flowing through this same `event` dict -- no new backend call);
+        falls back to the backend's inbound queue depth when neither is
+        present.
+        """
+        now = time.monotonic()
+        if now - self._last_gauges_at < GAUGES_INTERVAL_SECS:
+            return
+        self._last_gauges_at = now
+        values = {}
+        rssi = event.get("rssi")
+        if isinstance(rssi, (int, float)):
+            values["rssi"] = rssi
+        snr = event.get("snr")
+        if isinstance(snr, (int, float)):
+            values["snr"] = snr
+        if not values:
+            values["queue_depth"] = self.backend.queue_depth()
+        from relayfabric_sdk import ipc as relay_ipc
+
+        self._send_frame(relay_ipc.gauges(values))
+
     # ----- inbound (Meshtastic -> daemon); called from the backend's reader thread -----
 
     def handle_event(self, topic, event):
+        self._maybe_emit_gauges(event)
         parsed = parse_uplink(topic, event, self.by_index, self.cfg["gateway_id"])
         if parsed is None:
             return

@@ -27,7 +27,7 @@ def _connect_socket(sock_path):
 
 
 def run_plugin(plugin_name, version, bridge_factory, capabilities, *,
-                socket_env="RELAYFABRIC_SOCKET", config_env="RELAYFABRIC_CONFIG",
+                socket_env="RELAYFABRIC_SOCKET", config_env="RELAYFABRIC_PLUGIN_CONFIG",
                 connect=_connect_socket):
     """Run a plugin's main loop until shutdown or an unrecoverable error.
 

@@ -39,6 +39,7 @@ pub struct Daemon {
     pub cas: Cas,
     pub sender_limiter: Mutex<SenderLimiter>,
     pub budget_limiter: Mutex<BudgetLimiter>,
+    pub gauges: metrics::PluginGauges,
 }
 
 /// Creates `data_dir` (and any missing parents) with owner-only permissions
@@ -84,6 +85,7 @@ impl Daemon {
             cas,
             sender_limiter: Mutex::new(sender_limiter),
             budget_limiter: Mutex::new(BudgetLimiter::new()),
+            gauges: metrics::PluginGauges::new(),
         })
     }
 }
@@ -518,6 +520,19 @@ pub fn handle_result(d: &Daemon, corr: i64, delivered: bool, detail: Option<Stri
     let store = d.store.lock().unwrap();
     if delivered {
         metrics::inc(&metrics::EGRESS);
+        // Route counter + delivery latency (design §3): looked up from the
+        // delivery/message rows before the state flip below, though the
+        // flip's own 'attempting'-only guard means these two are
+        // best-effort like EGRESS just above (a late/duplicate delivered
+        // ack that the guard silently ignores still bumps these, exactly
+        // as it already bumps EGRESS) -- not worth a second query to
+        // detect that rare, harmless double-count.
+        if let Some(delivery) = store.deliveries_for_id(corr) {
+            metrics::inc_route(&delivery.route);
+            if let Ok(Some(env)) = store.get_message(delivery.message_id) {
+                metrics::record_latency(Utc::now() - env.created_at);
+            }
+        }
         warn_if_mark_failed(corr, "delivered", store.mark_delivered(corr));
         info!(delivery = corr, "delivered");
         return;
@@ -1573,7 +1588,14 @@ mod tests {
                        "second".into(), None, vec![], None);
 
         let after = metrics::QUEUE_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(after - before, 1, "the second delivery must bump QUEUE_REJECTED");
+        // QUEUE_REJECTED is a process-global counter shared by every test in
+        // this binary's parallel run, so only a monotonic ">" check is safe
+        // here (an exact +1 delta flakes when another test bumps the same
+        // counter concurrently) -- the real, race-free proof that exactly
+        // this test's rejection happened is the dead_letter row + QUEUE_FULL
+        // reason asserted below, which only this test's own over-quota
+        // delivery could have produced.
+        assert!(after > before, "the second delivery must bump QUEUE_REJECTED");
 
         let counts = d.store.lock().unwrap().queue_counts().unwrap();
         assert!(counts.contains(&("pending".to_string(), 1)), "counts was {counts:?}");
@@ -1588,6 +1610,56 @@ mod tests {
                        |r| r.get(0))
             .unwrap();
         assert_eq!(reason, "QUEUE_FULL");
+    }
+
+    /// design §3: a delivered message bumps `relayfabric_route_messages_total`
+    /// for its route and contributes to the `delivery_latency_seconds`
+    /// sum/count pair, computed from the envelope's `created_at`.
+    #[test]
+    fn handle_result_delivered_records_route_counter_and_delivery_latency() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+
+        let created_at = Utc::now() - CDuration::seconds(2);
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), Some(created_at), vec![], None);
+
+        let due = { let store = d.store.lock().unwrap(); store.due_deliveries(Utc::now(), 10).unwrap() };
+        assert_eq!(due.len(), 1);
+        let delivery_id = due[0].id;
+        assert_eq!(due[0].route, "general");
+        d.store.lock().unwrap().mark_attempting(delivery_id).unwrap();
+
+        let route_before =
+            metrics::ROUTE_MESSAGES.lock().unwrap().get("general").copied().unwrap_or(0);
+        let latency_count_before =
+            metrics::DELIVERY_LATENCY_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let latency_sum_before =
+            metrics::DELIVERY_LATENCY_MICROS_SUM.load(std::sync::atomic::Ordering::Relaxed);
+
+        handle_result(&d, delivery_id, true, None);
+
+        let route_after =
+            metrics::ROUTE_MESSAGES.lock().unwrap().get("general").copied().unwrap_or(0);
+        let latency_count_after =
+            metrics::DELIVERY_LATENCY_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let latency_sum_after =
+            metrics::DELIVERY_LATENCY_MICROS_SUM.load(std::sync::atomic::Ordering::Relaxed);
+
+        // ROUTE_MESSAGES/DELIVERY_LATENCY_* are process-globals, same
+        // reasoning as the QUEUE_REJECTED/BUDGET_DEFERRED fixes above: only
+        // monotonic checks are safe under this binary's parallel test run.
+        // The sum is additive-only (record_latency never subtracts), so
+        // "grew by at least this test's own ~2s contribution" is still a
+        // precise, race-free lower bound even though other tests may also
+        // be adding to it concurrently.
+        assert!(route_after > route_before, "a delivered message must bump its route's counter");
+        assert!(latency_count_after > latency_count_before);
+        assert!(latency_sum_after >= latency_sum_before + 1_500_000,
+            "expected roughly a 2s latency contribution: before={latency_sum_before} after={latency_sum_after}");
+
+        let state = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap().state;
+        assert_eq!(state, "delivered");
     }
 
     #[test]
@@ -1690,7 +1762,13 @@ mod tests {
             process_due(&d, del, now).await;
         }
         let after = metrics::BUDGET_DEFERRED.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(after - before, 1, "only the third send within the minute must be deferred");
+        // BUDGET_DEFERRED is a process-global counter shared by every test in
+        // this binary's parallel run, so only a monotonic ">" check is safe
+        // here (an exact +1 delta flakes when another test bumps the same
+        // counter concurrently) -- the real, race-free proof that exactly
+        // one of these three deliveries was deferred is the Send-count
+        // assertion below (exactly two Sends, then an empty channel).
+        assert!(after > before, "only the third send within the minute must be deferred");
 
         // the first two budget slots went out as real Sends...
         recv_send(&mut rx).await;

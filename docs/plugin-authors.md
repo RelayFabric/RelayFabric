@@ -87,7 +87,7 @@ null for unbounded) lets the daemon truncate before it ever reaches you.
 ## The Python runner: `relayfabric_sdk.run_plugin`
 
 `run_plugin(plugin_name, version, bridge_factory, capabilities, *,
-socket_env="RELAYFABRIC_SOCKET", config_env="RELAYFABRIC_CONFIG")` implements
+socket_env="RELAYFABRIC_SOCKET", config_env="RELAYFABRIC_PLUGIN_CONFIG")` implements
 steps 1–3 above so a plugin's `main()` doesn't hand-roll them: it reads the
 env contract, does the Hello/HelloAck handshake, calls
 `bridge_factory(cfg_dict, sock) -> bridge`, calls `bridge.start()` if

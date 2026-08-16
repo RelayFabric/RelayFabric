@@ -63,6 +63,29 @@ class MissingEnvTests(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 2)
 
 
+class DefaultEnvTests(unittest.TestCase):
+    def test_default_config_env_is_relayfabric_plugin_config(self):
+        # Carried fix from the Task 2 review: the daemon actually sets
+        # RELAYFABRIC_PLUGIN_CONFIG (switchyardd's plugins.rs `supervise()`),
+        # not the placeholder RELAYFABRIC_CONFIG the default used to name --
+        # this exercises the real default (no config_env= override) end to
+        # end, unlike every other test in this file.
+        sock = FakeSock(queued_frames=[HELLO_ACK_OK, {"t": "shutdown"}])
+        holder = {}
+
+        def factory(cfg, s):
+            holder["cfg"] = cfg
+            return _MinimalBridge(cfg, s)
+
+        env = {SOCKET_ENV: "/tmp/does-not-matter.sock",
+               "RELAYFABRIC_PLUGIN_CONFIG": '{"real": true}'}
+        with mock.patch.dict(os.environ, env, clear=True), self.assertRaises(SystemExit) as ctx:
+            run_plugin("p", "1.0", factory, relay_ipc.capabilities(),
+                       socket_env=SOCKET_ENV, connect=lambda path: sock)
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(holder["cfg"], {"real": True})
+
+
 class HandshakeTests(unittest.TestCase):
     def test_ok_sends_hello_and_calls_bridge_factory(self):
         sock = FakeSock(queued_frames=[HELLO_ACK_OK, {"t": "shutdown"}])

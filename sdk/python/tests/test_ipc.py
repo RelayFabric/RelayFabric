@@ -105,6 +105,30 @@ class CodecTests(unittest.TestCase):
         relay_ipc.write_frame(buf, msg)
         self.assertEqual(buf.getvalue().hex(), CANONICAL_INBOUND_ATTACHMENT_HEX)
 
+    def test_gauges_builder_roundtrip(self):
+        buf = io.BytesIO()
+        msg = relay_ipc.gauges({"rssi": -71, "queue_depth": 3})
+        relay_ipc.write_frame(buf, msg)
+        buf.seek(0)
+        decoded = relay_ipc.read_frame(buf)
+        self.assertEqual(decoded, {"t": "gauges",
+                                    "gauges": {"queue_depth": 3.0, "rssi": -71.0}})
+
+    def test_gauges_builder_coerces_values_to_float(self):
+        msg = relay_ipc.gauges({"queue_depth": 3})
+        self.assertIsInstance(msg["gauges"]["queue_depth"], float)
+
+    def test_gauges_builder_sorts_keys_like_a_btreemap(self):
+        # Key order must match Rust's BTreeMap<String, f64> iteration order
+        # so a frame built here and one built in Rust from the same
+        # name/value set encode identically byte-for-byte.
+        msg = relay_ipc.gauges({"snr": 1.0, "rssi": -71.0, "queue_depth": 3.0})
+        self.assertEqual(list(msg["gauges"].keys()), ["queue_depth", "rssi", "snr"])
+
+    def test_gauges_builder_empty_dict(self):
+        msg = relay_ipc.gauges({})
+        self.assertEqual(msg, {"t": "gauges", "gauges": {}})
+
 
 class FakeSockTests(unittest.TestCase):
     """FakeSock exercised against one recorded exchange: a queued Hello

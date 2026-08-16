@@ -16,11 +16,16 @@ import queue
 import socket
 import sys
 import threading
+import time
 import urllib.parse
 
 log = logging.getLogger(__name__)
 
 PLUGIN_VERSION = "0.1.0"
+
+# design §3 (cycle D): plugin-side rate limit on Gauges frame emission -- at
+# most one per this many seconds, regardless of how many events arrive.
+GAUGES_INTERVAL_SECS = 30
 
 # Hard ceiling on advertised Hello capabilities.max_payload, independent of
 # cfg["max_text_bytes"]: a practical cap for MeshCore text payloads regardless
@@ -335,6 +340,12 @@ class MeshCoreBackend:
         while True:
             yield self._queue.get()
 
+    def queue_depth(self):
+        """Current backlog of not-yet-bridged inbound events -- the gauges
+        fallback (design §3) for a channel packet that carries no RSSI/SNR
+        (MeshCore CHANNEL_MSG_RECV never does; see channel_event_to_dict)."""
+        return self._queue.qsize()
+
     def send_channel(self, idx, text):
         if self._loop is None or self._mc is None:
             raise RuntimeError("meshcore backend not started")
@@ -373,6 +384,10 @@ class Bridge:
         # README's one-swallow caveat).
         self.sent_cache = SentCache(ttl_secs=3600)
         self.by_index = channels_by_index(cfg)
+        # baseline to "now", not 0/never: a fresh Bridge must not emit a
+        # gauges frame on its very first handled event (see
+        # _maybe_emit_gauges), only after GAUGES_INTERVAL_SECS has elapsed.
+        self._last_gauges_at = time.monotonic()
 
     def _send_frame(self, obj):
         from relayfabric_sdk import ipc as relay_ipc
@@ -380,9 +395,25 @@ class Bridge:
         with self.write_lock:
             relay_ipc.write_frame(self.sock_file, obj)
 
+    def _maybe_emit_gauges(self):
+        """Best-effort gauge snapshot (design §3), rate-limited to at most
+        once every GAUGES_INTERVAL_SECS. MeshCore CHANNEL_MSG_RECV events
+        carry no RSSI/SNR at the protocol level (see channel_event_to_dict's
+        docstring) -- the only data "already flowing" here is the backend's
+        inbound queue depth.
+        """
+        now = time.monotonic()
+        if now - self._last_gauges_at < GAUGES_INTERVAL_SECS:
+            return
+        self._last_gauges_at = now
+        from relayfabric_sdk import ipc as relay_ipc
+
+        self._send_frame(relay_ipc.gauges({"queue_depth": self.backend.queue_depth()}))
+
     # ----- inbound (MeshCore -> daemon); called from the backend's reader thread -----
 
     def handle_event(self, ev):
+        self._maybe_emit_gauges()
         parsed = normalize_event(ev, self.by_index)
         if parsed is None:
             return

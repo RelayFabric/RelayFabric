@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use relay_core::Capabilities;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -48,6 +49,16 @@ pub enum PluginToDaemon {
         corr: i64,
         delivered: bool,
         detail: Option<String>,
+    },
+    // additive (design §3, cycle D): kept LAST so the canonical CBOR
+    // encoding of every pre-existing PluginToDaemon variant is unchanged —
+    // both golden-byte tests below stay byte-identical. Best-effort,
+    // rate-limited (plugin-side) gauge snapshot (e.g. RSSI/SNR, queue
+    // depth); a plugin that never sends it changes nothing for the daemon
+    // (unknown-t tolerance already covers older plugins on the daemon side,
+    // and older daemons ignore this the same way).
+    Gauges {
+        gauges: BTreeMap<String, f64>,
     },
 }
 
@@ -254,5 +265,60 @@ mod tests {
             panic!("wrong variant");
         };
         assert_eq!(priority.as_deref(), Some("emergency"));
+    }
+
+    #[tokio::test]
+    async fn gauges_frame_roundtrips() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let mut gauges = BTreeMap::new();
+        gauges.insert("rssi".to_string(), -71.5);
+        gauges.insert("queue_depth".to_string(), 3.0);
+        write_frame(&mut a, &PluginToDaemon::Gauges { gauges: gauges.clone() }).await.unwrap();
+        let PluginToDaemon::Gauges { gauges: got } = read_frame(&mut b).await.unwrap() else {
+            panic!("wrong variant");
+        };
+        assert_eq!(got, gauges);
+    }
+
+    #[tokio::test]
+    async fn gauges_is_the_last_plugin_to_daemon_variant_and_goldens_are_unaffected() {
+        // Gauges was added additively, kept last in the enum declaration
+        // specifically so it cannot perturb the discriminant/field layout
+        // of every earlier variant's CBOR encoding. This test re-asserts
+        // both golden frames byte-identical in the SAME test run as the new
+        // variant's own roundtrip (rather than relying on the pre-existing
+        // golden tests happening to still be green) so a future edit that
+        // reorders variants gets caught right here, not just incidentally
+        // elsewhere.
+        let mut hello_buf = Vec::new();
+        write_frame(&mut hello_buf, &PluginToDaemon::Hello {
+            plugin: "lxmf".into(),
+            version: "0.1.0".into(),
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: Capabilities {
+                direct_messages: true,
+                groups: true,
+                ..Capabilities::default()
+            },
+        }).await.unwrap();
+        let hex: String = hello_buf.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "000000a5a561746568656c6c6f66706c7567696e646c786d666776657273696f6e65302e312e307070726f746f636f6c5f76657273696f6e016c6361706162696c6974696573a96474657874f56f6469726563745f6d65737361676573f56667726f757073f56b6174746163686d656e7473f4686c6f636174696f6ef4697265616374696f6e73f4687265636569707473f46870726573656e6365f46b6d61785f7061796c6f6164f6");
+
+        let mut inbound_buf = Vec::new();
+        write_frame(&mut inbound_buf, &PluginToDaemon::Inbound {
+            endpoint: "chan".into(),
+            sender: "s".into(),
+            kind: "text".into(),
+            body: "hi".into(),
+            created_at: None,
+            attachments: vec![IpcAttachment {
+                filename: "a.bin".into(),
+                mime: "application/octet-stream".into(),
+                data: vec![1, 2, 3],
+            }],
+            priority: None,
+        }).await.unwrap();
+        let hex: String = inbound_buf.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "0000008fa8617467696e626f756e6468656e64706f696e74646368616e6673656e6465726173646b696e64647465787464626f64796268696a637265617465645f6174f66b6174746163686d656e747381a36866696c656e616d6565612e62696e646d696d6578186170706c69636174696f6e2f6f637465742d73747265616d646461746143010203687072696f72697479f6");
     }
 }
