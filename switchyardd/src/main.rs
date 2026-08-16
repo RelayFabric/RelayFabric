@@ -5,6 +5,7 @@ mod config;
 mod dedup;
 mod engine;
 mod events;
+mod fed;
 mod identity_links;
 mod limits;
 mod metrics;
