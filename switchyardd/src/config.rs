@@ -20,6 +20,13 @@ pub struct Config {
     pub hop_limit: u8,
     #[serde(default = "default_max_attachment_bytes")]
     pub max_attachment_bytes: u64,
+    #[serde(default)]
+    pub public_services: Vec<PublicService>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub limits: Limits,  // consumed by Task 3 (enforce limits); remove allow when used
+    #[serde(default)]
+    pub transport_budgets: BTreeMap<String, Budget>,
 }
 
 fn default_ttl() -> u64 { 86_400 }
@@ -30,6 +37,64 @@ fn default_max_attachment_bytes() -> u64 { 8 * 1024 * 1024 }
 pub struct NodeConfig {
     pub name: String,
     pub data_dir: PathBuf,
+    #[serde(default)]
+    pub public: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PublicService {
+    pub name: String,
+    #[allow(dead_code)]
+    pub r#type: String,  // consumed by Task 5 (request routing); remove allow when used
+    pub ingress: Vec<String>,
+    pub egress: Vec<String>,
+}
+
+#[allow(dead_code)]
+fn protocol_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let raw: Vec<String> = Vec::deserialize(d)?;
+    Ok(raw)
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Limits {
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub per_sender: PerSender,  // consumed by Task 3 (enforce limits); remove allow when used
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub per_route: PerRoute,  // consumed by Task 3 (enforce limits); remove allow when used
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub global: GlobalLimits,  // consumed by Task 3 (enforce limits); remove allow when used
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PerSender {
+    #[allow(dead_code)]
+    pub messages_per_minute: u32,  // consumed by Task 3 (enforce limits); remove allow when used
+    #[allow(dead_code)]
+    pub bytes_per_hour: u64,  // consumed by Task 3 (enforce limits); remove allow when used
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PerRoute {
+    #[allow(dead_code)]
+    pub queue_max: u32,  // consumed by Task 3 (enforce limits); remove allow when used
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GlobalLimits {
+    #[allow(dead_code)]
+    pub queue_max: u32,  // consumed by Task 3 (enforce limits); remove allow when used
+    #[allow(dead_code)]
+    pub cas_max_bytes: u64,  // consumed by Task 3 (enforce limits); remove allow when used
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Budget {
+    #[allow(dead_code)]
+    pub messages_per_minute: u32,  // consumed by Task 4 (enforce transport budgets); remove allow when used
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +192,85 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             }
         }
     }
+
+    // Validate public_services protocols are enabled plugins
+    for svc in &cfg.public_services {
+        for proto in svc.ingress.iter().chain(&svc.egress) {
+            match cfg.plugins.get(proto) {
+                Some(p) if p.enabled => {}
+                Some(_) => {
+                    return Err(format!(
+                        "public_services '{}' references disabled plugin '{}'; enable the plugin or remove the entry",
+                        svc.name, proto))
+                }
+                None => {
+                    return Err(format!(
+                        "public_services '{}' references unknown plugin '{}'; enable the plugin or remove the entry",
+                        svc.name, proto))
+                }
+            }
+        }
+    }
+
+    // Validate routes coverage when node.public is true
+    if cfg.node.public {
+        for route in &cfg.routes {
+            // Collect all protocols from public_services ingress
+            let ingress_protocols: BTreeSet<_> = cfg
+                .public_services
+                .iter()
+                .flat_map(|s| s.ingress.iter().cloned())
+                .collect();
+
+            // Collect all protocols from public_services egress
+            let egress_protocols: BTreeSet<_> = cfg
+                .public_services
+                .iter()
+                .flat_map(|s| s.egress.iter().cloned())
+                .collect();
+
+            // Check that all source protocols are in ingress
+            for ep in &route.sources {
+                if !ingress_protocols.contains(&ep.protocol) {
+                    return Err(format!(
+                        "node.public is true but route '{}' has source protocol '{}' not covered by any public_services ingress; add '{}' to a public_services ingress list",
+                        route.name, ep.protocol, ep.protocol));
+                }
+            }
+
+            // Check that all destination protocols are in egress
+            for ep in &route.destinations {
+                if !egress_protocols.contains(&ep.protocol) {
+                    return Err(format!(
+                        "node.public is true but route '{}' has destination protocol '{}' not covered by any public_services egress; add '{}' to a public_services egress list",
+                        route.name, ep.protocol, ep.protocol));
+                }
+            }
+        }
+    }
+
+    // Validate transport_budgets keys are enabled plugins
+    for (proto, budget) in &cfg.transport_budgets {
+        if budget.messages_per_minute == 0 {
+            return Err(format!(
+                "transport_budgets '{}' has messages_per_minute 0 which would block all egress; omit the entry instead",
+                proto));
+        }
+        match cfg.plugins.get(proto) {
+            Some(p) if p.enabled => {}
+            Some(_) => {
+                return Err(format!(
+                    "transport_budgets '{}' references disabled plugin '{}'; enable the plugin or remove the entry",
+                    proto, proto))
+            }
+            None => {
+                return Err(format!(
+                    "transport_budgets '{}' references unknown plugin '{}'; enable the plugin or remove the entry",
+                    proto, proto))
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -245,5 +389,277 @@ routes:
 ");
         let err = parse(&bad).unwrap_err();
         assert!(err.contains("duplicate"), "err was: {err}");
+    }
+
+    #[test]
+    fn v0_1_style_config_parses_with_all_defaults() {
+        // v0.1-style config has none of the new keys
+        let cfg = parse(GOOD).unwrap();
+        assert!(!cfg.node.public);
+        assert!(cfg.public_services.is_empty());
+        assert_eq!(cfg.limits.per_sender.messages_per_minute, 0);
+        assert_eq!(cfg.limits.per_sender.bytes_per_hour, 0);
+        assert_eq!(cfg.limits.per_route.queue_max, 0);
+        assert_eq!(cfg.limits.global.queue_max, 0);
+        assert_eq!(cfg.limits.global.cas_max_bytes, 0);
+        assert!(cfg.transport_budgets.is_empty());
+    }
+
+    #[test]
+    fn public_false_with_uncovered_routes_ok() {
+        let yaml = r#"
+node:
+  name: test-node
+  public: false
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan"]
+    destinations: ["mockb:chan"]
+"#;
+        let cfg = parse(yaml).unwrap();
+        assert!(!cfg.node.public);
+        assert_eq!(cfg.routes[0].name, "general");
+    }
+
+    #[test]
+    fn public_true_with_covered_routes_ok() {
+        let yaml = r#"
+node:
+  name: test-node
+  public: true
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+public_services:
+  - name: service1
+    type: mqtt
+    ingress: [mocka]
+    egress: [mockb]
+routes:
+  - name: general
+    sources: ["mocka:chan"]
+    destinations: ["mockb:chan"]
+"#;
+        let cfg = parse(yaml).unwrap();
+        assert!(cfg.node.public);
+        assert_eq!(cfg.public_services[0].name, "service1");
+        assert_eq!(cfg.public_services[0].ingress, vec!["mocka"]);
+        assert_eq!(cfg.public_services[0].egress, vec!["mockb"]);
+    }
+
+    #[test]
+    fn public_true_uncovered_source_protocol_err() {
+        let yaml = r#"
+node:
+  name: test-node
+  public: true
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+public_services:
+  - name: service1
+    type: mqtt
+    ingress: []
+    egress: [mockb]
+routes:
+  - name: general
+    sources: ["mocka:chan"]
+    destinations: ["mockb:chan"]
+"#;
+        let err = parse(yaml).unwrap_err();
+        assert!(err.contains("general"), "error should name route: {err}");
+        assert!(err.contains("mocka"), "error should name protocol: {err}");
+        assert!(err.contains("ingress"), "error should hint ingress: {err}");
+    }
+
+    #[test]
+    fn public_true_uncovered_destination_protocol_err() {
+        let yaml = r#"
+node:
+  name: test-node
+  public: true
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+public_services:
+  - name: service1
+    type: mqtt
+    ingress: [mocka]
+    egress: []
+routes:
+  - name: general
+    sources: ["mocka:chan"]
+    destinations: ["mockb:chan"]
+"#;
+        let err = parse(yaml).unwrap_err();
+        assert!(err.contains("general"), "error should name route: {err}");
+        assert!(err.contains("mockb"), "error should name protocol: {err}");
+        assert!(err.contains("egress"), "error should hint egress: {err}");
+    }
+
+    #[test]
+    fn unknown_plugin_in_public_services_err() {
+        let yaml = r#"
+node:
+  name: test-node
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+public_services:
+  - name: service1
+    type: mqtt
+    ingress: [ghost]
+    egress: [mocka]
+"#;
+        let err = parse(yaml).unwrap_err();
+        assert!(err.contains("service1"), "error should name service: {err}");
+        assert!(err.contains("ghost"), "error should name plugin: {err}");
+    }
+
+    #[test]
+    fn zero_transport_budget_err() {
+        let yaml = r#"
+node:
+  name: test-node
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+transport_budgets:
+  mocka:
+    messages_per_minute: 0
+"#;
+        let err = parse(yaml).unwrap_err();
+        assert!(err.contains("mocka"), "error should name budget: {err}");
+        assert!(err.contains("0"), "error should mention 0: {err}");
+        assert!(err.contains("omit"), "error should hint omit: {err}");
+    }
+
+    #[test]
+    fn unknown_plugin_in_transport_budgets_err() {
+        let yaml = r#"
+node:
+  name: test-node
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+transport_budgets:
+  ghost:
+    messages_per_minute: 100
+"#;
+        let err = parse(yaml).unwrap_err();
+        assert!(err.contains("ghost"), "error should name plugin: {err}");
+    }
+
+    #[test]
+    fn nonzero_transport_budget_ok() {
+        let yaml = r#"
+node:
+  name: test-node
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+transport_budgets:
+  mocka:
+    messages_per_minute: 100
+"#;
+        let cfg = parse(yaml).unwrap();
+        assert_eq!(cfg.transport_budgets["mocka"].messages_per_minute, 100);
+    }
+
+    #[test]
+    fn limits_all_zero_ok() {
+        let yaml = r#"
+node:
+  name: test-node
+  data_dir: /tmp/relayfabric-test
+limits:
+  per_sender:
+    messages_per_minute: 0
+    bytes_per_hour: 0
+  per_route:
+    queue_max: 0
+  global:
+    queue_max: 0
+    cas_max_bytes: 0
+"#;
+        let cfg = parse(yaml).unwrap();
+        assert_eq!(cfg.limits.per_sender.messages_per_minute, 0);
+        assert_eq!(cfg.limits.per_sender.bytes_per_hour, 0);
+    }
+
+    #[test]
+    fn limits_nonzero_ok() {
+        let yaml = r#"
+node:
+  name: test-node
+  data_dir: /tmp/relayfabric-test
+limits:
+  per_sender:
+    messages_per_minute: 100
+    bytes_per_hour: 50000
+  per_route:
+    queue_max: 1000
+  global:
+    queue_max: 10000
+    cas_max_bytes: 1000000000
+"#;
+        let cfg = parse(yaml).unwrap();
+        assert_eq!(cfg.limits.per_sender.messages_per_minute, 100);
+        assert_eq!(cfg.limits.per_sender.bytes_per_hour, 50000);
+        assert_eq!(cfg.limits.per_route.queue_max, 1000);
+        assert_eq!(cfg.limits.global.queue_max, 10000);
+        assert_eq!(cfg.limits.global.cas_max_bytes, 1000000000);
+    }
+
+    #[test]
+    fn multiple_public_services_ingress_and_egress_combined() {
+        let yaml = r#"
+node:
+  name: test-node
+  public: true
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+  mockc:
+    enabled: true
+public_services:
+  - name: service1
+    type: mqtt
+    ingress: [mocka]
+    egress: [mockb]
+  - name: service2
+    type: http
+    ingress: [mockc]
+    egress: [mockc]
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockc:chan"]
+    destinations: ["mockb:chan", "mockc:chan"]
+"#;
+        let cfg = parse(yaml).unwrap();
+        assert_eq!(cfg.public_services.len(), 2);
+        assert!(cfg.node.public);
     }
 }

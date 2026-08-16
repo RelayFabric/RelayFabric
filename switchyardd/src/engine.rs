@@ -453,7 +453,7 @@ pub mod tests_support {
             });
         }
         let cfg = Config {
-            node: NodeConfig { name: "t".into(), data_dir: dir.to_path_buf() },
+            node: NodeConfig { name: "t".into(), data_dir: dir.to_path_buf(), public: false },
             plugins,
             routes: vec![RouteConfig {
                 name: "general".into(),
@@ -465,6 +465,9 @@ pub mod tests_support {
             dedup_ttl_secs: 3600,
             hop_limit: 8,
             max_attachment_bytes: 8 * 1024 * 1024,
+            public_services: vec![],
+            limits: Default::default(),
+            transport_budgets: Default::default(),
         };
         Daemon::new(cfg, dir).unwrap()
     }

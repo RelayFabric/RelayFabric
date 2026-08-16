@@ -3,6 +3,9 @@
 node:
   name: example-gateway
   data_dir: /var/lib/relayfabric
+  # Set to true to require all routes to be covered by public_services
+  # ingress/egress; see public_services block below.
+  # public: false
 
 plugins:
   mqtt:
@@ -86,6 +89,41 @@ policies:
       drop_kinds: [location]        # location never crosses by default (spec §74)
       attachments: reject           # mqtt is payload-constrained; drop attachments outright
       max_attachment_bytes: 500000  # alternative to `reject`: cap attachment size instead (bytes)
+
+# Public service gating: routes and their ingress/egress protocols.
+# Required when node.public is true; optional when false.
+# When node.public is true, every route's source protocols must be covered by
+# the union of all public_services' ingress lists, and every route's destination
+# protocols must be covered by the union of all public_services' egress lists.
+# public_services:
+#   - name: mqtt-gateway
+#     type: mqtt
+#     ingress: [mqtt]          # protocols accepted as route sources
+#     egress: [mqtt]           # protocols accepted as route destinations
+#   - name: bridge-to-lxmf
+#     type: bridge
+#     ingress: [mqtt]
+#     egress: [lxmf]
+
+# Rate limits and queue limits. All fields default to 0 (unlimited).
+# limits:
+#   per_sender:                # limits apply per unique message sender
+#     messages_per_minute: 100
+#     bytes_per_hour: 1000000
+#   per_route:                 # limits apply per route
+#     queue_max: 5000
+#   global:                    # limits apply daemon-wide
+#     queue_max: 100000
+#     cas_max_bytes: 1000000000
+
+# Transport protocol budgets: rate limits per egress protocol.
+# Keys must be enabled plugin names. messages_per_minute of 0 is an error;
+# omit the entry instead to have no limit.
+# transport_budgets:
+#   mqtt:
+#     messages_per_minute: 500
+#   lxmf:
+#     messages_per_minute: 200
 
 # TTLs and limits (seconds)
 ttl_default_secs: 86400
