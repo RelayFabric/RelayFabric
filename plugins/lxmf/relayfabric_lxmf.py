@@ -46,6 +46,23 @@ def channel_by_name(cfg, name):
     return next((c for c in cfg["channels"] if c["name"] == name), None)
 
 
+def looks_like_hex_ref(ref):
+    """Plausible-hex check for a SendDirect native_ref (an LXMF/RNS
+    destination hash). Deliberately loose (any non-empty hex string is
+    accepted, not just the canonical 16-byte length) -- send_lxmf's own
+    RNS.Identity.recall/path lookup is what ultimately proves the ref
+    resolves to a real destination; this just rejects garbage before
+    spending a thread-pool submission and a 15s path-wait on it.
+    """
+    if not ref:
+        return False
+    try:
+        bytes.fromhex(ref)
+    except ValueError:
+        return False
+    return True
+
+
 def channel_for_member(cfg, sender_hex, dynamic):
     for ch in cfg["channels"]:
         if sender_hex in ch["members"] or sender_hex in dynamic.get(ch["name"], []):
@@ -457,6 +474,27 @@ class Bridge:
         if result is not None:
             self._send_frame(result)
 
+    def handle_send_direct(self, corr, native_ref, body):
+        """A single one-shot direct send to a native ref, outside any
+        channel/endpoint mapping (identity-link challenge delivery today).
+        No FanoutTracker -- that's for channel fan-out across members; a
+        direct send has exactly one recipient and one terminal result.
+        """
+        import relay_ipc
+
+        if not looks_like_hex_ref(native_ref):
+            self._send_frame(relay_ipc.delivery_result(corr, False, "invalid destination ref"))
+            return
+        self.pool.submit(
+            self.send_lxmf, native_ref, body,
+            lambda success: self._direct_done(corr, success))
+
+    def _direct_done(self, corr, success):
+        import relay_ipc
+
+        detail = None if success else "delivery failed"
+        self._send_frame(relay_ipc.delivery_result(corr, success, detail))
+
     def send_lxmf(self, dest_hex, text, on_result=None, method=None, fields=None):
         import LXMF
         import RNS
@@ -583,5 +621,7 @@ def main():
         if kind == "send":
             bridge.handle_send(frame["corr"], frame["endpoint"], frame["body"],
                                frame.get("attachments"))
+        elif kind == "send_direct":
+            bridge.handle_send_direct(frame["corr"], frame["native_ref"], frame["body"])
         elif kind == "shutdown":
             sys.exit(0)

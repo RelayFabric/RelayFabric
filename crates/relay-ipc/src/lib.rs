@@ -64,6 +64,16 @@ pub enum DaemonToPlugin {
         attachments: Vec<IpcAttachment>,
     },
     Shutdown,
+    // additive (design §IPC, cycle C): kept last so the canonical CBOR
+    // encoding of every pre-existing DaemonToPlugin variant is unchanged.
+    // Sent to direct-capable plugins (capabilities.direct_messages) to
+    // deliver a single message to a native destination ref, outside any
+    // channel/endpoint mapping (used by identity-link challenge delivery).
+    SendDirect {
+        corr: i64,
+        native_ref: String,
+        body: String,
+    },
 }
 
 pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
@@ -209,6 +219,22 @@ mod tests {
         // protocol changed — that is a breaking protocol event, not a test fix.
         let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, "0000008fa8617467696e626f756e6468656e64706f696e74646368616e6673656e6465726173646b696e64647465787464626f64796268696a637265617465645f6174f66b6174746163686d656e747381a36866696c656e616d6565612e62696e646d696d6578186170706c69636174696f6e2f6f637465742d73747265616d646461746143010203687072696f72697479f6");
+    }
+
+    #[tokio::test]
+    async fn send_direct_frame_roundtrips() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        write_frame(&mut a, &DaemonToPlugin::SendDirect {
+            corr: 99,
+            native_ref: "a91d00aa".into(),
+            body: "verification code".into(),
+        }).await.unwrap();
+        let DaemonToPlugin::SendDirect { corr, native_ref, body } = read_frame(&mut b).await.unwrap() else {
+            panic!("wrong variant");
+        };
+        assert_eq!(corr, 99);
+        assert_eq!(native_ref, "a91d00aa");
+        assert_eq!(body, "verification code");
     }
 
     #[tokio::test]

@@ -86,6 +86,16 @@ class CodecTests(unittest.TestCase):
         self.assertEqual(decoded["attachments"], [att])
         self.assertEqual(decoded["body"], "hi")
 
+    def test_send_direct_frame_roundtrips(self):
+        # SendDirect is daemon->plugin only; plugins never build/emit it
+        # (no relay_ipc helper for it), only read it off the wire.
+        buf = io.BytesIO()
+        msg = {"t": "send_direct", "corr": 17, "native_ref": "a91d00aa",
+               "body": "verification code"}
+        relay_ipc.write_frame(buf, msg)
+        buf.seek(0)
+        self.assertEqual(relay_ipc.read_frame(buf), msg)
+
     def test_matches_rust_canonical_inbound_attachment(self):
         # Golden test: must byte-match Rust canonical encoding
         buf = io.BytesIO()

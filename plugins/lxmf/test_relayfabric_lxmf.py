@@ -307,6 +307,51 @@ def _bare_bridge(cfg):
     return bridge
 
 
+class FakeSock:
+    """Captures frames the bridge writes to the daemon.
+
+    Copied from plugins/signal/test_relayfabric_signal.py's FakeSock (same
+    pattern across the plugin test suites): exercises the real _send_frame/
+    write_lock path instead of stubbing it out.
+    """
+
+    def __init__(self):
+        import io
+        self.buf = io.BytesIO()
+
+    def write(self, data):
+        self.buf.write(data)
+
+    def flush(self):
+        pass
+
+    def frames(self):
+        import io
+
+        import relay_ipc
+        out, rd = [], io.BytesIO(self.buf.getvalue())
+        while True:
+            try:
+                out.append(relay_ipc.read_frame(rd))
+            except EOFError:
+                return out
+
+
+def _bare_bridge_with_sock(cfg):
+    """Like _bare_bridge, but with a real wfile (FakeSock) instead of a
+    stubbed _send_frame, for tests that want to assert on the actual wire
+    frames written under the write lock.
+    """
+    bridge = plug.Bridge.__new__(plug.Bridge)
+    bridge.cfg = cfg
+    bridge.dynamic_members = {}
+    bridge.write_lock = threading.Lock()
+    bridge.pool = _ImmediatePool()
+    sock = FakeSock()
+    bridge.wfile = sock
+    return bridge, sock
+
+
 class BridgeInboundAttachmentTests(unittest.TestCase):
     def setUp(self):
         self.cfg = plug.load_config(CFG)
@@ -426,6 +471,65 @@ class BridgeEgressAttachmentTests(unittest.TestCase):
         call = self.send_calls[0]
         self.assertIsNone(call["fields"])
         self.assertEqual(call["text"], "hello")
+
+
+class SendDirectTests(unittest.TestCase):
+    """handle_send_direct: a single one-shot direct send, no FanoutTracker
+    (that's for channel fan-out). FakeSock-driven so the real _send_frame/
+    write_lock path is exercised, not stubbed.
+    """
+
+    def setUp(self):
+        self.cfg = plug.load_config(CFG)
+        self.bridge, self.sock = _bare_bridge_with_sock(self.cfg)
+        self.send_calls = []
+
+    def _stub_send_lxmf(self, outcome):
+        def fake(dest_hex, text, on_result=None, method=None, fields=None):
+            self.send_calls.append({"dest": dest_hex, "text": text})
+            if on_result:
+                on_result(outcome)
+        self.bridge.send_lxmf = fake
+
+    def test_valid_ref_calls_send_lxmf_and_reports_delivered(self):
+        self._stub_send_lxmf(True)
+
+        self.bridge.handle_send_direct(11, "a91d00aa", "verification code: 042817")
+
+        self.assertEqual(self.send_calls,
+                          [{"dest": "a91d00aa", "text": "verification code: 042817"}])
+        frames = self.sock.frames()
+        self.assertEqual(frames[-1],
+                          {"t": "delivery_result", "corr": 11,
+                           "delivered": True, "detail": None})
+
+    def test_valid_ref_failure_callback_reports_failed(self):
+        self._stub_send_lxmf(False)
+
+        self.bridge.handle_send_direct(12, "a91d00aa", "x")
+
+        frames = self.sock.frames()
+        self.assertEqual(frames[-1]["corr"], 12)
+        self.assertFalse(frames[-1]["delivered"])
+
+    def test_invalid_ref_reports_failed_immediately_without_sending(self):
+        self._stub_send_lxmf(True)
+
+        self.bridge.handle_send_direct(13, "not-a-hex-ref!", "x")
+
+        self.assertEqual(self.send_calls, [])
+        frames = self.sock.frames()
+        self.assertEqual(frames[-1],
+                          {"t": "delivery_result", "corr": 13,
+                           "delivered": False, "detail": "invalid destination ref"})
+
+    def test_empty_ref_is_invalid(self):
+        self._stub_send_lxmf(True)
+
+        self.bridge.handle_send_direct(14, "", "x")
+
+        self.assertEqual(self.send_calls, [])
+        self.assertFalse(self.sock.frames()[-1]["delivered"])
 
 
 if __name__ == "__main__":
