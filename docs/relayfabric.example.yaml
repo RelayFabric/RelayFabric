@@ -85,10 +85,20 @@ plugins:
   #       primary: {index: 0}
   #       secondary: {index: 1}
 
+# Identity linking (opt-in, challenge-verified — docs/SPEC.md §19/§21/§22):
+# a route's identity_mode: linked renders a VERIFIED link's display_name
+# instead of the per-route pseudonym at egress; default is "pseudonymous"
+# (no rendering change, and existing configs need no edits). Linking itself
+# never happens implicitly — it's always an operator/user action via
+# `switchyardctl link/unlink/identities` or the admin API's
+# GET/POST/DELETE /v1/identities... endpoints, gated by a verification-code
+# round-trip to the target's own device (requires a direct-capable plugin,
+# e.g. lxmf).
 routes:
   - name: demo
     sources: ["mqtt:chat/a", "mqtt:chat/b"]
     destinations: ["mqtt:chat/a", "mqtt:chat/b"]
+    # identity_mode: linked
 
   # - name: lxmf_mqtt_bridge
   #   sources: ["lxmf:pasadena", "mqtt:lxmf_bridge"]

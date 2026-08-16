@@ -71,6 +71,27 @@ limits:
     bytes_per_hour: 0
 "#;
 
+// identity-linking full-flow e2e (design §Lifecycle/§Rendering): "general"
+// opts into identity_mode: linked so the round-trip's rendering step has
+// something to observe. mocka plays plugin A (direct-capable — receives the
+// SendDirect challenge and confirms it); mockb plays plugin B (an ordinary
+// destination, used only to observe the pseudonym<->display_name swap).
+const IDENTITY_CONFIG: &str = r#"
+node:
+  name: e2e-identity
+  data_dir: DATA_DIR
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+    identity_mode: linked
+"#;
+
 // keep test output pristine: the daemon logs via tracing to stdout/stderr,
 // which is irrelevant noise for these tests and must not pollute `cargo test`
 // output.
@@ -193,13 +214,40 @@ async fn expect_send(r: &mut OwnedReadHalf) -> (i64, String, String, Vec<IpcAtta
     }
 }
 
+async fn expect_send_direct(r: &mut OwnedReadHalf) -> (i64, String, String) {
+    let msg: DaemonToPlugin = timeout(Duration::from_secs(10), read_frame(r))
+        .await.expect("timed out waiting for SendDirect").unwrap();
+    match msg {
+        DaemonToPlugin::SendDirect { corr, native_ref, body } => (corr, native_ref, body),
+        other => panic!("expected SendDirect, got {other:?}"),
+    }
+}
+
 async fn admin_get(sock: &Path, path: &str) -> String {
+    admin_request(sock, "GET", path, None).await.1
+}
+
+/// Hand-rolled HTTP/1.0 request over the admin socket, mirroring
+/// switchyardctl's `fetch()` (POST/DELETE with a `Content-Length`-framed
+/// JSON body) — switchyardctl is a separate binary crate, so its private
+/// helpers aren't importable here; this reproduces the same wire framing
+/// directly against a live daemon. Returns (status, body).
+async fn admin_request(sock: &Path, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = UnixStream::connect(sock).await.unwrap();
-    s.write_all(format!("GET {path} HTTP/1.0\r\nhost: x\r\n\r\n").as_bytes()).await.unwrap();
+    let mut head = format!("{method} {path} HTTP/1.0\r\nhost: x\r\n");
+    match body {
+        Some(b) => head.push_str(&format!(
+            "content-type: application/json\r\ncontent-length: {}\r\n\r\n{b}", b.len(),
+        )),
+        None => head.push_str("\r\n"),
+    }
+    s.write_all(head.as_bytes()).await.unwrap();
     let mut raw = String::new();
     s.read_to_string(&mut raw).await.unwrap();
-    raw.split_once("\r\n\r\n").map(|x| x.1.to_string()).unwrap_or_default()
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+    let status: u16 = head.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+    (status, body.to_string())
 }
 
 /// Polls an admin endpoint every 100ms (up to ~5s) until the response body
@@ -561,4 +609,96 @@ async fn sender_rate_limit_drops_the_second_inbound_from_the_same_sender() {
             .await.is_err(),
         "rate-limited message was bridged anyway"
     );
+}
+
+/// Full identity-linking round trip (design §Lifecycle/§Rendering, spec
+/// §19/§21/§22/§95): initiate via the admin socket, the challenge code
+/// arrives at the target plugin (A) as a `SendDirect`, A replies with the
+/// code to confirm, the link shows up (masked, code absent) at
+/// `/v1/identities`, a subsequent linked-mode route delivery renders A's
+/// `display_name` at B instead of the pseudonym, and unlinking reverts
+/// rendering to the pseudonym on the very next delivery.
+#[tokio::test]
+async fn identity_linking_full_flow_initiate_confirm_link_render_and_unlink() {
+    let d = start_daemon_with_config(tempfile::tempdir().unwrap(), IDENTITY_CONFIG);
+    wait_for(&d.plugin_sock()).await;
+
+    // Plugin A ("mocka"): direct-capable — this is who the challenge targets
+    // and who confirms it.
+    let (mut ra, mut wa) = connect_plugin_with_caps(&d.plugin_sock(), "mocka",
+        Capabilities { max_payload: Some(200), direct_messages: true, ..Default::default() }).await;
+    // Plugin B ("mockb"): an ordinary destination on the "general" route,
+    // used only to observe the rendered tag.
+    let (mut rb, mut wb) = connect_plugin(&d.plugin_sock(), "mockb").await;
+
+    // ---- 1. Initiate via the admin socket -------------------------------
+    let link_req = serde_json::json!({
+        "requester": "mockb:!bob-secret",
+        "target": "mocka:!alice-secret",
+        "display_name": "Jascha",
+    }).to_string();
+    let (status, resp_body) =
+        admin_request(&d.admin_sock(), "POST", "/v1/identities/link", Some(&link_req)).await;
+    assert_eq!(status, 202, "body was: {resp_body}");
+    assert!(!resp_body.contains("!bob-secret"),
+        "the requester's full ref must never leak in the 202 response: {resp_body}");
+    let challenge_id = serde_json::from_str::<serde_json::Value>(&resp_body).unwrap()
+        ["challenge_id"].as_i64().unwrap();
+    assert!(challenge_id > 0);
+
+    // ---- 2. SendDirect with the code arrives at A ------------------------
+    let (corr, native_ref, sd_body) = expect_send_direct(&mut ra).await;
+    assert_eq!(native_ref, "!alice-secret", "the target's native ref must be the SendDirect destination");
+    assert!(sd_body.contains("RelayFabric verification code:"), "body was: {sd_body}");
+    assert!(!sd_body.contains("!bob-secret"),
+        "the requester's full ref must never appear in the challenge body: {sd_body}");
+    let code = sd_body.split("code: ").nth(1).unwrap().split(' ').next().unwrap().to_string();
+    assert_eq!(code.len(), 6);
+    assert!(code.chars().all(|c| c.is_ascii_digit()));
+    write_frame(&mut wa, &PluginToDaemon::DeliveryResult {
+        corr, delivered: true, detail: None,
+    }).await.unwrap();
+
+    // ---- 3. A replies with the code to confirm ----------------------------
+    inbound(&mut wa, "chan", "!alice-secret", &code, chrono::Utc::now()).await;
+
+    // ---- 4. Poll /v1/identities until the link appears (masked, no code) --
+    let identities =
+        poll_until_contains(&d.admin_sock(), "/v1/identities", "\"display_name\":\"Jascha\"").await;
+    assert!(!identities.contains(&code), "the code must never appear in an API response: {identities}");
+    assert!(!identities.contains("!alice-secret"), "full target ref leaked: {identities}");
+    assert!(!identities.contains("!bob-secret"), "full requester ref leaked: {identities}");
+    let link_id = serde_json::from_str::<serde_json::Value>(&identities).unwrap()
+        ["links"][0]["id"].as_i64().unwrap();
+
+    // Drain A's best-effort confirmation notice so it doesn't stray into a
+    // later read (and, while here, check its body too: still no secrets).
+    let (confirm_corr, _, confirm_body) = expect_send_direct(&mut ra).await;
+    assert!(!confirm_body.contains("!bob-secret"),
+        "the requester's full ref must never appear in a confirmation notice: {confirm_body}");
+    write_frame(&mut wa, &PluginToDaemon::DeliveryResult {
+        corr: confirm_corr, delivered: true, detail: None,
+    }).await.unwrap();
+
+    // ---- 5. Linked-mode route delivery renders the display_name at B -----
+    inbound(&mut wa, "chan", "!alice-secret", "hello team", chrono::Utc::now()).await;
+    let (corr_b, _, body_b, _) = expect_send(&mut rb).await;
+    assert!(body_b.starts_with("[Jascha]\n"), "body was: {body_b}");
+    assert!(body_b.contains("hello team"));
+    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
+        corr: corr_b, delivered: true, detail: None,
+    }).await.unwrap();
+
+    // ---- 6. DELETE the link ------------------------------------------------
+    let (status, _) = admin_request(
+        &d.admin_sock(), "DELETE", &format!("/v1/identities/link/{link_id}"), None,
+    ).await;
+    assert_eq!(status, 204);
+
+    // ---- 7. Next message from the same identity renders the pseudonym -----
+    inbound(&mut wa, "chan", "!alice-secret", "hello again", chrono::Utc::now()).await;
+    let (_, _, body_after_unlink, _) = expect_send(&mut rb).await;
+    assert!(!body_after_unlink.contains("Jascha"),
+        "after unlink, rendering must revert to the pseudonym: {body_after_unlink}");
+    assert!(body_after_unlink.starts_with("[MOCK"), "body was: {body_after_unlink}");
 }

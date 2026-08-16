@@ -59,6 +59,14 @@ Sent as LXMF message text to the gateway address:
 `open: false` channel membership is operator-managed via
 `config.channels[].members`; dynamic joins persist to `<storage>/members.json`.
 
+## Identity linking
+
+This plugin advertises `direct_messages`, so LXMF members can be the target
+of an opt-in, challenge-verified identity link (daemon-side; see the root
+README and `switchyardctl link/unlink/identities`). The verification code
+is delivered as a direct LXMF message via the same `send_lxmf` path used for
+channel fan-out.
+
 ## Attachments
 
 Files, an inline image, and voice messages bridge as LXMF fields

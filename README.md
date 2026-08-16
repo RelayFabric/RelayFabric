@@ -9,7 +9,8 @@ preferred style), while Meshtastic uses MQTT (licensing favors it). Initial
 target networks: Reticulum/LXMF, Signal, Meshtastic, MeshCore, Bitchat, Nostr.
 
 **Status:** v0.2 in progress: MeshCore joins MQTT, LXMF, Signal + Meshtastic;
-public-node groundwork underway (identity, gating, quotas, priority via API).
+public-node groundwork underway (gating, quotas, priority via API).
+Opt-in, challenge-verified identity linking is available (admin API/ctl).
 
 ## Components
 
