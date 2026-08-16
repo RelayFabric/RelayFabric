@@ -124,8 +124,12 @@ pub fn handle_inbound(
         .collect();
     let all_shas: Vec<String> = hashed.iter().map(|h| h.sha.clone()).collect();
 
+    // Peek only (no insert yet): a message that turns out to be
+    // rate-limited below must not be recorded as seen, or its retransmission
+    // after the limit window clears would be silently swallowed as a
+    // "duplicate" for the rest of the dedup TTL.
     let key = dedup::key(plugin, &sender, &endpoint, &body, created_at, &all_shas);
-    if !d.dedup.lock().unwrap().check(&key, Instant::now()) {
+    if d.dedup.lock().unwrap().is_duplicate(&key, Instant::now()) {
         metrics::inc(&metrics::DUPLICATES);
         return;
     }
@@ -137,6 +141,9 @@ pub fn handle_inbound(
     // those bytes still crossed the wire and consumed ingress capacity.
     // Zero config (both dimensions 0, the default) always allows and never
     // touches the limiter's per-key state (see `SenderLimiter::allow`).
+    // Applies to every priority class, emergency included — there is no
+    // ingress bypass; the egress emergency bypass (see priority scheduling)
+    // is scheduling-only and never lets a message skip this gate.
     let sender_bytes = body.len() as u64
         + hashed.iter().map(|h| h.att.data.len() as u64).sum::<u64>();
     let sender_key = format!("{plugin}|{sender}");
@@ -146,6 +153,11 @@ pub fn handle_inbound(
         warn!(plugin, sender = %prefix, "sender rate limit exceeded, dropping message");
         return;
     }
+    // Accepted by both dedup and the rate limiter: record now, before
+    // routing/persistence. A message with no matching route still gets
+    // recorded here (dedup for unrouted repeats is desirable — no point
+    // re-evaluating the same unroutable message every retry).
+    d.dedup.lock().unwrap().record(&key, Instant::now());
     let now = Utc::now();
     let source = Endpoint { protocol: plugin.to_string(), endpoint };
     let targets: Vec<(String, Endpoint)> = routes::route(&d.cfg.routes, &source)

@@ -487,6 +487,56 @@ routes:
     assert!(stderr.contains("mockb"), "stderr should name the uncovered protocol: {stderr}");
 }
 
+/// Covers spec §112.8's "unlimited on a public node isn't silently assumed
+/// safe" note at the binary level: a `node.public: true` config that's
+/// otherwise valid (routes fully covered by `public_services`) but leaves
+/// every `per_sender`/`global` limit at its 0 (unlimited) default must still
+/// pass `--check-config` (warning, not error — exit 0), while printing a
+/// stderr warning pointing at SPEC §112.8.
+#[test]
+fn check_config_warns_on_public_node_with_no_limits_but_still_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let cfg_path = dir.path().join("relayfabric.yaml");
+    let config = format!(
+        r#"
+node:
+  name: e2e-public-no-limits
+  public: true
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+public_services:
+  - name: full-coverage
+    type: chat
+    ingress: [mocka]
+    egress: [mockb]
+routes:
+  - name: general
+    sources: ["mocka:chan"]
+    destinations: ["mockb:chan"]
+"#,
+        data.to_str().unwrap()
+    );
+    std::fs::write(&cfg_path, config).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_switchyardd"))
+        .arg("--config").arg(&cfg_path)
+        .arg("--check-config")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0),
+        "a covered public config with unset limits must still pass check-config");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("node.public is true but limits are unset (unlimited); see SPEC §112.8"),
+        "stderr should carry the unlimited-public-node warning: {stderr}");
+}
+
 /// Covers spec §112.8's per-sender rate limit end to end: with
 /// `messages_per_minute: 1` configured, a second inbound from the SAME
 /// sender within the same minute must never produce a `Send` to the

@@ -142,7 +142,27 @@ pub fn load(path: &Path) -> Result<Config, String> {
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let cfg: Config = serde_yaml::from_str(&raw).map_err(|e| e.to_string())?;
     validate(&cfg)?;
+    warn_if_public_with_no_limits(&cfg);
     Ok(cfg)
+}
+
+/// A public node with no `per_sender`/`global` limits configured is valid
+/// (every `limits` field defaults to 0, meaning unlimited — see §112.8) but
+/// almost certainly not what the operator intended: printed at load time,
+/// not enforced by `validate()`, because unlimited-but-public is a footgun
+/// warning, not a config error. Runs before `tracing_subscriber` is
+/// initialized (in particular on the `--check-config` path, which never
+/// initializes it at all), so this goes straight to stderr rather than
+/// through `tracing::warn!`.
+fn warn_if_public_with_no_limits(cfg: &Config) {
+    let per_sender_unset =
+        cfg.limits.per_sender.messages_per_minute == 0 && cfg.limits.per_sender.bytes_per_hour == 0;
+    let global_unset =
+        cfg.limits.global.queue_max == 0 && cfg.limits.global.cas_max_bytes == 0;
+    if cfg.node.public && per_sender_unset && global_unset {
+        eprintln!(
+            "warning: node.public is true but limits are unset (unlimited); see SPEC §112.8");
+    }
 }
 
 pub fn validate(cfg: &Config) -> Result<(), String> {

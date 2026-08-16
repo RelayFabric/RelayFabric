@@ -1,6 +1,5 @@
 use ed25519_dalek::{SigningKey, VerifyingKey, Signer};
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 pub struct NodeIdentity {
@@ -12,13 +11,10 @@ pub struct NodeIdentity {
 
 impl NodeIdentity {
     pub fn load_or_create(identity_dir: &Path) -> io::Result<Self> {
-        // Create identity directory with 0700 permissions
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(identity_dir)?;
-        std::fs::set_permissions(identity_dir, std::fs::Permissions::from_mode(0o700))?;
+        // Same owner-only (0700) directory hardening every other data_dir
+        // subdirectory gets — see `engine::create_data_dir`'s doc comment
+        // for why both the mode and the post-hoc set_permissions matter.
+        crate::engine::create_data_dir(identity_dir)?;
 
         let key_path = identity_dir.join("node.key");
 

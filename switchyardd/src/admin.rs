@@ -132,6 +132,7 @@ async fn trace(
         .map(|del| json!({
             "route": del.route,
             "destination": del.destination.to_string(),
+            "priority": del.priority,
             "state": del.state,
             "attempts": del.attempt_count,
             "reason": del.reason,
@@ -295,6 +296,22 @@ mod tests {
         assert!(body.contains("\"deliveries\""));
         let (code, _) = get(router(d), &format!("/v1/messages/{}", uuid::Uuid::now_v7())).await;
         assert_eq!(code, 404);
+    }
+
+    /// Each delivery in a trace must carry its numeric priority rank (spec
+    /// §46 scheduling), not just the state/route fields — a "high" priority
+    /// message must show rank 1 (`relay_core::priority_rank`'s ordering),
+    /// distinct from the default "normal" rank 2.
+    #[tokio::test]
+    async fn trace_deliveries_include_priority_rank() {
+        let d = daemon();
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "urgent-ish".into(), None, vec![], Some("high".into()));
+        let id = d.store.lock().unwrap()
+            .due_deliveries(chrono::Utc::now(), 1).unwrap()[0].message_id;
+        let (code, body) = get(router(d), &format!("/v1/messages/{id}")).await;
+        assert_eq!(code, 200);
+        assert!(body.contains("\"priority\":1"), "body was: {body}");
     }
 
     #[tokio::test]

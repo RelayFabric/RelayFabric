@@ -49,8 +49,16 @@ impl SenderLimiter {
         // minting a fresh native_ref per message would grow `self.windows`
         // without bound. O(keys) global prune per call; fine at gateway
         // volumes — move to a scheduled sweep if key counts ever grow large.
+        //
+        // Horizon matches whichever dimension is actually configured: an
+        // hour only when `bytes_per_hour` is in play (its window needs
+        // entries that old); a config with only `messages_per_minute` set
+        // has no use for anything past a minute, so pruning at the minute
+        // horizon there keeps stale entries from lingering 60x longer than
+        // any check will ever look back.
+        let horizon = if self.bytes_per_hour > 0 { HOUR } else { MINUTE };
         self.windows.retain(|_, entries| {
-            entries.retain(|(t, _)| now.duration_since(*t) < HOUR);
+            entries.retain(|(t, _)| now.duration_since(*t) < horizon);
             !entries.is_empty()
         });
 
@@ -205,6 +213,28 @@ mod tests {
         let t1 = t0 + Duration::from_secs(3_601);
         assert!(lim.allow("fresh", 1, t1));
         assert_eq!(lim.windows.len(), 1, "stale keys must be pruned, not just their windows");
+        assert!(lim.windows.contains_key("fresh"));
+    }
+
+    /// Regression guard: a messages-per-minute-only config (no byte budget)
+    /// must prune stale entries at the minute horizon, not linger on the
+    /// hour horizon the byte dimension needs — a stale key must age out
+    /// within a bit over a minute, not sit in the map for up to an hour
+    /// doing nothing useful.
+    #[test]
+    fn message_only_config_prunes_at_the_minute_horizon_not_the_hour() {
+        let mut lim = SenderLimiter::new(1, 0);
+        let t0 = Instant::now();
+        assert!(lim.allow("stale", 1, t0));
+        assert_eq!(lim.windows.len(), 1);
+
+        // just past a minute (well short of an hour): the stale key's only
+        // entry is older than the minute horizon and must be pruned away
+        // on the very next call, even though a different key is the one
+        // actually being looked up.
+        let t1 = t0 + Duration::from_secs(61);
+        assert!(lim.allow("fresh", 1, t1));
+        assert_eq!(lim.windows.len(), 1, "the message-only config must not wait a full hour to prune");
         assert!(lim.windows.contains_key("fresh"));
     }
 
