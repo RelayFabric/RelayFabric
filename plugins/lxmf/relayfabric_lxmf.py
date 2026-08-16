@@ -573,7 +573,10 @@ def main():
     while True:
         try:
             frame = relay_ipc.read_frame(rfile)
-        except (EOFError, OSError) as e:
+        except (EOFError, OSError, ValueError) as e:
+            # ValueError: oversize/corrupt frame (relay_ipc.read_frame's own
+            # MAX_FRAME check). The stream is desynced at that point, so exit
+            # rather than continue -- there is no way to resume mid-frame.
             RNS.log(f"Daemon connection lost, exiting: {e}", RNS.LOG_ERROR)
             sys.exit(1)
         kind = frame.get("t")

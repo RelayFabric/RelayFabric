@@ -358,6 +358,47 @@ class BridgeInboundAttachmentTests(unittest.TestCase):
         self.assertEqual(frame["attachments"], [])
         self.assertIn("unavailable", frame["body"])
 
+    def test_cumulative_frame_budget_drops_tail_but_bridges_text(self):
+        # Three attachments individually under the per-attachment cap (raised
+        # here so it doesn't interfere) but summing past relay_ipc.MAX_FRAME:
+        # the exact failure this guards against, where write_frame() used to
+        # raise ValueError and the whole message -- text included -- would
+        # silently vanish.
+        self.cfg["max_attachment_bytes"] = 7_000_000
+        bridge = plug.Bridge(self.cfg, self.backend, self.sock)
+        names = ["a.jpg", "b.jpg", "c.jpg"]
+        atts = []
+        for n in names:
+            with open(os.path.join(self.dir, n), "wb") as f:
+                f.write(b"x" * 6_000_000)
+            atts.append({"id": n, "filename": n, "contentType": "image/jpeg"})
+
+        bridge.handle_event(data_event(text="look at these", attachments=atts))
+
+        frames = self.sock.frames()
+        self.assertEqual(len(frames), 1)  # frame was written successfully
+        frame = frames[0]
+        self.assertIn("look at these", frame["body"])
+        self.assertEqual([a["filename"] for a in frame["attachments"]],
+                         ["a.jpg", "b.jpg"])
+        self.assertIn("[dropped c.jpg: 6000000 B over frame budget]",
+                      frame["body"])
+
+
+class CapFrameBudgetTests(unittest.TestCase):
+    def test_keeps_all_under_budget(self):
+        kept, notes = plug.cap_frame_budget(
+            [("a", "t", b"12"), ("b", "t", b"34")], 10)
+        self.assertEqual(kept, [("a", "t", b"12"), ("b", "t", b"34")])
+        self.assertEqual(notes, [])
+
+    def test_drops_tail_once_cumulative_exceeds_budget(self):
+        loaded = [("a", "t", b"x" * 6), ("b", "t", b"x" * 6), ("c", "t", b"x" * 6)]
+        kept, notes = plug.cap_frame_budget(loaded, 10)
+        self.assertEqual(kept, [("a", "t", b"x" * 6)])
+        self.assertEqual(notes, ["[dropped b: 6 B over frame budget]",
+                                 "[dropped c: 6 B over frame budget]"])
+
 
 class BridgeEgressAttachmentTests(unittest.TestCase):
     def setUp(self):

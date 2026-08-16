@@ -111,6 +111,27 @@ def cap_attachments(loaded, max_bytes):
     return kept, notes
 
 
+def cap_frame_budget(kept, budget):
+    """Drop attachments from the tail once cumulative size exceeds budget.
+
+    Applied after cap_attachments()'s per-attachment cap: several
+    individually-under-cap attachments (e.g. three 6MB photos) can still
+    sum past relay_ipc.MAX_FRAME, which would make write_frame() raise and
+    silently drop the entire message (text included). Notes use the same
+    drop-note wording as cap_attachments, but against the frame budget
+    rather than the per-attachment limit.
+    """
+    kept_out, notes = [], []
+    total = 0
+    for name, ctype, data in kept:
+        total += len(data)
+        if total > budget:
+            notes.append(f"[dropped {name}: {len(data)} B over frame budget]")
+        else:
+            kept_out.append((name, ctype, data))
+    return kept_out, notes
+
+
 class SentCache:
     """Loop guard for linked-device sync echoes of our own bridged posts."""
 
@@ -250,14 +271,17 @@ class Bridge:
             log.warning(f"Dropping Signal message from unlisted user {source}")
             return
 
+        import relay_ipc
+
         # attachment bytes are never logged, only counts/sizes via notes
         loaded, load_notes = load_signal_attachments(
             self.cfg["attachment_dir"], attachments_raw)
         kept, cap_notes = cap_attachments(loaded, self.cfg["max_attachment_bytes"])
-        notes = load_notes + cap_notes
+        budget = relay_ipc.MAX_FRAME - 64 * 1024
+        kept, budget_notes = cap_frame_budget(kept, budget)
+        notes = load_notes + cap_notes + budget_notes
         body = "\n".join(p for p in [text, *notes] if p)
 
-        import relay_ipc
         atts = [
             relay_ipc.attachment(
                 os.path.basename(fname), ctype or "application/octet-stream", data)
@@ -360,7 +384,10 @@ def main():
     while True:
         try:
             frame = relay_ipc.read_frame(rfile)
-        except (EOFError, OSError) as e:
+        except (EOFError, OSError, ValueError) as e:
+            # ValueError: oversize/corrupt frame (relay_ipc.read_frame's own
+            # MAX_FRAME check). The stream is desynced at that point, so exit
+            # rather than continue -- there is no way to resume mid-frame.
             log.error(f"Daemon connection lost, exiting: {e}")
             sys.exit(1)
         kind = frame.get("t")

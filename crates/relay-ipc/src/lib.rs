@@ -124,6 +124,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_frame_rejects_oversize_message() {
+        // Symmetric guard: write_frame must refuse to emit a frame whose
+        // encoded body exceeds MAX_FRAME, the same way read_frame refuses to
+        // accept one (rejects_oversize_frame above).
+        let mut buf = Vec::new();
+        let msg = PluginToDaemon::Inbound {
+            endpoint: "chan".into(),
+            sender: "s".into(),
+            kind: "text".into(),
+            body: String::new(),
+            created_at: None,
+            attachments: vec![IpcAttachment {
+                filename: "big.bin".into(),
+                mime: "application/octet-stream".into(),
+                data: vec![0u8; MAX_FRAME as usize + 1],
+            }],
+        };
+        let got = write_frame(&mut buf, &msg).await;
+        assert!(got.is_err());
+    }
+
+    #[tokio::test]
     async fn corr_survives_send_result_roundtrip() {
         let (mut a, mut b) = tokio::io::duplex(1024);
         write_frame(&mut a, &DaemonToPlugin::Send {
