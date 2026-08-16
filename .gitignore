@@ -3,7 +3,7 @@
 __pycache__/
 /livetest/run/
 
-# Claude/agent process artifacts — never committed
+# agent process artifacts — never committed
 /.claude/
 /.superpowers/
 /docs/superpowers/
