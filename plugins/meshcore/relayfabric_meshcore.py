@@ -186,19 +186,27 @@ def channel_event_to_dict(payload):
     text (str). Unlike CONTACT_MSG_RECV, a MeshCore channel packet carries
     NO pubkey_prefix / per-node sender identity at the protocol level --
     channels are pre-shared-key group broadcasts, confirmed by reading the
-    reader.py packet parser. `sender` is therefore synthesized as
-    "mc:<hex>" from sender_timestamp: a stable-per-message but NOT a
-    verified per-node identity. This is a documented assumption (see the
-    plugin README's field-test checklist), not a resolved sender id.
+    reader.py packet parser.
+
+    `sender` is therefore the CHANNEL, not a per-node identity: a stable
+    "mc:channel:<idx>" keyed on channel_idx (not name -- stable across
+    config renames), so every message on a given channel maps to the same
+    sender. This means the daemon's per-sender rate limits and alias
+    stability operate at CHANNEL granularity for this plugin -- the same
+    trade-off the mqtt plugin already makes with its topic-as-sender
+    (there, too, the transport has no per-node identity to key on). A
+    per-message value (e.g. hashing sender_timestamp) would look like a
+    per-node id but isn't one, and would silently defeat per-sender rate
+    limiting (fresh key every message => limits never trigger) and alias
+    stability (a new alias every message). `sender_timestamp` is a
+    timestamp, not an identity, so it flows into `ts` only, never `sender`.
     """
-    ts = payload.get("sender_timestamp")
-    sender_hex = f"{ts:08x}" if isinstance(ts, int) else "00000000"
     return {
         "kind": "channel_msg",
         "channel_idx": payload.get("channel_idx"),
-        "sender": f"mc:{sender_hex}",
+        "sender": f"mc:channel:{payload.get('channel_idx')}",
         "text": payload.get("text"),
-        "ts": ts,
+        "ts": payload.get("sender_timestamp"),
     }
 
 

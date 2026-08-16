@@ -300,18 +300,22 @@ class NormalizeEventTests(unittest.TestCase):
         self.assertEqual(sender, "user2")
         self.assertEqual(text, "world")
 
-    def test_sender_hex_format(self):
+    def test_sender_channel_keyed_format(self):
+        # normalize_event presents sender as given by the Backend: the
+        # Backend synthesizes "mc:channel:<idx>" (channel-scoped, not a
+        # per-node identity -- see channel_event_to_dict), and
+        # normalize_event just passes that string through unchanged.
         ev = {
             "kind": "channel_msg",
             "channel_idx": 0,
-            "sender": "mc:deadbeef",
+            "sender": "mc:channel:0",
             "text": "test",
             "ts": 1234567890
         }
         result = plug.normalize_event(ev, self.by_index)
         self.assertIsNotNone(result)
         _name, sender, _text, _ts = result
-        self.assertEqual(sender, "mc:deadbeef")
+        self.assertEqual(sender, "mc:channel:0")
 
 
 class HelloMaxPayloadTests(unittest.TestCase):
@@ -366,12 +370,30 @@ class ChannelEventToDictTests(unittest.TestCase):
         self.assertEqual(ev["channel_idx"], 2)
         self.assertEqual(ev["text"], "hello")
         self.assertEqual(ev["ts"], 1700000000)
-        self.assertEqual(ev["sender"], f"mc:{1700000000:08x}")
+        self.assertEqual(ev["sender"], "mc:channel:2")
 
-    def test_missing_timestamp_uses_placeholder_sender(self):
+    def test_sender_is_channel_keyed_not_per_message(self):
+        # Two different messages on the same channel (different
+        # sender_timestamp and text) must produce the SAME sender: MeshCore
+        # PSK channels carry no per-node identity, so a per-message value
+        # (e.g. one derived from sender_timestamp) would look like a
+        # per-node id but isn't one, and would silently defeat the daemon's
+        # per-sender rate limiting (fresh key every message => limits never
+        # trigger) and alias stability (a new alias every message). Keying
+        # on channel_idx instead means quotas/aliases operate at CHANNEL
+        # granularity -- the same trade-off the mqtt plugin makes with its
+        # topic-as-sender.
+        first = plug.channel_event_to_dict(
+            {"channel_idx": 0, "text": "hi", "sender_timestamp": 1})
+        second = plug.channel_event_to_dict(
+            {"channel_idx": 0, "text": "bye", "sender_timestamp": 999})
+        self.assertEqual(first["sender"], second["sender"])
+        self.assertEqual(first["sender"], "mc:channel:0")
+
+    def test_missing_timestamp_still_produces_channel_sender(self):
         payload = {"channel_idx": 0, "text": "hi"}
         ev = plug.channel_event_to_dict(payload)
-        self.assertEqual(ev["sender"], "mc:00000000")
+        self.assertEqual(ev["sender"], "mc:channel:0")
         self.assertIsNone(ev["ts"])
 
 
@@ -403,7 +425,7 @@ class MeshCoreBackendTests(unittest.TestCase):
         ev = backend._queue.get_nowait()
         self.assertEqual(ev, {
             "kind": "channel_msg", "channel_idx": 0, "text": "hi",
-            "ts": 1700000000, "sender": f"mc:{1700000000:08x}",
+            "ts": 1700000000, "sender": "mc:channel:0",
         })
 
     def test_on_channel_msg_drops_without_raising_when_queue_full(self):
@@ -442,7 +464,11 @@ def base_cfg(**overrides):
     return plug.load_config(cfg)
 
 
-def channel_event(text="hello", channel_idx=0, sender="mc:deadbeef", ts=1755280000):
+def channel_event(text="hello", channel_idx=0, sender=None, ts=1755280000):
+    # default sender mirrors what channel_event_to_dict actually produces
+    # (channel-keyed, not per-message) so Bridge fixtures stay realistic.
+    if sender is None:
+        sender = f"mc:channel:{channel_idx}"
     return {"kind": "channel_msg", "channel_idx": channel_idx, "sender": sender,
             "text": text, "ts": ts}
 
@@ -514,7 +540,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(frames), 1)
         self.assertEqual(frames[0]["t"], "inbound")
         self.assertEqual(frames[0]["endpoint"], "primary")
-        self.assertEqual(frames[0]["sender"], "mc:deadbeef")
+        self.assertEqual(frames[0]["sender"], "mc:channel:0")
         self.assertEqual(frames[0]["body"], "hello")
 
     def test_deny_unmapped_channel_dropped(self):
@@ -522,7 +548,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.sock.frames(), [])
 
     def test_deny_non_channel_msg_dropped(self):
-        ev = {"kind": "advert", "channel_idx": 0, "sender": "mc:deadbeef",
+        ev = {"kind": "advert", "channel_idx": 0, "sender": "mc:channel:0",
               "text": "hello", "ts": 1}
         self.bridge.handle_event(ev)
         self.assertEqual(self.sock.frames(), [])
