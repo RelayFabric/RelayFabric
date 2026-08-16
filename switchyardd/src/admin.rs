@@ -652,4 +652,70 @@ mod tests {
         assert!(body.contains("\"pending_count\":0"), "body was: {body}");
         assert!(body.contains("\"challenges\":[]"), "body was: {body}");
     }
+
+    // ---- secret reference redaction (design §2 / SPEC §51, §59) -----------
+
+    /// Builds a daemon through the real `config::load` path (not
+    /// `engine::tests_support`'s hand-built `Config` literals) so the
+    /// plugin config's `${env:...}` reference actually goes through
+    /// `config::resolve_secrets` -- the exact pipeline production runs.
+    /// `mocka`'s config carries a secret reference resolving to `sentinel`;
+    /// callers assert `sentinel` never appears in an admin response.
+    fn daemon_with_plugin_secret(sentinel: &str) -> Arc<Daemon> {
+        std::env::set_var("RF_ADMIN_TEST_SECRET", sentinel);
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let yaml = format!(
+            r#"
+node:
+  name: t
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+    config:
+      token: "${{env:RF_ADMIN_TEST_SECRET}}"
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#,
+            data_dir.display()
+        );
+        let cfg_path = dir.path().join("relayfabric.yaml");
+        std::fs::write(&cfg_path, &yaml).unwrap();
+        let cfg = crate::config::load(&cfg_path).unwrap();
+        // sanity: resolution actually happened, so a subsequent "never
+        // leaked" assertion isn't vacuously true because nothing resolved.
+        assert_eq!(
+            cfg.plugins["mocka"].config.get("token").unwrap().as_str().unwrap(),
+            sentinel,
+        );
+        std::env::remove_var("RF_ADMIN_TEST_SECRET");
+        let d = crate::engine::Daemon::new(cfg, &data_dir).unwrap();
+        std::mem::forget(dir);
+        Arc::new(d)
+    }
+
+    /// Design §2's redaction invariant, defensively: `/v1/routes`,
+    /// `/v1/plugins`, and `/v1/status` don't render plugin `config:` at all
+    /// today (they only echo route endpoints / connection state /
+    /// capabilities), so this test is a regression guard rather than proof
+    /// of active redaction logic -- if any of these handlers ever start
+    /// surfacing plugin config, they must read `Config::raw_plugin_configs`
+    /// (the unresolved snapshot), never `cfg.plugins[_].config` (resolved,
+    /// IPC-bound). See `config.rs`'s `raw_plugin_configs_retains_unresolved_
+    /// form_for_display` for the unit-level half of this invariant.
+    #[tokio::test]
+    async fn admin_responses_never_contain_a_resolved_secret_value() {
+        let sentinel = "sentinel-admin-leak-9f21";
+        let d = daemon_with_plugin_secret(sentinel);
+        for path in ["/v1/routes", "/v1/plugins", "/v1/status"] {
+            let (code, body) = get(router(d.clone()), path).await;
+            assert_eq!(code, 200, "path {path} status");
+            assert!(!body.contains(sentinel), "resolved secret leaked from {path}: {body}");
+        }
+    }
 }

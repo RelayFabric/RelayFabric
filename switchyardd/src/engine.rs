@@ -983,6 +983,7 @@ pub mod tests_support {
         let cfg = Config {
             node: NodeConfig { name: "t".into(), data_dir: dir.to_path_buf(), public },
             plugins,
+            raw_plugin_configs: BTreeMap::new(),
             routes: vec![RouteConfig {
                 name: "general".into(),
                 sources: vec!["mocka:chan".parse().unwrap(), "mockb:chan".parse().unwrap()],

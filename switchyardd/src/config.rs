@@ -1,3 +1,4 @@
+use crate::secrets;
 use relay_core::Endpoint;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -8,6 +9,16 @@ pub struct Config {
     pub node: NodeConfig,
     #[serde(default)]
     pub plugins: BTreeMap<String, PluginConfig>,
+    /// Pre-resolution snapshot of each plugin's `config:` block, taken
+    /// before `resolve_secrets` overwrites `plugins[_].config` with
+    /// resolved secret values (design §2's redaction invariant). Any
+    /// admin/display code that surfaces plugin config MUST read from here,
+    /// never from `plugins[_].config` -- see `admin.rs`'s redaction tests.
+    /// `plugins.rs::supervise` is the one consumer that legitimately reads
+    /// the resolved `plugins[_].config` (it forwards it to the plugin
+    /// process over the `RELAYFABRIC_PLUGIN_CONFIG` env var).
+    #[serde(skip)]
+    pub raw_plugin_configs: BTreeMap<String, serde_yaml::Value>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
@@ -156,10 +167,72 @@ pub struct PolicyRules {
 pub fn load(path: &Path) -> Result<Config, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let cfg: Config = serde_yaml::from_str(&raw).map_err(|e| e.to_string())?;
+    let mut cfg: Config = serde_yaml::from_str(&raw).map_err(|e| e.to_string())?;
     validate(&cfg)?;
+    resolve_secrets(&mut cfg)?;
     warn_if_public_with_no_limits(&cfg);
     Ok(cfg)
+}
+
+/// Resolves every `${env:NAME}`/`${file:/abs/path}` secret reference
+/// (design §2 / SPEC §51, §59) found anywhere inside a plugin's `config:`
+/// block, recursing through nested mappings and sequences. The resolved
+/// value replaces the reference in-place in `cfg.plugins[_].config` --
+/// that's the runtime config `plugins.rs::supervise` forwards to the
+/// plugin process over IPC (`RELAYFABRIC_PLUGIN_CONFIG`). The pre-
+/// resolution form is snapshotted into `cfg.raw_plugin_configs` first, so
+/// display/admin code has an UNRESOLVED copy to read instead (redaction
+/// invariant).
+///
+/// A config with no secret references anywhere (every v0.1-style config)
+/// round-trips with zero resolution attempts and zero errors -- `resolve_value`
+/// only ever calls `secrets::resolve` for string leaves that
+/// `secrets::parse_ref` recognizes.
+///
+/// All failures are collected (not short-circuited) so `--check-config`
+/// can report every failing reference in one pass (SPEC §59).
+fn resolve_secrets(cfg: &mut Config) -> Result<(), String> {
+    let mut errors = Vec::new();
+    let mut raw = BTreeMap::new();
+    for (name, plugin) in cfg.plugins.iter_mut() {
+        raw.insert(name.clone(), plugin.config.clone());
+        plugin.config = resolve_value(&plugin.config, &mut errors);
+    }
+    cfg.raw_plugin_configs = raw;
+    if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+}
+
+/// Recursively walks a `serde_yaml::Value`, replacing any string leaf that
+/// is entirely a secret reference with its resolved value. Non-reference
+/// strings and non-string values pass through unchanged. Resolution
+/// failures are appended to `errors` (naming the `${...}` form, never a
+/// value -- see `secrets::resolve`) and the original reference string is
+/// left in place for that leaf, since the overall load fails regardless
+/// once any error is recorded.
+fn resolve_value(v: &serde_yaml::Value, errors: &mut Vec<String>) -> serde_yaml::Value {
+    match v {
+        serde_yaml::Value::String(s) => match secrets::parse_ref(s) {
+            Some(r) => match secrets::resolve(&r) {
+                Ok(resolved) => serde_yaml::Value::String(resolved),
+                Err(e) => {
+                    errors.push(e);
+                    v.clone()
+                }
+            },
+            None => v.clone(),
+        },
+        serde_yaml::Value::Sequence(items) => {
+            serde_yaml::Value::Sequence(items.iter().map(|i| resolve_value(i, errors)).collect())
+        }
+        serde_yaml::Value::Mapping(map) => {
+            let mut out = serde_yaml::Mapping::new();
+            for (k, val) in map {
+                out.insert(k.clone(), resolve_value(val, errors));
+            }
+            serde_yaml::Value::Mapping(out)
+        }
+        other => other.clone(),
+    }
 }
 
 /// A public node with no `per_sender`/`global` limits configured is valid
@@ -332,6 +405,16 @@ routes:
     fn parse(s: &str) -> Result<Config, String> {
         let cfg: Config = serde_yaml::from_str(s).map_err(|e| e.to_string())?;
         validate(&cfg)?;
+        Ok(cfg)
+    }
+
+    /// Like `parse`, but also runs the secret-reference resolution step
+    /// (`load`'s third stage) -- the step `parse` above deliberately skips,
+    /// since most of this module's tests are about structural validation
+    /// and don't want real env vars / files as a dependency.
+    fn parse_and_resolve(s: &str) -> Result<Config, String> {
+        let mut cfg = parse(s)?;
+        resolve_secrets(&mut cfg)?;
         Ok(cfg)
     }
 
@@ -728,5 +811,222 @@ routes:
         let cfg = parse(yaml).unwrap();
         assert_eq!(cfg.public_services.len(), 2);
         assert!(cfg.node.public);
+    }
+
+    // ---- secret references (design §2 / SPEC §51, §59) --------------------
+
+    /// `var_name` is caller-supplied (rather than a shared const) so that
+    /// tests running concurrently under `cargo test`'s multi-threaded
+    /// default never share a process-global env var: `std::env::set_var`/
+    /// `remove_var` racing across threads on the SAME key was a real,
+    /// reproduced flake here (a test asserting "unset" could observe
+    /// another thread's concurrent `set_var` on the identical name, and
+    /// vice versa). Every call site below passes a name unique to that
+    /// test.
+    fn with_secret_config(var_name: &str) -> String {
+        format!(
+            r#"
+node:
+  name: test-node
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+    config:
+      token: "${{env:{var_name}}}"
+      plain: "literal-value"
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#
+        )
+    }
+
+    #[test]
+    fn plugin_config_secret_ref_resolves_into_runtime_config() {
+        std::env::set_var("RF_CONFIG_TEST_TOKEN_RESOLVE", "sentinel-runtime-value");
+        let cfg = parse_and_resolve(&with_secret_config("RF_CONFIG_TEST_TOKEN_RESOLVE")).unwrap();
+        let token = cfg.plugins["mocka"].config.get("token").unwrap().as_str().unwrap();
+        assert_eq!(token, "sentinel-runtime-value");
+        // an ordinary literal string alongside the reference is untouched.
+        assert_eq!(cfg.plugins["mocka"].config.get("plain").unwrap().as_str().unwrap(), "literal-value");
+        std::env::remove_var("RF_CONFIG_TEST_TOKEN_RESOLVE");
+    }
+
+    #[test]
+    fn raw_plugin_configs_retains_unresolved_form_for_display() {
+        std::env::set_var("RF_CONFIG_TEST_TOKEN_RAW", "sentinel-runtime-value");
+        let cfg = parse_and_resolve(&with_secret_config("RF_CONFIG_TEST_TOKEN_RAW")).unwrap();
+        let raw_token = cfg.raw_plugin_configs["mocka"].get("token").unwrap().as_str().unwrap();
+        assert_eq!(raw_token, "${env:RF_CONFIG_TEST_TOKEN_RAW}");
+        // the resolved runtime config must never leak into the raw snapshot.
+        assert!(!format!("{:?}", cfg.raw_plugin_configs).contains("sentinel-runtime-value"));
+        std::env::remove_var("RF_CONFIG_TEST_TOKEN_RAW");
+    }
+
+    #[test]
+    fn plugin_config_secret_ref_resolves_recursively_through_nested_objects_and_arrays() {
+        std::env::set_var("RF_CONFIG_TEST_NESTED", "sentinel-nested-value");
+        let yaml = r#"
+node:
+  name: test-node
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+    config:
+      nested:
+        list:
+          - "${env:RF_CONFIG_TEST_NESTED}"
+          - "literal"
+        inner:
+          deep: "${env:RF_CONFIG_TEST_NESTED}"
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#;
+        let cfg = parse_and_resolve(yaml).unwrap();
+        let config = &cfg.plugins["mocka"].config;
+        let list_item = config["nested"]["list"][0].as_str().unwrap();
+        assert_eq!(list_item, "sentinel-nested-value");
+        assert_eq!(config["nested"]["list"][1].as_str().unwrap(), "literal");
+        assert_eq!(config["nested"]["inner"]["deep"].as_str().unwrap(), "sentinel-nested-value");
+        std::env::remove_var("RF_CONFIG_TEST_NESTED");
+    }
+
+    #[test]
+    fn v0_1_style_plugin_config_without_secret_refs_is_unaffected() {
+        // GOOD's plugins carry no `config:` block at all -- the v0.1-compat
+        // case: no secret refs anywhere means zero resolution attempts and
+        // zero errors, and `raw_plugin_configs` mirrors the (unchanged)
+        // resolved config exactly.
+        let cfg = parse_and_resolve(GOOD).unwrap();
+        assert_eq!(cfg.plugins["mocka"].config, serde_yaml::Value::Null);
+        assert_eq!(cfg.raw_plugin_configs["mocka"], serde_yaml::Value::Null);
+    }
+
+    #[test]
+    fn unresolvable_env_secret_ref_fails_load_naming_the_reference_not_a_value() {
+        // RF_CONFIG_TEST_TOKEN_UNSET is unique to this test (see
+        // `with_secret_config`'s doc comment) and never set anywhere else,
+        // so no `remove_var` race with a concurrently running test is
+        // possible; the removal below only guards against a stale leftover
+        // from a prior manual run.
+        std::env::remove_var("RF_CONFIG_TEST_TOKEN_UNSET");
+        let err = parse_and_resolve(&with_secret_config("RF_CONFIG_TEST_TOKEN_UNSET")).unwrap_err();
+        assert!(err.contains("${env:RF_CONFIG_TEST_TOKEN_UNSET}"), "err should name the reference: {err}");
+    }
+
+    #[test]
+    fn multiple_failing_secret_refs_are_all_reported() {
+        std::env::remove_var("RF_CONFIG_TEST_MULTI_A");
+        std::env::remove_var("RF_CONFIG_TEST_MULTI_B");
+        let yaml = r#"
+node:
+  name: test-node
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+    config:
+      a: "${env:RF_CONFIG_TEST_MULTI_A}"
+  mockb:
+    enabled: true
+    config:
+      b: "${env:RF_CONFIG_TEST_MULTI_B}"
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#;
+        let err = parse_and_resolve(yaml).unwrap_err();
+        assert!(err.contains("${env:RF_CONFIG_TEST_MULTI_A}"), "err was: {err}");
+        assert!(err.contains("${env:RF_CONFIG_TEST_MULTI_B}"), "err was: {err}");
+    }
+
+    /// Integration-level companion to `secrets::tests::resolve_file_errors_
+    /// naming_ref_for_relative_path`: a relative `${file:...}` path must
+    /// fail the whole config load, naming the reference, not just fail at
+    /// the `secrets` unit level.
+    #[test]
+    fn relative_file_secret_ref_fails_load_naming_the_reference() {
+        let yaml = r#"
+node:
+  name: test-node
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+    config:
+      token: "${file:relative/token.txt}"
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#;
+        let err = parse_and_resolve(yaml).unwrap_err();
+        assert!(err.contains("${file:relative/token.txt}"), "err should name the reference: {err}");
+    }
+
+    #[test]
+    fn file_secret_ref_resolves_via_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("token.txt");
+        std::fs::write(&secret_path, "sentinel-file-token\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let yaml = format!(
+            r#"
+node:
+  name: test-node
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+    config:
+      token: "${{file:{}}}"
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#,
+            secret_path.display()
+        );
+        let cfg_path = dir.path().join("relayfabric.yaml");
+        std::fs::write(&cfg_path, &yaml).unwrap();
+
+        let cfg = load(&cfg_path).unwrap();
+        assert_eq!(cfg.plugins["mocka"].config.get("token").unwrap().as_str().unwrap(), "sentinel-file-token");
+        assert_eq!(
+            cfg.raw_plugin_configs["mocka"].get("token").unwrap().as_str().unwrap(),
+            format!("${{file:{}}}", secret_path.display()),
+        );
+    }
+
+    /// v0.1/v0.2-with-no-secret-refs example config used in CI/manual sanity
+    /// checks (`cargo run -p switchyardd -- --config docs/relayfabric.example.yaml
+    /// --check-config`) must keep loading unchanged: no secret refs anywhere
+    /// means `resolve_secrets` is a pure no-op.
+    #[test]
+    fn example_config_has_no_secret_refs_and_loads_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/relayfabric.example.yaml"),
+        ).unwrap();
+        let cfg_path = dir.path().join("relayfabric.yaml");
+        std::fs::write(&cfg_path, &raw).unwrap();
+        let cfg = load(&cfg_path).unwrap();
+        assert_eq!(cfg.plugins["mqtt"].config["broker"], serde_yaml::Value::String("mqtt://127.0.0.1:1883".into()));
     }
 }

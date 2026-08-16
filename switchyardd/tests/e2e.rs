@@ -702,3 +702,156 @@ async fn identity_linking_full_flow_initiate_confirm_link_render_and_unlink() {
         "after unlink, rendering must revert to the pseudonym: {body_after_unlink}");
     assert!(body_after_unlink.starts_with("[MOCK"), "body was: {body_after_unlink}");
 }
+
+// ---- config secret references (Task 3, design §2 / SPEC §51, §59) --------
+
+/// Covers SPEC §59's "secrets references" `--check-config` validation at
+/// the binary level: an unresolvable `${env:...}` reference in a plugin's
+/// `config:` block must make `--check-config` fail loudly -- exit 1, with
+/// stderr naming the reference form -- and, critically, must never echo
+/// any value (there isn't one to leak here, since resolution failed, but
+/// the reference form itself is the only thing allowed to appear).
+#[test]
+fn check_config_rejects_an_unresolvable_secret_reference_naming_the_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let cfg_path = dir.path().join("relayfabric.yaml");
+    let config = format!(
+        r#"
+node:
+  name: e2e-secret-missing
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+    config:
+      token: "${{env:RF_E2E_CHECK_CONFIG_MISSING}}"
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan"]
+    destinations: ["mockb:chan"]
+"#,
+        data.to_str().unwrap()
+    );
+    std::fs::write(&cfg_path, config).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_switchyardd"))
+        .arg("--config").arg(&cfg_path)
+        .arg("--check-config")
+        // ensure the referenced var really is unset for this child, no
+        // matter what's in the outer test process's own environment.
+        .env_remove("RF_E2E_CHECK_CONFIG_MISSING")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "check-config must exit 1 on an unresolvable secret ref");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("${env:RF_E2E_CHECK_CONFIG_MISSING}"),
+        "stderr should name the reference form: {stderr}");
+}
+
+/// Covers the redaction half of the same invariant: when the reference
+/// DOES resolve, `--check-config` success output must never print the
+/// resolved value -- only the unresolved reference form (if anything at
+/// all) may appear anywhere in stdout/stderr.
+#[test]
+fn check_config_succeeds_and_never_prints_the_resolved_secret_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let cfg_path = dir.path().join("relayfabric.yaml");
+    let config = format!(
+        r#"
+node:
+  name: e2e-secret-present
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+    config:
+      token: "${{env:RF_E2E_CHECK_CONFIG_PRESENT}}"
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan"]
+    destinations: ["mockb:chan"]
+"#,
+        data.to_str().unwrap()
+    );
+    std::fs::write(&cfg_path, config).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_switchyardd"))
+        .arg("--config").arg(&cfg_path)
+        .arg("--check-config")
+        .env("RF_E2E_CHECK_CONFIG_PRESENT", "sentinel-checkconfig-77ab")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "check-config must pass once the reference resolves");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("sentinel-checkconfig-77ab"), "resolved secret leaked on stdout: {stdout}");
+    assert!(!stderr.contains("sentinel-checkconfig-77ab"), "resolved secret leaked on stderr: {stderr}");
+}
+
+/// The core Task 3 invariant end to end: the RESOLVED secret value must
+/// reach the plugin process, which reads it from the `RELAYFABRIC_PLUGIN_CONFIG`
+/// env var `plugins::supervise` sets at spawn (design §2). Rather than
+/// asserting against the in-memory `Config` (which `config.rs`'s own unit
+/// tests already cover), this spawns the REAL daemon binary with a real
+/// `command:` plugin and captures what actually lands in that plugin
+/// process's environment -- the true IPC-adjacent handoff, not a stand-in.
+#[tokio::test]
+async fn plugin_config_secret_ref_resolves_to_real_value_over_supervise_env_var() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let out_file = dir.path().join("captured-plugin-config.txt");
+    let cfg_path = dir.path().join("relayfabric.yaml");
+    let config = format!(
+        r#"
+node:
+  name: e2e-secret-forward
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+    command: printenv RELAYFABRIC_PLUGIN_CONFIG > {}
+    config:
+      token: "${{env:RF_E2E_SUPERVISE_SECRET}}"
+"#,
+        data.to_str().unwrap(),
+        out_file.to_str().unwrap(),
+    );
+    std::fs::write(&cfg_path, config).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_switchyardd"))
+        .arg("--config").arg(&cfg_path)
+        .env("RUST_LOG", "error")
+        .env("RF_E2E_SUPERVISE_SECRET", "sentinel-supervise-e2e-9f3c")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    wait_for(&out_file).await;
+    // the plugin process's shell redirect can still be mid-flush right as
+    // the file first appears; poll for non-empty content rather than
+    // asserting immediately.
+    let mut captured = String::new();
+    for _ in 0..50 {
+        captured = std::fs::read_to_string(&out_file).unwrap_or_default();
+        if !captured.trim().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(captured.contains("sentinel-supervise-e2e-9f3c"),
+        "resolved secret must reach the plugin process's env: {captured:?}");
+    assert!(!captured.contains("${env:"),
+        "the unresolved reference form must never cross into the plugin's env: {captured:?}");
+}

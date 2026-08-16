@@ -12,6 +12,7 @@ mod plugins;
 mod policy;
 mod queue;
 mod routes;
+mod secrets;
 mod storage;
 mod transform;
 
