@@ -44,22 +44,30 @@ fn queue_map(d: &Daemon) -> BTreeMap<String, i64> {
     d.store.lock().unwrap().queue_counts().unwrap_or_default().into_iter().collect()
 }
 
+/// Cfg is read (and dropped) BEFORE `plugins` is locked -- consistent lock
+/// order (cfg never held across another Daemon lock acquisition) matters
+/// more than which order is chosen, but "cfg first" is what every other
+/// call site in this module follows too.
 fn plugin_state(d: &Daemon) -> Vec<(String, bool)> {
+    let enabled_names: Vec<String> = d.cfg_snapshot(|c| {
+        c.plugins.iter().filter(|(_, p)| p.enabled).map(|(name, _)| name.clone()).collect()
+    });
     let connected = d.plugins.lock().unwrap();
-    d.cfg.plugins.iter()
-        .filter(|(_, p)| p.enabled)
-        .map(|(name, _)| {
-            (name.clone(), connected.get(name).map(|h| h.connected).unwrap_or(false))
+    enabled_names.into_iter()
+        .map(|name| {
+            let up = connected.get(&name).map(|h| h.connected).unwrap_or(false);
+            (name, up)
         })
         .collect()
 }
 
 async fn status(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let plugins: BTreeMap<_, _> = plugin_state(&d).into_iter().collect();
+    let (node_name, public) = d.cfg_snapshot(|c| (c.node.name.clone(), c.node.public));
     Json(json!({
-        "node": d.cfg.node.name,
+        "node": node_name,
         "node_id": d.node_id,
-        "public": d.cfg.node.public,
+        "public": public,
         "plugins": plugins,
         "queue": queue_map(&d),
     }))
@@ -69,13 +77,16 @@ async fn status(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
 /// ingress/egress protocol coverage — the WebUI (and, later, RFDP
 /// discovery) read this rather than parsing the raw config.
 async fn public(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
-    let services: Vec<_> = d.cfg.public_services.iter().map(|s| json!({
-        "name": s.name,
-        "type": s.r#type,
-        "ingress": s.ingress,
-        "egress": s.egress,
-    })).collect();
-    Json(json!({ "public": d.cfg.node.public, "services": services }))
+    let (public, services) = d.cfg_snapshot(|c| {
+        let services: Vec<_> = c.public_services.iter().map(|s| json!({
+            "name": s.name,
+            "type": s.r#type,
+            "ingress": s.ingress,
+            "egress": s.egress,
+        })).collect();
+        (c.node.public, services)
+    });
+    Json(json!({ "public": public, "services": services }))
 }
 
 /// Configured quotas and transport budgets (spec §112.8/§45/§79) — a config
@@ -84,47 +95,53 @@ async fn public(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
 /// limiter windows aren't worth exposing (they reset on restart and aren't
 /// meaningful without matching request context anyway).
 async fn limits(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
-    let transport_budgets: BTreeMap<_, _> = d.cfg.transport_budgets.iter()
-        .map(|(proto, b)| (proto.clone(), json!({ "messages_per_minute": b.messages_per_minute })))
-        .collect();
-    Json(json!({
-        "per_sender": {
-            "messages_per_minute": d.cfg.limits.per_sender.messages_per_minute,
-            "bytes_per_hour": d.cfg.limits.per_sender.bytes_per_hour,
-        },
-        "per_route": {
-            "queue_max": d.cfg.limits.per_route.queue_max,
-        },
-        "global": {
-            "queue_max": d.cfg.limits.global.queue_max,
-            "cas_max_bytes": d.cfg.limits.global.cas_max_bytes,
-        },
-        "transport_budgets": transport_budgets,
+    Json(d.cfg_snapshot(|c| {
+        let transport_budgets: BTreeMap<_, _> = c.transport_budgets.iter()
+            .map(|(proto, b)| (proto.clone(), json!({ "messages_per_minute": b.messages_per_minute })))
+            .collect();
+        json!({
+            "per_sender": {
+                "messages_per_minute": c.limits.per_sender.messages_per_minute,
+                "bytes_per_hour": c.limits.per_sender.bytes_per_hour,
+            },
+            "per_route": {
+                "queue_max": c.limits.per_route.queue_max,
+            },
+            "global": {
+                "queue_max": c.limits.global.queue_max,
+                "cas_max_bytes": c.limits.global.cas_max_bytes,
+            },
+            "transport_budgets": transport_budgets,
+        })
     }))
 }
 
 async fn plugins(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
+    let enabled_names: Vec<String> = d.cfg_snapshot(|c| {
+        c.plugins.iter().filter(|(_, p)| p.enabled).map(|(name, _)| name.clone()).collect()
+    });
     let handles = d.plugins.lock().unwrap();
-    let out: BTreeMap<String, serde_json::Value> = d.cfg.plugins.iter()
-        .filter(|(_, p)| p.enabled)
-        .map(|(name, _)| {
-            let h = handles.get(name);
-            (name.clone(), json!({
+    let out: BTreeMap<String, serde_json::Value> = enabled_names.into_iter()
+        .map(|name| {
+            let h = handles.get(&name);
+            let entry = json!({
                 "connected": h.map(|h| h.connected).unwrap_or(false),
                 "capabilities": h.map(|h| serde_json::to_value(&h.capabilities).unwrap()),
-            }))
+            });
+            (name, entry)
         })
         .collect();
     Json(out)
 }
 
 async fn routes(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
-    let out: Vec<_> = d.cfg.routes.iter().map(|r| json!({
-        "name": r.name,
-        "sources": r.sources.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
-        "destinations": r.destinations.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
-    })).collect();
-    Json(out)
+    Json(d.cfg_snapshot(|c| {
+        c.routes.iter().map(|r| json!({
+            "name": r.name,
+            "sources": r.sources.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+            "destinations": r.destinations.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>()
+    }))
 }
 
 async fn queue(State(d): State<Arc<Daemon>>) -> impl IntoResponse {

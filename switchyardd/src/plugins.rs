@@ -36,7 +36,7 @@ async fn handle_conn(
         return Err(std::io::Error::other("first frame must be Hello"));
     };
     // trust boundary: only configured+enabled plugin names may attach
-    let allowed = d.cfg.plugins.get(&plugin).map(|p| p.enabled).unwrap_or(false);
+    let allowed = d.cfg_snapshot(|c| c.plugins.get(&plugin).map(|p| p.enabled).unwrap_or(false));
     if !allowed || protocol_version != PROTOCOL_VERSION {
         let err = if allowed { "unsupported protocol version" } else { "unknown plugin" };
         write_frame(&mut w, &DaemonToPlugin::HelloAck {
@@ -90,9 +90,9 @@ async fn handle_conn(
 }
 
 pub async fn supervise(d: Arc<Daemon>, name: String, command: String, socket: PathBuf) {
-    let cfg_json = d.cfg.plugins.get(&name)
+    let cfg_json = d.cfg_snapshot(|c| c.plugins.get(&name)
         .map(|p| serde_json::to_string(&p.config).unwrap_or_default())
-        .unwrap_or_default();
+        .unwrap_or_default());
     let backoffs = [1u64, 5, 30, 120]; // spec §69
     let mut strikes = 0usize;
     loop {

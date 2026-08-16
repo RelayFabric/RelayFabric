@@ -1,5 +1,5 @@
 use crate::cas::{self, Cas};
-use crate::config::{Config, IDENTITY_ROUTE};
+use crate::config::{Config, RouteConfig, IDENTITY_ROUTE};
 use crate::limits::{BudgetLimiter, SenderLimiter};
 use crate::storage::Store;
 use crate::{
@@ -12,10 +12,10 @@ use chrono::{DateTime, Duration as CDuration, Utc};
 use relay_core::{AttachmentMeta, Capabilities, Endpoint, Envelope, Sender};
 use relay_ipc::{DaemonToPlugin, IpcAttachment, MAX_FRAME};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -26,8 +26,34 @@ pub struct PluginHandle {
     pub connected: bool,
 }
 
+/// Result of `Daemon::apply_config` (design §1): names of plugins that were
+/// added, removed, or had their `{command, config, enabled}` changed (the
+/// running plugin process is NOT restarted by apply -- `supervise` keeps
+/// the old set running; this is purely informational for the caller/UI to
+/// act on), plus the `"daemon"` pseudo-entry when a restart-only field
+/// (`node.*` / the data-dir-derived socket paths) changed. Empty when
+/// nothing in `new` requires a restart to take effect.
+#[allow(dead_code)]
+// consumed by admin `PUT /v1/config` / `POST /v1/config/rollback` (Task 3);
+// remove allow once those handlers call `apply_config` and return this.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ApplyOutcome {
+    pub restart_required: Vec<String>,
+}
+
+/// Config lives behind a `std::sync::RwLock` (design §1) so
+/// `Daemon::apply_config` can hot-swap it while readers throughout
+/// engine.rs/admin.rs/plugins.rs/main.rs see the new values on their very
+/// next read -- no restart needed for routes/policies/limits/render/
+/// identity_mode/public_services/transport_budgets. LOCK ORDER: a `cfg`
+/// read (or write) guard must never be held while acquiring `store`/
+/// `dedup`/`plugins`/`sender_limiter`/`budget_limiter`, and never across an
+/// `.await` -- every call site here either uses `cfg_snapshot`/`route_cfg`
+/// (which copy out what's needed and drop the guard before returning) or
+/// binds the guard to a throwaway temporary that drops at the end of its
+/// own statement, before any other lock is touched.
 pub struct Daemon {
-    pub cfg: Config,
+    pub cfg: RwLock<Config>,
     pub store: Mutex<Store>,
     pub dedup: Mutex<dedup::Dedup>,
     pub aliaser: Aliaser,
@@ -75,7 +101,7 @@ impl Daemon {
         let sender_limiter = SenderLimiter::new(
             cfg.limits.per_sender.messages_per_minute, cfg.limits.per_sender.bytes_per_hour);
         Ok(Daemon {
-            cfg,
+            cfg: RwLock::new(cfg),
             store: Mutex::new(store),
             dedup: Mutex::new(dedup::Dedup::new(ttl)),
             aliaser,
@@ -87,6 +113,81 @@ impl Daemon {
             budget_limiter: Mutex::new(BudgetLimiter::new()),
             gauges: metrics::PluginGauges::new(),
         })
+    }
+
+    /// Clones the current config's snapshot for route `name`, if any --
+    /// cuts the noise of a `cfg.read()...find()` at every `process_due`-style
+    /// call site while keeping the returned value fully owned (no borrow
+    /// tying the caller to the read guard), so it's safe to hold across
+    /// subsequent store/plugins lock acquisitions.
+    pub fn route_cfg(&self, name: &str) -> Option<RouteConfig> {
+        self.cfg.read().unwrap().routes.iter().find(|r| r.name == name).cloned()
+    }
+
+    /// Runs `f` against a read guard on the current config and returns
+    /// whatever it computes -- `f` should copy out owned values (clones of
+    /// small fields, or `Copy` numbers/strings), never return or retain a
+    /// borrow into the config. The read guard is dropped the moment `f`
+    /// returns, before the caller can acquire any other lock, which is what
+    /// keeps this safe to call from anywhere without violating the lock
+    /// order documented on `Daemon::cfg`.
+    pub fn cfg_snapshot<T>(&self, f: impl FnOnce(&Config) -> T) -> T {
+        f(&self.cfg.read().unwrap())
+    }
+
+    /// Hot-swaps `cfg` under the write lock (design §1): computes
+    /// `restart_required` from the OLD config (plugin names whose
+    /// `{command, config, enabled}` changed, plus added/removed plugin
+    /// names, plus `"daemon"` if any `node.*` field changed -- data_dir in
+    /// particular, since the plugin/admin socket paths are derived from it
+    /// at startup and never re-bound), swaps in `new`, then -- OUTSIDE the
+    /// write lock, so this never holds `cfg` while taking another lock --
+    /// rebuilds `sender_limiter` from the new per-sender numbers, resets
+    /// `budget_limiter`'s windows, and pushes the new dedup TTL into
+    /// `dedup` via `set_ttl` (affects only entries recorded from this point
+    /// on; entries already recorded keep aging out under whatever TTL was
+    /// in effect when they were recorded -- see `dedup::Dedup::set_ttl`).
+    /// Routes/policies/limits/render/identity_mode/public_services/
+    /// transport_budgets need no explicit action here: every reader goes
+    /// through `cfg.read()`/`cfg_snapshot`/`route_cfg`, so they see `new`'s
+    /// values on their very next call. Callers are responsible for having
+    /// already validated `new` (see `config::validate`) -- this method
+    /// trusts it as-is and never fails.
+    #[allow(dead_code)]
+    // consumed by admin `PUT /v1/config` / `POST /v1/config/rollback`
+    // (Task 3); remove allow once those handlers call this.
+    pub fn apply_config(&self, new: Config) -> ApplyOutcome {
+        let mut restart_required = Vec::new();
+        let (dedup_ttl_secs, sender_mm, sender_bph) = {
+            let mut cfg = self.cfg.write().unwrap();
+            if cfg.node != new.node {
+                restart_required.push("daemon".to_string());
+            }
+            let old_names: BTreeSet<&String> = cfg.plugins.keys().collect();
+            let new_names: BTreeSet<&String> = new.plugins.keys().collect();
+            for name in old_names.difference(&new_names) {
+                restart_required.push((*name).clone());
+            }
+            for name in new_names.difference(&old_names) {
+                restart_required.push((*name).clone());
+            }
+            for name in old_names.intersection(&new_names) {
+                if cfg.plugins[*name] != new.plugins[*name] {
+                    restart_required.push((*name).clone());
+                }
+            }
+            let dedup_ttl_secs = new.dedup_ttl_secs;
+            let sender_mm = new.limits.per_sender.messages_per_minute;
+            let sender_bph = new.limits.per_sender.bytes_per_hour;
+            *cfg = new;
+            (dedup_ttl_secs, sender_mm, sender_bph)
+        };
+        *self.sender_limiter.lock().unwrap() = SenderLimiter::new(sender_mm, sender_bph);
+        *self.budget_limiter.lock().unwrap() = BudgetLimiter::new();
+        self.dedup.lock().unwrap().set_ttl(std::time::Duration::from_secs(dedup_ttl_secs));
+        restart_required.sort();
+        restart_required.dedup();
+        ApplyOutcome { restart_required }
     }
 }
 
@@ -109,6 +210,17 @@ pub fn handle_inbound(
 ) {
     metrics::inc(&metrics::INGRESS);
 
+    // Snapshot every config value this call needs, up front, in one read-lock
+    // acquisition (lock discipline: never hold the cfg read guard while
+    // taking the dedup/sender_limiter/store locks below, or across the
+    // .await points elsewhere in this module) -- `routes` is the one
+    // non-trivial clone (a `Vec<RouteConfig>`), everything else is Copy.
+    let (max_attachment_bytes, ttl_default_secs, hop_limit, routes_snapshot, route_max, global_max) =
+        d.cfg_snapshot(|c| (
+            c.max_attachment_bytes, c.ttl_default_secs, c.hop_limit, c.routes.clone(),
+            c.limits.per_route.queue_max, c.limits.global.queue_max,
+        ));
+
     // Hash every attachment up front — a bare in-memory digest, no CAS I/O —
     // so the dedup key can be sensitive to the *full* attachment set,
     // including ones that will end up dropped for being oversize (two sends
@@ -122,7 +234,7 @@ pub fn handle_inbound(
     let hashed: Vec<Hashed> = attachments
         .into_iter()
         .map(|att| {
-            let oversize = att.data.len() as u64 > d.cfg.max_attachment_bytes;
+            let oversize = att.data.len() as u64 > max_attachment_bytes;
             let sha = hex::encode(Sha256::digest(&att.data));
             Hashed { att, sha, oversize }
         })
@@ -192,7 +304,7 @@ pub fn handle_inbound(
     }
 
     let source = Endpoint { protocol: plugin.to_string(), endpoint };
-    let targets: Vec<(String, Endpoint)> = routes::route(&d.cfg.routes, &source)
+    let targets: Vec<(String, Endpoint)> = routes::route(&routes_snapshot, &source)
         .into_iter()
         .map(|(r, e)| (r.to_string(), e.clone()))
         .collect();
@@ -212,7 +324,7 @@ pub fn handle_inbound(
         if h.oversize {
             notes.push_str(&format!(
                 "\n[dropped {}: {size} B over {} B limit]",
-                h.att.filename, d.cfg.max_attachment_bytes
+                h.att.filename, max_attachment_bytes
             ));
             continue;
         }
@@ -243,8 +355,8 @@ pub fn handle_inbound(
         kind,
         body,
         created_at.unwrap_or(now),
-        now + CDuration::seconds(d.cfg.ttl_default_secs as i64),
-        d.cfg.hop_limit,
+        now + CDuration::seconds(ttl_default_secs as i64),
+        hop_limit,
     );
     env.attachments = metas;
     // The envelope keeps whatever the plugin actually sent (defaulted to
@@ -275,8 +387,6 @@ pub fn handle_inbound(
         // a rate-limited message does — deliberate: a full queue is
         // operationally interesting in a way a sender's own excess traffic
         // isn't.
-        let route_max = d.cfg.limits.per_route.queue_max;
-        let global_max = d.cfg.limits.global.queue_max;
         let over_route = route_max > 0
             && store.pending_count(Some(route.as_str())).unwrap_or(0) >= i64::from(route_max);
         let over_global = !over_route
@@ -391,6 +501,7 @@ pub fn initiate_link(
 fn enqueue_identity_send(
     d: &Daemon, dest: Endpoint, body: String, now: DateTime<Utc>, expires: DateTime<Utc>,
 ) -> Result<(), String> {
+    let (hop_limit, global_max) = d.cfg_snapshot(|c| (c.hop_limit, c.limits.global.queue_max));
     let env = Envelope::new(
         Endpoint { protocol: IDENTITY_ROUTE.trim_start_matches('@').to_string(), endpoint: "system".to_string() },
         Sender { native_ref: IDENTITY_ROUTE.to_string() },
@@ -398,14 +509,13 @@ fn enqueue_identity_send(
         body,
         now,
         expires,
-        d.cfg.hop_limit,
+        hop_limit,
     );
     let store = d.store.lock().unwrap();
     if let Err(e) = store.insert_message(&env) {
         warn!(error = %e, "failed to persist identity notice message");
         return Ok(());
     }
-    let global_max = d.cfg.limits.global.queue_max;
     let over_global = global_max > 0
         && store.pending_count(None).unwrap_or(0) >= i64::from(global_max);
     if over_global {
@@ -481,7 +591,7 @@ fn confirm_link(d: &Daemon, challenge: storage::Challenge, now: DateTime<Utc>) {
         identity_links::mask_ref(&challenge.requester_ref));
     let masked_target = format!("{}:{}", challenge.target_protocol,
         identity_links::mask_ref(&challenge.target_ref));
-    let expires = now + CDuration::seconds(d.cfg.ttl_default_secs as i64);
+    let expires = now + CDuration::seconds(d.cfg_snapshot(|c| c.ttl_default_secs) as i64);
 
     // Best-effort (design §Lifecycle step 2): a queue-full rejection here
     // (RULING 1) dead-letters the notice but must not undo the link that
@@ -643,7 +753,13 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
         process_due_identity(d, del, env, now).await;
         return;
     }
-    match policy::evaluate(&d.cfg.policies, &env, &del.destination) {
+    // Cloned out (not read live inline in the `match`): a `d.cfg.read()`
+    // temporary would otherwise live for the whole match expression (every
+    // arm, per Rust's temporary-lifetime rules), and the Allow arm below
+    // takes the plugins/store/budget_limiter locks -- exactly the
+    // cfg-guard-held-across-other-locks pattern the lock order forbids.
+    let policies = d.cfg_snapshot(|c| c.policies.clone());
+    match policy::evaluate(&policies, &env, &del.destination) {
         policy::Decision::Deny { policy } => {
             metrics::inc(&metrics::POLICY_DENIALS);
             let result = d.store.lock().unwrap()
@@ -686,10 +802,10 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             // bypass. A protocol with no configured budget always allows
             // (see `BudgetLimiter::allow`) and never checks priority.
             if del.priority > 0 {
-                let per_minute = d.cfg.transport_budgets
+                let per_minute = d.cfg_snapshot(|c| c.transport_budgets
                     .get(&del.destination.protocol)
                     .map(|b| b.messages_per_minute)
-                    .unwrap_or(0);
+                    .unwrap_or(0));
                 let allowed = d.budget_limiter.lock().unwrap()
                     .allow(&del.destination.protocol, per_minute, Instant::now());
                 if !allowed {
@@ -718,8 +834,13 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             // "pseudonymous" (the default, backward-compatible with configs
             // that predate this field), and the alias is used exactly as
             // before.
-            let route_cfg = d.cfg.routes.iter().find(|r| r.name == del.route);
-            let linked_mode = route_cfg.map(|r| r.identity_mode == "linked").unwrap_or(false);
+            // Owned clone (`Daemon::route_cfg`), not a borrow into a cfg
+            // read guard: `linked_mode` below takes the store lock while
+            // this is still in scope, and `render_tag`/`render_max_chars`
+            // further down need it too -- an `Option<&RouteConfig>` tied to
+            // a live read guard would hold that guard across all of it.
+            let route_cfg = d.route_cfg(&del.route);
+            let linked_mode = route_cfg.as_ref().map(|r| r.identity_mode == "linked").unwrap_or(false);
             let tag = if linked_mode {
                 let link = d.store.lock().unwrap()
                     .link_for_identity(&env.source.protocol, &env.sender.native_ref)
@@ -739,11 +860,12 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             // nor the notes are ever eaten by it; see `transform::
             // truncate_body`'s doc comment for why an earlier ruling that
             // truncated the assembled `"[tag]\nbody"` string was reverted.
-            let render_tag = match route_cfg.map(|r| r.render.tag.as_str()) {
+            let render_tag = match route_cfg.as_ref().map(|r| r.render.tag.as_str()) {
                 Some("none") => None,
                 _ => Some(tag.as_str()),
             };
             let render_max_chars = route_cfg
+                .as_ref()
                 .and_then(|r| (r.render.max_chars > 0).then_some(r.render.max_chars));
 
             let (attachments, notes) = if env.attachments.is_empty() {
@@ -873,10 +995,10 @@ async fn process_due_identity(
     };
 
     if del.priority > 0 {
-        let per_minute = d.cfg.transport_budgets
+        let per_minute = d.cfg_snapshot(|c| c.transport_budgets
             .get(&del.destination.protocol)
             .map(|b| b.messages_per_minute)
-            .unwrap_or(0);
+            .unwrap_or(0));
         let allowed = d.budget_limiter.lock().unwrap()
             .allow(&del.destination.protocol, per_minute, Instant::now());
         if !allowed {
@@ -1034,6 +1156,7 @@ pub mod tests_support {
             node: NodeConfig { name: "t".into(), data_dir: dir.to_path_buf(), public },
             plugins,
             raw_plugin_configs: BTreeMap::new(),
+            raw_yaml: String::new(),
             routes: vec![RouteConfig {
                 name: "general".into(),
                 sources: vec!["mocka:chan".parse().unwrap(), "mockb:chan".parse().unwrap()],
@@ -1250,8 +1373,8 @@ mod tests {
     #[test]
     fn inbound_drops_oversize_attachment_stores_accepted_one_and_notes_the_drop() {
         let dir = tempfile::tempdir().unwrap();
-        let mut d = test_daemon(dir.path());
-        d.cfg.max_attachment_bytes = 16;
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().max_attachment_bytes = 16;
 
         let small = IpcAttachment {
             filename: "small.txt".into(),
@@ -1452,8 +1575,8 @@ mod tests {
     #[tokio::test]
     async fn process_due_strips_attachments_when_policy_rejects_them_even_if_capability_allows() {
         let dir = tempfile::tempdir().unwrap();
-        let mut d = test_daemon(dir.path());
-        d.cfg.policies = vec![crate::config::Policy {
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().policies = vec![crate::config::Policy {
             name: "no-attachments-for-b".into(),
             r#match: crate::config::PolicyMatch { destination_protocol: vec!["mockb".into()] },
             rules: crate::config::PolicyRules {
@@ -1485,8 +1608,8 @@ mod tests {
     #[tokio::test]
     async fn process_due_drops_attachment_over_the_policy_byte_cap_and_notes_the_limit() {
         let dir = tempfile::tempdir().unwrap();
-        let mut d = test_daemon(dir.path());
-        d.cfg.policies = vec![crate::config::Policy {
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().policies = vec![crate::config::Policy {
             name: "small-attachments-for-b".into(),
             r#match: crate::config::PolicyMatch { destination_protocol: vec!["mockb".into()] },
             rules: crate::config::PolicyRules {
@@ -1585,8 +1708,8 @@ mod tests {
     #[test]
     fn dedup_key_is_sensitive_to_dropped_attachments_not_just_accepted_ones() {
         let dir = tempfile::tempdir().unwrap();
-        let mut d = test_daemon(dir.path());
-        d.cfg.max_attachment_bytes = 16;
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().max_attachment_bytes = 16;
 
         let a = IpcAttachment {
             filename: "a.bin".into(), mime: "application/octet-stream".into(),
@@ -2371,8 +2494,8 @@ mod tests {
     #[tokio::test]
     async fn process_due_renders_display_name_when_route_is_linked_and_a_verified_link_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let mut d = test_daemon(dir.path());
-        d.cfg.routes[0].identity_mode = "linked".to_string();
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().routes[0].identity_mode = "linked".to_string();
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", false);
 
@@ -2416,8 +2539,8 @@ mod tests {
     #[tokio::test]
     async fn process_due_renders_alias_in_linked_mode_when_no_link_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let mut d = test_daemon(dir.path());
-        d.cfg.routes[0].identity_mode = "linked".to_string();
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().routes[0].identity_mode = "linked".to_string();
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", false);
 
@@ -2436,8 +2559,8 @@ mod tests {
     #[tokio::test]
     async fn unlink_reverts_rendering_to_pseudonym_on_the_next_delivery() {
         let dir = tempfile::tempdir().unwrap();
-        let mut d = test_daemon(dir.path());
-        d.cfg.routes[0].identity_mode = "linked".to_string();
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().routes[0].identity_mode = "linked".to_string();
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", false);
 
@@ -2478,8 +2601,8 @@ mod tests {
     #[tokio::test]
     async fn render_tag_none_suppresses_the_alias_prefix_on_a_pseudonymous_route() {
         let dir = tempfile::tempdir().unwrap();
-        let mut d = test_daemon(dir.path()); // default identity_mode: "pseudonymous"
-        d.cfg.routes[0].render.tag = "none".to_string();
+        let d = test_daemon(dir.path()); // default identity_mode: "pseudonymous"
+        d.cfg.write().unwrap().routes[0].render.tag = "none".to_string();
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", false);
 
@@ -2503,9 +2626,9 @@ mod tests {
     #[tokio::test]
     async fn render_tag_none_suppresses_the_display_name_on_a_linked_route_with_a_verified_link() {
         let dir = tempfile::tempdir().unwrap();
-        let mut d = test_daemon(dir.path());
-        d.cfg.routes[0].identity_mode = "linked".to_string();
-        d.cfg.routes[0].render.tag = "none".to_string();
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().routes[0].identity_mode = "linked".to_string();
+        d.cfg.write().unwrap().routes[0].render.tag = "none".to_string();
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", false);
 
@@ -2531,8 +2654,8 @@ mod tests {
     #[tokio::test]
     async fn render_max_chars_truncates_the_body_only_leaving_the_tag_intact() {
         let dir = tempfile::tempdir().unwrap();
-        let mut d = test_daemon(dir.path());
-        d.cfg.routes[0].render.max_chars = 20;
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().routes[0].render.max_chars = 20;
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", false);
 
@@ -2561,9 +2684,9 @@ mod tests {
     #[tokio::test]
     async fn render_max_chars_at_the_16_floor_never_truncates_a_long_linked_display_name() {
         let dir = tempfile::tempdir().unwrap();
-        let mut d = test_daemon(dir.path());
-        d.cfg.routes[0].identity_mode = "linked".to_string();
-        d.cfg.routes[0].render.max_chars = 16;
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().routes[0].identity_mode = "linked".to_string();
+        d.cfg.write().unwrap().routes[0].render.max_chars = 16;
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", false);
 
@@ -2592,8 +2715,8 @@ mod tests {
     #[tokio::test]
     async fn render_max_chars_truncates_body_before_notes_are_appended_notes_not_counted_toward_max_chars() {
         let dir = tempfile::tempdir().unwrap();
-        let mut d = test_daemon(dir.path());
-        d.cfg.routes[0].render.max_chars = 16;
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().routes[0].render.max_chars = 16;
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", false); // no attachments capability
 
@@ -2618,5 +2741,176 @@ mod tests {
         let body_only = &body[body.find('\n').unwrap() + 1..note_start];
         assert_eq!(body_only.chars().count(), 16,
             "max_chars must bound the body alone, not the body+note total: {body}");
+    }
+
+    // ---- apply_config (design §1: hot-reloadable config behind RwLock) ----
+
+    #[test]
+    fn apply_config_unchanged_config_has_no_restart_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let new_cfg = d.cfg.read().unwrap().clone();
+        let outcome = d.apply_config(new_cfg);
+        assert!(outcome.restart_required.is_empty(), "outcome was: {outcome:?}");
+    }
+
+    #[test]
+    fn apply_config_plugin_command_change_is_restart_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.plugins.get_mut("mockb").unwrap().command = Some("new-command".into());
+        let outcome = d.apply_config(new_cfg);
+        assert_eq!(outcome.restart_required, vec!["mockb".to_string()]);
+    }
+
+    #[test]
+    fn apply_config_plugin_config_block_change_is_restart_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.plugins.get_mut("mocka").unwrap().config =
+            serde_yaml::Value::String("changed".into());
+        let outcome = d.apply_config(new_cfg);
+        assert_eq!(outcome.restart_required, vec!["mocka".to_string()]);
+    }
+
+    #[test]
+    fn apply_config_plugin_enabled_change_is_restart_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.plugins.get_mut("mockb").unwrap().enabled = false;
+        let outcome = d.apply_config(new_cfg);
+        assert_eq!(outcome.restart_required, vec!["mockb".to_string()]);
+    }
+
+    #[test]
+    fn apply_config_added_plugin_is_restart_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.plugins.insert("mockc".to_string(), crate::config::PluginConfig {
+            enabled: true, command: None, config: serde_yaml::Value::Null,
+        });
+        let outcome = d.apply_config(new_cfg);
+        assert_eq!(outcome.restart_required, vec!["mockc".to_string()]);
+    }
+
+    #[test]
+    fn apply_config_removed_plugin_is_restart_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.plugins.remove("mockb");
+        let outcome = d.apply_config(new_cfg);
+        assert_eq!(outcome.restart_required, vec!["mockb".to_string()]);
+    }
+
+    #[test]
+    fn apply_config_node_data_dir_change_is_restart_required_under_daemon_pseudo_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.node.data_dir = dir.path().join("moved");
+        let outcome = d.apply_config(new_cfg);
+        assert_eq!(outcome.restart_required, vec!["daemon".to_string()]);
+    }
+
+    #[test]
+    fn apply_config_node_public_change_is_restart_required_under_daemon_pseudo_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.node.public = !new_cfg.node.public;
+        let outcome = d.apply_config(new_cfg);
+        assert_eq!(outcome.restart_required, vec!["daemon".to_string()]);
+    }
+
+    #[test]
+    fn apply_config_multiple_changes_are_all_reported_sorted_and_deduped() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.node.public = !new_cfg.node.public;
+        new_cfg.plugins.get_mut("mockb").unwrap().enabled = false;
+        new_cfg.plugins.insert("aaa-new".to_string(), crate::config::PluginConfig {
+            enabled: true, command: None, config: serde_yaml::Value::Null,
+        });
+        let outcome = d.apply_config(new_cfg);
+        assert_eq!(outcome.restart_required,
+            vec!["aaa-new".to_string(), "daemon".to_string(), "mockb".to_string()]);
+    }
+
+    /// Live-effect half of the matrix: a route added via `apply_config` must
+    /// route the very next inbound message with no restart in between.
+    #[test]
+    fn apply_config_route_added_is_live_for_the_next_message_no_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+
+        // "newchan" isn't wired into any route in the base config: dropped.
+        handle_inbound(&d, "mocka", "newchan".into(), "!a".into(), "text".into(),
+                       "before".into(), None, vec![], None);
+        assert_eq!(d.store.lock().unwrap().queue_counts().unwrap(), vec![]);
+
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.routes.push(crate::config::RouteConfig {
+            name: "extra".into(),
+            sources: vec!["mocka:newchan".parse().unwrap()],
+            destinations: vec!["mockb:chan".parse().unwrap()],
+            identity_mode: "pseudonymous".into(),
+            render: crate::config::RenderConfig::default(),
+        });
+        let outcome = d.apply_config(new_cfg);
+        assert!(outcome.restart_required.is_empty(),
+            "a route addition alone must never require a restart: {outcome:?}");
+
+        handle_inbound(&d, "mocka", "newchan".into(), "!a".into(), "text".into(),
+                       "after".into(), None, vec![], None);
+        assert_eq!(d.store.lock().unwrap().queue_counts().unwrap(),
+            vec![("pending".to_string(), 1)],
+            "the new route must be live without a restart");
+    }
+
+    /// Live-effect half of the matrix: tightening `per_sender` must rebuild
+    /// `sender_limiter` so the new, tighter numbers apply to the very next
+    /// message -- driven end to end through `handle_inbound` rather than
+    /// asserted against the limiter's internals directly.
+    #[test]
+    fn apply_config_per_sender_tightened_rebuilds_the_sender_limiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path()); // Limits::default(): unlimited
+
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.limits.per_sender.messages_per_minute = 1;
+        d.apply_config(new_cfg);
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "one".into(), None, vec![], None);
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "two".into(), None, vec![], None);
+
+        assert_eq!(d.store.lock().unwrap().queue_counts().unwrap(),
+            vec![("pending".to_string(), 1)],
+            "the second message from the same sender must be rate-limited \
+             immediately after tightening, no restart involved");
+    }
+
+    /// `apply_config` must store the incoming config's `raw_yaml` (Task 3's
+    /// PUT will have set it via `config::load_from_str` before calling this)
+    /// so a subsequent `GET /v1/config` (Task 2) serves the newly-applied
+    /// text, not the config the daemon booted with.
+    #[test]
+    fn apply_config_stores_the_new_configs_raw_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        assert_eq!(d.cfg.read().unwrap().raw_yaml, "", "test_daemon's Config has no raw_yaml");
+
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.raw_yaml = "node:\n  name: applied\n".to_string();
+        d.apply_config(new_cfg);
+
+        assert_eq!(d.cfg.read().unwrap().raw_yaml, "node:\n  name: applied\n");
     }
 }

@@ -25,12 +25,32 @@ pub fn key(
 
 pub struct Dedup {
     ttl: Duration,
-    seen: HashMap<String, Instant>,
+    // Each entry carries the TTL that was in effect when it was recorded
+    // (not a shared field checked at read time): this is what gives
+    // `set_ttl` "new-entries-only" semantics (design §1 hot-reload) --
+    // entries already recorded keep aging out under whichever TTL applied
+    // when `record` inserted them, while entries recorded after a
+    // `set_ttl` call pick up the new one. Swapping in a whole new `Dedup`
+    // on config apply was considered and rejected: that would drop every
+    // in-flight entry outright, reopening the replay window `is_duplicate`
+    // exists to close.
+    seen: HashMap<String, (Instant, Duration)>,
 }
 
 impl Dedup {
     pub fn new(ttl: Duration) -> Dedup {
         Dedup { ttl, seen: HashMap::new() }
+    }
+
+    /// Changes the TTL applied to entries recorded from this point on;
+    /// entries already in `seen` are untouched and keep expiring under the
+    /// TTL captured at their own `record` call (see the field doc above).
+    #[allow(dead_code)]
+    // consumed by `Daemon::apply_config` (engine.rs); remove allow once
+    // Task 3's admin `PUT /v1/config` calls apply_config from production
+    // code (today it's exercised only by apply_config's own tests).
+    pub fn set_ttl(&mut self, ttl: Duration) {
+        self.ttl = ttl;
     }
 
     /// True if `key` has already been seen within the TTL. Prunes expired
@@ -42,15 +62,15 @@ impl Dedup {
         // O(n) prune per call, in-memory only (restart forgets the
         // cache). Fine at gateway volumes; move to the sqlite dedup table if
         // restart-replay ever bites.
-        self.seen.retain(|_, t| now.duration_since(*t) < self.ttl);
+        self.seen.retain(|_, (t, ttl)| now.duration_since(*t) < *ttl);
         self.seen.contains_key(key)
     }
 
-    /// Records `key` as seen as of `now`. Call once a message has cleared
-    /// whatever gates (e.g. rate limiting) must not themselves be dedup'd
-    /// away on retry.
+    /// Records `key` as seen as of `now`, under whatever TTL is currently
+    /// configured. Call once a message has cleared whatever gates (e.g.
+    /// rate limiting) must not themselves be dedup'd away on retry.
     pub fn record(&mut self, key: &str, now: Instant) {
-        self.seen.insert(key.to_string(), now);
+        self.seen.insert(key.to_string(), (now, self.ttl));
     }
 }
 
@@ -77,6 +97,31 @@ mod tests {
         d.record("k", t0);
         assert!(d.is_duplicate("k", t0 + Duration::from_secs(59)));
         assert!(!d.is_duplicate("k", t0 + Duration::from_secs(61)));
+    }
+
+    /// `Daemon::apply_config`'s dedup-TTL handling (design §1): `set_ttl`
+    /// must affect only entries recorded AFTER the call. An entry recorded
+    /// under the old (long) TTL must keep expiring on that old TTL even
+    /// after the TTL is tightened, while a fresh entry recorded after
+    /// `set_ttl` picks up the new (short) one immediately.
+    #[test]
+    fn set_ttl_affects_only_subsequently_recorded_entries() {
+        let mut d = Dedup::new(Duration::from_secs(3600));
+        let t0 = Instant::now();
+        d.record("old", t0);
+
+        // Tighten the TTL way down, then record a new key.
+        d.set_ttl(Duration::from_secs(5));
+        d.record("new", t0);
+
+        // Just past the new 5s TTL, but nowhere near the old 3600s one:
+        // "old" must still be a duplicate (its own TTL never changed),
+        // "new" must have already expired.
+        let t1 = t0 + Duration::from_secs(6);
+        assert!(d.is_duplicate("old", t1),
+            "an entry recorded before set_ttl must keep aging out on its original TTL");
+        assert!(!d.is_duplicate("new", t1),
+            "an entry recorded after set_ttl must expire on the new, shorter TTL");
     }
 
     #[test]

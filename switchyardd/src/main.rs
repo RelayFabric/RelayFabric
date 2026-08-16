@@ -59,7 +59,8 @@ fn main() {
         let _ = std::fs::remove_file(&plugin_sock);
         let listener = tokio::net::UnixListener::bind(&plugin_sock).expect("bind plugin socket");
         tokio::spawn(plugins::listen(daemon.clone(), listener));
-        for (name, pc) in &daemon.cfg.plugins {
+        let plugin_configs = daemon.cfg_snapshot(|c| c.plugins.clone());
+        for (name, pc) in &plugin_configs {
             if pc.enabled {
                 if let Some(cmd) = &pc.command {
                     tokio::spawn(plugins::supervise(
@@ -73,7 +74,7 @@ fn main() {
         let admin_listener =
             tokio::net::UnixListener::bind(&admin_sock).expect("bind admin socket");
         tokio::spawn(admin::serve(daemon.clone(), admin_listener));
-        tracing::info!(node = daemon.cfg.node.name, "switchyardd running");
+        tracing::info!(node = daemon.cfg_snapshot(|c| c.node.name.clone()), "switchyardd running");
         tokio::signal::ctrl_c().await.expect("ctrl_c");
         tracing::info!("shutting down");
     });

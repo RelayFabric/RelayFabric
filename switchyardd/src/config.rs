@@ -19,6 +19,19 @@ pub struct Config {
     /// process over the `RELAYFABRIC_PLUGIN_CONFIG` env var).
     #[serde(skip)]
     pub raw_plugin_configs: BTreeMap<String, serde_yaml::Value>,
+    /// Verbatim text of the config file, captured by `load`/`load_from_str`
+    /// BEFORE parsing/secret resolution touch anything (design §1/§2).
+    /// Skipped by serde (empty by default, e.g. for every hand-built
+    /// `Config` literal the test suite constructs directly rather than
+    /// through `load_from_str`) and never mutated afterward except by
+    /// `Daemon::apply_config`, which stores the incoming request's raw text
+    /// here on swap. Admin `GET /v1/config` (Task 2) serves this back
+    /// byte-for-byte -- secrets stay in their unresolved `${...}` form and
+    /// resolution never touches this field at all, so byte-fidelity and
+    /// zero secret exposure both fall out of "just don't re-serialize
+    /// anything".
+    #[serde(skip)]
+    pub raw_yaml: String,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
@@ -50,7 +63,10 @@ fn default_max_attachment_bytes() -> u64 { 8 * 1024 * 1024 }
 /// `Send`/alias/render path.
 pub const IDENTITY_ROUTE: &str = "@identity";
 
-#[derive(Debug, Clone, Deserialize)]
+/// `PartialEq` powers `Daemon::apply_config`'s restart-required diff
+/// (design §1): any change to `node.*` is restart-only (the plugin/admin
+/// socket paths are derived from `data_dir` and bound once at startup).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NodeConfig {
     pub name: String,
     pub data_dir: PathBuf,
@@ -98,7 +114,11 @@ pub struct Budget {
     pub messages_per_minute: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// `PartialEq` powers `Daemon::apply_config`'s restart-required diff
+/// (design §1): a plugin process is only ever restarted-by-implication
+/// (never actually restarted by apply itself -- `supervise` keeps the old
+/// one running) when `{enabled, command, config}` changes.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PluginConfig {
     pub enabled: bool,
     pub command: Option<String>,
@@ -211,7 +231,19 @@ pub struct PolicyRules {
 pub fn load(path: &Path) -> Result<Config, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mut cfg: Config = serde_yaml::from_str(&raw).map_err(|e| e.to_string())?;
+    load_from_str(&raw)
+}
+
+/// Parses, validates, and resolves secrets for `raw` YAML config text --
+/// the same pipeline `load` runs against a file's contents, factored out so
+/// callers with text that didn't come from disk (admin `PUT /v1/config` and
+/// `POST /v1/config/validate`, Task 3) can run it too. `Config.raw_yaml` is
+/// captured from `raw` verbatim, immediately after parsing and BEFORE
+/// `resolve_secrets` mutates `plugins[_].config` in place -- so it always
+/// holds exactly what the caller supplied, secrets un-resolved.
+pub fn load_from_str(raw: &str) -> Result<Config, String> {
+    let mut cfg: Config = serde_yaml::from_str(raw).map_err(|e| e.to_string())?;
+    cfg.raw_yaml = raw.to_string();
     validate(&cfg)?;
     resolve_secrets(&mut cfg)?;
     warn_if_public_with_no_limits(&cfg);
@@ -481,6 +513,38 @@ routes:
         let mut cfg = parse(s)?;
         resolve_secrets(&mut cfg)?;
         Ok(cfg)
+    }
+
+    // ---- raw_yaml (design §1: hot-reloadable config / admin GET /v1/config) --
+
+    #[test]
+    fn load_from_str_captures_raw_yaml_verbatim() {
+        let cfg = load_from_str(GOOD).unwrap();
+        assert_eq!(cfg.raw_yaml, GOOD);
+    }
+
+    #[test]
+    fn hand_built_config_literals_default_raw_yaml_to_empty() {
+        // The struct-literal path every other test in this module (and
+        // engine.rs's test_daemon_full) uses never goes through
+        // load_from_str, so raw_yaml -- being #[serde(skip)] -- must fall
+        // back to String::default() rather than require every call site to
+        // set it.
+        let cfg = parse(GOOD).unwrap();
+        assert_eq!(cfg.raw_yaml, "");
+    }
+
+    #[test]
+    fn raw_yaml_retains_unresolved_secret_refs_verbatim_and_never_the_resolved_value() {
+        std::env::set_var("RF_CONFIG_TEST_RAW_YAML", "sentinel-raw-yaml-value");
+        let yaml = with_secret_config("RF_CONFIG_TEST_RAW_YAML");
+        let cfg = load_from_str(&yaml).unwrap();
+        assert_eq!(cfg.raw_yaml, yaml);
+        assert!(cfg.raw_yaml.contains("${env:RF_CONFIG_TEST_RAW_YAML}"),
+            "raw_yaml must keep the reference form: {}", cfg.raw_yaml);
+        assert!(!cfg.raw_yaml.contains("sentinel-raw-yaml-value"),
+            "raw_yaml must never contain a resolved secret value: {}", cfg.raw_yaml);
+        std::env::remove_var("RF_CONFIG_TEST_RAW_YAML");
     }
 
     #[test]

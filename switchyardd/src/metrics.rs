@@ -15,7 +15,7 @@ pub static QUEUE_REJECTED: AtomicU64 = AtomicU64::new(0);
 pub static BUDGET_DEFERRED: AtomicU64 = AtomicU64::new(0);
 pub static LINKS_VERIFIED: AtomicU64 = AtomicU64::new(0);
 
-// design §3 (cycle D): created_at -> delivered wall-clock latency, accrued
+// design §3 (cycle D): received_at -> delivered wall-clock latency, accrued
 // as a micros sum + count pair (rendered in seconds) rather than a
 // histogram — the SHOULD-list ask is a Prometheus summary's _sum/_count,
 // not buckets.
