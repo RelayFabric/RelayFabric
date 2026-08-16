@@ -4,12 +4,12 @@ RelayFabric is an open communications routing fabric for interconnecting
 otherwise incompatible messaging, mesh, radio, and Internet communications
 systems. It provides a common routing, policy, identity, security, and
 message-processing layer while delegating protocol-specific behavior to
-plugins — initial target networks include Reticulum/LXMF, Signal,
-Meshtastic, MeshCore, Bitchat, Nostr, and MQTT.
+plugins. MeshCore uses the native MIT Companion Radio Protocol (spec §8's
+preferred style), while Meshtastic uses MQTT (licensing favors it). Initial
+target networks: Reticulum/LXMF, Signal, Meshtastic, MeshCore, Bitchat, Nostr.
 
-**Status:** v0.2 in progress: MeshCore joins MQTT, LXMF, Signal + Meshtastic.
-Public-node groundwork: node identity, public-service gating, quotas, priority
-scheduling through the admin API.
+**Status:** v0.2 in progress: MeshCore joins MQTT, LXMF, Signal + Meshtastic;
+public-node groundwork underway (identity, gating, quotas, priority via API).
 
 ## Components
 
@@ -33,8 +33,7 @@ Binaries in `target/release/`.
 
 ## Quick start
 
-Commands below assume `target/release/` is on your `PATH` (or prefix each
-one with `./target/release/`).
+Commands assume `target/release/` is on your `PATH`.
 
 1. Copy `docs/relayfabric.example.yaml` and adjust `node.data_dir`, then
    validate it:

@@ -15,7 +15,7 @@ pip install -r plugins/meshcore/requirements.txt
 ## Connection
 
 Companion-mode firmware required. Supported: `serial://<path>[?baud=N]`,
-`tcp://host:port`, `ble://<addr>`.
+`tcp://host:port`, `ble://<addr>` (best-effort, untested).
 
 ## Daemon config
 
@@ -39,10 +39,11 @@ sender on channel index (`mc:channel:<idx>`), so all messages on a channel map
 to the same sender.
 
 **Consequence 1:** daemon rate limits and aliases operate at CHANNEL granularity
-(one alias per channel, quotas shared by all participants). Public-node operators
-should size `per_sender` limits accordingly.
+(one alias per channel, quotas shared by all participants). Size `per_sender`
+limits accordingly and lean on per-route and global queue caps for
+meshcore-heavy nodes.
 
-**Consequence 2:** protocol-level moderation per-user is impossible: muting or
+**Consequence 2:** protocol-level moderation per-user impossible: muting or
 rate-limiting one user on a meshcore channel affects all users on that channel.
 
 ## Loop guard
@@ -56,7 +57,7 @@ can also be swallowed — at most once per send, within 1 hour.
 
 - Library API exercised only against fakes — verify one end-to-end send on
   hardware.
+- Alias prefix collision with Meshtastic: both protocols alias as MESH-XXXX
+  (first 4 protocol-name chars); cosmetic, aliases remain distinct per sender.
 - Some firmware validates downlink `from`; plugin always sends `from: 0`.
 - Timestamp (`ts`) units assumed to be epoch seconds.
-- Lost echo leaves loop-guard entry for 1 hour; one identical genuine message
-  can be swallowed during that window.
