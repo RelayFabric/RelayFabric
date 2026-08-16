@@ -1,6 +1,7 @@
 use crate::config::IDENTITY_ROUTE;
 use crate::engine::{self, Daemon};
 use crate::events::Event;
+use crate::fed::conn::PeerConn;
 use crate::identity_links;
 use crate::metrics;
 use axum::body::Bytes;
@@ -14,7 +15,7 @@ use chrono::Utc;
 use relay_core::Endpoint;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -67,6 +68,7 @@ pub fn router(d: Arc<Daemon>, config_path: PathBuf) -> Router {
         .route("/v1/identities/link", post(create_link))
         .route("/v1/identities/link/{id}", delete(delete_link))
         .route("/v1/identities/challenges", get(challenges))
+        .route("/v1/federation", get(federation))
         .route("/v1/events", get(events_stream))
         .route("/metrics", get(metrics_text))
         .with_state(state)
@@ -644,6 +646,76 @@ async fn challenges(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
         "expires_at": c.expires_at,
     })).collect();
     Json(json!({ "pending_count": out.len(), "challenges": out }))
+}
+
+/// `GET /v1/federation` (design §6, Task 5): every configured
+/// `federation.peers[]` entry PLUS any trust-store node not covered by one
+/// ("inbound-only seen": a node that has completed a Noise handshake with
+/// this daemon but has no `peers[]` entry -- `name: null`), each with its
+/// live `connected` state and a `last_seen` timestamp. Deliberately omits
+/// `addr` (peer config's dial address) -- addresses are infrastructure, not
+/// admin-surface data (§111.4 spirit; same posture as never surfacing
+/// native refs). Federation entirely off (`d.fed` is `None`, i.e. no
+/// `federation:` config block) reports an empty list rather than 404 --
+/// consistent with `public()`'s "disabled reports zero services" precedent
+/// below, not an error condition.
+async fn federation(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
+    let Some(fed) = &d.fed else {
+        return Json(json!({ "peers": Vec::<serde_json::Value>::new() }));
+    };
+    let configured: Vec<crate::config::PeerConfig> =
+        d.cfg_snapshot(|c| c.federation.as_ref().map(|f| f.peers.clone()).unwrap_or_default());
+    let trust_rows = d.store.lock().unwrap().list_trust().unwrap_or_default();
+    let conns = fed.conns.lock().unwrap();
+    // Keyed by node_id, not `FedState.conns`'s own map key (a configured
+    // peer's NAME, or an unconfigured connection's raw node_id -- see
+    // `fed::conn::accept_loop_with_cap`'s `configured_peer_name` fallback):
+    // reading `PeerConn.node_id` directly here makes the lookup below
+    // uniform for both configured and inbound-only entries, with no need to
+    // guess which key shape a given `conns` entry uses.
+    let live: BTreeMap<&str, &PeerConn> = conns.values().map(|c| (c.node_id.as_str(), c)).collect();
+
+    let mut named: BTreeSet<&str> = BTreeSet::new();
+    let mut peers_out: Vec<serde_json::Value> = Vec::new();
+    for p in &configured {
+        named.insert(p.node_id.as_str());
+        peers_out.push(federation_peer_json(
+            Some(p.name.as_str()), &p.node_id, &trust_rows, live.get(p.node_id.as_str()).copied(),
+        ));
+    }
+    for row in &trust_rows {
+        let node_id = row.0.as_str();
+        if named.contains(node_id) {
+            continue; // already listed above, under its configured name
+        }
+        peers_out.push(federation_peer_json(None, node_id, &trust_rows, live.get(node_id).copied()));
+    }
+    drop(conns);
+    Json(json!({ "peers": peers_out }))
+}
+
+/// One `GET /v1/federation` peer entry. `last_seen` (Task 5 choice,
+/// documented here since the design leaves it open): a currently-connected
+/// peer reports its live connection's `connected_at` (more precise than the
+/// trust store, which only advances `updated_at` on a fresh handshake, not
+/// per-frame); otherwise it falls back to the trust store's `updated_at` --
+/// the best record this daemon has of when it last actually saw the node.
+/// `trust` similarly falls back to `"unknown"` for the (should-not-happen
+/// in practice, since boot-time seeding covers every configured peer)
+/// case of a configured peer absent from the trust store entirely.
+fn federation_peer_json(
+    name: Option<&str>, node_id: &str, trust_rows: &[crate::storage::TrustRow], conn: Option<&PeerConn>,
+) -> serde_json::Value {
+    let row = trust_rows.iter().find(|row| row.0 == node_id);
+    let trust = row.map(|r| r.1.as_str()).unwrap_or("unknown");
+    let last_seen = conn.map(|c| c.connected_at).or_else(|| row.map(|r| r.3));
+    json!({
+        "name": name,
+        "node_id": node_id,
+        "trust": trust,
+        "connected": conn.is_some(),
+        "last_seen": last_seen,
+    })
 }
 
 /// Builds the `GET /v1/events` (design §4) SSE stream from a live broadcast
@@ -1292,6 +1364,121 @@ policies:
         assert_eq!(code, 200);
         assert!(body.contains("\"pending_count\":0"), "body was: {body}");
         assert!(body.contains("\"challenges\":[]"), "body was: {body}");
+    }
+
+    // ---- GET /v1/federation (design §6, Task 5) ----------------------------
+
+    fn fed_peer(name: &str, node_id: &str) -> crate::config::PeerConfig {
+        crate::config::PeerConfig {
+            name: name.into(), node_id: node_id.into(),
+            addr: "10.0.0.2:47000".into(), trust: "verified".into(),
+        }
+    }
+
+    fn fed_cfg(peers: Vec<crate::config::PeerConfig>) -> crate::config::FederationConfig {
+        crate::config::FederationConfig {
+            listen: None, accept_from: "verified".into(), max_hops: 4, max_ttl_secs: 86_400,
+            identity_exposure: "pseudonymous".into(), ingress_routes: vec![],
+            peers, trusted: vec![], blocked: vec![],
+        }
+    }
+
+    fn daemon_with_federation(fed: crate::config::FederationConfig) -> Arc<Daemon> {
+        let dir = tempfile::tempdir().unwrap();
+        let d = crate::engine::tests_support::test_daemon_with_federation(dir.path(), fed);
+        std::mem::forget(dir);
+        Arc::new(d)
+    }
+
+    /// Registers a live federation connection directly on `d.fed.conns`
+    /// under `key` -- the same map a real handshake (`fed::conn::
+    /// register_up`) would populate, without needing an actual Noise
+    /// connection. `key` is a configured peer's NAME for the "configured,
+    /// connected" tests, or the raw node_id for the "inbound-only,
+    /// unconfigured" test (mirroring `fed::conn::accept_loop_with_cap`'s own
+    /// `configured_peer_name`-or-`node_id` keying).
+    fn register_fed_conn(d: &Daemon, key: &str, node_id: &str, connected_at: chrono::DateTime<Utc>) {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<crate::fed::wire::Fed>(1);
+        d.fed.as_ref().unwrap().conns.lock().unwrap().insert(
+            key.to_string(),
+            PeerConn { tx, node_id: node_id.to_string(), connected_at },
+        );
+    }
+
+    #[tokio::test]
+    async fn federation_endpoint_reports_empty_peers_when_federation_is_not_configured() {
+        let (code, body) = get(router(daemon()), "/v1/federation").await;
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["peers"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn federation_endpoint_lists_a_connected_configured_peer() {
+        let node_id = format!("rf:{}", "aa".repeat(32));
+        let d = daemon_with_federation(fed_cfg(vec![fed_peer("phoenix", &node_id)]));
+        register_fed_conn(&d, "phoenix", &node_id, Utc::now());
+
+        let (code, body) = get(router(d), "/v1/federation").await;
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let peers = v["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0]["name"], "phoenix");
+        assert_eq!(peers[0]["node_id"], node_id);
+        assert_eq!(peers[0]["trust"], "verified", "seeded from peers[].trust at boot");
+        assert_eq!(peers[0]["connected"], true);
+        assert!(!peers[0]["last_seen"].is_null());
+    }
+
+    #[tokio::test]
+    async fn federation_endpoint_reports_a_configured_but_disconnected_peer() {
+        let node_id = format!("rf:{}", "bb".repeat(32));
+        let d = daemon_with_federation(fed_cfg(vec![fed_peer("phoenix", &node_id)]));
+        // No register_fed_conn call: configured, but never connected.
+
+        let (code, body) = get(router(d), "/v1/federation").await;
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let peers = v["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0]["name"], "phoenix");
+        assert_eq!(peers[0]["connected"], false);
+        // Seeded at boot (test_daemon_with_federation calls
+        // seed_federation_trust) -- last_seen falls back to the trust
+        // store's updated_at, never null for a configured peer.
+        assert!(!peers[0]["last_seen"].is_null());
+    }
+
+    #[tokio::test]
+    async fn federation_endpoint_includes_an_inbound_only_seen_node_with_null_name() {
+        let d = daemon_with_federation(fed_cfg(vec![])); // no configured peers at all
+        let node_id = format!("rf:{}", "cc".repeat(32));
+        d.store.lock().unwrap().record_seen(&node_id, Utc::now()).unwrap();
+        register_fed_conn(&d, &node_id, &node_id, Utc::now()); // unconfigured: keyed by its own node_id
+
+        let (code, body) = get(router(d), "/v1/federation").await;
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let peers = v["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert!(peers[0]["name"].is_null(), "an inbound-only node has no configured name: {body}");
+        assert_eq!(peers[0]["node_id"], node_id);
+        assert_eq!(peers[0]["trust"], "seen");
+        assert_eq!(peers[0]["connected"], true);
+    }
+
+    #[tokio::test]
+    async fn federation_endpoint_never_includes_an_addr_field() {
+        let node_id = format!("rf:{}", "dd".repeat(32));
+        let mut peer = fed_peer("phoenix", &node_id);
+        peer.addr = "203.0.113.7:47000".into(); // distinctive marker, must never leak
+        let d = daemon_with_federation(fed_cfg(vec![peer]));
+        register_fed_conn(&d, "phoenix", &node_id, Utc::now());
+
+        let (_, body) = get(router(d), "/v1/federation").await;
+        assert!(!body.contains("addr"), "response must never surface a peer's dial address: {body}");
+        assert!(!body.contains("203.0.113.7"), "response must never surface a peer's dial address: {body}");
     }
 
     // ---- secret reference redaction (design §2 / SPEC §51, §59) -----------

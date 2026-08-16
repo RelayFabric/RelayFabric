@@ -1,5 +1,5 @@
 use crate::cas::{self, Cas};
-use crate::config::{Config, RouteConfig, IDENTITY_ROUTE};
+use crate::config::{Config, RouteConfig, FED_PROTOCOL, IDENTITY_ROUTE};
 use crate::events::Event;
 use crate::limits::{BudgetLimiter, SenderLimiter};
 use crate::storage::Store;
@@ -1290,6 +1290,10 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
         process_due_identity(d, del, env, now).await;
         return;
     }
+    if del.destination.protocol == FED_PROTOCOL {
+        process_due_fed(d, del, env, now).await;
+        return;
+    }
     // Cloned out (not read live inline in the `match`): a `d.cfg.read()`
     // temporary would otherwise live for the whole match expression (every
     // arm, per Rust's temporary-lifetime rules), and the Allow arm below
@@ -1568,6 +1572,127 @@ async fn process_due_identity(
         warn_if_mark_failed(del.id, "pending", result);
         warn!(delivery = del.id, plugin = %del.destination.protocol,
               reason = closed_or_full, "plugin channel unavailable, requeued");
+    }
+}
+
+/// Federation egress (design §5, Task 5): delivers an envelope whose
+/// destination is `fed:<peer_name>/<remote_route>` (`del.destination.
+/// endpoint`, already validated at config-load time to have this shape --
+/// see `config::validate_fed_destination`) over a live `fed::conn`
+/// connection to that peer. Mirrors `process_due_identity`'s
+/// dispatch-by-destination shape in `process_due` above: this function owns
+/// the entire fed-specific send end to end.
+///
+/// CONNECTION LOOKUP FIRST (design §5's own ordering): `FedState.conns` is
+/// keyed by peer NAME for a configured peer (`fed::conn::register_up`'s
+/// convention, whichever side dialed) -- looked up before any of the
+/// envelope work below runs, so a disconnected peer costs nothing more than
+/// a `mark_retry` (existing retry/backoff/TTL posture, unchanged), exactly
+/// like a disconnected plugin in `process_due`/`process_due_identity`
+/// above.
+///
+/// PSEUDONYMIZATION ORDER (design §5, Task 5 -- documented here because
+/// it's easy to get backwards and silently ship a signature that doesn't
+/// cover what the peer actually sees): `env.origin.is_none()` is the signal
+/// for "locally originated, never signed before". ONLY in that case does
+/// this daemon (a) optionally replace `sender.native_ref` with a
+/// route-scoped alias (`identity_exposure: pseudonymous`, the default) and
+/// (b) sign the origin itself -- pseudonymization strictly BEFORE signing,
+/// so the origin signature's canonical bytes (which include
+/// `sender.native_ref`, see `fed::sign::canonical_bytes`) cover the alias
+/// the peer will actually see, never the raw ref. An envelope that already
+/// carries an origin signature (relayed federation traffic: this daemon
+/// ingressed it from ANOTHER peer, via `fed_ingress`, and is now forwarding
+/// it onward because the local route it landed on also has a `fed:`
+/// destination) is NEVER pseudonymized or re-signed here -- the ref was
+/// already fixed (or deliberately left raw, if THAT origin's own
+/// `identity_exposure` was `full`) by whichever gateway actually signed it,
+/// and mutating `sender.native_ref` on an already-signed envelope would
+/// break that origin signature outright: any downstream peer's
+/// `fed::sign::verify_chain` would then fail with `BAD_SIGNATURE`,
+/// dead-lettering a perfectly legitimate relay. Appending this daemon's own
+/// attestation and incrementing `hops` happen unconditionally, on BOTH
+/// paths -- that's this hop's actual provenance record regardless of
+/// whether it originated the message or is merely forwarding it.
+async fn process_due_fed(d: &Arc<Daemon>, del: storage::Delivery, env: Envelope, now: DateTime<Utc>) {
+    let Some((peer_name, remote_route)) = del.destination.endpoint.split_once('/') else {
+        // Unreachable in practice: `config::validate_fed_destination`
+        // enforces this shape at config-load time, so every `fed:` delivery
+        // row's `dest_endpoint` already has the separator. Defensive only
+        // (e.g. a hand-built row in a test) -- failed outright rather than
+        // retried forever against a shape that can never become valid.
+        let result = d.store.lock().unwrap()
+            .mark_terminal(del.id, "failed", "FED_DEST_MALFORMED");
+        warn_if_mark_failed(del.id, "failed", result);
+        emit_delivery(d, del.message_id, del.route.clone(), "failed");
+        return;
+    };
+
+    let tx = d.fed.as_ref().and_then(|fed| {
+        fed.conns.lock().unwrap().get(peer_name).map(|c| c.tx.clone())
+    });
+    let Some(tx) = tx else {
+        // No live connection to this peer (never connected, or currently
+        // down between reconnect attempts) -- same posture as a
+        // disconnected plugin: nudge next_attempt forward, stay pending.
+        let result = d.store.lock().unwrap()
+            .mark_retry(del.id, now + CDuration::seconds(5));
+        warn_if_mark_failed(del.id, "pending", result);
+        return;
+    };
+
+    let identity_exposure = d.cfg_snapshot(|c| {
+        c.federation.as_ref().map(|f| f.identity_exposure.clone())
+    }).unwrap_or_else(|| "pseudonymous".to_string());
+
+    let mut out_env = env.clone();
+    if out_env.origin.is_none() {
+        // Locally originated: never signed before this hop (see this
+        // function's doc comment for why this check gates BOTH the
+        // pseudonymization and the signing below).
+        if identity_exposure == "pseudonymous" {
+            let scope = format!("fed:{peer_name}/{remote_route}");
+            out_env.sender.native_ref =
+                d.aliaser.alias(&out_env.source.protocol, &out_env.sender.native_ref, &scope);
+        }
+        out_env.origin = Some(fed::sign::sign_origin(&out_env, &d.identity));
+    }
+    if let Err(e) = fed::sign::append_attestation(&mut out_env, &d.identity, Utc::now()) {
+        // Only reachable if `out_env.origin` is somehow still `None` here,
+        // which the branch above already ruled out -- defensive, not a
+        // real runtime path. Retried rather than dropped: a transient bug
+        // here shouldn't silently lose the message.
+        warn!(delivery = del.id, error = %e, "failed to append federation attestation");
+        let result = d.store.lock().unwrap()
+            .mark_retry(del.id, now + CDuration::seconds(5));
+        warn_if_mark_failed(del.id, "pending", result);
+        return;
+    }
+    out_env.hops += 1;
+
+    let result = d.store.lock().unwrap().mark_attempting(del.id);
+    warn_if_mark_failed(del.id, "attempting", result);
+
+    let frame = fed::wire::Fed::Envelope {
+        env: Box::new(out_env),
+        target_route: remote_route.to_string(),
+    };
+    // try_send, not send().await -- see process_due's identical rationale
+    // above: this pump task must never block on one peer connection's
+    // channel.
+    match tx.try_send(frame) {
+        Ok(()) => metrics::inc(&metrics::FED_EGRESS),
+        Err(e) => {
+            let closed_or_full = match e {
+                mpsc::error::TrySendError::Full(_) => "full",
+                mpsc::error::TrySendError::Closed(_) => "closed",
+            };
+            let result = d.store.lock().unwrap()
+                .mark_retry(del.id, now + CDuration::seconds(5));
+            warn_if_mark_failed(del.id, "pending", result);
+            warn!(delivery = del.id, peer = peer_name, reason = closed_or_full,
+                  "federation connection unavailable, requeued");
+        }
     }
 }
 
@@ -4466,5 +4591,258 @@ routes:
         // second message gets no dead_letter row at all (silent drop,
         // mirroring handle_inbound's own rate-limit gate).
         assert_eq!(store.queue_counts().unwrap(), vec![("pending".to_string(), 2)]);
+    }
+
+    // ==== process_due_fed (design §5 egress, Task 5) =======================
+
+    /// Registers a live federation connection under `peer_name` directly on
+    /// `d.fed.conns` -- the same map `process_due_fed`'s connection lookup
+    /// reads, and the same shape `fed::conn::register_up` (Task 4) would
+    /// populate from a real handshake -- without needing an actual Noise
+    /// connection or a `federation.peers[]` config entry for it (config's
+    /// peer list is never consulted by `process_due_fed`'s connection
+    /// lookup itself, only its `identity_exposure` field is).
+    fn register_fed_conn(d: &Daemon, peer_name: &str, node_id: &str) -> mpsc::Receiver<fed::wire::Fed> {
+        let (tx, rx) = mpsc::channel(8);
+        d.fed.as_ref().unwrap().conns.lock().unwrap().insert(
+            peer_name.to_string(),
+            crate::fed::conn::PeerConn { tx, node_id: node_id.to_string(), connected_at: Utc::now() },
+        );
+        rx
+    }
+
+    /// A locally-originated (never signed, `origin: None`) envelope from a
+    /// `mocka:chan` source -- `process_due_fed`'s "sign it here" branch.
+    fn local_env(native_ref: &str, body: &str) -> Envelope {
+        let now = Utc::now();
+        Envelope::new(
+            Endpoint { protocol: "mocka".into(), endpoint: "chan".into() },
+            Sender { native_ref: native_ref.into() },
+            "text".into(), body.into(), now, now + CDuration::hours(1), 8,
+        )
+    }
+
+    /// Persists `env` and queues one `pending` delivery row addressed to
+    /// `fed:<dest_endpoint>` -- bypassing `fan_out_deliveries`/route config
+    /// entirely (process_due_fed reads only `del.destination.endpoint` and
+    /// `del.route`/`del.message_id` for bookkeeping, never a real
+    /// `RouteConfig`), so these tests can drive `process_due_fed` directly
+    /// against a hand-picked `dest_endpoint` shape. Returns the delivery
+    /// row's own id.
+    fn queue_fed_delivery(d: &Daemon, env: &Envelope, dest_endpoint: &str) -> i64 {
+        let now = Utc::now();
+        let dest = Endpoint { protocol: FED_PROTOCOL.to_string(), endpoint: dest_endpoint.to_string() };
+        let store = d.store.lock().unwrap();
+        store.insert_message(env).unwrap();
+        store.insert_delivery(env.id, "outbound", &dest, now, env.expires_at, 2).unwrap()
+    }
+
+    fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    fn unwrap_envelope_frame(frame: fed::wire::Fed) -> (Envelope, String) {
+        match frame {
+            fed::wire::Fed::Envelope { env, target_route } => (*env, target_route),
+            other => panic!("expected Fed::Envelope, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_due_fed_pseudonymous_default_wire_bytes_contain_alias_not_raw_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_config("verified", 4, 86_400)));
+        let mut rx = register_fed_conn(&d, "phoenix", &format!("rf:{}", "11".repeat(32)));
+
+        let env = local_env("!secret-ref", "hello federation");
+        let raw_ref = env.sender.native_ref.clone();
+        let expected_alias = d.aliaser.alias("mocka", &raw_ref, "fed:phoenix/regional-chat");
+
+        let delivery_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let now = Utc::now();
+        let before = metrics::FED_EGRESS.load(std::sync::atomic::Ordering::Relaxed);
+        process_due(&d, del, now).await;
+
+        let (sent_env, target_route) = unwrap_envelope_frame(
+            rx.try_recv().expect("process_due_fed must send a Fed::Envelope frame"));
+        assert_eq!(target_route, "regional-chat");
+        assert_eq!(sent_env.sender.native_ref, expected_alias);
+        assert_ne!(sent_env.sender.native_ref, raw_ref);
+
+        // Sentinel (design §5, brief): the raw ref must not appear ANYWHERE
+        // in the serialized wire bytes, not merely in the struct field this
+        // test already checked above.
+        let mut buf = Vec::new();
+        ciborium::into_writer(&sent_env, &mut buf).unwrap();
+        assert!(!bytes_contain(&buf, raw_ref.as_bytes()),
+            "raw native ref must never reach the wire under identity_exposure: pseudonymous");
+        assert!(bytes_contain(&buf, expected_alias.as_bytes()),
+            "the alias must actually be present in the wire bytes");
+
+        assert_eq!(sent_env.hops, 1, "hops must increment from the fixture's default of 0");
+        assert!(sent_env.origin.is_some(), "a locally-originated envelope must be origin-signed before it egresses");
+        assert_eq!(fed::sign::verify_chain(&sent_env), Ok(()),
+            "the signature must verify against what was ACTUALLY sent (signed after pseudonymization)");
+
+        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert_eq!(after.state, "attempting");
+        assert!(metrics::FED_EGRESS.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "FED_EGRESS must increment on a successful send");
+    }
+
+    #[tokio::test]
+    async fn process_due_fed_full_mode_sends_the_raw_native_ref_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        fed_cfg.identity_exposure = "full".into();
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+        let mut rx = register_fed_conn(&d, "phoenix", &format!("rf:{}", "22".repeat(32)));
+
+        let env = local_env("!raw-ref-stays-raw", "hi");
+        let delivery_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        process_due(&d, del, Utc::now()).await;
+
+        let (sent_env, _) = unwrap_envelope_frame(rx.try_recv().unwrap());
+        assert_eq!(sent_env.sender.native_ref, "!raw-ref-stays-raw",
+            "identity_exposure: full is explicit opt-in to sending the raw ref");
+        assert!(sent_env.origin.is_some());
+        assert_eq!(fed::sign::verify_chain(&sent_env), Ok(()));
+    }
+
+    /// The relay path (design §5, Task 5 binding logic): an envelope that
+    /// arrives at `process_due_fed` ALREADY origin-signed (this daemon
+    /// ingressed it from one peer and is forwarding it to another) must
+    /// never be pseudonymized or re-signed here, even under the default
+    /// `identity_exposure: pseudonymous` -- only a NEW attestation and the
+    /// hop increment are this hop's to add.
+    #[tokio::test]
+    async fn process_due_fed_relayed_envelope_with_existing_origin_is_never_pseudonymized_or_resigned() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_config("verified", 4, 86_400)));
+        let mut rx = register_fed_conn(&d, "seattle", &format!("rf:{}", "33".repeat(32)));
+
+        let origin_identity = test_peer_identity(dir.path(), "origin-gateway");
+        let mut env = local_env("!never-touched", "relay me onward");
+        env.origin = Some(fed::sign::sign_origin(&env, &origin_identity));
+        fed::sign::append_attestation(&mut env, &origin_identity, Utc::now()).unwrap();
+        env.hops = 1;
+        assert_eq!(fed::sign::verify_chain(&env), Ok(()), "fixture sanity check");
+        let original_origin = env.origin.clone().unwrap();
+        let original_attestation_count = env.attestations.len();
+
+        let delivery_id = queue_fed_delivery(&d, &env, "seattle/regional-chat");
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        process_due(&d, del, Utc::now()).await;
+
+        let (sent_env, _) = unwrap_envelope_frame(rx.try_recv().unwrap());
+        assert_eq!(sent_env.sender.native_ref, "!never-touched",
+            "an already origin-signed envelope's ref must never be mutated, or its origin sig breaks");
+        assert_eq!(sent_env.origin.as_ref().unwrap().node_id, original_origin.node_id,
+            "origin must stay the ORIGIN gateway's identity, never overwritten by this daemon's own");
+        assert_eq!(sent_env.origin.as_ref().unwrap().sig, original_origin.sig,
+            "origin signature bytes must be byte-identical -- proof it was not recomputed");
+        assert_eq!(sent_env.attestations.len(), original_attestation_count + 1,
+            "this hop appends exactly one new attestation on top of whatever was already there");
+        assert_eq!(sent_env.hops, 2, "hops increments by exactly one on top of the relayed value");
+        assert_eq!(fed::sign::verify_chain(&sent_env), Ok(()),
+            "the full chain -- untouched origin + all attestations including this new one -- must verify");
+    }
+
+    #[tokio::test]
+    async fn process_due_fed_retries_with_backoff_when_no_live_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_config("verified", 4, 86_400)));
+        // Deliberately no `register_fed_conn` call: `d.fed` exists (the
+        // `federation` block is configured) but no connection to "phoenix"
+        // is registered -- never connected, or currently down.
+
+        let env = local_env("!ref", "hello");
+        let delivery_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let now = Utc::now();
+        process_due(&d, del, now).await;
+
+        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert_eq!(after.state, "pending", "no connection => existing retry posture, never attempting");
+        assert!(after.next_attempt >= now + CDuration::seconds(5));
+        assert_eq!(after.attempt_count, 0, "no send was ever attempted, so mark_attempting never ran");
+        // FED_EGRESS is a shared process-global counter (see fed_ingress's
+        // own tests for the same constraint under parallel `cargo test`) --
+        // not safely comparable to a captured "before" snapshot here.
+        // `attempt_count` staying 0 on THIS row is the reliable,
+        // per-Daemon proof that no send was ever attempted.
+    }
+
+    #[tokio::test]
+    async fn process_due_fed_retries_when_the_peer_connections_channel_is_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_config("verified", 4, 86_400)));
+        let (tx, _rx) = mpsc::channel::<fed::wire::Fed>(1);
+        tx.try_send(fed::wire::Fed::Ping {}).unwrap(); // fill the connection's one slot
+        d.fed.as_ref().unwrap().conns.lock().unwrap().insert(
+            "phoenix".to_string(),
+            crate::fed::conn::PeerConn {
+                tx, node_id: format!("rf:{}", "44".repeat(32)), connected_at: Utc::now(),
+            },
+        );
+
+        let env = local_env("!ref", "hello");
+        let delivery_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let now = Utc::now();
+        process_due(&d, del, now).await;
+
+        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert_eq!(after.state, "pending",
+            "a full connection channel must fall back to retry, not get stuck attempting forever");
+        assert!(after.next_attempt >= now + CDuration::seconds(5));
+        assert_eq!(after.attempt_count, 1,
+            "mark_attempting still ran once (before the send was even attempted)");
+    }
+
+    /// The binding integration test the brief calls for: an egress row
+    /// inserted by `process_due_fed` must be findable by
+    /// `Store::deliveries_for_fed_ack` AND actually marked delivered by the
+    /// REAL `fed::conn::handle_fed_ack` -- not just asserted to match by
+    /// string-format inspection. This is the single test proving the
+    /// `Endpoint{protocol: "fed", endpoint: "<peer>/<route>"}` binding
+    /// (Task 4 review) actually round-trips end to end between the two
+    /// independently-implemented sides (egress writes it, Task 4's ack
+    /// handler reads it back).
+    #[tokio::test]
+    async fn fed_egress_row_is_found_and_delivered_by_the_real_fed_ack_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_config("verified", 4, 86_400)));
+        let mut rx = register_fed_conn(&d, "phoenix", &format!("rf:{}", "55".repeat(32)));
+
+        let env = local_env("!ref", "round trip");
+        let delivery_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        process_due(&d, del, Utc::now()).await;
+
+        let (sent_env, _) = unwrap_envelope_frame(rx.try_recv().unwrap());
+        let after_send = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert_eq!(after_send.state, "attempting");
+
+        // The lookup Task 4's real Ack handler performs, driven directly:
+        // proves `process_due_fed`'s `dest_endpoint` write is EXACTLY what
+        // `deliveries_for_fed_ack`'s `LIKE peer || '/%'` match expects.
+        let found = d.store.lock().unwrap()
+            .deliveries_for_fed_ack(sent_env.id, "phoenix").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, delivery_id);
+
+        let mut events_rx = d.events.subscribe();
+        crate::fed::conn::handle_fed_ack(&d, "phoenix", &sent_env.id.to_string());
+
+        let after_ack = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert_eq!(after_ack.state, "delivered");
+        let ev = events_rx.try_recv().expect("handle_fed_ack must emit a Delivery(delivered) event");
+        match ev {
+            Event::Delivery { state, .. } => assert_eq!(state, "delivered"),
+            other => panic!("expected Delivery, got {other:?}"),
+        }
     }
 }

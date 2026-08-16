@@ -7,9 +7,8 @@
 //! origin signatures are v0.4.
 //!
 //! `verify_chain` is consumed by `engine::fed_ingress` (Task 4). `sign_origin`/
-//! `append_attestation` are consumed by federation egress (Task 5, not yet
-//! landed) — still `pub` and fully tested here, but not yet called from any
-//! production code path.
+//! `append_attestation` are consumed by federation egress
+//! (`engine::process_due_fed`, Task 5).
 
 use super::domains;
 use crate::node_identity::{self, NodeIdentity};
@@ -123,13 +122,10 @@ fn origin_bytes(env: &Envelope) -> Vec<u8> {
 /// Sign an envelope's canonical bytes at the origin gateway (design §2:
 /// `domains::ENVELOPE_V1 || canonical_bytes`).
 ///
-/// Staged: consumed by federation egress (Task 5, not yet landed) and by
-/// this crate's own test fixtures (`engine::tests_support::
-/// signed_test_envelope`) — not yet called from any production code path,
-/// so `dead_code` stays silenced here specifically (narrowed from Task 1's
-/// module-level `#![allow(dead_code)]` now that `verify_chain` below IS
-/// live, via `engine::fed_ingress`).
-#[allow(dead_code)]
+/// Consumed by federation egress (`engine::process_due_fed`, Task 5: signs
+/// a locally-originated envelope's `origin` the first time it egresses to a
+/// peer) and by this crate's own test fixtures (`engine::tests_support::
+/// signed_test_envelope`).
 pub fn sign_origin(env: &Envelope, identity: &NodeIdentity) -> OriginSig {
     OriginSig {
         node_id: identity.node_id(),
@@ -162,9 +158,10 @@ fn attestation_bytes(digest: &[u8; 32], prev_sig: &[u8], ts: DateTime<Utc>) -> V
 /// the first attestation), plus `now`. Requires an origin signature to
 /// already be present -- an envelope can't be attested before it's signed.
 ///
-/// Staged: consumed by federation egress (Task 5, not yet landed) — see
-/// `sign_origin`'s doc comment for the same posture.
-#[allow(dead_code)]
+/// Consumed by federation egress (`engine::process_due_fed`, Task 5): every
+/// outbound hop -- whether this daemon is the origin (just signed above) or
+/// a forwarding gateway relaying an already-signed envelope -- appends its
+/// own attestation before sending.
 pub fn append_attestation(
     env: &mut Envelope,
     identity: &NodeIdentity,

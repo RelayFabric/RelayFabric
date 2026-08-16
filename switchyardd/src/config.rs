@@ -520,6 +520,15 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             ));
         }
         for ep in r.sources.iter().chain(&r.destinations) {
+            if ep.protocol == FED_PROTOCOL {
+                // A route SOURCE with protocol "fed" was already rejected
+                // above, so reaching here with FED_PROTOCOL means `ep` is a
+                // destination -- validated by `validate_fed_destination`
+                // below (design §5, Task 5) instead of the plugin-existence
+                // check every other protocol goes through, since `fed` is
+                // never a `cfg.plugins` entry (it's reserved, not a plugin).
+                continue;
+            }
             match cfg.plugins.get(&ep.protocol) {
                 Some(p) if p.enabled => {}
                 Some(_) => {
@@ -530,6 +539,11 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
                     return Err(format!(
                         "route '{}' references unknown plugin '{}'", r.name, ep.protocol))
                 }
+            }
+        }
+        for ep in &r.destinations {
+            if ep.protocol == FED_PROTOCOL {
+                validate_fed_destination(cfg, &r.name, &ep.endpoint)?;
             }
         }
     }
@@ -701,6 +715,45 @@ fn validate_federation(cfg: &Config) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+/// Validates a `fed:<peer_name>/<remote_route>` route DESTINATION (design
+/// §5 egress, Task 5): `endpoint` here is `ep.endpoint` -- the part after
+/// the `fed:` protocol, e.g. `"phoenix/regional-chat"`. Rejects entirely
+/// when the `federation` block is absent (design §5: "reject entirely when
+/// federation block absent" -- there are no peers to name in that case, so
+/// any `fed:` destination is unreachable by construction); otherwise
+/// requires the `<peer_name>` half to name a configured
+/// `federation.peers[]` entry (a `fed:` destination can only ever egress to
+/// a peer this daemon actually dials/accepts) and the `<remote_route>` half
+/// to be non-empty and DNS-label-ish, matching `is_valid_peer_name`'s
+/// `[a-z0-9-]{1,32}` charset -- there's no local `RouteConfig` to check the
+/// remote name against (it names a route on the PEER's daemon, a
+/// configuration this side has no visibility into), so this is a pure shape
+/// check, not an existence check, same posture `is_valid_peer_name` already
+/// takes for a peer name.
+fn validate_fed_destination(cfg: &Config, route_name: &str, endpoint: &str) -> Result<(), String> {
+    let Some(fed) = &cfg.federation else {
+        return Err(format!(
+            "route '{route_name}' has a fed: destination '{endpoint}' but no federation block is configured"
+        ));
+    };
+    let Some((peer_name, remote_route)) = endpoint.split_once('/') else {
+        return Err(format!(
+            "route '{route_name}' has an invalid fed: destination '{endpoint}' (expected \"fed:<peer_name>/<remote_route>\")"
+        ));
+    };
+    if !fed.peers.iter().any(|p| p.name == peer_name) {
+        return Err(format!(
+            "route '{route_name}' has a fed: destination naming unknown peer '{peer_name}'"
+        ));
+    }
+    if !is_valid_peer_name(remote_route) {
+        return Err(format!(
+            "route '{route_name}' has an invalid fed: destination remote route '{remote_route}' (expected 1-32 chars of [a-z0-9-])"
+        ));
+    }
     Ok(())
 }
 
@@ -1848,22 +1901,104 @@ federation:
         assert!(err.contains("source"), "err was: {err}");
     }
 
-    /// This task deliberately does NOT special-case `fed:` route
-    /// DESTINATIONS (design §5 egress is Task 5's job) -- a `fed:`
-    /// destination is still rejected today, but for the SAME reason any
-    /// other undefined-protocol destination would be ("unknown plugin"),
-    /// proving the new reserved-name check didn't accidentally start firing
-    /// on destinations too and swallow that distinct, pre-existing error
-    /// path. Task 5 replaces this behavior for destinations specifically.
+    // ---- fed: route destinations (design §5 egress, Task 5) ---------------
+    //
+    // Supersedes Task 3's `fed_destination_is_rejected_as_unknown_plugin_
+    // not_as_reserved_this_cycle` (that test's own doc comment named this
+    // task as the one that would replace it): a `fed:<peer>/<route>`
+    // destination is no longer just "an unknown plugin" -- it gets its own
+    // validation path (`validate_fed_destination`) with its own error
+    // reasons, exercised by the matrix below.
+
+    /// `GOOD` (used by every test in this module) has no `federation:`
+    /// block at all -- a `fed:` destination must be rejected entirely in
+    /// that case (design §5: "reject entirely when federation block
+    /// absent"), not fall through to the generic "unknown plugin" error a
+    /// pre-Task-5 build produced.
     #[test]
-    fn fed_destination_is_rejected_as_unknown_plugin_not_as_reserved_this_cycle() {
+    fn fed_destination_is_rejected_when_federation_block_is_absent() {
         let yaml = GOOD.replace(
             "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
             "    destinations: [\"fed:phoenix/regional-chat\", \"mockb:chan\"]",
         );
         let err = parse(&yaml).unwrap_err();
-        assert!(err.contains("unknown plugin"), "err was: {err}");
-        assert!(err.contains("fed"), "err was: {err}");
+        assert!(err.contains("general"), "err should name the route: {err}");
+        assert!(err.contains("federation"), "err was: {err}");
+        assert!(!err.contains("unknown plugin"), "must not fall through to the generic plugin check: {err}");
+    }
+
+    /// A `fed:<peer>/<route>` destination naming a peer that's actually
+    /// configured in `federation.peers[]` is a valid destination -- no
+    /// `cfg.plugins` entry needed, unlike every other protocol.
+    #[test]
+    fn fed_destination_naming_a_configured_peer_is_accepted() {
+        let yaml = format!(
+            "{}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{}\"\n      addr: \"10.0.0.2:47000\"\n",
+            GOOD.replace(
+                "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+                "    destinations: [\"fed:phoenix/regional-chat\", \"mockb:chan\"]",
+            ),
+            node_id_a(),
+        );
+        parse(&yaml).unwrap_or_else(|e| panic!("a fed: destination naming a configured peer should be valid: {e}"));
+    }
+
+    #[test]
+    fn fed_destination_naming_an_unconfigured_peer_is_rejected() {
+        let yaml = format!(
+            "{}\nfederation:\n  peers:\n    - name: seattle\n      node_id: \"{}\"\n      addr: \"10.0.0.2:47000\"\n",
+            GOOD.replace(
+                "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+                "    destinations: [\"fed:phoenix/regional-chat\", \"mockb:chan\"]",
+            ),
+            node_id_a(),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("phoenix"), "err should name the unknown peer: {err}");
+        assert!(err.contains("unknown peer"), "err was: {err}");
+    }
+
+    #[test]
+    fn fed_destination_missing_the_slash_separator_is_rejected() {
+        let yaml = format!(
+            "{}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{}\"\n      addr: \"10.0.0.2:47000\"\n",
+            GOOD.replace(
+                "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+                "    destinations: [\"fed:phoenixregionalchat\", \"mockb:chan\"]",
+            ),
+            node_id_a(),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("invalid fed: destination"), "err was: {err}");
+    }
+
+    #[test]
+    fn fed_destination_with_empty_remote_route_is_rejected() {
+        let yaml = format!(
+            "{}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{}\"\n      addr: \"10.0.0.2:47000\"\n",
+            GOOD.replace(
+                "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+                "    destinations: [\"fed:phoenix/\", \"mockb:chan\"]",
+            ),
+            node_id_a(),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("remote route"), "err was: {err}");
+    }
+
+    #[test]
+    fn fed_destination_with_invalid_remote_route_charset_is_rejected() {
+        let yaml = format!(
+            "{}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{}\"\n      addr: \"10.0.0.2:47000\"\n",
+            GOOD.replace(
+                "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+                "    destinations: [\"fed:phoenix/Regional_Chat\", \"mockb:chan\"]",
+            ),
+            node_id_a(),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("Regional_Chat"), "err was: {err}");
+        assert!(err.contains("remote route"), "err was: {err}");
     }
 
     /// v0.2 example config carries no `federation:` key -- must keep

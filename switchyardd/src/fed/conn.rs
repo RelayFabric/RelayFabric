@@ -53,12 +53,14 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 
 /// One live federation connection's write handle + metadata (design §1
-/// interface, exact). Nothing in Task 4's own code reads these back out of
-/// `FedState.conns` (only inserts/removes them) -- consumed by federation
-/// egress (Task 5, not yet landed), which looks up a peer's live `tx` to
-/// send a `Fed::Envelope` through it. Same staging posture as `fed/sign.rs`'s
-/// `sign_origin`/`append_attestation`.
-#[allow(dead_code)]
+/// interface, exact). `tx` is federation egress's send handle
+/// (`engine::process_due_fed`, Task 5): looked up by peer name/node_id and
+/// used to hand a `Fed::Envelope` to this connection's own task. `node_id`/
+/// `connected_at` back `GET /v1/federation`'s `connected`/`last_seen`
+/// fields (`admin::federation`, Task 5) -- read directly rather than
+/// re-derived from whatever key this entry happens to be stored under in
+/// `FedState.conns` (a configured peer's NAME vs an unconfigured
+/// connection's raw node_id), so that lookup is uniform either way.
 pub struct PeerConn {
     pub tx: mpsc::Sender<Fed>,
     pub node_id: String,
@@ -465,7 +467,14 @@ fn handle_frame(d: &Daemon, peer_node_id: &str, peer_key: &str, frame: Fed) -> O
 /// `FedState.conns` registration key -- see
 /// `storage::Store::deliveries_for_fed_ack`'s doc comment for the scoping
 /// rationale.
-fn handle_fed_ack(d: &Daemon, peer_key: &str, id: &str) {
+///
+/// `pub(crate)` (not private): `engine`'s own egress round-trip test
+/// (`fed_egress_row_is_found_and_delivered_by_the_real_fed_ack_handler`,
+/// Task 5) drives this directly to prove `process_due_fed`'s
+/// `dest_endpoint` format is EXACTLY what this function's own
+/// `deliveries_for_fed_ack` lookup expects, end to end, rather than
+/// asserting the two sides' string formats match by inspection alone.
+pub(crate) fn handle_fed_ack(d: &Daemon, peer_key: &str, id: &str) {
     let Ok(message_id) = id.parse::<uuid::Uuid>() else {
         warn!(peer = %peer_key, "federation Ack carried a malformed envelope id");
         return;
