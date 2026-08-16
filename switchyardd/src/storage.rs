@@ -1,12 +1,17 @@
 use chrono::{DateTime, Utc};
 use relay_core::{Endpoint, Envelope};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use uuid::Uuid;
 
 pub struct Store {
     conn: Connection,
 }
+
+/// `(node_id, level, first_seen, updated_at)` -- `Store::list_trust`'s row
+/// shape (design §3), named so the return type reads cleanly rather than a
+/// four-tuple spelled out inline (clippy::type_complexity).
+pub type TrustRow = (String, String, DateTime<Utc>, DateTime<Utc>);
 
 #[derive(Debug, Clone)]
 pub struct Delivery {
@@ -129,6 +134,12 @@ CREATE TABLE IF NOT EXISTS link_challenges (
   requester_protocol TEXT NOT NULL, requester_ref TEXT NOT NULL,
   display_name TEXT NOT NULL,
   created_at TEXT NOT NULL, expires_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS node_trust (
+  node_id TEXT PRIMARY KEY,
+  level TEXT NOT NULL,
+  first_seen TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 ";
 
@@ -709,6 +720,104 @@ impl Store {
             "DELETE FROM link_challenges WHERE expires_at < ?1",
             params![ts(now)],
         )
+    }
+
+    // ---- federation trust store (design §3, §112.7) ----------------------
+
+    /// Current trust level for `node_id`, or `None` if the store has never
+    /// seen or been told about it (§112.7's implicit `unknown`, which is
+    /// never actually stored as a row -- there's nothing to record until a
+    /// handshake or config seed happens).
+    pub fn trust_level(&self, node_id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT level FROM node_trust WHERE node_id = ?1",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Records a successful handshake from a node the store has no prior
+    /// entry for, at level `seen` (design §3: "a successful handshake from
+    /// an unknown node records `seen`"). `INSERT OR IGNORE` -- if `node_id`
+    /// already has ANY row (whether `seen` from an earlier handshake, or
+    /// `verified`/`trusted`/`blocked` from config seeding), this is a no-op:
+    /// discovery/handshake must NEVER raise trust beyond `seen` (§112.7
+    /// MUST), and it must not touch a level that's already at or above it
+    /// either.
+    pub fn record_seen(&self, node_id: &str, now: DateTime<Utc>) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO node_trust (node_id, level, first_seen, updated_at)
+             VALUES (?1, 'seen', ?2, ?2)",
+            params![node_id, ts(now)],
+        )?;
+        Ok(())
+    }
+
+    /// Sets `node_id`'s trust level, config-wins semantics (design §3:
+    /// `federation.peers[]`/`trusted`/`blocked` "wins over DB on load --
+    /// re-seeded each boot"). Upserts via `ON CONFLICT DO UPDATE` rather
+    /// than a literal `INSERT OR REPLACE` specifically so `first_seen`
+    /// survives a level change on an existing row -- `INSERT OR REPLACE`
+    /// deletes-then-reinserts the row, which would stamp `first_seen` to
+    /// `now` on every boot instead of preserving when the node was truly
+    /// first observed. `updated_at` always advances to `now`, on both the
+    /// fresh-insert and the update path.
+    pub fn seed_trust(&self, node_id: &str, level: &str, now: DateTime<Utc>) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO node_trust (node_id, level, first_seen, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(node_id) DO UPDATE SET level = excluded.level, updated_at = excluded.updated_at",
+            params![node_id, level, ts(now)],
+        )?;
+        Ok(())
+    }
+
+    /// Lists every known node's trust record, node_id ascending (a stable,
+    /// deterministic order for `GET /v1/federation`-style admin listings and
+    /// tests, not any notion of recency).
+    pub fn list_trust(&self) -> rusqlite::Result<Vec<TrustRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, level, first_seen, updated_at FROM node_trust ORDER BY node_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                parse_ts(&row.get::<_, String>(2)?),
+                parse_ts(&row.get::<_, String>(3)?),
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Boot-time trust seeding (design §3): applies `federation.peers[]`
+    /// (each at its own `trust` field, validated to `verified`|`trusted`),
+    /// `federation.trusted` (⇒ `trusted`), and `federation.blocked` (⇒
+    /// `blocked`) via `seed_trust`, in that order -- so a node_id listed in
+    /// more than one place (e.g. a peer ALSO named in `blocked`, an
+    /// operator's explicit override) resolves to the LAST list it appears
+    /// in below, `blocked` always winning as the most restrictive outcome.
+    /// Called once per config load/boot (Task 4/5 wire the call site); each
+    /// call is idempotent and re-asserts config's view over whatever the DB
+    /// currently holds for those node_ids, per `seed_trust`'s config-wins
+    /// semantics.
+    pub fn seed_federation_trust(
+        &self,
+        fed: &crate::config::FederationConfig,
+        now: DateTime<Utc>,
+    ) -> rusqlite::Result<()> {
+        for peer in &fed.peers {
+            self.seed_trust(&peer.node_id, &peer.trust, now)?;
+        }
+        for node_id in &fed.trusted {
+            self.seed_trust(node_id, "trusted", now)?;
+        }
+        for node_id in &fed.blocked {
+            self.seed_trust(node_id, "blocked", now)?;
+        }
+        Ok(())
     }
 }
 
@@ -1624,5 +1733,218 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let (_d, s) = store();
         let links = s.list_links().unwrap();
         assert!(links.is_empty());
+    }
+
+    // ---- federation trust store (design §3, §112.7) ----------------------
+
+    fn node_id(byte: u8) -> String {
+        format!("rf:{}", hex::encode([byte; 32]))
+    }
+
+    fn peer(name: &str, node_id: &str, trust: &str) -> crate::config::PeerConfig {
+        crate::config::PeerConfig {
+            name: name.into(),
+            node_id: node_id.into(),
+            addr: "10.0.0.1:47000".into(),
+            trust: trust.into(),
+        }
+    }
+
+    fn fed_cfg(
+        peers: Vec<crate::config::PeerConfig>,
+        trusted: Vec<String>,
+        blocked: Vec<String>,
+    ) -> crate::config::FederationConfig {
+        crate::config::FederationConfig {
+            listen: None,
+            accept_from: "verified".into(),
+            max_hops: 4,
+            max_ttl_secs: 86_400,
+            identity_exposure: "pseudonymous".into(),
+            ingress_routes: vec![],
+            peers,
+            trusted,
+            blocked,
+        }
+    }
+
+    #[test]
+    fn trust_level_of_unknown_node_is_none() {
+        let (_d, s) = store();
+        assert_eq!(s.trust_level(&node_id(1)).unwrap(), None);
+    }
+
+    #[test]
+    fn record_seen_sets_level_seen_for_a_new_node() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        s.record_seen(&node_id(1), now).unwrap();
+        assert_eq!(s.trust_level(&node_id(1)).unwrap().as_deref(), Some("seen"));
+    }
+
+    #[test]
+    fn record_seen_never_raises_trust_beyond_seen() {
+        // §112.7 MUST: discovery/handshake never raises trust beyond `seen`.
+        // A node already seeded verified/trusted at config load must stay at
+        // that level through any number of subsequent handshakes.
+        let (_d, s) = store();
+        let now = Utc::now();
+        let id = node_id(1);
+        s.seed_trust(&id, "trusted", now).unwrap();
+        s.record_seen(&id, now + Duration::hours(1)).unwrap();
+        assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("trusted"));
+    }
+
+    #[test]
+    fn record_seen_is_idempotent_for_an_already_seen_node() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        let id = node_id(1);
+        s.record_seen(&id, now).unwrap();
+        s.record_seen(&id, now + Duration::hours(1)).unwrap();
+        assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("seen"));
+    }
+
+    #[test]
+    fn seed_trust_inserts_a_fresh_row_with_first_seen_and_updated_at_equal_to_now() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        let id = node_id(1);
+        s.seed_trust(&id, "verified", now).unwrap();
+
+        let rows = s.list_trust().unwrap();
+        assert_eq!(rows.len(), 1);
+        let (row_id, level, first_seen, updated_at) = &rows[0];
+        assert_eq!(row_id, &id);
+        assert_eq!(level, "verified");
+        assert_eq!(*first_seen, now);
+        assert_eq!(*updated_at, now);
+    }
+
+    /// The core config-wins-over-DB + first_seen-preservation matrix (design
+    /// §3): a node first observed at runtime (`record_seen`, stamping
+    /// `first_seen`) is then re-seeded from config on a later boot at a
+    /// higher level -- the level must move to what config says, but
+    /// `first_seen` must NOT reset to the reseed time; only `updated_at`
+    /// advances. This is exactly what an `INSERT OR REPLACE` would get
+    /// wrong (it would blow away `first_seen`), which is why `seed_trust`
+    /// uses `ON CONFLICT DO UPDATE` instead.
+    #[test]
+    fn seed_trust_config_wins_over_runtime_seen_level_and_preserves_first_seen() {
+        let (_d, s) = store();
+        let id = node_id(1);
+        let first_seen_at = Utc::now();
+        s.record_seen(&id, first_seen_at).unwrap();
+        assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("seen"));
+
+        let reseed_at = first_seen_at + Duration::hours(2);
+        s.seed_trust(&id, "verified", reseed_at).unwrap();
+
+        assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("verified"));
+        let (_, _, first_seen, updated_at) =
+            s.list_trust().unwrap().into_iter().find(|r| r.0 == id).unwrap();
+        assert_eq!(first_seen, first_seen_at, "first_seen must survive the level change");
+        assert_eq!(updated_at, reseed_at, "updated_at must advance to the reseed time");
+    }
+
+    /// Same shape as above but re-seeding at a LOWER-sounding level than
+    /// what's currently stored still overwrites -- `seed_trust` is a
+    /// straight config-wins set, not a monotonic ratchet (only
+    /// `record_seen` has the "never raise beyond seen" restriction; explicit
+    /// config seeding is authoritative in either direction).
+    #[test]
+    fn seed_trust_overwrites_an_existing_level_in_either_direction() {
+        let (_d, s) = store();
+        let id = node_id(1);
+        let t0 = Utc::now();
+        s.seed_trust(&id, "trusted", t0).unwrap();
+        let t1 = t0 + Duration::hours(1);
+        s.seed_trust(&id, "verified", t1).unwrap();
+        assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("verified"));
+    }
+
+    #[test]
+    fn list_trust_lists_every_node_ordered_by_node_id() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        s.seed_trust(&node_id(2), "trusted", now).unwrap();
+        s.seed_trust(&node_id(1), "verified", now).unwrap();
+        s.record_seen(&node_id(3), now).unwrap();
+
+        let rows = s.list_trust().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, node_id(1));
+        assert_eq!(rows[1].0, node_id(2));
+        assert_eq!(rows[2].0, node_id(3));
+        assert_eq!(rows[2].1, "seen");
+    }
+
+    #[test]
+    fn seed_federation_trust_seeds_peers_at_their_own_trust_field() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        let fed = fed_cfg(
+            vec![
+                peer("phoenix", &node_id(1), "trusted"),
+                peer("tucson", &node_id(2), "verified"),
+            ],
+            vec![],
+            vec![],
+        );
+        s.seed_federation_trust(&fed, now).unwrap();
+        assert_eq!(s.trust_level(&node_id(1)).unwrap().as_deref(), Some("trusted"));
+        assert_eq!(s.trust_level(&node_id(2)).unwrap().as_deref(), Some("verified"));
+    }
+
+    #[test]
+    fn seed_federation_trust_seeds_trusted_and_blocked_lists() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        let fed = fed_cfg(vec![], vec![node_id(1)], vec![node_id(2)]);
+        s.seed_federation_trust(&fed, now).unwrap();
+        assert_eq!(s.trust_level(&node_id(1)).unwrap().as_deref(), Some("trusted"));
+        assert_eq!(s.trust_level(&node_id(2)).unwrap().as_deref(), Some("blocked"));
+    }
+
+    /// A node_id listed both as a `verified` peer AND in `blocked` (an
+    /// operator override -- e.g. temporarily blocking a misbehaving
+    /// configured peer without deleting its peer entry) must end up
+    /// `blocked`: `seed_federation_trust` applies `blocked` last precisely
+    /// so it wins any such conflict, the most restrictive outcome.
+    #[test]
+    fn seed_federation_trust_blocked_overrides_a_peer_entry_for_the_same_node() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        let id = node_id(1);
+        let fed = fed_cfg(vec![peer("phoenix", &id, "trusted")], vec![], vec![id.clone()]);
+        s.seed_federation_trust(&fed, now).unwrap();
+        assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("blocked"));
+    }
+
+    /// Re-running boot seeding (design §3: "re-seeded each boot") against a
+    /// node the DB already has a runtime-learned `first_seen` for must not
+    /// reset that `first_seen`, across multiple config-seed calls -- the
+    /// full "config wins over DB on load" story end to end via the
+    /// aggregate boot-seeding entry point, not just the underlying
+    /// `seed_trust` primitive.
+    #[test]
+    fn seed_federation_trust_preserves_first_seen_across_repeated_boots() {
+        let (_d, s) = store();
+        let id = node_id(1);
+        let first_seen_at = Utc::now();
+        s.record_seen(&id, first_seen_at).unwrap();
+
+        let boot1 = first_seen_at + Duration::hours(1);
+        let fed = fed_cfg(vec![peer("phoenix", &id, "verified")], vec![], vec![]);
+        s.seed_federation_trust(&fed, boot1).unwrap();
+
+        let boot2 = boot1 + Duration::hours(1);
+        s.seed_federation_trust(&fed, boot2).unwrap();
+
+        let (_, level, first_seen, updated_at) =
+            s.list_trust().unwrap().into_iter().find(|r| r.0 == id).unwrap();
+        assert_eq!(level, "verified");
+        assert_eq!(first_seen, first_seen_at, "first_seen must survive repeated re-seeding");
+        assert_eq!(updated_at, boot2);
     }
 }

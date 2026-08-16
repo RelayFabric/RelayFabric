@@ -50,6 +50,18 @@ pub struct Config {
     pub limits: Limits,
     #[serde(default)]
     pub transport_budgets: BTreeMap<String, Budget>,
+    /// Design §3/§4, cycle F: absent entirely (every pre-cycle-F config,
+    /// including the v0.2 example config) means federation is off, exactly
+    /// like today -- no Noise listener, no fed egress/ingress, no trust
+    /// seeding. `apply_config` (engine.rs) treats ANY change to this block
+    /// as `"daemon"` restart-required this cycle: live fed reconfig
+    /// (rebinding the listener, tearing down/rekeying live peer
+    /// connections against a changed `peers`/`accept_from`/etc without a
+    /// restart) is deferred to a later cycle, so a config write here only
+    /// takes effect on next daemon start, unlike routes/policies/limits/
+    /// render/identity_mode.
+    #[serde(default)]
+    pub federation: Option<FederationConfig>,
 }
 
 fn default_ttl() -> u64 { 86_400 }
@@ -187,6 +199,90 @@ impl Default for RenderConfig {
 }
 
 fn default_render_tag() -> String { "alias".to_string() }
+
+/// Federation policy config (design §3/§4, cycle F). `PartialEq`/`Eq` power
+/// `Daemon::apply_config`'s restart-required diff (see `Config::federation`'s
+/// doc comment): the whole block compares as one unit, so any field change
+/// anywhere in here -- including a peer added/removed/edited -- trips the
+/// `"daemon"` restart entry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct FederationConfig {
+    /// Optional: absent means outbound-only (no Noise listener bound).
+    #[serde(default)]
+    pub listen: Option<String>,
+    /// "verified" (default) or "trusted" -- minimum trust store level
+    /// (`storage::Store::trust_level`) an origin/attestation chain's signer
+    /// must have for an inbound envelope to be accepted (design §3).
+    #[serde(default = "default_accept_from")]
+    pub accept_from: String,
+    /// Inbound envelopes at or over this hop count are dead_lettered
+    /// `HOP_LIMIT` (design §5).
+    #[serde(default = "default_max_hops")]
+    pub max_hops: u32,
+    /// Inbound TTL is clamped down to this many seconds (design §4).
+    #[serde(default = "default_max_ttl_secs")]
+    pub max_ttl_secs: u64,
+    /// "pseudonymous" (default) or "full" -- outbound source ref handling
+    /// (design §4).
+    #[serde(default = "default_identity_exposure")]
+    pub identity_exposure: String,
+    /// Local route names federated peers may inject an ingress envelope
+    /// into (design §4). Default empty: no route accepts fed ingress unless
+    /// explicitly listed here.
+    #[serde(default)]
+    pub ingress_routes: Vec<String>,
+    #[serde(default)]
+    pub peers: Vec<PeerConfig>,
+    /// Extra node_ids seeded to trust level `trusted` at boot, beyond
+    /// whatever `peers[].trust` already grants (design §3).
+    #[serde(default)]
+    pub trusted: Vec<String>,
+    /// Node_ids seeded to trust level `blocked` at boot; a blocked peer's
+    /// connection is refused at handshake (design §3).
+    #[serde(default)]
+    pub blocked: Vec<String>,
+}
+
+fn default_accept_from() -> String {
+    "verified".to_string()
+}
+fn default_max_hops() -> u32 {
+    4
+}
+fn default_max_ttl_secs() -> u64 {
+    86_400
+}
+fn default_identity_exposure() -> String {
+    "pseudonymous".to_string()
+}
+
+/// One configured federation peer (design §4 YAML `federation.peers[]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PeerConfig {
+    pub name: String,
+    /// `"rf:" + 64 hex chars` -- the peer's Ed25519 public key, cycle-A
+    /// format (see `node_identity::NodeIdentity::node_id`).
+    pub node_id: String,
+    pub addr: String,
+    /// "verified" (default) or "trusted" -- this peer's trust store level,
+    /// seeded at boot (design §3: "peers[] entries with node_id ⇒ at least
+    /// verified").
+    #[serde(default = "default_peer_trust")]
+    pub trust: String,
+}
+
+fn default_peer_trust() -> String {
+    "verified".to_string()
+}
+
+/// Protocol name reserved for federation (design §4/§5): no plugin may
+/// claim it, and no route SOURCE may claim it as a source protocol -- a fed
+/// envelope is injected into a route's fan-out programmatically (design
+/// §5 ingress), never received the way a plugin's inbound traffic is.
+/// Route DESTINATIONS are deliberately NOT restricted here: Task 5 teaches
+/// `fed:<peer_name>/<remote_route>` as a valid destination endpoint (design
+/// §5 egress) -- validating that shape is Task 5's job, not this one's.
+pub const FED_PROTOCOL: &str = "fed";
 
 fn endpoints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Endpoint>, D::Error> {
     let raw: Vec<String> = Vec::deserialize(d)?;
@@ -340,6 +436,12 @@ fn warn_if_public_with_no_limits(cfg: &Config) {
 }
 
 pub fn validate(cfg: &Config) -> Result<(), String> {
+    if cfg.plugins.contains_key(FED_PROTOCOL) {
+        return Err(format!(
+            "plugin name '{FED_PROTOCOL}' is reserved for federation (design §4/§5) and cannot be used as a plugin name"
+        ));
+    }
+
     let mut names = BTreeSet::new();
     for r in &cfg.routes {
         if r.name == IDENTITY_ROUTE {
@@ -366,6 +468,12 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             return Err(format!(
                 "route '{}' has render.max_chars {} which is below the minimum of 16 (0 disables route-level truncation)",
                 r.name, r.render.max_chars
+            ));
+        }
+        if r.sources.iter().any(|ep| ep.protocol == FED_PROTOCOL) {
+            return Err(format!(
+                "route '{}' has a source with protocol '{FED_PROTOCOL}', which is reserved for federation and cannot be a route source (fed envelopes are injected into a route's fan-out directly, design §5 ingress)",
+                r.name
             ));
         }
         for ep in r.sources.iter().chain(&r.destinations) {
@@ -469,7 +577,108 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         }
     }
 
+    validate_federation(cfg)?;
+
     Ok(())
+}
+
+/// Design §3/§4 validation for the (optional) `federation` block. A no-op
+/// when the block is absent -- every pre-cycle-F config, including the
+/// v0.2 example config, must keep loading unchanged.
+fn validate_federation(cfg: &Config) -> Result<(), String> {
+    let Some(fed) = &cfg.federation else {
+        return Ok(());
+    };
+
+    if fed.accept_from != "verified" && fed.accept_from != "trusted" {
+        return Err(format!(
+            "federation.accept_from '{}' is invalid (expected \"verified\" or \"trusted\")",
+            fed.accept_from
+        ));
+    }
+    if fed.identity_exposure != "pseudonymous" && fed.identity_exposure != "full" {
+        return Err(format!(
+            "federation.identity_exposure '{}' is invalid (expected \"pseudonymous\" or \"full\")",
+            fed.identity_exposure
+        ));
+    }
+    if let Some(listen) = &fed.listen {
+        if listen.parse::<std::net::SocketAddr>().is_err() {
+            return Err(format!(
+                "federation.listen '{listen}' is not a valid address (expected host:port)"
+            ));
+        }
+    }
+
+    let route_names: BTreeSet<&String> = cfg.routes.iter().map(|r| &r.name).collect();
+    for name in &fed.ingress_routes {
+        if !route_names.contains(name) {
+            return Err(format!(
+                "federation.ingress_routes names unknown route '{name}'"
+            ));
+        }
+    }
+
+    let mut peer_names = BTreeSet::new();
+    for p in &fed.peers {
+        if !is_valid_peer_name(&p.name) {
+            return Err(format!(
+                "federation peer name '{}' is invalid (expected 1-32 chars of [a-z0-9-])",
+                p.name
+            ));
+        }
+        if !peer_names.insert(&p.name) {
+            return Err(format!("duplicate federation peer name '{}'", p.name));
+        }
+        if !is_valid_rf_node_id(&p.node_id) {
+            return Err(format!(
+                "federation peer '{}' has invalid node_id '{}' (expected \"rf:\" + 64 hex chars)",
+                p.name, p.node_id
+            ));
+        }
+        if p.addr.parse::<std::net::SocketAddr>().is_err() {
+            return Err(format!(
+                "federation peer '{}' has invalid addr '{}' (expected host:port)",
+                p.name, p.addr
+            ));
+        }
+        if p.trust != "verified" && p.trust != "trusted" {
+            return Err(format!(
+                "federation peer '{}' has invalid trust '{}' (expected \"verified\" or \"trusted\")",
+                p.name, p.trust
+            ));
+        }
+    }
+
+    for node_id in fed.trusted.iter().chain(&fed.blocked) {
+        if !is_valid_rf_node_id(node_id) {
+            return Err(format!(
+                "federation node_id '{node_id}' is invalid (expected \"rf:\" + 64 hex chars)"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// DNS-label-ish peer name check (design §4: "names unique + DNS-label-ish"):
+/// 1-32 chars, each an ASCII lowercase letter, digit, or hyphen. No regex
+/// dependency needed for a character class this small.
+fn is_valid_peer_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// `"rf:" + 64 hex chars` format check (cycle-A node identity format, design
+/// §4/§112.6) -- the same shape `node_identity::verify` parses, duplicated
+/// here as a pure format check (config validation has no key material to
+/// verify against, just the string shape).
+fn is_valid_rf_node_id(s: &str) -> bool {
+    match s.strip_prefix("rf:") {
+        Some(hex_part) => hex_part.len() == 64 && hex_part.chars().all(|c| c.is_ascii_hexdigit()),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -1254,5 +1463,305 @@ routes:
         std::fs::write(&cfg_path, &raw).unwrap();
         let cfg = load(&cfg_path).unwrap();
         assert_eq!(cfg.plugins["mqtt"].config["broker"], serde_yaml::Value::String("mqtt://127.0.0.1:1883".into()));
+    }
+
+    // ---- federation (design §3/§4, cycle F) --------------------------------
+
+    const FED_BASE: &str = r#"
+node:
+  name: test-node
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+routes:
+  - name: regional-chat
+    sources: ["mocka:chan"]
+    destinations: ["mockb:chan"]
+"#;
+
+    fn node_id_a() -> String { format!("rf:{}", "ab".repeat(32)) }
+    fn node_id_b() -> String { format!("rf:{}", "cd".repeat(32)) }
+    fn node_id_c() -> String { format!("rf:{}", "ef".repeat(32)) }
+
+    #[test]
+    fn federation_block_absent_is_valid_and_field_is_none() {
+        // v0.1/pre-cycle-F config has no `federation:` key at all.
+        let cfg = parse(GOOD).unwrap();
+        assert!(cfg.federation.is_none());
+    }
+
+    #[test]
+    fn federation_full_block_matches_design_4_yaml_exactly() {
+        let yaml = format!(
+            r#"{FED_BASE}
+federation:
+  listen: "127.0.0.1:47000"
+  accept_from: trusted
+  max_hops: 6
+  max_ttl_secs: 3600
+  identity_exposure: full
+  ingress_routes: [regional-chat]
+  peers:
+    - name: phoenix
+      node_id: "{a}"
+      addr: "10.0.0.2:47000"
+      trust: trusted
+  trusted: ["{b}"]
+  blocked: ["{c}"]
+"#,
+            a = node_id_a(), b = node_id_b(), c = node_id_c(),
+        );
+        let cfg = parse(&yaml).unwrap_or_else(|e| panic!("full federation block should be valid: {e}"));
+        let fed = cfg.federation.unwrap();
+        assert_eq!(fed.listen.as_deref(), Some("127.0.0.1:47000"));
+        assert_eq!(fed.accept_from, "trusted");
+        assert_eq!(fed.max_hops, 6);
+        assert_eq!(fed.max_ttl_secs, 3600);
+        assert_eq!(fed.identity_exposure, "full");
+        assert_eq!(fed.ingress_routes, vec!["regional-chat".to_string()]);
+        assert_eq!(fed.peers.len(), 1);
+        assert_eq!(fed.peers[0].name, "phoenix");
+        assert_eq!(fed.peers[0].node_id, node_id_a());
+        assert_eq!(fed.peers[0].addr, "10.0.0.2:47000");
+        assert_eq!(fed.peers[0].trust, "trusted");
+        assert_eq!(fed.trusted, vec![node_id_b()]);
+        assert_eq!(fed.blocked, vec![node_id_c()]);
+    }
+
+    #[test]
+    fn federation_minimal_block_defaults_every_optional_field() {
+        let yaml = format!("{FED_BASE}\nfederation: {{}}\n");
+        let cfg = parse(&yaml).unwrap();
+        let fed = cfg.federation.unwrap();
+        assert_eq!(fed.listen, None, "absent listen = outbound-only node");
+        assert_eq!(fed.accept_from, "verified");
+        assert_eq!(fed.max_hops, 4);
+        assert_eq!(fed.max_ttl_secs, 86_400);
+        assert_eq!(fed.identity_exposure, "pseudonymous");
+        assert!(fed.ingress_routes.is_empty(), "default: no route accepts fed ingress");
+        assert!(fed.peers.is_empty());
+        assert!(fed.trusted.is_empty());
+        assert!(fed.blocked.is_empty());
+    }
+
+    #[test]
+    fn federation_peer_trust_defaults_to_verified_when_absent() {
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{a}\"\n      addr: \"10.0.0.2:47000\"\n",
+            a = node_id_a(),
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.federation.unwrap().peers[0].trust, "verified");
+    }
+
+    #[test]
+    fn federation_rejects_invalid_accept_from() {
+        let yaml = format!("{FED_BASE}\nfederation:\n  accept_from: maybe\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("accept_from"), "err was: {err}");
+        assert!(err.contains("maybe"), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_rejects_invalid_identity_exposure() {
+        let yaml = format!("{FED_BASE}\nfederation:\n  identity_exposure: nope\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("identity_exposure"), "err was: {err}");
+        assert!(err.contains("nope"), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_rejects_invalid_listen_address() {
+        let yaml = format!("{FED_BASE}\nfederation:\n  listen: \"not-an-addr\"\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("listen"), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_rejects_ingress_route_naming_an_unknown_route() {
+        let yaml = format!("{FED_BASE}\nfederation:\n  ingress_routes: [ghost-route]\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("ingress_routes"), "err was: {err}");
+        assert!(err.contains("ghost-route"), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_ingress_routes_naming_an_existing_route_is_ok() {
+        let yaml = format!("{FED_BASE}\nfederation:\n  ingress_routes: [regional-chat]\n");
+        assert!(parse(&yaml).is_ok());
+    }
+
+    #[test]
+    fn federation_rejects_duplicate_peer_names() {
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{a}\"\n      addr: \"10.0.0.2:47000\"\n    - name: phoenix\n      node_id: \"{b}\"\n      addr: \"10.0.0.3:47000\"\n",
+            a = node_id_a(), b = node_id_b(),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("duplicate"), "err was: {err}");
+        assert!(err.contains("phoenix"), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_rejects_peer_name_with_invalid_characters() {
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: \"Phoenix_AZ\"\n      node_id: \"{a}\"\n      addr: \"10.0.0.2:47000\"\n",
+            a = node_id_a(),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("Phoenix_AZ"), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_rejects_peer_name_over_32_chars() {
+        let long_name = "a".repeat(33);
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: \"{long_name}\"\n      node_id: \"{a}\"\n      addr: \"10.0.0.2:47000\"\n",
+            a = node_id_a(),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains(&long_name), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_accepts_peer_name_at_the_32_char_ceiling() {
+        let name = "a".repeat(32);
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: \"{name}\"\n      node_id: \"{a}\"\n      addr: \"10.0.0.2:47000\"\n",
+            a = node_id_a(),
+        );
+        let cfg = parse(&yaml).unwrap_or_else(|e| panic!("32-char name should be valid: {e}"));
+        assert_eq!(cfg.federation.unwrap().peers[0].name, name);
+    }
+
+    #[test]
+    fn federation_rejects_malformed_peer_node_id_missing_prefix() {
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"not-rf-formatted\"\n      addr: \"10.0.0.2:47000\"\n",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("node_id"), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_rejects_peer_node_id_with_wrong_hex_length() {
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"rf:abcd\"\n      addr: \"10.0.0.2:47000\"\n",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("node_id"), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_rejects_peer_node_id_with_non_hex_characters() {
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"rf:{}\"\n      addr: \"10.0.0.2:47000\"\n",
+            "zz".repeat(32),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("node_id"), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_rejects_invalid_peer_addr() {
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{a}\"\n      addr: \"not-an-addr\"\n",
+            a = node_id_a(),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("addr"), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_rejects_invalid_peer_trust() {
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{a}\"\n      addr: \"10.0.0.2:47000\"\n      trust: superfan\n",
+            a = node_id_a(),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("trust"), "err was: {err}");
+        assert!(err.contains("superfan"), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_rejects_malformed_trusted_entry() {
+        let yaml = format!("{FED_BASE}\nfederation:\n  trusted: [\"not-rf\"]\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("not-rf"), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_rejects_malformed_blocked_entry() {
+        let yaml = format!("{FED_BASE}\nfederation:\n  blocked: [\"not-rf\"]\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("not-rf"), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_valid_trusted_and_blocked_entries_are_ok() {
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  trusted: [\"{a}\"]\n  blocked: [\"{b}\"]\n",
+            a = node_id_a(), b = node_id_b(),
+        );
+        let cfg = parse(&yaml).unwrap();
+        let fed = cfg.federation.unwrap();
+        assert_eq!(fed.trusted, vec![node_id_a()]);
+        assert_eq!(fed.blocked, vec![node_id_b()]);
+    }
+
+    #[test]
+    fn fed_reserved_as_plugin_name_is_rejected() {
+        let yaml = GOOD.replace(
+            "  mocka:\n    enabled: true",
+            "  mocka:\n    enabled: true\n  fed:\n    enabled: true",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("fed"), "err was: {err}");
+        assert!(err.contains("reserved"), "err was: {err}");
+    }
+
+    #[test]
+    fn fed_reserved_as_route_source_protocol_is_rejected() {
+        let yaml = GOOD.replace(
+            "    sources: [\"mocka:chan\", \"mockb:chan\"]",
+            "    sources: [\"fed:phoenix/regional-chat\", \"mockb:chan\"]",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("fed"), "err was: {err}");
+        assert!(err.contains("general"), "err should name the route: {err}");
+        assert!(err.contains("source"), "err was: {err}");
+    }
+
+    /// This task deliberately does NOT special-case `fed:` route
+    /// DESTINATIONS (design §5 egress is Task 5's job) -- a `fed:`
+    /// destination is still rejected today, but for the SAME reason any
+    /// other undefined-protocol destination would be ("unknown plugin"),
+    /// proving the new reserved-name check didn't accidentally start firing
+    /// on destinations too and swallow that distinct, pre-existing error
+    /// path. Task 5 replaces this behavior for destinations specifically.
+    #[test]
+    fn fed_destination_is_rejected_as_unknown_plugin_not_as_reserved_this_cycle() {
+        let yaml = GOOD.replace(
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+            "    destinations: [\"fed:phoenix/regional-chat\", \"mockb:chan\"]",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("unknown plugin"), "err was: {err}");
+        assert!(err.contains("fed"), "err was: {err}");
+    }
+
+    /// v0.2 example config carries no `federation:` key -- must keep
+    /// validating exactly as it did before this task's additions.
+    #[test]
+    fn example_config_has_no_federation_block_and_stays_valid() {
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/relayfabric.example.yaml"),
+        ).unwrap();
+        let cfg: Config = serde_yaml::from_str(&raw).unwrap();
+        assert!(cfg.federation.is_none());
+        assert!(validate(&cfg).is_ok());
     }
 }

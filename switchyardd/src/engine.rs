@@ -203,6 +203,15 @@ impl Daemon {
     /// already validated `new` (see `config::validate`) -- this method
     /// trusts it as-is and never fails.
     ///
+    /// `federation` (design §3/§4, cycle F) is the one exception to "no
+    /// restart needed": ANY change to the block -- listener address, peer
+    /// list, accept_from, ingress_routes, anything -- reports the
+    /// `"daemon"` restart entry, the same as `node.*`. Live fed reconfig
+    /// (rebinding the Noise listener, tearing down/renegotiating already-
+    /// connected peers whose config just changed) is deferred to a later
+    /// cycle; this cycle a federation config edit only takes effect on the
+    /// next daemon start.
+    ///
     /// CALLERS MUST CONSTRUCT `new` VIA `config::load_from_str`, never a
     /// bare parse: the restart-required diff below compares `cfg.plugins`
     /// (always resolved -- it's whatever the daemon is running with) against
@@ -239,6 +248,9 @@ impl Daemon {
         let (dedup_ttl_secs, sender_mm, sender_bph) = {
             let mut cfg = self.cfg.write().unwrap();
             if cfg.node != new.node {
+                restart_required.push("daemon".to_string());
+            }
+            if cfg.federation != new.federation {
                 restart_required.push("daemon".to_string());
             }
             let old_names: BTreeSet<&String> = cfg.plugins.keys().collect();
@@ -1350,6 +1362,7 @@ pub mod tests_support {
             public_services,
             limits,
             transport_budgets,
+            federation: None,
         };
         Daemon::new(cfg, dir).unwrap()
     }
@@ -3003,6 +3016,64 @@ mod tests {
         new_cfg.node.public = !new_cfg.node.public;
         let outcome = d.apply_config(new_cfg);
         assert_eq!(outcome.restart_required, vec!["daemon".to_string()]);
+    }
+
+    fn test_federation_config() -> crate::config::FederationConfig {
+        crate::config::FederationConfig {
+            listen: None,
+            accept_from: "verified".into(),
+            max_hops: 4,
+            max_ttl_secs: 86_400,
+            identity_exposure: "pseudonymous".into(),
+            ingress_routes: vec![],
+            peers: vec![],
+            trusted: vec![],
+            blocked: vec![],
+        }
+    }
+
+    /// Design §3/§4, cycle F: `test_daemon` starts with `federation: None`
+    /// (no block at all) -- adding one is exactly as restart-required as any
+    /// other federation-block change, under the same `"daemon"` pseudo-entry
+    /// `node.*` changes use.
+    #[test]
+    fn apply_config_federation_block_added_is_restart_required_under_daemon_pseudo_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.federation = Some(test_federation_config());
+        let outcome = d.apply_config(new_cfg);
+        assert_eq!(outcome.restart_required, vec!["daemon".to_string()]);
+    }
+
+    /// A field-level edit inside an already-present federation block (not
+    /// just adding/removing the block itself) must also trip the `"daemon"`
+    /// restart entry -- design §3/§4's "ANY change to the federation block"
+    /// this cycle (live fed reconfig deferred).
+    #[test]
+    fn apply_config_federation_field_change_is_restart_required_under_daemon_pseudo_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().federation = Some(test_federation_config());
+
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.federation.as_mut().unwrap().max_hops = 6;
+        let outcome = d.apply_config(new_cfg);
+        assert_eq!(outcome.restart_required, vec!["daemon".to_string()]);
+    }
+
+    /// Re-applying an UNCHANGED federation block must not report a restart
+    /// -- the diff is a real equality check, not "federation present at
+    /// all ⇒ always restart".
+    #[test]
+    fn apply_config_federation_block_unchanged_has_no_restart_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().federation = Some(test_federation_config());
+
+        let new_cfg = d.cfg.read().unwrap().clone();
+        let outcome = d.apply_config(new_cfg);
+        assert!(outcome.restart_required.is_empty(), "outcome was: {outcome:?}");
     }
 
     #[test]
