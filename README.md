@@ -8,8 +8,7 @@ plugins. MeshCore uses the native MIT Companion Radio Protocol (spec §8's
 preferred style), while Meshtastic uses MQTT (licensing favors it). Initial
 target networks: Reticulum/LXMF, Signal, Meshtastic, MeshCore, Bitchat, Nostr.
 
-**Status:** v0.2 complete — MeshCore, MQTT, LXMF, Signal, Meshtastic; public
-nodes, identity linking, secret refs, plugin metrics, per-route rendering.
+**Status:** v0.2 complete; WebUI-ready admin API (config apply/reload, SSE events).
 
 ## Components
 

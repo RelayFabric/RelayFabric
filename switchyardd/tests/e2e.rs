@@ -92,6 +92,25 @@ routes:
     identity_mode: linked
 "#;
 
+// Task 5's full-workflow e2e (design §Testing): one route, two plugins --
+// deliberately smaller than CONFIG above (no third "attach" route/plugin),
+// since this test's whole point is a SECOND route the workflow itself adds
+// via PUT /v1/config, not anything pre-wired.
+const WEBUI_WORKFLOW_CONFIG: &str = r#"
+node:
+  name: e2e-webui-workflow
+  data_dir: DATA_DIR
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan"]
+    destinations: ["mockb:chan"]
+"#;
+
 // keep test output pristine: the daemon logs via tracing to stdout/stderr,
 // which is irrelevant noise for these tests and must not pollute `cargo test`
 // output.
@@ -264,6 +283,56 @@ async fn poll_until_contains(sock: &Path, path: &str, needle: &str) -> String {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("timed out waiting for {path} to contain {needle:?}; last body: {last}");
+}
+
+/// Opens a raw HTTP/1.0 SSE connection to `/v1/events`, mirroring
+/// `events_stream_over_http_1_0_flushes_incrementally_not_buffered_to_eof`'s
+/// wire framing (switchyardctl is a separate binary crate, unreachable from
+/// here -- see that test's doc comment). Returns the still-open stream; the
+/// caller drives it with `poll_stream_until_contains` below rather than ever
+/// reading to EOF, since `/v1/events` streams for as long as the daemon is
+/// alive.
+async fn open_events_stream(sock: &Path) -> UnixStream {
+    use tokio::io::AsyncWriteExt;
+    let mut s = UnixStream::connect(sock).await.unwrap();
+    s.write_all(b"GET /v1/events HTTP/1.0\r\nhost: x\r\n\r\n").await.unwrap();
+    s
+}
+
+/// Polls an already-open SSE stream (`open_events_stream`) with a bounded
+/// per-attempt read timeout, appending every byte read into `collected`,
+/// until `collected` contains `needle` -- the same "poll rather than
+/// sleep-and-hope" convention as `poll_until_contains`, adapted for a
+/// stream that never reaches EOF on its own while the daemon is alive.
+async fn poll_stream_until_contains(s: &mut UnixStream, collected: &mut String, needle: &str) {
+    poll_stream_until_count(s, collected, needle, 1).await;
+}
+
+/// Like `poll_stream_until_contains`, but waits until `needle` has appeared
+/// at least `min_count` times -- for asserting a REPEAT of an event type the
+/// buffer already contains (e.g. rollback's second `config_applied`).
+async fn poll_stream_until_count(
+    s: &mut UnixStream, collected: &mut String, needle: &str, min_count: usize,
+) {
+    use tokio::io::AsyncReadExt;
+    if collected.matches(needle).count() >= min_count {
+        return;
+    }
+    let mut buf = [0u8; 4096];
+    for _ in 0..100 {
+        match timeout(Duration::from_millis(100), s.read(&mut buf)).await {
+            Ok(Ok(0)) => break, // EOF -- shouldn't happen while the daemon is alive
+            Ok(Ok(n)) => {
+                collected.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if collected.matches(needle).count() >= min_count {
+                    return;
+                }
+            }
+            Ok(Err(e)) => panic!("SSE read error: {e}"),
+            Err(_) => continue, // no bytes ready this tick -- keep polling
+        }
+    }
+    panic!("timed out waiting for SSE stream to contain {needle:?} x{min_count}; collected so far: {collected}");
 }
 
 #[tokio::test]
@@ -910,4 +979,107 @@ async fn events_stream_over_http_1_0_flushes_incrementally_not_buffered_to_eof()
     assert!(collected.contains("\"routes\":[\"general\"]"), "stream: {collected}");
     assert!(!collected.contains("!e2e-sender"), "full native ref leaked: {collected}");
     assert!(!collected.contains("hello over sse"), "message body leaked: {collected}");
+}
+
+/// Task 5's full-workflow e2e (design §Testing): boots a daemon with one
+/// route, reads the live config back byte-for-byte, opens an SSE connection,
+/// PUTs a mutated config that adds a second route, drives a message over
+/// that brand-new route with no restart, confirms the workflow's three
+/// signature events (`config_applied`, `ingress`, `delivery`) all arrived on
+/// the SSE feed, then rolls the config back and confirms the added route is
+/// gone -- CONTROLLER RULING (pre-flight): a message aimed at the
+/// now-rolled-back route matches ZERO routes post-rollback (the route no
+/// longer exists to dead-letter against), so the negative assertion is
+/// "never arrives as a Send", not "arrives as a dead letter".
+#[tokio::test]
+async fn config_apply_reload_and_events_full_workflow() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = start_daemon_with_config(dir, WEBUI_WORKFLOW_CONFIG);
+    wait_for(&d.plugin_sock()).await;
+    wait_for(&d.admin_sock()).await;
+    let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
+    let (mut rb, mut wb) = connect_plugin(&d.plugin_sock(), "mockb").await;
+
+    // ---- 1. GET /v1/config byte-equals the file on disk -------------------
+    let cfg_path = d.dir.path().join("relayfabric.yaml");
+    let original_text = std::fs::read_to_string(&cfg_path).unwrap();
+    let served = admin_get(&d.admin_sock(), "/v1/config").await;
+    assert_eq!(served, original_text, "GET /v1/config must serve the file verbatim");
+
+    // ---- 2. open the SSE connection BEFORE the mutation --------------------
+    let mut sse = open_events_stream(&d.admin_sock()).await;
+    let mut sse_buf = String::new();
+
+    // ---- 3. PUT a mutated config adding a second route ("extra"), reusing
+    // the already-enabled mocka/mockb -- restart_required must be empty
+    // (design §1: a route-only change never needs a restart).
+    let mutated_text = format!(
+        "{original_text}  - name: extra\n    sources: [\"mocka:newchan\"]\n    destinations: [\"mockb:chan\"]\n"
+    );
+    let (status, body) =
+        admin_request(&d.admin_sock(), "PUT", "/v1/config", Some(&mutated_text)).await;
+    assert_eq!(status, 200, "body was: {body}");
+    assert_eq!(body, "{\"applied\":true,\"restart_required\":[]}",
+        "adding a route alone must never require a restart: {body}");
+
+    // the new route is visible immediately (the PUT handler applies before
+    // responding -- no poll needed for this read).
+    let routes_after_put = admin_get(&d.admin_sock(), "/v1/routes").await;
+    assert!(routes_after_put.contains("\"name\":\"extra\""),
+        "new route missing from /v1/routes: {routes_after_put}");
+
+    // SSE must have already seen config_applied with an empty restart list.
+    poll_stream_until_contains(&mut sse, &mut sse_buf, "event: config_applied").await;
+    assert!(sse_buf.contains("\"restart_required\":[]"), "sse: {sse_buf}");
+
+    // ---- 4. drive a message over the NEW route -- live, no restart --------
+    inbound(&mut wa, "newchan", "!e2e-workflow-sender", "hello via the new route",
+        chrono::Utc::now()).await;
+    let (corr, endpoint, body, _) = expect_send(&mut rb).await;
+    // `endpoint` here is the DESTINATION channel ("extra" route's
+    // `mockb:chan`), not the source endpoint ("newchan") the inbound
+    // arrived on -- those are independent namespaces.
+    assert_eq!(endpoint, "chan");
+    assert!(body.contains("hello via the new route"), "body was: {body}");
+    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
+        corr, delivered: true, detail: None,
+    }).await.unwrap();
+
+    // SSE must have seen the ingress (routed onto "extra") and the delivery
+    // (delivered, on "extra") for this exact message.
+    poll_stream_until_contains(&mut sse, &mut sse_buf, "event: ingress").await;
+    assert!(sse_buf.contains("\"routes\":[\"extra\"]"), "sse: {sse_buf}");
+    poll_stream_until_contains(&mut sse, &mut sse_buf, "event: delivery").await;
+    assert!(sse_buf.contains("\"route\":\"extra\""), "sse: {sse_buf}");
+    assert!(sse_buf.contains("\"state\":\"delivered\""), "sse: {sse_buf}");
+    assert!(!sse_buf.contains("!e2e-workflow-sender"), "full native ref leaked: {sse_buf}");
+    assert!(!sse_buf.contains("hello via the new route"), "message body leaked: {sse_buf}");
+
+    // ---- 5. rollback: old (one-route) config becomes live again -----------
+    let (status, body) =
+        admin_request(&d.admin_sock(), "POST", "/v1/config/rollback", None).await;
+    assert_eq!(status, 200, "body was: {body}");
+    assert_eq!(body, "{\"applied\":true,\"restart_required\":[]}", "body was: {body}");
+
+    let config_after_rollback = admin_get(&d.admin_sock(), "/v1/config").await;
+    assert_eq!(config_after_rollback, original_text,
+        "rollback must restore the original config text verbatim");
+
+    let routes_after_rollback = admin_get(&d.admin_sock(), "/v1/routes").await;
+    assert!(!routes_after_rollback.contains("\"name\":\"extra\""),
+        "rolled-back route must no longer be listed: {routes_after_rollback}");
+
+    // Rollback re-applies the previous config through the same apply_config
+    // path as PUT, so the stream must carry a SECOND config_applied event.
+    poll_stream_until_count(&mut sse, &mut sse_buf, "event: config_applied", 2).await;
+
+    // ---- 6. bounded negative: a message aimed at the now-gone route is ----
+    // dropped (matches zero routes), never bridged as a Send -- NOT a dead
+    // letter, since the route itself no longer exists (CONTROLLER RULING).
+    inbound(&mut wa, "newchan", "!e2e-workflow-sender", "should never arrive post-rollback",
+        chrono::Utc::now()).await;
+    assert!(
+        timeout(Duration::from_secs(2), read_frame::<_, DaemonToPlugin>(&mut rb)).await.is_err(),
+        "a message on the rolled-back route's endpoint was bridged anyway"
+    );
 }

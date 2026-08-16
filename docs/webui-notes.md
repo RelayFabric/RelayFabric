@@ -67,3 +67,13 @@ Remote access via SSH tunnel / WireGuard / Tailscale / mTLS reverse proxy.
 Remote configuration supports TLS, WebAuthn/passkeys, RBAC, session
 expiration, audit logging. Roles per spec §78; identity-linking permissions
 stay separate from route management (correlation data is more sensitive).
+
+## Shipped API surface (v0.2+)
+
+- `GET /v1/config` — raw YAML, secrets unresolved
+- `POST /v1/config/validate` — dry-run validation, 422 on error
+- `PUT /v1/config` — apply a new config; writes + one-revision `.prev` history
+- `POST /v1/config/rollback` — restore previous config; 404 (none) / 409 (env drift)
+- `GET /v1/events` — SSE: ingress, delivery, plugin, link_verified, config_applied
+- `GET /v1/routes` — per-route identity_mode, render knobs, matched policies
+- `GET /v1/plugins` — per-plugin connection state, capabilities, gauges
