@@ -530,7 +530,14 @@ pub fn handle_result(d: &Daemon, corr: i64, delivered: bool, detail: Option<Stri
         if let Some(delivery) = store.deliveries_for_id(corr) {
             metrics::inc_route(&delivery.route);
             if let Ok(Some(env)) = store.get_message(delivery.message_id) {
-                metrics::record_latency(Utc::now() - env.created_at);
+                // Fabric-internal latency only: `created_at` is whatever the
+                // remote sender's clock claims (meshtastic MQTT `timestamp`,
+                // meshcore `sender_timestamp`, signal `ts`), unclamped and
+                // untrusted. A node with a wrong/epoch-0 RTC would otherwise
+                // poison this process-lifetime sum permanently. `received_at`
+                // is stamped by us at ingestion (`Envelope::new`) and is the
+                // only honest measurement of how long delivery took.
+                metrics::record_latency(Utc::now() - env.received_at);
             }
         }
         warn_if_mark_failed(corr, "delivered", store.mark_delivered(corr));
@@ -1643,12 +1650,19 @@ mod tests {
 
     /// design §3: a delivered message bumps `relayfabric_route_messages_total`
     /// for its route and contributes to the `delivery_latency_seconds`
-    /// sum/count pair, computed from the envelope's `created_at`.
+    /// sum/count pair, computed from the envelope's daemon-stamped
+    /// `received_at` (not the sender-controlled `created_at` -- see the
+    /// poisoning regression test below).
     #[test]
     fn handle_result_delivered_records_route_counter_and_delivery_latency() {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
 
+        // created_at is sender-controlled and, in this test, deliberately a
+        // lie (2s in the past); received_at is stamped internally by
+        // `Envelope::new` at roughly "now". If the recorded latency ever
+        // tracked created_at again, this test's contribution to the sum
+        // would be >= 2s instead of near-zero.
         let created_at = Utc::now() - CDuration::seconds(2);
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
                        "hello".into(), Some(created_at), vec![], None);
@@ -1678,17 +1692,59 @@ mod tests {
         // ROUTE_MESSAGES/DELIVERY_LATENCY_* are process-globals, same
         // reasoning as the QUEUE_REJECTED/BUDGET_DEFERRED fixes above: only
         // monotonic checks are safe under this binary's parallel test run.
-        // The sum is additive-only (record_latency never subtracts), so
-        // "grew by at least this test's own ~2s contribution" is still a
-        // precise, race-free lower bound even though other tests may also
-        // be adding to it concurrently.
+        // The sum is additive-only (record_latency never subtracts), so an
+        // upper bound generous enough to absorb concurrent tests' own
+        // (real, small) contributions still catches the 2s-lie this test
+        // planted in created_at: 1 minute is orders of magnitude more than
+        // this in-process round trip takes, and orders of magnitude less
+        // than the fake 2s would have contributed had created_at leaked in.
         assert!(route_after > route_before, "a delivered message must bump its route's counter");
         assert!(latency_count_after > latency_count_before);
-        assert!(latency_sum_after >= latency_sum_before + 1_500_000,
-            "expected roughly a 2s latency contribution: before={latency_sum_before} after={latency_sum_after}");
+        assert!(latency_sum_after < latency_sum_before + 60_000_000,
+            "recorded latency must track received_at, not the lied-about \
+             created_at: before={latency_sum_before} after={latency_sum_after}");
 
         let state = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap().state;
         assert_eq!(state, "delivered");
+    }
+
+    /// Finding: `created_at` is remote-sender-controlled (meshtastic MQTT
+    /// `timestamp`, meshcore `sender_timestamp`, signal `ts`) and arrives
+    /// unclamped. A node reporting the Unix epoch would, under the old
+    /// created_at-based computation, inflate the process-lifetime latency
+    /// sum by ~56 years *permanently*. `received_at` is stamped by us at
+    /// ingestion and is immune -- assert the recorded contribution stays
+    /// small (well under an hour), not decades.
+    #[test]
+    fn handle_result_latency_ignores_sender_controlled_epoch_zero_created_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+
+        let epoch_zero = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), Some(epoch_zero), vec![], None);
+
+        let due = { let store = d.store.lock().unwrap(); store.due_deliveries(Utc::now(), 10).unwrap() };
+        assert_eq!(due.len(), 1);
+        let delivery_id = due[0].id;
+        d.store.lock().unwrap().mark_attempting(delivery_id).unwrap();
+
+        let latency_sum_before =
+            metrics::DELIVERY_LATENCY_MICROS_SUM.load(std::sync::atomic::Ordering::Relaxed);
+
+        handle_result(&d, delivery_id, true, None);
+
+        let latency_sum_after =
+            metrics::DELIVERY_LATENCY_MICROS_SUM.load(std::sync::atomic::Ordering::Relaxed);
+
+        // 1 hour in micros: comfortably larger than any real in-process
+        // latency (including concurrent tests' own small contributions to
+        // this shared counter) and comfortably smaller than the ~56 years
+        // an epoch-0 created_at would have contributed.
+        const ONE_HOUR_MICROS: u64 = 3_600_000_000;
+        assert!(latency_sum_after < latency_sum_before + ONE_HOUR_MICROS,
+            "an epoch-0 created_at must not poison the latency metric: \
+             before={latency_sum_before} after={latency_sum_after}");
     }
 
     #[test]

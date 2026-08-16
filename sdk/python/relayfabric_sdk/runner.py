@@ -49,6 +49,11 @@ def run_plugin(plugin_name, version, bridge_factory, capabilities, *,
         sys.exit(2)
 
     raw_cfg = json.loads(os.environ.get(config_env, "{}"))
+    # Scrub the resolved config (may carry secrets substituted by the daemon
+    # from a ${env:}/${file:} reference) out of our own environment so any
+    # child process this plugin spawns (e.g. lxmf's media.py running ffmpeg
+    # over attacker-supplied audio) doesn't inherit it.
+    os.environ.pop(config_env, None)
     sock = connect(sock_path)
 
     write_frame(sock, hello(plugin_name, version, capabilities))

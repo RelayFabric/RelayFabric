@@ -263,7 +263,16 @@ fn resolve_value(v: &serde_yaml::Value, errors: &mut Vec<String>) -> serde_yaml:
                     v.clone()
                 }
             },
-            None => v.clone(),
+            None => {
+                // Same rationale as `secrets::resolve`'s permission-file
+                // warning: this runs inside `config::load`, before `main`
+                // sets up `tracing_subscriber` (and never on the
+                // `--check-config` path), so it goes straight to stderr.
+                if let Some(warning) = secrets::malformed_ref_warning(s) {
+                    eprintln!("warning: {warning}");
+                }
+                v.clone()
+            }
         },
         serde_yaml::Value::Sequence(items) => {
             serde_yaml::Value::Sequence(items.iter().map(|i| resolve_value(i, errors)).collect())
@@ -1131,6 +1140,39 @@ routes:
         assert_eq!(
             cfg.raw_plugin_configs["mocka"].get("token").unwrap().as_str().unwrap(),
             format!("${{file:{}}}", secret_path.display()),
+        );
+    }
+
+    /// Finding: `${vault:x}`-shaped values (unsupported scheme) used to
+    /// parse as `None` and silently stay literal with no signal at all --
+    /// the plugin then receives the literal string as its token and fails
+    /// confusingly downstream, unlike `${file:relative}` which errors
+    /// loudly. The fix keeps the "stays literal" behavior (no load
+    /// failure -- this is a warning, not an error) but is loud about it via
+    /// `secrets::malformed_ref_warning` (see its own unit tests in
+    /// `secrets.rs` for the warning content itself).
+    #[test]
+    fn unknown_scheme_secret_ref_loads_fine_and_stays_literal() {
+        let yaml = r#"
+node:
+  name: test-node
+  data_dir: /tmp/relayfabric-test
+plugins:
+  mocka:
+    enabled: true
+    config:
+      token: "${vault:x}"
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#;
+        let cfg = parse_and_resolve(yaml).unwrap();
+        assert_eq!(
+            cfg.plugins["mocka"].config.get("token").unwrap().as_str().unwrap(),
+            "${vault:x}",
         );
     }
 

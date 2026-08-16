@@ -86,6 +86,24 @@ class DefaultEnvTests(unittest.TestCase):
         self.assertEqual(holder["cfg"], {"real": True})
 
 
+class ConfigEnvScrubbedTests(unittest.TestCase):
+    def test_config_env_popped_after_handshake(self):
+        # The config env var carries fully-resolved secrets (e.g. a ${env:}
+        # or ${file:} reference already substituted by the daemon). Plugins
+        # that spawn children (lxmf's media.py runs ffmpeg over
+        # attacker-supplied audio) must not leak those into that child's
+        # inherited environment.
+        sock = FakeSock(queued_frames=[HELLO_ACK_OK, {"t": "shutdown"}])
+        env = _env(**{CONFIG_ENV: '{"token": "shh-secret"}'})
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(SystemExit) as ctx:
+                run_plugin("p", "1.0", _MinimalBridge, relay_ipc.capabilities(),
+                           socket_env=SOCKET_ENV, config_env=CONFIG_ENV,
+                           connect=lambda path: sock)
+            self.assertEqual(ctx.exception.code, 0)
+            self.assertNotIn(CONFIG_ENV, os.environ)
+
+
 class HandshakeTests(unittest.TestCase):
     def test_ok_sends_hello_and_calls_bridge_factory(self):
         sock = FakeSock(queued_frames=[HELLO_ACK_OK, {"t": "shutdown"}])

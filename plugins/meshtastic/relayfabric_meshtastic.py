@@ -413,6 +413,10 @@ def main():
     sock_path = os.environ["RELAYFABRIC_SOCKET"]
     plugin_name = os.environ.get("RELAYFABRIC_PLUGIN_NAME", "meshtastic")
     raw_cfg = json.loads(os.environ.get("RELAYFABRIC_PLUGIN_CONFIG", "{}"))
+    # Scrub the resolved config (may carry secrets substituted by the daemon
+    # from a ${env:}/${file:} reference) out of our own environment so any
+    # child process this plugin spawns doesn't inherit it.
+    os.environ.pop("RELAYFABRIC_PLUGIN_CONFIG", None)
     try:
         cfg = load_config(raw_cfg)
     except (ValueError, TypeError) as e:

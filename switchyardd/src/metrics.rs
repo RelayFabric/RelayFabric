@@ -33,8 +33,9 @@ pub fn inc(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Records one delivery's created_at -> delivered latency. A negative delta
-/// (clock skew, or a bogus/future created_at) clamps to zero rather than
+/// Records one delivery's received_at -> delivered latency (fabric-internal
+/// only; callers must not pass a delta derived from the sender-controlled
+/// `created_at`). A negative delta (clock skew) clamps to zero rather than
 /// underflowing the unsigned accumulator.
 pub fn record_latency(latency: CDuration) {
     let micros = latency.num_microseconds().unwrap_or(0).max(0) as u64;

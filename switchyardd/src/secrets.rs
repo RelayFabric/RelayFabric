@@ -98,6 +98,35 @@ pub fn resolve(r: &SecretRef) -> Result<String, String> {
     }
 }
 
+/// A config value that is whole-string `${...}`-shaped but that
+/// `parse_ref` didn't recognize (empty/unknown scheme, wrong case, stray
+/// braces, ...) almost certainly means the operator *intended* a secret
+/// reference and typo'd it, rather than coincidentally writing ordinary
+/// literal text shaped like one. `resolve_value` still leaves it as a
+/// literal (no behavior change -- a plugin that expects a real token would
+/// otherwise fail confusingly downstream instead of here), but silence
+/// would be worse: this returns the warning to print, naming the value's
+/// `${...}` FORM (safe to print -- it never resolved to a secret, it's just
+/// the literal config text) and the two supported schemes. Split out from
+/// the `eprintln!` call site so the message is unit-testable without
+/// capturing stderr, mirroring `permission_warning` above. Self-contained
+/// (re-checks `parse_ref` internally) so it's correct to call standalone,
+/// not just from `resolve_value`'s `None` branch. Returns `None` for
+/// anything not ref-shaped at all, or that DOES parse -- an ordinary
+/// literal or a real reference, left alone silently, same as always.
+pub fn malformed_ref_warning(s: &str) -> Option<String> {
+    if !(s.starts_with("${") && s.ends_with('}') && s.len() >= 3) {
+        return None;
+    }
+    if parse_ref(s).is_some() {
+        return None;
+    }
+    Some(format!(
+        "config value {s} looks like a secret reference but matches neither \
+         supported scheme (${{env:NAME}} or ${{file:/abs/path}}); using it as a literal value"
+    ))
+}
+
 /// Group/world-readable secret files are a footgun, not an error (design
 /// §2): still resolves, just warns. Split out from the `eprintln!` call
 /// site so the message content -- which must name only the path, never the
@@ -311,5 +340,53 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let got = resolve(&SecretRef::File(path)).unwrap();
         assert_eq!(got, "sentinel-permissive");
+    }
+
+    // ---- malformed_ref_warning ------------------------------------------
+
+    #[test]
+    fn malformed_ref_warning_none_for_ordinary_literal() {
+        assert_eq!(malformed_ref_warning("just a value"), None);
+    }
+
+    #[test]
+    fn malformed_ref_warning_none_for_a_ref_that_actually_parses() {
+        // A value parse_ref already handles must not also get the
+        // "malformed" warning -- resolve_value only calls this helper in
+        // parse_ref's None branch, but the helper itself should agree.
+        assert!(parse_ref("${env:TOKEN}").is_some());
+        assert_eq!(malformed_ref_warning("${env:TOKEN}"), None);
+    }
+
+    #[test]
+    fn malformed_ref_warning_fires_for_unknown_scheme() {
+        assert_eq!(parse_ref("${vault:x}"), None);
+        let msg = malformed_ref_warning("${vault:x}").unwrap();
+        assert!(msg.contains("${vault:x}"), "msg was: {msg}");
+        assert!(msg.contains("${env:NAME}"), "msg was: {msg}");
+        assert!(msg.contains("${file:/abs/path}"), "msg was: {msg}");
+    }
+
+    #[test]
+    fn malformed_ref_warning_fires_for_empty_env_name() {
+        assert_eq!(parse_ref("${env:}"), None);
+        let msg = malformed_ref_warning("${env:}").unwrap();
+        assert!(msg.contains("${env:}"), "msg was: {msg}");
+    }
+
+    #[test]
+    fn malformed_ref_warning_fires_for_wrong_case_scheme() {
+        assert_eq!(parse_ref("${Env:X}"), None);
+        let msg = malformed_ref_warning("${Env:X}").unwrap();
+        assert!(msg.contains("${Env:X}"), "msg was: {msg}");
+    }
+
+    #[test]
+    fn malformed_ref_warning_none_for_a_ref_embedded_in_a_longer_string() {
+        // Not whole-string ${...}-shaped -- ordinary literal text that
+        // happens to contain a reference-looking substring, same as
+        // parse_ref's own embedded-ref rejection. Must stay silent.
+        assert_eq!(malformed_ref_warning("prefix ${env:TOKEN}"), None);
+        assert_eq!(malformed_ref_warning("${env:TOKEN} suffix"), None);
     }
 }
