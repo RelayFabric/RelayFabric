@@ -78,9 +78,11 @@ pub struct PolicyRules {
     pub drop_kinds: Vec<String>,
     #[serde(default)]
     pub deny: bool,
-    /// "allow" or "reject"; anything else (including absent) is allow, same
-    /// posture as the rest of this struct's optional fields (see
-    /// policy::evaluate).
+    /// "allow" or "reject"; absent is allow, same posture as the rest of
+    /// this struct's optional fields (see policy::evaluate). Any other
+    /// string is rejected by `validate()` at config load time — a typo here
+    /// is a security-relevant fail-open (it would silently behave like
+    /// "allow" at runtime otherwise), so it must fail loudly instead.
     #[serde(default)]
     pub attachments: Option<String>,
     #[serde(default)]
@@ -112,6 +114,16 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
                     return Err(format!(
                         "route '{}' references unknown plugin '{}'", r.name, ep.protocol))
                 }
+            }
+        }
+    }
+    for p in &cfg.policies {
+        if let Some(v) = &p.rules.attachments {
+            if v != "allow" && v != "reject" {
+                return Err(format!(
+                    "policy '{}' has invalid attachments value '{v}' (expected \"allow\" or \"reject\")",
+                    p.name
+                ));
             }
         }
     }
@@ -179,6 +191,36 @@ routes:
         let cfg = parse(GOOD).unwrap();
         assert_eq!(cfg.policies[0].rules.attachments, None);
         assert_eq!(cfg.policies[0].rules.max_attachment_bytes, None);
+    }
+
+    /// A typo in `rules.attachments` (e.g. "rejct" instead of "reject") must
+    /// fail loudly at config load, not fail open at runtime: `evaluate()`
+    /// only ever checks for the literal string "reject", so any other value
+    /// silently behaves like "allow" unless caught here.
+    #[test]
+    fn rejects_invalid_attachments_policy_value() {
+        let bad = GOOD.replace(
+            "      max_payload: 200\n      drop_kinds: [location]",
+            "      max_payload: 200\n      drop_kinds: [location]\n      attachments: rejct",
+        );
+        let err = parse(&bad).unwrap_err();
+        assert!(err.contains("small"), "err should name the policy: {err}");
+        assert!(err.contains("rejct"), "err should quote the bad value: {err}");
+    }
+
+    #[test]
+    fn allow_reject_and_absent_attachments_values_are_all_valid() {
+        for value in ["allow", "reject"] {
+            let yaml = GOOD.replace(
+                "      max_payload: 200\n      drop_kinds: [location]",
+                &format!("      max_payload: 200\n      drop_kinds: [location]\n      attachments: {value}"),
+            );
+            let cfg = parse(&yaml).unwrap_or_else(|e| panic!("'{value}' should be valid: {e}"));
+            assert_eq!(cfg.policies[0].rules.attachments.as_deref(), Some(value));
+        }
+        // absent (GOOD as-is) is also valid, covered by
+        // attachment_policy_fields_default_to_none_when_absent above.
+        assert!(parse(GOOD).is_ok());
     }
 
     #[test]
