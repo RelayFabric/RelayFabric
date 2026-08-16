@@ -53,11 +53,8 @@ impl Cas {
         Ok(self.dir.join(sha))
     }
 
-    // Not yet called from production code: egress (rehydrating attachments
-    // to send to a plugin) is a later task. Kept `pub` now because it's part
-    // of the CAS interface contract and is exercised by this module's own
-    // tests plus the engine ingress test (put-then-get roundtrip).
-    #[allow(dead_code)]
+    /// Rehydrates a blob's bytes for egress (`engine::load_attachments`
+    /// reads accepted attachments back out here to build an outgoing Send).
     pub fn get(&self, sha: &str) -> io::Result<Vec<u8>> {
         std::fs::read(self.path_for(sha)?)
     }

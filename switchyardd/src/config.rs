@@ -78,6 +78,13 @@ pub struct PolicyRules {
     pub drop_kinds: Vec<String>,
     #[serde(default)]
     pub deny: bool,
+    /// "allow" or "reject"; anything else (including absent) is allow, same
+    /// posture as the rest of this struct's optional fields (see
+    /// policy::evaluate).
+    #[serde(default)]
+    pub attachments: Option<String>,
+    #[serde(default)]
+    pub max_attachment_bytes: Option<u64>,
 }
 
 pub fn load(path: &Path) -> Result<Config, String> {
@@ -154,6 +161,24 @@ routes:
         assert_eq!(cfg.max_attachment_bytes, 8 * 1024 * 1024);
         assert_eq!(cfg.policies[0].rules.max_payload, Some(200));
         assert!(cfg.plugins["mocka"].command.is_none());
+    }
+
+    #[test]
+    fn parses_attachment_policy_rules() {
+        let yaml = GOOD.replace(
+            "      max_payload: 200\n      drop_kinds: [location]",
+            "      max_payload: 200\n      drop_kinds: [location]\n      attachments: reject\n      max_attachment_bytes: 1000000",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.policies[0].rules.attachments.as_deref(), Some("reject"));
+        assert_eq!(cfg.policies[0].rules.max_attachment_bytes, Some(1_000_000));
+    }
+
+    #[test]
+    fn attachment_policy_fields_default_to_none_when_absent() {
+        let cfg = parse(GOOD).unwrap();
+        assert_eq!(cfg.policies[0].rules.attachments, None);
+        assert_eq!(cfg.policies[0].rules.max_attachment_bytes, None);
     }
 
     #[test]

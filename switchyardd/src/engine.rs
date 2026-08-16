@@ -5,7 +5,7 @@ use crate::{alias, dedup, metrics, policy, queue, routes, storage, transform};
 use alias::Aliaser;
 use chrono::{DateTime, Duration as CDuration, Utc};
 use relay_core::{AttachmentMeta, Capabilities, Endpoint, Envelope, Sender};
-use relay_ipc::{DaemonToPlugin, IpcAttachment};
+use relay_ipc::{DaemonToPlugin, IpcAttachment, MAX_FRAME};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -287,16 +287,17 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             warn_if_mark_failed(del.id, "dead_letter", result);
             info!(delivery = del.id, policy, "policy denied");
         }
-        policy::Decision::Allow { max_payload } => {
+        policy::Decision::Allow { max_payload, attachments_allowed, max_attachment_bytes } => {
             // capability + policy limits combine to the tighter one
-            let (tx, cap_limit) = {
+            let (tx, cap_limit, dest_supports_attachments) = {
                 let plugins = d.plugins.lock().unwrap();
                 match plugins.get(&del.destination.protocol).filter(|h| h.connected) {
                     Some(h) => (
                         Some(h.tx.clone()),
                         h.capabilities.max_payload.map(|v| v as usize),
+                        h.capabilities.attachments,
                     ),
-                    None => (None, None),
+                    None => (None, None, false),
                 }
             };
             let Some(tx) = tx else {
@@ -312,7 +313,30 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             };
             let alias = d.aliaser.alias(
                 &env.source.protocol, &env.sender.native_ref, &del.route);
-            let body = transform::render(&alias, &env.body, limit);
+
+            let (attachments, notes) = if env.attachments.is_empty() {
+                (Vec::new(), String::new())
+            } else if attachments_allowed && dest_supports_attachments {
+                let frame_budget = u64::from(MAX_FRAME) - FRAME_HEADROOM_BYTES;
+                load_attachments(d, &env.attachments, max_attachment_bytes, frame_budget)
+            } else {
+                // destination lacks the capability, or policy rejects
+                // attachments outright: strip every attachment and note it
+                // once per attachment, without naming any of them (a
+                // blanket strip must not reveal which files existed).
+                let dropped: Vec<(String, u64)> =
+                    env.attachments.iter().map(|a| (a.filename.clone(), a.size)).collect();
+                (Vec::new(), transform::attachment_notes(&dropped, "omitted"))
+            };
+            // Decision: notes (capability/policy strip, byte-cap drops, CAS
+            // misses) are folded into the body BEFORE max_payload
+            // truncation runs, not appended after — so that a note-inflated
+            // body still respects the destination's byte cap instead of the
+            // notes sneaking past it by arriving post-truncation. That does
+            // mean a very tight cap can truncate a note away entirely; that
+            // is the correct trade-off since the byte cap is the harder
+            // constraint the plugin actually enforces on the wire.
+            let body = transform::render(&alias, &format!("{}{notes}", env.body), limit);
             let result = d.store.lock().unwrap().mark_attempting(del.id);
             warn_if_mark_failed(del.id, "attempting", result);
             let send = DaemonToPlugin::Send {
@@ -320,7 +344,7 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
                 endpoint: del.destination.endpoint.clone(),
                 kind: env.kind.clone(),
                 body,
-                attachments: vec![],
+                attachments,
             };
             // try_send, not send().await: this pump task is the single driver
             // of ALL plugins' deliveries plus reclaim_stale. Awaiting a full
@@ -341,6 +365,69 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             }
         }
     }
+}
+
+/// Headroom subtracted from `MAX_FRAME` when budgeting cumulative attachment
+/// bytes for a single Send: the frame also carries the CBOR envelope, the
+/// body/notes text, and per-attachment filenames/mime types, none of which
+/// count toward the raw attachment bytes summed in `load_attachments`. 64
+/// KiB comfortably covers that overhead for any realistic body/note size.
+const FRAME_HEADROOM_BYTES: u64 = 64 * 1024;
+
+/// Rehydrates the accepted attachments of an outgoing message from the CAS,
+/// applying (in cheapest-first order, to avoid disk I/O for anything that
+/// will be dropped anyway):
+/// 1. the per-attachment policy byte cap (`max_attachment_bytes`), then
+/// 2. the cumulative `frame_budget` guard, so the whole Send frame stays
+///    under `MAX_FRAME` even when several in-cap attachments are combined.
+///
+/// Anything that fails either check, plus anything whose blob has gone
+/// missing from the CAS, is dropped from the attachment list and noted in
+/// the returned string instead — never logged, since attachment
+/// filenames/content are message content (see `handle_inbound`'s
+/// module-level note on the same point).
+fn load_attachments(
+    d: &Daemon,
+    metas: &[AttachmentMeta],
+    max_attachment_bytes: Option<u64>,
+    frame_budget: u64,
+) -> (Vec<IpcAttachment>, String) {
+    let mut attachments = Vec::new();
+    let mut notes = String::new();
+    let mut cumulative: u64 = 0;
+    for meta in metas {
+        if let Some(cap) = max_attachment_bytes {
+            if meta.size > cap {
+                notes.push_str(&transform::attachment_notes(
+                    &[(meta.filename.clone(), meta.size)],
+                    &format!("{cap} B limit"),
+                ));
+                continue;
+            }
+        }
+        if cumulative + meta.size > frame_budget {
+            notes.push_str(&transform::attachment_notes(
+                &[(meta.filename.clone(), meta.size)],
+                &format!("{frame_budget} B limit"),
+            ));
+            continue;
+        }
+        match d.cas.get(&meta.sha256) {
+            Ok(data) => {
+                cumulative += meta.size;
+                attachments.push(IpcAttachment {
+                    filename: meta.filename.clone(),
+                    mime: meta.mime.clone(),
+                    data,
+                });
+            }
+            Err(e) => {
+                warn!(sha = %meta.sha256, error = %e, "attachment missing from CAS");
+                notes.push_str(&format!("\n[attachment {} unavailable]", meta.filename));
+            }
+        }
+    }
+    (attachments, notes)
 }
 
 #[cfg(test)]
@@ -642,6 +729,210 @@ mod tests {
             d.cas.remove(s).unwrap();
         }
         assert!(d.cas.get(&sha).is_err(), "now-truly-orphaned blob must be removable");
+    }
+
+    /// Registers a connected mock plugin with the given `attachments`
+    /// capability and a fresh channel, returning the receiving half so a
+    /// test can inspect the `Send` frame `process_due` produces for it.
+    fn register_plugin(d: &Daemon, name: &str, attachments: bool) -> mpsc::Receiver<DaemonToPlugin> {
+        let (tx, rx) = mpsc::channel(8);
+        d.plugins.lock().unwrap().insert(name.to_string(), PluginHandle {
+            tx,
+            capabilities: Capabilities { attachments, ..Capabilities::default() },
+            connected: true,
+        });
+        rx
+    }
+
+    async fn recv_send(rx: &mut mpsc::Receiver<DaemonToPlugin>) -> DaemonToPlugin {
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for Send")
+            .expect("channel closed without a Send")
+    }
+
+    #[tokio::test]
+    async fn process_due_attaches_bytes_when_capability_and_policy_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let mut rx = register_plugin(&d, "mockb", true);
+
+        let att = IpcAttachment {
+            filename: "photo.jpg".into(), mime: "image/jpeg".into(),
+            data: b"just some bytes".to_vec(),
+        };
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "look at this".into(), None, vec![att.clone()]);
+        let now = Utc::now();
+        let del = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+        };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].data, att.data);
+        assert_eq!(attachments[0].filename, "photo.jpg");
+        assert!(!body.contains("[attachment omitted]"), "body was: {body}");
+    }
+
+    #[tokio::test]
+    async fn process_due_strips_attachments_and_notes_when_capability_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let mut rx = register_plugin(&d, "mockb", false); // no attachments capability
+
+        let att = IpcAttachment {
+            filename: "photo.jpg".into(), mime: "image/jpeg".into(), data: b"bytes".to_vec(),
+        };
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "look at this".into(), None, vec![att]);
+        let now = Utc::now();
+        let del = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+        };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert!(attachments.is_empty());
+        assert!(body.contains("[attachment omitted]"), "body was: {body}");
+        assert!(!body.contains("photo.jpg"),
+            "a blanket capability strip must not name the dropped file: {body}");
+    }
+
+    #[tokio::test]
+    async fn process_due_strips_attachments_when_policy_rejects_them_even_if_capability_allows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.cfg.policies = vec![crate::config::Policy {
+            name: "no-attachments-for-b".into(),
+            r#match: crate::config::PolicyMatch { destination_protocol: vec!["mockb".into()] },
+            rules: crate::config::PolicyRules {
+                attachments: Some("reject".into()), ..Default::default()
+            },
+        }];
+        let d = Arc::new(d);
+        let mut rx = register_plugin(&d, "mockb", true); // capability says yes...
+
+        let att = IpcAttachment {
+            filename: "photo.jpg".into(), mime: "image/jpeg".into(), data: b"bytes".to_vec(),
+        };
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "look at this".into(), None, vec![att]);
+        let now = Utc::now();
+        let del = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+        };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert!(attachments.is_empty(), "...but policy says no, and policy wins");
+        assert!(body.contains("[attachment omitted]"), "body was: {body}");
+    }
+
+    #[tokio::test]
+    async fn process_due_drops_attachment_over_the_policy_byte_cap_and_notes_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.cfg.policies = vec![crate::config::Policy {
+            name: "small-attachments-for-b".into(),
+            r#match: crate::config::PolicyMatch { destination_protocol: vec!["mockb".into()] },
+            rules: crate::config::PolicyRules {
+                max_attachment_bytes: Some(10), ..Default::default()
+            },
+        }];
+        let d = Arc::new(d);
+        let mut rx = register_plugin(&d, "mockb", true);
+
+        let att = IpcAttachment {
+            filename: "toobig.bin".into(), mime: "application/octet-stream".into(),
+            data: vec![0u8; 20], // over the 10 B policy cap, under the ingress cap
+        };
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "look at this".into(), None, vec![att]);
+        let now = Utc::now();
+        let del = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+        };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert!(attachments.is_empty());
+        assert!(
+            body.contains("[dropped toobig.bin: 20 B over 10 B limit]"),
+            "body was: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_due_notes_unavailable_when_the_cas_blob_has_gone_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let mut rx = register_plugin(&d, "mockb", true);
+
+        let att = IpcAttachment {
+            filename: "gone.bin".into(), mime: "application/octet-stream".into(),
+            data: b"will vanish".to_vec(),
+        };
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "look at this".into(), None, vec![att]);
+        let now = Utc::now();
+        let del = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+        };
+        let env = d.store.lock().unwrap().get_message(del.message_id).unwrap().unwrap();
+        let sha = env.attachments[0].sha256.clone();
+        d.cas.remove(&sha).unwrap(); // simulate the blob having gone missing
+
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert!(attachments.is_empty());
+        assert!(body.contains("[attachment gone.bin unavailable]"), "body was: {body}");
+    }
+
+    #[test]
+    fn load_attachments_drops_whatever_would_exceed_the_cumulative_frame_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+
+        let sha_a = d.cas.put(&[1u8; 10]).unwrap();
+        let sha_b = d.cas.put(&[2u8; 10]).unwrap();
+        let metas = vec![
+            AttachmentMeta {
+                filename: "a.bin".into(), mime: "application/octet-stream".into(),
+                size: 10, sha256: sha_a,
+            },
+            AttachmentMeta {
+                filename: "b.bin".into(), mime: "application/octet-stream".into(),
+                size: 10, sha256: sha_b,
+            },
+        ];
+
+        // budget only has room for the first attachment's 10 bytes.
+        let (attachments, notes) = load_attachments(&d, &metas, None, 15);
+
+        assert_eq!(attachments.len(), 1, "only the first fits under the frame budget");
+        assert_eq!(attachments[0].filename, "a.bin");
+        assert!(
+            notes.contains("[dropped b.bin: 10 B over 15 B limit]"),
+            "notes was: {notes}"
+        );
     }
 
     /// Two inbound sends that are identical except for which oversize
