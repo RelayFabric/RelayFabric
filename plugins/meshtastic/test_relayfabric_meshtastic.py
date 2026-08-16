@@ -554,6 +554,19 @@ class BridgeGaugesTests(unittest.TestCase):
         frames = self.sock.frames()
         self.assertEqual(frames[0], {"t": "gauges", "gauges": {"queue_depth": 7.0}})
 
+    def test_non_finite_rssi_and_snr_are_dropped_falling_back_to_queue_depth(self):
+        # rssi/snr are attacker-influenced (an untrusted MQTT gateway/broker
+        # controls this JSON, and Python's stdlib json module parses the
+        # NaN/Infinity/-Infinity literals by default) -- both must be
+        # rejected here, not forwarded to the daemon.
+        self.bridge._last_gauges_at = 0
+        ev = text_event()
+        ev["rssi"] = float("nan")
+        ev["snr"] = float("inf")
+        self.bridge.handle_event("msh/2/json/ch-0/!12345678", ev)
+        frames = self.sock.frames()
+        self.assertEqual(frames[0], {"t": "gauges", "gauges": {"queue_depth": 7.0}})
+
     def test_second_event_within_the_window_does_not_re_emit(self):
         self.bridge._last_gauges_at = 0
         self.bridge.handle_event("msh/2/json/ch-0/!12345678", text_event())

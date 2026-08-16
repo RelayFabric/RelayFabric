@@ -74,18 +74,29 @@ impl PluginGauges {
     }
 
     /// Sanitizes gauge names to `[a-z0-9_]` (any other byte -> `_`,
-    /// uppercase -> lowercase), keeps at most `MAX_GAUGES_PER_PLUGIN`
+    /// uppercase -> lowercase), drops non-finite values (NaN/+inf/-inf --
+    /// a plugin-controlled value that reaches `/metrics` unchecked; NaN/inf
+    /// are valid `f64`s so they survive the CBOR wire roundtrip untouched,
+    /// but Rust's `Display` spells infinities "inf"/"-inf", not the
+    /// Prometheus text-format token, and NaN silently poisons PromQL
+    /// threshold comparisons -- both must be stopped at this boundary, not
+    /// left for the renderer), keeps at most `MAX_GAUGES_PER_PLUGIN`
     /// entries (excess ignored with one warn for the whole frame), and
     /// stores the result as this plugin's new latest snapshot, stamped with
     /// the current time for staleness eviction at render.
     pub fn record(&self, plugin: &str, gauges: std::collections::BTreeMap<String, f64>) {
         let total = gauges.len();
+        let non_finite = gauges.values().filter(|v| !v.is_finite()).count();
         let sanitized: HashMap<String, f64> = gauges
             .into_iter()
+            .filter(|(_, value)| value.is_finite())
             .take(MAX_GAUGES_PER_PLUGIN)
             .map(|(name, value)| (sanitize_gauge_name(&name), value))
             .collect();
-        if total > MAX_GAUGES_PER_PLUGIN {
+        if non_finite > 0 {
+            warn!(plugin, non_finite, "gauges frame contained non-finite value(s); dropped");
+        }
+        if total - non_finite > MAX_GAUGES_PER_PLUGIN {
             warn!(plugin, total, cap = MAX_GAUGES_PER_PLUGIN,
                 "gauges frame exceeded per-plugin cap; excess ignored");
         }
@@ -345,6 +356,29 @@ mod tests {
         let out = g.render(Instant::now());
         let count = out.matches("plugin=\"chatty\"").count();
         assert_eq!(count, 32, "excess gauges beyond the 32 cap must be ignored: {out}");
+    }
+
+    #[test]
+    fn gauges_record_drops_non_finite_values() {
+        // NaN/+inf/-inf are valid f64s that survive the CBOR wire roundtrip
+        // untouched (a plugin-controlled value, e.g. meshtastic's rssi/snr
+        // sourced from attacker-influenced MQTT gateway JSON) -- they must
+        // never reach /metrics: Rust's Display spells infinities
+        // "inf"/"-inf" (not the Prometheus text-format token), and NaN
+        // silently poisons PromQL threshold comparisons.
+        let g = PluginGauges::new();
+        let mut vals = std::collections::BTreeMap::new();
+        vals.insert("nan_gauge".to_string(), f64::NAN);
+        vals.insert("pos_inf_gauge".to_string(), f64::INFINITY);
+        vals.insert("neg_inf_gauge".to_string(), f64::NEG_INFINITY);
+        vals.insert("finite_gauge".to_string(), -71.0);
+        g.record("meshtastic", vals);
+
+        let out = g.render(Instant::now());
+        assert_eq!(out, "relayfabric_plugin_gauge{plugin=\"meshtastic\",name=\"finite_gauge\"} -71\n",
+            "only the finite value may survive record(): {out}");
+        assert!(!out.to_lowercase().contains("inf"), "no inf/-inf token may reach render output: {out}");
+        assert!(!out.to_lowercase().contains("nan"), "no NaN token may reach render output: {out}");
     }
 
     #[test]

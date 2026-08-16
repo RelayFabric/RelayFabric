@@ -10,6 +10,7 @@ Text bytes are never logged, only names/types.
 
 import json
 import logging
+import math
 import os
 import queue
 import socket
@@ -308,6 +309,12 @@ class Bridge:
         flowing through this same `event` dict -- no new backend call);
         falls back to the backend's inbound queue depth when neither is
         present.
+
+        rssi/snr are attacker-influenced (an untrusted MQTT gateway/broker
+        controls this JSON, and Python's stdlib json module parses the
+        NaN/Infinity/-Infinity literals by default), so both are checked
+        with math.isfinite here -- defense in depth alongside the daemon's
+        own PluginGauges::record boundary check, which is the enforced one.
         """
         now = time.monotonic()
         if now - self._last_gauges_at < GAUGES_INTERVAL_SECS:
@@ -315,10 +322,10 @@ class Bridge:
         self._last_gauges_at = now
         values = {}
         rssi = event.get("rssi")
-        if isinstance(rssi, (int, float)):
+        if isinstance(rssi, (int, float)) and math.isfinite(rssi):
             values["rssi"] = rssi
         snr = event.get("snr")
-        if isinstance(snr, (int, float)):
+        if isinstance(snr, (int, float)) and math.isfinite(snr):
             values["snr"] = snr
         if not values:
             values["queue_depth"] = self.backend.queue_depth()
