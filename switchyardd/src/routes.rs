@@ -24,7 +24,7 @@ pub fn route<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RouteConfig;
+    use crate::config::{RenderConfig, RouteConfig};
     use relay_core::Endpoint;
 
     fn ep(s: &str) -> Endpoint { s.parse().unwrap() }
@@ -35,6 +35,7 @@ mod tests {
             sources: vec![ep("mocka:chan"), ep("mockb:chan")],
             destinations: vec![ep("mocka:chan"), ep("mockb:chan")],
             identity_mode: "pseudonymous".into(),
+            render: RenderConfig::default(),
         }]
     }
 

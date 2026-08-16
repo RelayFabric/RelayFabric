@@ -711,10 +711,8 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             // "pseudonymous" (the default, backward-compatible with configs
             // that predate this field), and the alias is used exactly as
             // before.
-            let linked_mode = d.cfg.routes.iter()
-                .find(|r| r.name == del.route)
-                .map(|r| r.identity_mode == "linked")
-                .unwrap_or(false);
+            let route_cfg = d.cfg.routes.iter().find(|r| r.name == del.route);
+            let linked_mode = route_cfg.map(|r| r.identity_mode == "linked").unwrap_or(false);
             let tag = if linked_mode {
                 let link = d.store.lock().unwrap()
                     .link_for_identity(&env.source.protocol, &env.sender.native_ref)
@@ -723,6 +721,18 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             } else {
                 alias.clone()
             };
+            // Design §4: `render.tag == "none"` means the route opted out
+            // of tags altogether, suppressing whichever of the alias/
+            // display_name `tag` above resolved to; `render.max_chars`
+            // (0 = disabled) is a route-level char-count truncation applied
+            // before `limit` (the transport byte cap) below — see
+            // `transform::render`'s doc comment for the two-stage ordering.
+            let render_tag = match route_cfg.map(|r| r.render.tag.as_str()) {
+                Some("none") => None,
+                _ => Some(tag.as_str()),
+            };
+            let render_max_chars = route_cfg
+                .and_then(|r| (r.render.max_chars > 0).then_some(r.render.max_chars));
 
             let (attachments, notes) = if env.attachments.is_empty() {
                 (Vec::new(), String::new())
@@ -746,7 +756,8 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             // mean a very tight cap can truncate a note away entirely; that
             // is the correct trade-off since the byte cap is the harder
             // constraint the plugin actually enforces on the wire.
-            let body = transform::render(&tag, &format!("{}{notes}", env.body), limit);
+            let body = transform::render(
+                render_tag, &format!("{}{notes}", env.body), render_max_chars, limit);
             let result = d.store.lock().unwrap().mark_attempting(del.id);
             warn_if_mark_failed(del.id, "attempting", result);
             let send = DaemonToPlugin::Send {
@@ -942,7 +953,7 @@ fn load_attachments(
 pub mod tests_support {
     use super::*;
     use crate::config::{
-        Budget, Config, Limits, NodeConfig, PluginConfig, PublicService, RouteConfig,
+        Budget, Config, Limits, NodeConfig, PluginConfig, PublicService, RenderConfig, RouteConfig,
     };
     use std::collections::BTreeMap;
 
@@ -1004,6 +1015,7 @@ pub mod tests_support {
                 sources: vec!["mocka:chan".parse().unwrap(), "mockb:chan".parse().unwrap()],
                 destinations: vec!["mocka:chan".parse().unwrap(), "mockb:chan".parse().unwrap()],
                 identity_mode: "pseudonymous".into(),
+                render: RenderConfig::default(),
             }],
             policies: vec![],
             ttl_default_secs: 3600,
@@ -2386,5 +2398,78 @@ mod tests {
             panic!("expected Send");
         };
         assert!(!body2.contains("Jascha"), "after unlink, rendering must revert to the pseudonym: {body2}");
+    }
+
+    // ---- design §4: route render knobs (tag: none, max_chars) -------------
+
+    #[tokio::test]
+    async fn render_tag_none_suppresses_the_alias_prefix_on_a_pseudonymous_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path()); // default identity_mode: "pseudonymous"
+        d.cfg.routes[0].render.tag = "none".to_string();
+        let d = Arc::new(d);
+        let mut rx = register_plugin(&d, "mockb", false);
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+        let now = Utc::now();
+        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert_eq!(body, "hello", "tag: none must omit the [alias]\\n prefix entirely: {body}");
+    }
+
+    /// design §4: "the route opted out of tags altogether" — `tag: none`
+    /// must suppress the sender tag even when the route is in `linked` mode
+    /// AND a verified link exists (the case that would otherwise render the
+    /// display_name, per `process_due_renders_display_name_when_route_is_
+    /// linked_and_a_verified_link_exists` above).
+    #[tokio::test]
+    async fn render_tag_none_suppresses_the_display_name_on_a_linked_route_with_a_verified_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.cfg.routes[0].identity_mode = "linked".to_string();
+        d.cfg.routes[0].render.tag = "none".to_string();
+        let d = Arc::new(d);
+        let mut rx = register_plugin(&d, "mockb", false);
+
+        d.store.lock().unwrap()
+            .insert_link("mocka", "!a", "signal", "+1", "Jascha", Utc::now()).unwrap();
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+        let now = Utc::now();
+        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert_eq!(body, "hello",
+            "tag: none must suppress the linked display_name too, not just the pseudonym: {body}");
+    }
+
+    #[tokio::test]
+    async fn render_max_chars_truncates_before_the_transport_max_payload_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.cfg.routes[0].render.max_chars = 20;
+        let d = Arc::new(d);
+        let mut rx = register_plugin(&d, "mockb", false);
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "this body is much longer than twenty characters".into(), None, vec![], None);
+        let now = Utc::now();
+        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert_eq!(body.chars().count(), 20, "route-level max_chars must truncate to exactly 20 chars: {body}");
+        assert!(body.ends_with('…'), "body was: {body}");
     }
 }

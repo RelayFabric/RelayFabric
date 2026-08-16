@@ -16,6 +16,17 @@ plugins:
     config:
       broker: mqtt://127.0.0.1:1883
       topics: [chat/a, chat/b]
+      # Secret references (design §2 / SPEC §51, §59): a STRING value inside
+      # any plugin's config: block may be, in its ENTIRETY, `${env:NAME}` or
+      # `${file:/abs/path}` -- no interpolation inside a longer string, the
+      # whole value must be the reference. Resolved once at config load: an
+      # env var (error if unset or empty) or a file's trimmed contents
+      # (error if unreadable; the path MUST be absolute -- a relative
+      # `${file:...}` is rejected). Resolved values are forwarded to the
+      # plugin over IPC but never appear in admin API responses, logs, or
+      # --check-config output, which always shows the unresolved ${...}
+      # form. Example (harmless here: this plugin has no such field today):
+      # broker_token: ${env:RELAYFABRIC_MQTT_TOKEN}
 
   # lxmf:
   #   enabled: true
@@ -99,6 +110,17 @@ routes:
     sources: ["mqtt:chat/a", "mqtt:chat/b"]
     destinations: ["mqtt:chat/a", "mqtt:chat/b"]
     # identity_mode: linked
+    # Rendering knobs (design §4): tuning for the transform pipeline that
+    # already runs on every send. tag: "alias" (default) renders the
+    # per-route pseudonym (or, in identity_mode: linked with a verified
+    # link, that link's display_name); "none" suppresses the [tag] prefix
+    # entirely, including the linked display_name. max_chars (0 = disabled,
+    # else >= 16) truncates the rendered message to that many Unicode
+    # characters BEFORE the transport's own byte cap, which still applies
+    # afterward as the hard floor.
+    # render:
+    #   tag: alias
+    #   max_chars: 900
 
   # - name: lxmf_mqtt_bridge
   #   sources: ["lxmf:pasadena", "mqtt:lxmf_bridge"]

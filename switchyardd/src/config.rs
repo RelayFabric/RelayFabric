@@ -120,9 +120,45 @@ pub struct RouteConfig {
     /// see `engine::process_due`. `validate()` rejects any other value.
     #[serde(default = "default_identity_mode")]
     pub identity_mode: String,
+    /// Design §4: per-route rendering knobs, sized for the WebUI to expose.
+    /// Absent entirely (every pre-cycle-D config) defaults to
+    /// `RenderConfig::default()` -- `tag: "alias"`, `max_chars: 0` -- which
+    /// reproduces today's rendering exactly (`engine::process_due`,
+    /// `transform::render`). `validate()` rejects `tag` outside
+    /// {alias, none} and `max_chars` in 1..16.
+    #[serde(default)]
+    pub render: RenderConfig,
 }
 
 fn default_identity_mode() -> String { "pseudonymous".to_string() }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RenderConfig {
+    /// "alias" (default): render the sender tag as today -- the HMAC alias,
+    /// or in `identity_mode: linked` with a verified link, that link's
+    /// `display_name`. "none": suppress the `[tag]\n` prefix ENTIRELY --
+    /// the route opted out of tags altogether, so this also suppresses the
+    /// linked display_name, not just the pseudonym (see
+    /// `engine::process_due`'s render-tag selection).
+    #[serde(default = "default_render_tag")]
+    pub tag: String,
+    /// 0 (default): no route-level truncation. >=16: truncate the rendered
+    /// message to this many Unicode *characters* (not bytes) before the
+    /// transport's `max_payload` byte cap, which still applies afterward as
+    /// the hard floor (`transform::render`). Values 1..16 are rejected by
+    /// `validate()` -- large enough to be a meaningful message, not a
+    /// footgun that truncates everything to near-nothing.
+    #[serde(default)]
+    pub max_chars: u32,
+}
+
+impl Default for RenderConfig {
+    fn default() -> Self {
+        RenderConfig { tag: default_render_tag(), max_chars: 0 }
+    }
+}
+
+fn default_render_tag() -> String { "alias".to_string() }
 
 fn endpoints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Endpoint>, D::Error> {
     let raw: Vec<String> = Vec::deserialize(d)?;
@@ -269,6 +305,18 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             return Err(format!(
                 "route '{}' has invalid identity_mode '{}' (expected \"pseudonymous\" or \"linked\")",
                 r.name, r.identity_mode
+            ));
+        }
+        if r.render.tag != "alias" && r.render.tag != "none" {
+            return Err(format!(
+                "route '{}' has invalid render.tag '{}' (expected \"alias\" or \"none\")",
+                r.name, r.render.tag
+            ));
+        }
+        if r.render.max_chars != 0 && r.render.max_chars < 16 {
+            return Err(format!(
+                "route '{}' has render.max_chars {} which is below the minimum of 16 (0 disables route-level truncation)",
+                r.name, r.render.max_chars
             ));
         }
         for ep in r.sources.iter().chain(&r.destinations) {
@@ -778,6 +826,70 @@ limits:
         let err = parse(&yaml).unwrap_err();
         assert!(err.contains("@identity"), "err was: {err}");
         assert!(err.contains("reserved"), "err was: {err}");
+    }
+
+    #[test]
+    fn render_defaults_to_alias_tag_and_zero_max_chars_when_absent() {
+        // v0.1/pre-cycle-D configs have no `render:` key on a route at all.
+        let cfg = parse(GOOD).unwrap();
+        assert_eq!(cfg.routes[0].render.tag, "alias");
+        assert_eq!(cfg.routes[0].render.max_chars, 0);
+    }
+
+    #[test]
+    fn render_tag_none_is_accepted() {
+        let yaml = GOOD.replace(
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]\n    render:\n      tag: none",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.routes[0].render.tag, "none");
+        // max_chars omitted under a present `render:` block still defaults to 0.
+        assert_eq!(cfg.routes[0].render.max_chars, 0);
+    }
+
+    #[test]
+    fn render_max_chars_is_accepted_at_and_above_the_16_floor() {
+        for max_chars in [16, 900] {
+            let yaml = GOOD.replace(
+                "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+                &format!(
+                    "    destinations: [\"mocka:chan\", \"mockb:chan\"]\n    render:\n      max_chars: {max_chars}"
+                ),
+            );
+            let cfg = parse(&yaml).unwrap_or_else(|e| panic!("max_chars {max_chars} should be valid: {e}"));
+            assert_eq!(cfg.routes[0].render.max_chars, max_chars);
+            // tag omitted under a present `render:` block still defaults to "alias".
+            assert_eq!(cfg.routes[0].render.tag, "alias");
+        }
+    }
+
+    /// A typo in `render.tag` (e.g. "alais") must fail loudly at config
+    /// load, not fail open at runtime the way `identity_mode` and
+    /// `policies.rules.attachments` already do for their own typo cases.
+    #[test]
+    fn render_tag_unknown_value_is_rejected() {
+        let yaml = GOOD.replace(
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]\n    render:\n      tag: alais",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("general"), "err should name the route: {err}");
+        assert!(err.contains("alais"), "err should quote the bad value: {err}");
+    }
+
+    /// `max_chars` below the 16 floor is rejected rather than silently
+    /// truncating messages down to near-nothing; 0 is the explicit
+    /// "disabled" sentinel and stays valid (see `render_defaults_to_alias_tag_and_zero_max_chars_when_absent`).
+    #[test]
+    fn render_max_chars_below_16_is_rejected() {
+        let yaml = GOOD.replace(
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]\n    render:\n      max_chars: 5",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("general"), "err should name the route: {err}");
+        assert!(err.contains('5'), "err should quote the bad value: {err}");
     }
 
     #[test]
