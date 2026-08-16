@@ -6,6 +6,27 @@ use uuid::Uuid;
 
 pub const ENVELOPE_VERSION: u8 = 1;
 
+/// Priority classes (spec §39), highest urgency first. Index in this array
+/// IS the numeric rank stored in `deliveries.priority` (0..4) — `emergency`
+/// schedules ahead of everything else, `background` behind everything.
+pub const PRIORITY_CLASSES: [&str; 5] = ["emergency", "high", "normal", "bulk", "background"];
+
+fn default_priority() -> String {
+    PRIORITY_CLASSES[2].to_string()
+}
+
+/// Maps a priority class name to its scheduling rank (0..4, lower = more
+/// urgent). Any name not in `PRIORITY_CLASSES` — including a sender-supplied
+/// value we've never heard of — falls back to `normal`'s rank (2) rather
+/// than erroring: an unrecognized priority must not be treated as either the
+/// most or least urgent traffic by default.
+pub fn priority_rank(priority: &str) -> u8 {
+    PRIORITY_CLASSES
+        .iter()
+        .position(|&class| class == priority)
+        .map_or(2, |i| i as u8)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Endpoint {
     pub protocol: String,
@@ -61,6 +82,11 @@ pub struct Envelope {
     pub hop_limit: u8,
     #[serde(default)]
     pub attachments: Vec<AttachmentMeta>,
+    // additive (spec §39): old envelopes stored before this field existed
+    // deserialize as "normal", the same fallback `priority_rank` uses for
+    // any other unrecognized class name.
+    #[serde(default = "default_priority")]
+    pub priority: String,
 }
 
 impl Envelope {
@@ -88,6 +114,7 @@ impl Envelope {
             hop_count: 0,
             hop_limit,
             attachments: Vec::new(),
+            priority: default_priority(),
         }
     }
 
@@ -152,6 +179,57 @@ mod tests {
         assert!(env.is_expired(now + Duration::hours(25)));
         env.expires_at = now - Duration::seconds(1);
         assert!(env.is_expired(now));
+    }
+
+    #[test]
+    fn priority_rank_maps_every_class_in_order() {
+        assert_eq!(priority_rank("emergency"), 0);
+        assert_eq!(priority_rank("high"), 1);
+        assert_eq!(priority_rank("normal"), 2);
+        assert_eq!(priority_rank("bulk"), 3);
+        assert_eq!(priority_rank("background"), 4);
+    }
+
+    #[test]
+    fn priority_rank_unknown_falls_back_to_normal() {
+        assert_eq!(priority_rank("urgent"), 2);
+        assert_eq!(priority_rank(""), 2);
+        assert_eq!(priority_rank("EMERGENCY"), 2, "class names are case-sensitive, not fuzzy-matched");
+    }
+
+    #[test]
+    fn envelope_new_defaults_priority_to_normal() {
+        let now = Utc::now();
+        let env = Envelope::new(
+            Endpoint { protocol: "mock".into(), endpoint: "chan".into() },
+            Sender { native_ref: "!abcd".into() },
+            "text".into(), "hi".into(), now, now + Duration::hours(24), 8,
+        );
+        assert_eq!(env.priority, "normal");
+    }
+
+    #[test]
+    fn envelope_priority_serde_roundtrip_and_old_json_defaults_normal() {
+        let now = Utc::now();
+        let mut env = Envelope::new(
+            Endpoint { protocol: "mock".into(), endpoint: "chan".into() },
+            Sender { native_ref: "!abcd".into() },
+            "text".into(), "hi".into(), now, now + Duration::hours(24), 8,
+        );
+        env.priority = "emergency".into();
+        let json = serde_json::to_string(&env).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.priority, "emergency");
+
+        // Old-format JSON, captured before priority existed, must still
+        // deserialize (forward compatibility with rows already in
+        // storage.rs's sqlite blob column).
+        let mut old: serde_json::Value = serde_json::to_string(&env)
+            .map(|s| serde_json::from_str(&s).unwrap())
+            .unwrap();
+        old.as_object_mut().unwrap().remove("priority");
+        let old_env: Envelope = serde_json::from_value(old).unwrap();
+        assert_eq!(old_env.priority, "normal");
     }
 
     #[test]

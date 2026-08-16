@@ -65,9 +65,11 @@ async fn handle_conn(
 
     let result = loop {
         match read_frame::<_, PluginToDaemon>(&mut r).await {
-            Ok(PluginToDaemon::Inbound { endpoint, sender, kind, body, created_at, attachments }) => {
+            Ok(PluginToDaemon::Inbound {
+                endpoint, sender, kind, body, created_at, attachments, priority,
+            }) => {
                 engine::handle_inbound(
-                    &d, &plugin, endpoint, sender, kind, body, created_at, attachments);
+                    &d, &plugin, endpoint, sender, kind, body, created_at, attachments, priority);
             }
             Ok(PluginToDaemon::DeliveryResult { corr, delivered, detail }) => {
                 engine::handle_result(&d, corr, delivered, detail);

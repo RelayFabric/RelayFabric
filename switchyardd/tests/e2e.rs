@@ -134,6 +134,19 @@ async fn inbound_with_attachments(
     created_at: chrono::DateTime<chrono::Utc>,
     attachments: Vec<IpcAttachment>,
 ) {
+    inbound_with_priority(w, endpoint, sender, body, created_at, attachments, None).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn inbound_with_priority(
+    w: &mut OwnedWriteHalf,
+    endpoint: &str,
+    sender: &str,
+    body: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+    attachments: Vec<IpcAttachment>,
+    priority: Option<&str>,
+) {
     write_frame(w, &PluginToDaemon::Inbound {
         endpoint: endpoint.into(),
         sender: sender.into(),
@@ -141,6 +154,7 @@ async fn inbound_with_attachments(
         body: body.into(),
         created_at: Some(created_at),
         attachments,
+        priority: priority.map(String::from),
     }).await.unwrap();
 }
 
@@ -286,6 +300,54 @@ async fn queues_for_offline_plugin_and_survives_restart() {
     write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
         corr: corr2, delivered: true, detail: None,
     }).await.unwrap();
+}
+
+/// Covers Task 4's priority scheduling end to end (spec §39): several
+/// bulk-priority messages queue for an offline plugin, then one
+/// emergency-priority message queues last. Once the plugin connects, the
+/// emergency message must be the FIRST Send it receives despite having
+/// arrived after all the bulk ones — `due_deliveries`'s `ORDER BY priority
+/// ASC, next_attempt ASC` overriding pure arrival order is the whole point
+/// of this task.
+#[tokio::test]
+async fn emergency_priority_overtakes_bulk_priority_for_an_offline_plugin() {
+    let d = start_daemon(tempfile::tempdir().unwrap());
+    wait_for(&d.plugin_sock()).await;
+    let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
+
+    // B is not connected: three bulk-priority messages queue first...
+    for body in ["bulk one", "bulk two", "bulk three"] {
+        inbound_with_priority(
+            &mut wa, "chan", "!abcd1234", body, chrono::Utc::now(), vec![], Some("bulk"),
+        ).await;
+    }
+    // ...then one emergency-priority message queues last.
+    inbound_with_priority(
+        &mut wa, "chan", "!abcd1234", "emergency evacuation notice", chrono::Utc::now(),
+        vec![], Some("emergency"),
+    ).await;
+
+    let queue = poll_until_contains(&d.admin_sock(), "/v1/queue", "\"pending\":4").await;
+    assert!(queue.contains("\"pending\":4"), "queue was: {queue}");
+
+    // B connects: despite arriving last, the emergency message must be the
+    // FIRST Send delivered.
+    let (mut rb, mut wb) = connect_plugin(&d.plugin_sock(), "mockb").await;
+    let (corr, _, body, _) = expect_send(&mut rb).await;
+    assert!(body.contains("emergency evacuation notice"),
+        "emergency message did not arrive first, body was: {body}");
+    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
+        corr, delivered: true, detail: None,
+    }).await.unwrap();
+
+    // the three bulk messages still follow, in some order, none lost.
+    for _ in 0..3 {
+        let (corr, _, body, _) = expect_send(&mut rb).await;
+        assert!(body.contains("bulk "), "expected a bulk message, body was: {body}");
+        write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
+            corr, delivered: true, detail: None,
+        }).await.unwrap();
+    }
 }
 
 /// Covers Task 4's egress capability/policy split: the SAME inbound message

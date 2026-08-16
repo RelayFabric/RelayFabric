@@ -84,8 +84,7 @@ pub struct GlobalLimits {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Budget {
-    #[allow(dead_code)]
-    pub messages_per_minute: u32,  // consumed by Task 4 (enforce transport budgets); remove allow when used
+    pub messages_per_minute: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]

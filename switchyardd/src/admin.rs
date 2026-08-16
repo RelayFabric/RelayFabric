@@ -143,7 +143,7 @@ mod tests {
     async fn status_reports_node_and_queue() {
         let d = daemon();
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![]);
+                       "hello".into(), None, vec![], None);
         let (code, body) = get(router(d), "/v1/status").await;
         assert_eq!(code, 200);
         assert!(body.contains("\"node\":\"t\""));
@@ -155,7 +155,7 @@ mod tests {
     async fn trace_omits_body_and_404s_unknown() {
         let d = daemon();
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "secret-content".into(), None, vec![]);
+                       "secret-content".into(), None, vec![], None);
         let id = d.store.lock().unwrap()
             .due_deliveries(chrono::Utc::now(), 1).unwrap()[0].message_id;
         let (code, body) = get(router(d.clone()), &format!("/v1/messages/{id}")).await;

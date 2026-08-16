@@ -80,9 +80,10 @@ impl SenderLimiter {
 }
 
 /// Per-protocol sliding-window limiter used for transport egress budgets
-/// (spec §45 / config `transport_budgets`). Defined here (Task 3) because it
-/// shares `SenderLimiter`'s window-math shape; wired into the delivery pump
-/// by Task 4.
+/// (spec §4/§45 / config `transport_budgets`). Shares `SenderLimiter`'s
+/// window-math shape; checked in the delivery pump (`engine::process_due`)
+/// right before a Send goes out, with priority-0 (emergency) deliveries
+/// bypassing it entirely.
 #[derive(Default)]
 pub struct BudgetLimiter {
     windows: HashMap<String, VecDeque<Instant>>,
@@ -96,7 +97,6 @@ impl BudgetLimiter {
     /// True (and records) if `protocol` has sent fewer than `per_minute`
     /// messages in the trailing minute; false (nothing recorded) otherwise.
     /// `per_minute` of 0 always allows and never touches `self.windows`.
-    #[allow(dead_code)] // consumed by transport budget scheduling (Task 4); remove allow when used
     pub fn allow(&mut self, protocol: &str, per_minute: u32, now: Instant) -> bool {
         if per_minute == 0 {
             return true;

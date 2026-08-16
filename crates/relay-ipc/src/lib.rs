@@ -36,6 +36,13 @@ pub enum PluginToDaemon {
         created_at: Option<DateTime<Utc>>,
         #[serde(default)]
         attachments: Vec<IpcAttachment>,
+        // additive (spec §39): kept last so the canonical CBOR encoding of
+        // every pre-existing Inbound field is unchanged; only appends one
+        // trailing map entry. A plugin that doesn't send it (older plugin,
+        // or a class the daemon doesn't recognize) normalizes to "normal"
+        // via relay_core::priority_rank, same as any other unknown value.
+        #[serde(default)]
+        priority: Option<String>,
     },
     DeliveryResult {
         corr: i64,
@@ -140,6 +147,7 @@ mod tests {
                 mime: "application/octet-stream".into(),
                 data: vec![0u8; MAX_FRAME as usize + 1],
             }],
+            priority: None,
         };
         let got = write_frame(&mut buf, &msg).await;
         assert!(got.is_err());
@@ -193,12 +201,32 @@ mod tests {
                 mime: "application/octet-stream".into(),
                 data: vec![1, 2, 3],
             }],
+            priority: None,
         };
         write_frame(&mut buf, &msg).await.unwrap();
         // Wire-format lock: Python plugins reproduce these exact bytes
         // (test_relay_ipc.py). If this assertion ever fails, the plugin
         // protocol changed — that is a breaking protocol event, not a test fix.
         let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, "00000085a7617467696e626f756e6468656e64706f696e74646368616e6673656e6465726173646b696e64647465787464626f64796268696a637265617465645f6174f66b6174746163686d656e747381a36866696c656e616d6565612e62696e646d696d6578186170706c69636174696f6e2f6f637465742d73747265616d646461746143010203");
+        assert_eq!(hex, "0000008fa8617467696e626f756e6468656e64706f696e74646368616e6673656e6465726173646b696e64647465787464626f64796268696a637265617465645f6174f66b6174746163686d656e747381a36866696c656e616d6565612e62696e646d696d6578186170706c69636174696f6e2f6f637465742d73747265616d646461746143010203687072696f72697479f6");
+    }
+
+    #[tokio::test]
+    async fn priority_field_roundtrips_and_defaults_to_none() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let msg = PluginToDaemon::Inbound {
+            endpoint: "chan".into(),
+            sender: "s".into(),
+            kind: "text".into(),
+            body: "hi".into(),
+            created_at: None,
+            attachments: vec![],
+            priority: Some("emergency".into()),
+        };
+        write_frame(&mut a, &msg).await.unwrap();
+        let PluginToDaemon::Inbound { priority, .. } = read_frame(&mut b).await.unwrap() else {
+            panic!("wrong variant");
+        };
+        assert_eq!(priority.as_deref(), Some("emergency"));
     }
 }

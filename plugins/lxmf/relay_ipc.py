@@ -66,7 +66,7 @@ def attachment(filename, mime, data):
     return {"filename": filename, "mime": mime, "data": data}
 
 
-def inbound(endpoint, sender, body, created_at_epoch=None, *, attachments=None):
+def inbound(endpoint, sender, body, created_at_epoch=None, *, attachments=None, priority=None):
     created = None
     if created_at_epoch is not None:
         try:
@@ -78,7 +78,7 @@ def inbound(endpoint, sender, body, created_at_epoch=None, *, attachments=None):
             created = None
     return {"t": "inbound", "endpoint": endpoint, "sender": sender,
             "kind": "text", "body": body, "created_at": created,
-            "attachments": attachments or []}
+            "attachments": attachments or [], "priority": priority}
 
 
 def delivery_result(corr, delivered, detail=None):

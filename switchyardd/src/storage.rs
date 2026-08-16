@@ -14,6 +14,7 @@ pub struct Delivery {
     pub message_id: Uuid,
     pub route: String,
     pub destination: Endpoint,
+    pub priority: u8,
     pub attempt_count: u32,
     pub state: String,
     pub reason: Option<String>,
@@ -33,6 +34,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
   route TEXT NOT NULL,
   dest_protocol TEXT NOT NULL,
   dest_endpoint TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 2,
   attempt_count INTEGER NOT NULL DEFAULT 0,
   state TEXT NOT NULL DEFAULT 'pending',
   reason TEXT,
@@ -40,7 +42,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
   attempted_at TEXT,
   expires_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_deliveries_due ON deliveries(state, next_attempt);
+CREATE INDEX IF NOT EXISTS idx_deliveries_due ON deliveries(state, priority, next_attempt);
 CREATE TABLE IF NOT EXISTS message_attachments (
   message_id TEXT NOT NULL,
   sha256 TEXT NOT NULL
@@ -48,6 +50,32 @@ CREATE TABLE IF NOT EXISTS message_attachments (
 CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
   ON message_attachments(message_id);
 ";
+
+/// Brings a pre-Task-4 database (created before `deliveries.priority`
+/// existed) up to the current schema. `SCHEMA`'s `CREATE TABLE/INDEX IF NOT
+/// EXISTS` above is a no-op against an existing `deliveries` table — it
+/// never adds columns to a table that's already there — so a v0.1-era DB
+/// opened by this build would otherwise be missing the column entirely and
+/// every query below referencing it would fail at first use. Guarded by a
+/// `pragma_table_info` check (rather than trying the `ALTER TABLE`
+/// unconditionally and swallowing a "duplicate column" error) so this is
+/// also a safe, idempotent no-op on every subsequent open of an
+/// already-migrated DB, fresh or upgraded.
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let has_priority: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('deliveries') WHERE name = 'priority'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_priority == 0 {
+        conn.execute_batch(
+            "ALTER TABLE deliveries ADD COLUMN priority INTEGER NOT NULL DEFAULT 2;
+             DROP INDEX IF EXISTS idx_deliveries_due;
+             CREATE INDEX idx_deliveries_due ON deliveries(state, priority, next_attempt);",
+        )?;
+    }
+    Ok(())
+}
 
 fn ts(t: DateTime<Utc>) -> String {
     t.to_rfc3339()
@@ -62,6 +90,7 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Store { conn })
     }
 
@@ -99,6 +128,10 @@ impl Store {
         }
     }
 
+    /// `priority` is the numeric rank (0=emergency..4=background) computed
+    /// by `relay_core::priority_rank` from the envelope's priority class —
+    /// callers pass the already-resolved rank, not a class name, so this
+    /// module has no dependency on the class-name-to-rank mapping.
     pub fn insert_delivery(
         &self,
         message_id: Uuid,
@@ -106,13 +139,14 @@ impl Store {
         dest: &Endpoint,
         next_attempt: DateTime<Utc>,
         expires_at: DateTime<Utc>,
+        priority: u8,
     ) -> rusqlite::Result<i64> {
         self.conn.execute(
             "INSERT INTO deliveries
-               (message_id, route, dest_protocol, dest_endpoint, next_attempt, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+               (message_id, route, dest_protocol, dest_endpoint, next_attempt, expires_at, priority)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![message_id.to_string(), route, dest.protocol, dest.endpoint,
-                    ts(next_attempt), ts(expires_at)],
+                    ts(next_attempt), ts(expires_at), priority],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -168,18 +202,24 @@ impl Store {
             message_id: row.get::<_, String>(1)?.parse().unwrap_or_default(),
             route: row.get(2)?,
             destination: Endpoint { protocol: row.get(3)?, endpoint: row.get(4)? },
-            attempt_count: row.get(5)?,
-            state: row.get(6)?,
-            reason: row.get(7)?,
-            next_attempt: parse_ts(&row.get::<_, String>(8)?),
-            expires_at: parse_ts(&row.get::<_, String>(9)?),
+            priority: row.get(5)?,
+            attempt_count: row.get(6)?,
+            state: row.get(7)?,
+            reason: row.get(8)?,
+            next_attempt: parse_ts(&row.get::<_, String>(9)?),
+            expires_at: parse_ts(&row.get::<_, String>(10)?),
         })
     }
 
     const DELIVERY_COLS: &'static str =
-        "id, message_id, route, dest_protocol, dest_endpoint, attempt_count,
+        "id, message_id, route, dest_protocol, dest_endpoint, priority, attempt_count,
          state, reason, next_attempt, expires_at";
 
+    /// Priority first (0=emergency ahead of 4=background), next_attempt as
+    /// the tiebreaker within the same priority tier — spec §39's "low
+    /// bandwidth plugins MAY use priority to determine queue ordering",
+    /// applied unconditionally here since the scheduler has no per-plugin
+    /// opt-out.
     pub fn due_deliveries(
         &self,
         now: DateTime<Utc>,
@@ -188,7 +228,7 @@ impl Store {
         let sql = format!(
             "SELECT {} FROM deliveries
              WHERE state = 'pending' AND next_attempt <= ?1
-             ORDER BY next_attempt LIMIT ?2",
+             ORDER BY priority ASC, next_attempt ASC LIMIT ?2",
             Self::DELIVERY_COLS
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -386,9 +426,9 @@ mod tests {
         let e = env();
         let now = Utc::now();
         s.insert_message(&e).unwrap();
-        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at).unwrap();
+        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
         let _future = s
-            .insert_delivery(e.id, "general", &dest(), now + Duration::hours(1), e.expires_at)
+            .insert_delivery(e.id, "general", &dest(), now + Duration::hours(1), e.expires_at, 2)
             .unwrap();
         let due = s.due_deliveries(now, 10).unwrap();
         assert_eq!(due.len(), 1);
@@ -403,7 +443,7 @@ mod tests {
         let e = env();
         let now = Utc::now();
         s.insert_message(&e).unwrap();
-        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at).unwrap();
+        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
 
         s.mark_attempting(id).unwrap();
         assert!(s.due_deliveries(now, 10).unwrap().is_empty());
@@ -427,7 +467,7 @@ mod tests {
         s.mark_terminal(id, "dead_letter", "RETRY_EXHAUSTED").unwrap();
         assert_eq!(s.deliveries_for(e.id).unwrap()[0].state, "delivered");
 
-        let id2 = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at).unwrap();
+        let id2 = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
         s.mark_terminal(id2, "dead_letter", "RETRY_EXHAUSTED").unwrap();
         let d2 = s.deliveries_for(e.id).unwrap().into_iter().find(|d| d.id == id2).unwrap();
         assert_eq!(d2.reason.as_deref(), Some("RETRY_EXHAUSTED"));
@@ -447,7 +487,7 @@ mod tests {
         s.insert_message(&e).unwrap();
         // still 'pending': never entered 'attempting', so a stray delivered
         // ack must not apply.
-        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at).unwrap();
+        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
         s.mark_delivered(id).unwrap();
         assert_eq!(s.deliveries_for(e.id).unwrap()[0].state, "pending");
     }
@@ -462,7 +502,7 @@ mod tests {
         let delivered_msg = env();
         s.insert_message(&delivered_msg).unwrap();
         let delivered_id = s.insert_delivery(
-            delivered_msg.id, "general", &dest(), now, delivered_msg.expires_at).unwrap();
+            delivered_msg.id, "general", &dest(), now, delivered_msg.expires_at, 2).unwrap();
         s.mark_attempting(delivered_id).unwrap();
         s.mark_delivered(delivered_id).unwrap();
 
@@ -470,7 +510,7 @@ mod tests {
         let pending_msg = env();
         s.insert_message(&pending_msg).unwrap();
         let pending_id = s.insert_delivery(
-            pending_msg.id, "general", &dest(), now, pending_msg.expires_at).unwrap();
+            pending_msg.id, "general", &dest(), now, pending_msg.expires_at, 2).unwrap();
 
         let (purged, orphans) = s.purge_terminal(now + Duration::hours(1)).unwrap();
         assert_eq!(purged, 1);
@@ -519,7 +559,7 @@ mod tests {
         s.insert_message(&delivered_msg).unwrap();
         s.insert_attachment_refs(delivered_msg.id, &["orphan-sha".to_string()]).unwrap();
         let delivered_id = s.insert_delivery(
-            delivered_msg.id, "general", &dest(), now, delivered_msg.expires_at).unwrap();
+            delivered_msg.id, "general", &dest(), now, delivered_msg.expires_at, 2).unwrap();
         s.mark_attempting(delivered_id).unwrap();
         s.mark_delivered(delivered_id).unwrap();
 
@@ -528,7 +568,7 @@ mod tests {
         let pending_msg = env();
         s.insert_message(&pending_msg).unwrap();
         s.insert_attachment_refs(pending_msg.id, &["surviving-sha".to_string()]).unwrap();
-        s.insert_delivery(pending_msg.id, "general", &dest(), now, pending_msg.expires_at).unwrap();
+        s.insert_delivery(pending_msg.id, "general", &dest(), now, pending_msg.expires_at, 2).unwrap();
 
         let (deleted, orphans) = s.purge_terminal(now + Duration::hours(1)).unwrap();
         assert_eq!(deleted, 1);
@@ -557,12 +597,12 @@ mod tests {
         let msg1 = env();
         s.insert_message(&msg1).unwrap();
         s.insert_attachment_refs(msg1.id, &["shared-sha".to_string()]).unwrap();
-        let id1 = s.insert_delivery(msg1.id, "general", &dest(), now, msg1.expires_at).unwrap();
+        let id1 = s.insert_delivery(msg1.id, "general", &dest(), now, msg1.expires_at, 2).unwrap();
 
         let msg2 = env();
         s.insert_message(&msg2).unwrap();
         s.insert_attachment_refs(msg2.id, &["shared-sha".to_string()]).unwrap();
-        let id2 = s.insert_delivery(msg2.id, "general", &dest(), now, msg2.expires_at).unwrap();
+        let id2 = s.insert_delivery(msg2.id, "general", &dest(), now, msg2.expires_at, 2).unwrap();
 
         // terminate + purge msg1 only. msg2 (and its ref to the same sha) is
         // still alive: the shared sha must NOT be reported as orphaned, and
@@ -593,7 +633,7 @@ mod tests {
         let e = env();
         let now = Utc::now();
         s.insert_message(&e).unwrap();
-        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at).unwrap();
+        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
         s.mark_attempting(id).unwrap();
         assert_eq!(s.recover().unwrap(), 1);
         assert_eq!(s.deliveries_for(e.id).unwrap()[0].state, "pending");
@@ -609,8 +649,8 @@ mod tests {
         let e = env();
         let now = Utc::now();
         s.insert_message(&e).unwrap();
-        s.insert_delivery(e.id, "r", &dest(), now, e.expires_at).unwrap();
-        let id2 = s.insert_delivery(e.id, "r", &dest(), now, e.expires_at).unwrap();
+        s.insert_delivery(e.id, "r", &dest(), now, e.expires_at, 2).unwrap();
+        let id2 = s.insert_delivery(e.id, "r", &dest(), now, e.expires_at, 2).unwrap();
         s.mark_terminal(id2, "dead_letter", "POLICY_DENIED").unwrap();
         let counts = s.queue_counts().unwrap();
         assert!(counts.contains(&("pending".to_string(), 1)));
@@ -623,9 +663,9 @@ mod tests {
         let e = env();
         let now = Utc::now();
         s.insert_message(&e).unwrap();
-        let a = s.insert_delivery(e.id, "route-a", &dest(), now, e.expires_at).unwrap();
-        s.insert_delivery(e.id, "route-a", &dest(), now, e.expires_at).unwrap();
-        let b = s.insert_delivery(e.id, "route-b", &dest(), now, e.expires_at).unwrap();
+        let a = s.insert_delivery(e.id, "route-a", &dest(), now, e.expires_at, 2).unwrap();
+        s.insert_delivery(e.id, "route-a", &dest(), now, e.expires_at, 2).unwrap();
+        let b = s.insert_delivery(e.id, "route-b", &dest(), now, e.expires_at, 2).unwrap();
 
         assert_eq!(s.pending_count(Some("route-a")).unwrap(), 2);
         assert_eq!(s.pending_count(Some("route-b")).unwrap(), 1);
@@ -660,5 +700,108 @@ mod tests {
             "a dead-lettered row must never count as in-flight");
         let counts = s.queue_counts().unwrap();
         assert!(counts.contains(&("dead_letter".to_string(), 1)));
+    }
+
+    #[test]
+    fn due_deliveries_returns_emergency_before_bulk_inserted_earlier() {
+        let (_d, s) = store();
+        let e = env();
+        let now = Utc::now();
+        s.insert_message(&e).unwrap();
+
+        // two bulk (rank 3) rows inserted first...
+        let bulk1 = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 3).unwrap();
+        let bulk2 = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 3).unwrap();
+        // ...then one emergency (rank 0) row inserted last, same next_attempt.
+        let emergency =
+            s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 0).unwrap();
+
+        let due = s.due_deliveries(now, 10).unwrap();
+        assert_eq!(due.len(), 3);
+        assert_eq!(due[0].id, emergency,
+            "emergency (priority 0) must be scheduled first despite being inserted last: {due:?}");
+        assert_eq!(due[0].priority, 0);
+        let remaining_ids: Vec<i64> = due[1..].iter().map(|d| d.id).collect();
+        assert!(remaining_ids.contains(&bulk1) && remaining_ids.contains(&bulk2));
+    }
+
+    /// Schema captured verbatim as it existed before this task added
+    /// `deliveries.priority` — used to simulate opening a real v0.1-era
+    /// database file with `Store::open` and confirm the migration guard
+    /// brings it up to date without data loss.
+    const PRE_PRIORITY_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS messages (
+  id TEXT PRIMARY KEY,
+  envelope TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS deliveries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL REFERENCES messages(id),
+  route TEXT NOT NULL,
+  dest_protocol TEXT NOT NULL,
+  dest_endpoint TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'pending',
+  reason TEXT,
+  next_attempt TEXT NOT NULL,
+  attempted_at TEXT,
+  expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_deliveries_due ON deliveries(state, next_attempt);
+CREATE TABLE IF NOT EXISTS message_attachments (
+  message_id TEXT NOT NULL,
+  sha256 TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
+  ON message_attachments(message_id);
+";
+
+    #[test]
+    fn store_open_migrates_a_pre_priority_database_without_losing_existing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+
+        // Build a DB exactly the way a v0.1 daemon would have: no
+        // `priority` column at all, plus one pre-existing row so the
+        // migration's `ALTER TABLE ADD COLUMN` can be checked against real
+        // data, not just an empty table.
+        let msg_id = Uuid::now_v7();
+        let now = Utc::now();
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(PRE_PRIORITY_SCHEMA).unwrap();
+            raw.execute(
+                "INSERT INTO messages (id, envelope, created_at) VALUES (?1, ?2, ?3)",
+                params![msg_id.to_string(), "{}", ts(now)],
+            ).unwrap();
+            raw.execute(
+                "INSERT INTO deliveries
+                   (message_id, route, dest_protocol, dest_endpoint, next_attempt, expires_at)
+                 VALUES (?1, 'general', 'mockb', 'chan', ?2, ?3)",
+                params![msg_id.to_string(), ts(now), ts(now + Duration::hours(1))],
+            ).unwrap();
+        }
+
+        // Store::open must migrate this in place, not error or wipe it.
+        let s = Store::open(&path).unwrap();
+
+        let has_priority: i64 = s.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('deliveries') WHERE name = 'priority'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(has_priority, 1, "migration must add the priority column");
+
+        // the pre-existing row must survive, backfilled to the default rank.
+        let due = s.due_deliveries(now + Duration::seconds(1), 10).unwrap();
+        assert_eq!(due.len(), 1, "the row that existed before migration must survive it");
+        assert_eq!(due[0].priority, 2, "pre-existing rows must backfill to the default rank");
+        assert_eq!(due[0].message_id, msg_id);
+
+        // and the migration is idempotent: reopening (e.g. a daemon restart)
+        // must not error or re-run the ALTER TABLE.
+        drop(s);
+        let s2 = Store::open(&path).unwrap();
+        assert_eq!(s2.due_deliveries(now + Duration::seconds(1), 10).unwrap().len(), 1);
     }
 }

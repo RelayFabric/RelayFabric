@@ -35,8 +35,6 @@ pub struct Daemon {
     pub plugins: Mutex<HashMap<String, PluginHandle>>,
     pub cas: Cas,
     pub sender_limiter: Mutex<SenderLimiter>,
-    #[allow(dead_code)]
-    // consumed by transport budget scheduling (Task 4); remove allow when used
     pub budget_limiter: Mutex<BudgetLimiter>,
 }
 
@@ -102,6 +100,7 @@ pub fn handle_inbound(
     body: String,
     created_at: Option<DateTime<Utc>>,
     attachments: Vec<IpcAttachment>,
+    priority: Option<String>,
 ) {
     metrics::inc(&metrics::INGRESS);
 
@@ -204,6 +203,15 @@ pub fn handle_inbound(
         d.cfg.hop_limit,
     );
     env.attachments = metas;
+    // The envelope keeps whatever the plugin actually sent (defaulted to
+    // "normal" only when it sent nothing at all) — useful as-is for
+    // diagnostics (e.g. a trace showing a plugin sent a typo'd class name).
+    // `relay_core::priority_rank` is the single source of what counts as a
+    // recognized class: it's the only place an unrecognized value gets
+    // folded to the "normal" scheduling rank, so the DB's numeric ordering
+    // is never out of step with this mapping.
+    env.priority = priority.unwrap_or_else(|| "normal".to_string());
+    let priority_rank = relay_core::priority_rank(&env.priority);
     let store = d.store.lock().unwrap();
     if let Err(e) = store.insert_message(&env) {
         warn!(error = %e, "failed to persist message");
@@ -240,7 +248,9 @@ pub fn handle_inbound(
             warn!(route = %route, destination = %dest, "queue full, delivery rejected");
             continue;
         }
-        if let Err(e) = store.insert_delivery(env.id, route, dest, now, env.expires_at) {
+        if let Err(e) =
+            store.insert_delivery(env.id, route, dest, now, env.expires_at, priority_rank)
+        {
             warn!(error = %e, "failed to enqueue delivery");
         }
     }
@@ -376,6 +386,36 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
                 warn_if_mark_failed(del.id, "pending", result);
                 return;
             };
+
+            // Transport egress budget (spec §4/§45): a per-protocol cap on
+            // sends-per-minute, independent of the sender-side and queue
+            // quotas above (those gate what gets *accepted*; this gates what
+            // gets *sent out*, so a route with slow/expensive egress -
+            // meshtastic airtime, a metered uplink - can't be saturated by a
+            // burst that already made it into the queue). Priority 0
+            // (emergency) bypasses this check entirely, including the
+            // recording `allow` would otherwise do — life-safety traffic
+            // must never wait behind a transport's throughput cap, and
+            // spending emergency sends against the budget would also let a
+            // flood of them starve everything else out from behind the
+            // bypass. A protocol with no configured budget always allows
+            // (see `BudgetLimiter::allow`) and never checks priority.
+            if del.priority > 0 {
+                let per_minute = d.cfg.transport_budgets
+                    .get(&del.destination.protocol)
+                    .map(|b| b.messages_per_minute)
+                    .unwrap_or(0);
+                let allowed = d.budget_limiter.lock().unwrap()
+                    .allow(&del.destination.protocol, per_minute, Instant::now());
+                if !allowed {
+                    metrics::inc(&metrics::BUDGET_DEFERRED);
+                    let result = d.store.lock().unwrap()
+                        .mark_retry(del.id, now + CDuration::seconds(10));
+                    warn_if_mark_failed(del.id, "pending", result);
+                    return;
+                }
+            }
+
             let limit = match (max_payload, cap_limit) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -502,11 +542,11 @@ fn load_attachments(
 #[cfg(test)]
 pub mod tests_support {
     use super::*;
-    use crate::config::{Config, Limits, NodeConfig, PluginConfig, RouteConfig};
+    use crate::config::{Budget, Config, Limits, NodeConfig, PluginConfig, RouteConfig};
     use std::collections::BTreeMap;
 
     pub fn test_daemon(dir: &std::path::Path) -> Daemon {
-        test_daemon_with_limits(dir, Limits::default())
+        test_daemon_full(dir, Limits::default(), BTreeMap::new())
     }
 
     /// Like `test_daemon`, but with a caller-supplied `Limits` baked into the
@@ -518,6 +558,23 @@ pub mod tests_support {
     /// — rather than re-read live from `d.cfg` on every call the way the
     /// queue-cap checks are.
     pub fn test_daemon_with_limits(dir: &std::path::Path, limits: Limits) -> Daemon {
+        test_daemon_full(dir, limits, BTreeMap::new())
+    }
+
+    /// Like `test_daemon`, but with caller-supplied `transport_budgets`.
+    /// `BudgetLimiter` is re-read live from `d.cfg.transport_budgets` on
+    /// every pump tick (unlike `sender_limiter`/`cas`, which cache their
+    /// config at construction) — this only exists so budget tests don't have
+    /// to spell out the full `Config` literal.
+    pub fn test_daemon_with_budgets(
+        dir: &std::path::Path, transport_budgets: BTreeMap<String, Budget>,
+    ) -> Daemon {
+        test_daemon_full(dir, Limits::default(), transport_budgets)
+    }
+
+    fn test_daemon_full(
+        dir: &std::path::Path, limits: Limits, transport_budgets: BTreeMap<String, Budget>,
+    ) -> Daemon {
         let mut plugins = BTreeMap::new();
         for name in ["mocka", "mockb"] {
             plugins.insert(name.to_string(), PluginConfig {
@@ -539,7 +596,7 @@ pub mod tests_support {
             max_attachment_bytes: 8 * 1024 * 1024,
             public_services: vec![],
             limits,
-            transport_budgets: Default::default(),
+            transport_budgets,
         };
         Daemon::new(cfg, dir).unwrap()
     }
@@ -548,14 +605,14 @@ pub mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tests_support::{test_daemon, test_daemon_with_limits};
+    use tests_support::{test_daemon, test_daemon_with_budgets, test_daemon_with_limits};
 
     #[test]
     fn inbound_routes_to_other_endpoint_and_dedups() {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![]);
+                       "hello".into(), None, vec![], None);
         // one delivery row, to mockb, none echoed to mocka
         let store = d.store.lock().unwrap();
         let counts = store.queue_counts().unwrap();
@@ -565,14 +622,43 @@ mod tests {
         drop(store);
         // duplicate is dropped
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![]);
+                       "hello".into(), None, vec![], None);
         assert_eq!(d.store.lock().unwrap().queue_counts().unwrap(),
                    vec![("pending".to_string(), 1)]);
         // unrouted endpoint is dropped (deny by default)
         handle_inbound(&d, "mocka", "elsewhere".into(), "!a".into(), "text".into(),
-                       "hi".into(), None, vec![]);
+                       "hi".into(), None, vec![], None);
         assert_eq!(d.store.lock().unwrap().queue_counts().unwrap(),
                    vec![("pending".to_string(), 1)]);
+    }
+
+    /// A missing priority defaults the envelope's stored class to "normal";
+    /// an unrecognized one (a plugin's typo, or a class this daemon version
+    /// predates) is stored verbatim rather than silently rewritten — but
+    /// either way `relay_core::priority_rank` is the only place the
+    /// "unknown means normal" fallback applies, so both schedule at rank 2.
+    #[test]
+    fn inbound_priority_missing_or_unrecognized_both_schedule_at_the_normal_rank() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "no priority sent".into(), None, vec![], None);
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "typo'd priority".into(), None, vec![], Some("urgent".into()));
+
+        let store = d.store.lock().unwrap();
+        let due = store.due_deliveries(chrono::Utc::now(), 10).unwrap();
+        assert_eq!(due.len(), 2);
+        assert!(due.iter().all(|d| d.priority == 2),
+            "both a missing and an unrecognized priority must schedule at the normal rank");
+
+        let envs: Vec<_> = due.iter()
+            .map(|d| store.get_message(d.message_id).unwrap().unwrap())
+            .collect();
+        assert!(envs.iter().any(|e| e.priority == "normal"),
+            "a missing priority must default the stored class to \"normal\"");
+        assert!(envs.iter().any(|e| e.priority == "urgent"),
+            "an unrecognized class name must be stored verbatim, not silently rewritten");
     }
 
     #[tokio::test]
@@ -600,7 +686,7 @@ mod tests {
         let delivery_id = {
             let store = d.store.lock().unwrap();
             store
-                .insert_delivery(ghost_id, "general", &dest, now, now + CDuration::hours(1))
+                .insert_delivery(ghost_id, "general", &dest, now, now + CDuration::hours(1), 2)
                 .unwrap()
         };
         let del = {
@@ -647,7 +733,7 @@ mod tests {
         let d = Arc::new(test_daemon(dir.path()));
 
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![]);
+                       "hello".into(), None, vec![], None);
         // sample `now` after handle_inbound (which stamps next_attempt with
         // its own, slightly later, internal Utc::now()) so due_deliveries
         // actually finds the row.
@@ -698,7 +784,7 @@ mod tests {
         let expected_sha = hex::encode(Sha256::digest(&small.data));
 
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![small, big]);
+                       "hello".into(), None, vec![small, big], None);
 
         let store = d.store.lock().unwrap();
         let due = store.due_deliveries(chrono::Utc::now(), 10).unwrap();
@@ -736,7 +822,7 @@ mod tests {
 
         // "elsewhere" is not a configured route source for test_daemon.
         handle_inbound(&d, "mocka", "elsewhere".into(), "!a".into(), "text".into(),
-                       "hi".into(), None, vec![att]);
+                       "hi".into(), None, vec![att], None);
 
         assert!(d.cas.get(&sha).is_err(),
             "unrouted message must not write attachment bytes to the CAS");
@@ -766,9 +852,9 @@ mod tests {
         // two independent messages (different bodies, so dedup doesn't
         // collapse them) carrying an attachment with identical bytes.
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "first".into(), None, vec![shared.clone()]);
+                       "first".into(), None, vec![shared.clone()], None);
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "second".into(), None, vec![shared]);
+                       "second".into(), None, vec![shared], None);
         assert_eq!(d.cas.get(&sha).unwrap(), b"shared bytes");
 
         let now = Utc::now();
@@ -846,7 +932,7 @@ mod tests {
             data: b"just some bytes".to_vec(),
         };
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "look at this".into(), None, vec![att.clone()]);
+                       "look at this".into(), None, vec![att.clone()], None);
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
@@ -873,7 +959,7 @@ mod tests {
             filename: "photo.jpg".into(), mime: "image/jpeg".into(), data: b"bytes".to_vec(),
         };
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "look at this".into(), None, vec![att]);
+                       "look at this".into(), None, vec![att], None);
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
@@ -908,7 +994,7 @@ mod tests {
             filename: "photo.jpg".into(), mime: "image/jpeg".into(), data: b"bytes".to_vec(),
         };
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "look at this".into(), None, vec![att]);
+                       "look at this".into(), None, vec![att], None);
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
@@ -942,7 +1028,7 @@ mod tests {
             data: vec![0u8; 20], // over the 10 B policy cap, under the ingress cap
         };
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "look at this".into(), None, vec![att]);
+                       "look at this".into(), None, vec![att], None);
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
@@ -971,7 +1057,7 @@ mod tests {
             data: b"will vanish".to_vec(),
         };
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "look at this".into(), None, vec![att]);
+                       "look at this".into(), None, vec![att], None);
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
@@ -1040,9 +1126,9 @@ mod tests {
         let same_created_at = Utc::now();
 
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), Some(same_created_at), vec![a]);
+                       "hello".into(), Some(same_created_at), vec![a], None);
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), Some(same_created_at), vec![b]);
+                       "hello".into(), Some(same_created_at), vec![b], None);
 
         let counts = d.store.lock().unwrap().queue_counts().unwrap();
         assert_eq!(counts, vec![("pending".to_string(), 2)],
@@ -1060,9 +1146,9 @@ mod tests {
         let before = metrics::QUEUE_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
 
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "first".into(), None, vec![]);
+                       "first".into(), None, vec![], None);
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "second".into(), None, vec![]);
+                       "second".into(), None, vec![], None);
 
         let after = metrics::QUEUE_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(after - before, 1, "the second delivery must bump QUEUE_REJECTED");
@@ -1092,9 +1178,9 @@ mod tests {
         let before = metrics::RATELIMITED.load(std::sync::atomic::Ordering::Relaxed);
 
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "first".into(), None, vec![]);
+                       "first".into(), None, vec![], None);
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "second".into(), None, vec![]);
+                       "second".into(), None, vec![], None);
 
         let after = metrics::RATELIMITED.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(after - before, 1,
@@ -1117,9 +1203,9 @@ mod tests {
         });
 
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "from a".into(), None, vec![]);
+                       "from a".into(), None, vec![], None);
         handle_inbound(&d, "mocka", "chan".into(), "!b".into(), "text".into(),
-                       "from b".into(), None, vec![]);
+                       "from b".into(), None, vec![], None);
 
         let counts = d.store.lock().unwrap().queue_counts().unwrap();
         assert_eq!(counts, vec![("pending".to_string(), 2)],
@@ -1140,7 +1226,7 @@ mod tests {
             data: vec![0u8; 20], // over the 5-byte CAS budget, under the ingress size cap
         };
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![att]);
+                       "hello".into(), None, vec![att], None);
 
         let store = d.store.lock().unwrap();
         let due = store.due_deliveries(chrono::Utc::now(), 10).unwrap();
@@ -1151,5 +1237,70 @@ mod tests {
             env.body.contains("[dropped over-budget.bin: cas budget exceeded]"),
             "body was: {}", env.body
         );
+    }
+
+    #[tokio::test]
+    async fn transport_budget_defers_the_send_over_it_and_emergency_bypasses() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut budgets = std::collections::BTreeMap::new();
+        budgets.insert("mockb".to_string(), crate::config::Budget { messages_per_minute: 2 });
+        let d = Arc::new(test_daemon_with_budgets(dir.path(), budgets));
+        let mut rx = register_plugin(&d, "mockb", false);
+
+        // three normal-priority messages queued for mockb, a 2/minute budget.
+        for body in ["one", "two", "three"] {
+            handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                           body.into(), None, vec![], None);
+        }
+        let now = Utc::now();
+        let dues = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 10).unwrap() };
+        assert_eq!(dues.len(), 3);
+        assert!(dues.iter().all(|d| d.priority == 2), "these are all normal priority");
+        let ids: Vec<i64> = dues.iter().map(|d| d.id).collect();
+
+        let before = metrics::BUDGET_DEFERRED.load(std::sync::atomic::Ordering::Relaxed);
+        for del in dues {
+            process_due(&d, del, now).await;
+        }
+        let after = metrics::BUDGET_DEFERRED.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after - before, 1, "only the third send within the minute must be deferred");
+
+        // the first two budget slots went out as real Sends...
+        recv_send(&mut rx).await;
+        recv_send(&mut rx).await;
+        // ...and nothing else: the third never called try_send at all.
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "the budget-deferred delivery must not have produced a Send");
+
+        // the deferred delivery (whichever of the three it was) must still be
+        // 'pending' with its next_attempt pushed ~10s out, not immediately
+        // due again and not dead-lettered.
+        let deferred_id = ids[2];
+        {
+            let store = d.store.lock().unwrap();
+            assert!(store.due_deliveries(now + CDuration::seconds(9), 10).unwrap()
+                .iter().all(|d| d.id != deferred_id),
+                "must not be due again before the ~10s budget backoff elapses");
+            assert!(store.due_deliveries(now + CDuration::seconds(11), 10).unwrap()
+                .iter().any(|d| d.id == deferred_id),
+                "must be due again once the ~10s budget backoff has elapsed");
+        }
+
+        // an emergency send for the same over-budget destination must
+        // bypass the check entirely and go out immediately.
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "urgent".into(), None, vec![], Some("emergency".into()));
+        let now2 = Utc::now();
+        let emergency_del = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now2, 10).unwrap().into_iter()
+                .find(|d| d.priority == 0)
+                .expect("the emergency delivery must be immediately due")
+        };
+        process_due(&d, emergency_del, now2).await;
+        let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert!(body.contains("urgent"), "body was: {body}");
     }
 }
