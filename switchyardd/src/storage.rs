@@ -853,11 +853,42 @@ impl Store {
     /// call is idempotent and re-asserts config's view over whatever the DB
     /// currently holds for those node_ids, per `seed_trust`'s config-wins
     /// semantics.
+    ///
+    /// REVOCATION (final-review I-3): this function is AUTHORITATIVE for the
+    /// config-derived levels (`verified`/`trusted`) -- before upserting the
+    /// current config, any node_id still holding one of those levels that is
+    /// no longer in `peers[]`/`trusted` is downgraded to `seen` (row kept,
+    /// `first_seen` preserved, `updated_at` advanced). Without this pass, an
+    /// operator deleting a peer from config would leave its durable
+    /// `verified`/`trusted` row passing `fed_ingress`'s `accept_from` gate
+    /// forever. Deliberately untouched: runtime-learned `seen` rows (not
+    /// config-derived), and `blocked` rows (sticky by design -- unblocking
+    /// is an explicit operator action, never an implicit config-diff side
+    /// effect; a blocked node also removed from config stays blocked).
+    /// Order matters: downgrade FIRST, then upsert -- so a node in the
+    /// current config passes through with its configured level intact.
     pub fn seed_federation_trust(
         &self,
         fed: &crate::config::FederationConfig,
         now: DateTime<Utc>,
     ) -> rusqlite::Result<()> {
+        let authorized: Vec<&str> = fed
+            .peers
+            .iter()
+            .map(|p| p.node_id.as_str())
+            .chain(fed.trusted.iter().map(|s| s.as_str()))
+            .collect();
+        let placeholders =
+            (0..authorized.len()).map(|i| format!("?{}", i + 2)).collect::<Vec<_>>().join(", ");
+        self.conn.execute(
+            &format!(
+                "UPDATE node_trust SET level = 'seen', updated_at = ?1
+                 WHERE level IN ('verified', 'trusted') AND node_id NOT IN ({placeholders})"
+            ),
+            rusqlite::params_from_iter(
+                std::iter::once(ts(now)).chain(authorized.iter().map(|s| s.to_string())),
+            ),
+        )?;
         for peer in &fed.peers {
             self.seed_trust(&peer.node_id, &peer.trust, now)?;
         }
@@ -1996,6 +2027,108 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         assert_eq!(level, "verified");
         assert_eq!(first_seen, first_seen_at, "first_seen must survive repeated re-seeding");
         assert_eq!(updated_at, boot2);
+    }
+
+    /// Trust REVOCATION (final-review I-3): a node that was `verified` only
+    /// because config said so must lose that level when config stops saying
+    /// so -- a boot-time re-seed with the peer entry gone downgrades it to
+    /// `seen` (never deletes the row: `first_seen` history is kept). Without
+    /// this, deleting a peer from the config would leave its durable
+    /// `verified` row passing `fed_ingress`'s accept_from gate forever.
+    #[test]
+    fn seed_federation_trust_downgrades_a_removed_verified_peer_to_seen() {
+        let (_d, s) = store();
+        let id = node_id(1);
+        let first_seen_at = Utc::now();
+        let boot1 = first_seen_at + Duration::hours(1);
+        s.record_seen(&id, first_seen_at).unwrap();
+        s.seed_federation_trust(&fed_cfg(vec![peer("phoenix", &id, "verified")], vec![], vec![]), boot1)
+            .unwrap();
+        assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("verified"));
+
+        // Boot 2: the peer entry is gone from config entirely.
+        let boot2 = boot1 + Duration::hours(1);
+        s.seed_federation_trust(&fed_cfg(vec![], vec![], vec![]), boot2).unwrap();
+
+        let (_, level, first_seen, updated_at) =
+            s.list_trust().unwrap().into_iter().find(|r| r.0 == id).unwrap();
+        assert_eq!(level, "seen", "a removed peer's config-derived level must be revoked");
+        assert_eq!(first_seen, first_seen_at, "downgrade must preserve first_seen");
+        assert_eq!(updated_at, boot2, "downgrade must advance updated_at");
+    }
+
+    /// Same revocation for the `trusted: [...]` list: a node_id dropped from
+    /// it loses `trusted` on the next re-seed.
+    #[test]
+    fn seed_federation_trust_downgrades_a_removed_trusted_list_entry_to_seen() {
+        let (_d, s) = store();
+        let id = node_id(1);
+        let boot1 = Utc::now();
+        s.seed_federation_trust(&fed_cfg(vec![], vec![id.clone()], vec![]), boot1).unwrap();
+        assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("trusted"));
+
+        s.seed_federation_trust(&fed_cfg(vec![], vec![], vec![]), boot1 + Duration::hours(1)).unwrap();
+        assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("seen"));
+    }
+
+    /// The downgrade must be scoped to REMOVED nodes only: a peer still in
+    /// config keeps its level through the same re-seed that revokes its
+    /// removed sibling.
+    #[test]
+    fn seed_federation_trust_downgrade_spares_a_still_configured_peer() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        let removed = node_id(1);
+        let kept = node_id(2);
+        let both = fed_cfg(
+            vec![peer("phoenix", &removed, "verified"), peer("tucson", &kept, "trusted")],
+            vec![],
+            vec![],
+        );
+        s.seed_federation_trust(&both, now).unwrap();
+
+        let only_kept = fed_cfg(vec![peer("tucson", &kept, "trusted")], vec![], vec![]);
+        s.seed_federation_trust(&only_kept, now + Duration::hours(1)).unwrap();
+
+        assert_eq!(s.trust_level(&removed).unwrap().as_deref(), Some("seen"));
+        assert_eq!(s.trust_level(&kept).unwrap().as_deref(), Some("trusted"),
+            "a still-configured peer must keep its config level through the downgrade pass");
+    }
+
+    /// `blocked` is sticky by design: removing a blocked node_id from config
+    /// does NOT unblock it (the downgrade pass only touches
+    /// verified/trusted). Unblocking is a deliberate operator action (a
+    /// future admin surface), never an implicit config-diff side effect.
+    #[test]
+    fn seed_federation_trust_blocked_stays_blocked_when_removed_from_config() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        let id = node_id(1);
+        s.seed_federation_trust(&fed_cfg(vec![], vec![], vec![id.clone()]), now).unwrap();
+        assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("blocked"));
+
+        s.seed_federation_trust(&fed_cfg(vec![], vec![], vec![]), now + Duration::hours(1)).unwrap();
+        assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("blocked"),
+            "blocked is sticky: config removal must not implicitly unblock");
+    }
+
+    /// A runtime-learned `seen` row (never config-derived at all) is not the
+    /// downgrade pass's business: it must pass through a re-seed untouched,
+    /// `updated_at` included.
+    #[test]
+    fn seed_federation_trust_leaves_runtime_seen_rows_untouched() {
+        let (_d, s) = store();
+        let seen_at = Utc::now();
+        let id = node_id(1);
+        s.record_seen(&id, seen_at).unwrap();
+
+        s.seed_federation_trust(&fed_cfg(vec![], vec![], vec![]), seen_at + Duration::hours(1)).unwrap();
+
+        let (_, level, first_seen, updated_at) =
+            s.list_trust().unwrap().into_iter().find(|r| r.0 == id).unwrap();
+        assert_eq!(level, "seen");
+        assert_eq!(first_seen, seen_at);
+        assert_eq!(updated_at, seen_at, "a runtime seen row must not even have updated_at touched");
     }
 
     #[test]

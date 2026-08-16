@@ -1401,7 +1401,7 @@ policies:
         let (tx, _rx) = tokio::sync::mpsc::channel::<crate::fed::wire::Fed>(1);
         d.fed.as_ref().unwrap().conns.lock().unwrap().insert(
             key.to_string(),
-            PeerConn { tx, node_id: node_id.to_string(), connected_at },
+            PeerConn::new(tx, node_id.to_string(), connected_at),
         );
     }
 

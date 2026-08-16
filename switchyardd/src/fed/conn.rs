@@ -50,7 +50,7 @@ use tokio::sync::{mpsc, Semaphore};
 // test. `tokio::time::interval`/`timeout` are already tokio-native and
 // unaffected either way.
 use tokio::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// One live federation connection's write handle + metadata (design §1
 /// interface, exact). `tx` is federation egress's send handle
@@ -65,6 +65,24 @@ pub struct PeerConn {
     pub tx: mpsc::Sender<Fed>,
     pub node_id: String,
     pub connected_at: DateTime<Utc>,
+    /// Which registration this entry belongs to (final-review I-2): a
+    /// process-unique token allocated per `PeerConn` so `register_down`
+    /// can prove the map entry it's about to remove is ITS OWN -- a stale
+    /// teardown (a connection that lost/never had the key) must never
+    /// evict a live successor registered under the same key. Private on
+    /// purpose: only this module's register_up/register_down compare it.
+    instance: u64,
+}
+
+impl PeerConn {
+    pub fn new(tx: mpsc::Sender<Fed>, node_id: String, connected_at: DateTime<Utc>) -> Self {
+        /// Monotonic per-process; never reused, so two `PeerConn`s can
+        /// never share a token (relaxed ordering is enough: uniqueness,
+        /// not cross-thread ordering, is all the guard needs).
+        static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let instance = NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { tx, node_id, connected_at, instance }
+    }
 }
 
 /// Federation runtime state on `Daemon` (design §1 interface, exact):
@@ -227,6 +245,23 @@ fn configured_peer_name(d: &Daemon, node_id: &str) -> Option<String> {
     })
 }
 
+/// Whether a live connection is currently registered under `peer_key` --
+/// a single self-contained lock scope (module lock discipline). Consulted
+/// by `spawn_outbound` before each dial (final-review I-2): once ANY
+/// connection (its own earlier dial, or an inbound one from the same peer)
+/// holds the key, redialing is pure waste -- the new connection would only
+/// be refused by `register_up`'s first-wins guard on one side or the
+/// other. Checked per-attempt rather than once, so the dialer resumes
+/// within one recheck interval of the live connection ending.
+fn has_live_conn(d: &Daemon, peer_key: &str) -> bool {
+    d.fed.as_ref().is_some_and(|fed| fed.conns.lock().unwrap().contains_key(peer_key))
+}
+
+/// How often `spawn_outbound` rechecks a peer it's NOT dialing because a
+/// live connection already covers it -- also the ceiling on how stale the
+/// "someone else already holds this key" observation can get.
+const DIAL_RECHECK: Duration = Duration::from_secs(5);
+
 /// Outbound dialer for one configured peer (design §1): connects, drives
 /// the initiator handshake with `expected_node_id` set (a peer presenting
 /// a different identity than configured is dropped by `noise::
@@ -236,10 +271,17 @@ fn configured_peer_name(d: &Daemon, node_id: &str) -> Option<String> {
 /// failure to connect or handshake; a successful handshake resets it back
 /// to 1s (still with at least a 1s pause before the next attempt, so a
 /// peer that accepts-then-immediately-drops every connection can't spin
-/// this loop hot).
+/// this loop hot). While `has_live_conn` reports the peer's key already
+/// held (e.g. by an inbound connection from that same peer -- the crossed
+/// mutual-listen case, final-review I-2), no dial is attempted at all;
+/// the loop just rechecks every `DIAL_RECHECK`.
 async fn spawn_outbound(d: Arc<Daemon>, peer: PeerConfig, static_key: Arc<StaticKey>) {
     let mut backoff = Duration::from_secs(1);
     loop {
+        if has_live_conn(&d, &peer.name) {
+            tokio::time::sleep(DIAL_RECHECK).await;
+            continue;
+        }
         let handshake_ok = match TcpStream::connect(&peer.addr).await {
             Ok(stream) => {
                 match noise::handshake_initiator(stream, &static_key, &d.identity, Some(&peer.node_id))
@@ -292,9 +334,20 @@ where
     }
 
     let (tx, rx) = mpsc::channel::<Fed>(64);
-    register_up(&d, &peer_key, &node_id, now, tx);
+    let Some(instance) = register_up(&d, &peer_key, &node_id, now, tx) else {
+        // Crossed dials (final-review I-2): a live connection already holds
+        // this peer key -- mutual listen + mutual peering means A dialing B
+        // while B dials A lands BOTH connections on the same key. Keep the
+        // existing one, drop this one: returning here ends this task, so
+        // the channel (and, for an inbound conn, its accept permit) is
+        // released cleanly, and no down event/teardown ever fires for a
+        // registration that never happened.
+        debug!(peer = %display_peer_key(&peer_key),
+            "federation connection for an already-connected peer dropped (crossed dial)");
+        return;
+    };
     run_conn(&d, channel, &peer_key, &node_id, rx).await;
-    register_down(&d, &peer_key);
+    register_down(&d, &peer_key, instance);
 }
 
 /// SSE/metrics-safe rendering of a `FedState.conns` key: a configured
@@ -313,21 +366,55 @@ fn display_peer_key(peer_key: &str) -> String {
     }
 }
 
-fn register_up(d: &Daemon, peer_key: &str, node_id: &str, now: DateTime<Utc>, tx: mpsc::Sender<Fed>) {
-    let Some(fed) = &d.fed else { return };
-    fed.conns.lock().unwrap().insert(
-        peer_key.to_string(),
-        PeerConn { tx, node_id: node_id.to_string(), connected_at: now },
-    );
+/// Registers a new connection under `peer_key`, first-wins (final-review
+/// I-2): if a live connection already holds the key, this one is REFUSED
+/// (`None`) and the map is untouched -- never an overwrite, which is what
+/// let crossed dials cascade (the first conn's teardown removing the
+/// second, live, entry -- a perpetual flap). On success returns the new
+/// `PeerConn`'s instance token, which the caller must hand back to
+/// `register_down` so teardown is provably scoped to THIS registration.
+#[must_use]
+fn register_up(
+    d: &Daemon, peer_key: &str, node_id: &str, now: DateTime<Utc>, tx: mpsc::Sender<Fed>,
+) -> Option<u64> {
+    let fed = d.fed.as_ref()?;
+    let conn = PeerConn::new(tx, node_id.to_string(), now);
+    let instance = conn.instance;
+    {
+        // Single self-contained lock scope (module lock discipline).
+        let mut conns = fed.conns.lock().unwrap();
+        if conns.contains_key(peer_key) {
+            return None;
+        }
+        conns.insert(peer_key.to_string(), conn);
+    }
     let label = display_peer_key(peer_key);
     metrics::set_federation_peer_up(&label, true);
     d.emit_event(|| Event::Federation { peer: label.clone(), up: true, ts: now });
     info!(peer = %label, "federation connection up");
+    Some(instance)
 }
 
-fn register_down(d: &Daemon, peer_key: &str) {
+/// Tears down `peer_key`'s registration ONLY if the map entry still
+/// belongs to the caller's own registration (`instance` matches -- see
+/// `PeerConn.instance`). A stale teardown is a silent no-op: no removal,
+/// no metric flip, no down event -- a live successor under the same key
+/// must be completely unaffected.
+fn register_down(d: &Daemon, peer_key: &str, instance: u64) {
     let Some(fed) = &d.fed else { return };
-    fed.conns.lock().unwrap().remove(peer_key);
+    let removed = {
+        // Single self-contained lock scope (module lock discipline).
+        let mut conns = fed.conns.lock().unwrap();
+        if conns.get(peer_key).is_some_and(|c| c.instance == instance) {
+            conns.remove(peer_key);
+            true
+        } else {
+            false
+        }
+    };
+    if !removed {
+        return;
+    }
     let label = display_peer_key(peer_key);
     metrics::set_federation_peer_up(&label, false);
     d.emit_event(|| Event::Federation { peer: label.clone(), up: false, ts: Utc::now() });
@@ -618,6 +705,158 @@ mod tests {
             Event::Federation { up, .. } => assert!(!up),
             other => panic!("expected Federation, got {other:?}"),
         }
+    }
+
+    // ---- crossed-dial collision (final-review I-2) -------------------------
+
+    /// Mutual listen + mutual peering: A dials B while B dials A, and both
+    /// connections land on the SAME `FedState.conns` key. The FIRST live
+    /// connection must win -- the second `register_up` is refused, never an
+    /// overwrite (an overwrite is what set off the perpetual flap: the
+    /// first conn's teardown then removed the second, live, entry).
+    #[tokio::test]
+    async fn crossed_register_up_keeps_the_first_connection_not_the_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![]));
+        let node_id = format!("rf:{}", "11".repeat(32));
+        let now = Utc::now();
+
+        let (tx1, mut rx1) = mpsc::channel::<Fed>(4);
+        let (tx2, mut rx2) = mpsc::channel::<Fed>(4);
+        assert!(register_up(&d, "phoenix", &node_id, now, tx1).is_some(),
+            "first registration must succeed");
+        assert!(register_up(&d, "phoenix", &node_id, now, tx2).is_none(),
+            "second registration for a live key must be refused");
+
+        let conns = d.fed.as_ref().unwrap().conns.lock().unwrap();
+        assert_eq!(conns.len(), 1);
+        conns.get("phoenix").unwrap().tx.try_send(Fed::Ping {}).unwrap();
+        drop(conns);
+        assert!(rx1.try_recv().is_ok(),
+            "the registered connection must still be the FIRST one -- \
+             a crossed second registration must not displace a live conn");
+        assert!(rx2.try_recv().is_err());
+    }
+
+    /// Instance-guarded teardown: a `register_down` carrying a STALE
+    /// instance token (a connection that no longer owns the map entry) must
+    /// not evict the live successor holding the same key -- and must not
+    /// emit a spurious `Federation{up:false}` event for it either. Only the
+    /// down carrying the LIVE instance's own token removes the entry.
+    #[tokio::test]
+    async fn stale_register_down_does_not_evict_a_live_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![]));
+        let node_id = format!("rf:{}", "22".repeat(32));
+        let now = Utc::now();
+
+        let (tx1, _rx1) = mpsc::channel::<Fed>(4);
+        let stale = register_up(&d, "phoenix", &node_id, now, tx1)
+            .expect("first registration must succeed");
+        // Simulate the first conn's entry being replaced by a successor
+        // out from under it (the interleaving the instance guard defends
+        // against): remove + re-register.
+        d.fed.as_ref().unwrap().conns.lock().unwrap().remove("phoenix");
+        let (tx2, _rx2) = mpsc::channel::<Fed>(4);
+        let live = register_up(&d, "phoenix", &node_id, now, tx2)
+            .expect("successor registration must succeed once the key is free");
+        assert_ne!(stale, live, "each registration must get its own instance token");
+
+        let mut events = d.events.subscribe();
+        register_down(&d, "phoenix", stale);
+        assert!(d.fed.as_ref().unwrap().conns.lock().unwrap().contains_key("phoenix"),
+            "a stale teardown must not evict the live successor");
+        assert!(events.try_recv().is_err(),
+            "a stale teardown must not emit a Federation down event");
+
+        register_down(&d, "phoenix", live);
+        assert!(d.fed.as_ref().unwrap().conns.lock().unwrap().is_empty(),
+            "the live instance's own teardown must still remove the entry");
+        match events.try_recv().expect("the live teardown must emit the down event") {
+            Event::Federation { up, .. } => assert!(!up),
+            other => panic!("expected Federation, got {other:?}"),
+        }
+    }
+
+    /// The dialer-side half of the crossed-dial fix: `spawn_outbound`
+    /// consults `has_live_conn` before each dial attempt so a peer whose
+    /// key is already served by a live (e.g. inbound) connection isn't
+    /// redialed over and over just to be refused by the far side's own
+    /// admission guard.
+    #[tokio::test]
+    async fn has_live_conn_tracks_registration_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![]));
+        assert!(!has_live_conn(&d, "phoenix"));
+
+        let (tx, _rx) = mpsc::channel::<Fed>(4);
+        let node_id = format!("rf:{}", "33".repeat(32));
+        let instance = register_up(&d, "phoenix", &node_id, Utc::now(), tx).unwrap();
+        assert!(has_live_conn(&d, "phoenix"));
+        assert!(!has_live_conn(&d, "tucson"));
+
+        register_down(&d, "phoenix", instance);
+        assert!(!has_live_conn(&d, "phoenix"));
+    }
+
+    /// The full crossed-dial shape at the `admit_and_run` level (duplex, no
+    /// TCP): while the first connection for a peer key is live, a second
+    /// `admit_and_run` for the SAME key must drop its connection and return
+    /// promptly (its remote side sees EOF) -- leaving the first connection
+    /// registered and NOT emitting any down event for the shared key.
+    #[tokio::test]
+    async fn crossed_admit_and_run_drops_the_second_connection_and_keeps_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![])));
+
+        // First connection: full handshake, then parked in run_conn.
+        let (peer1_key, peer1_id) = keypair(dir.path());
+        let (a1, b1) = tokio::io::duplex(1 << 16);
+        let (ds1, di1) = keypair(dir.path());
+        let responder =
+            tokio::spawn(async move { noise::handshake_responder(b1, &ds1, &di1).await });
+        let _client1 = handshake_initiator(a1, &peer1_key, &peer1_id, None).await.unwrap();
+        let (server1, node1) = responder.await.unwrap().unwrap();
+        let d2 = d.clone();
+        tokio::spawn(async move { admit_and_run(d2, server1, "phoenix".to_string(), node1).await });
+        // Wait until the first connection is actually registered.
+        for _ in 0..100 {
+            if d.fed.as_ref().unwrap().conns.lock().unwrap().contains_key("phoenix") { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let first_instance =
+            d.fed.as_ref().unwrap().conns.lock().unwrap().get("phoenix").unwrap().instance;
+
+        // Second connection, same peer key (the crossed dial).
+        let mut events = d.events.subscribe();
+        let (peer2_key, peer2_id) = keypair(dir.path());
+        let (a2, b2) = tokio::io::duplex(1 << 16);
+        let (ds2, di2) = keypair(dir.path());
+        let responder =
+            tokio::spawn(async move { noise::handshake_responder(b2, &ds2, &di2).await });
+        let mut client2 = handshake_initiator(a2, &peer2_key, &peer2_id, None).await.unwrap();
+        let (server2, node2) = responder.await.unwrap().unwrap();
+        let d3 = d.clone();
+        let second = tokio::spawn(async move {
+            admit_and_run(d3, server2, "phoenix".to_string(), node2).await
+        });
+
+        // The second admit_and_run must return promptly (refused, not run) --
+        // its client sees the channel closed rather than a live idle conn.
+        tokio::time::timeout(std::time::Duration::from_secs(2), second)
+            .await.expect("the crossed second connection must be dropped promptly, not kept running")
+            .unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client2.recv_frame()).await;
+        assert!(result.is_ok(), "must not hang");
+        assert!(result.unwrap().is_err(), "the second connection must be closed, not idle");
+
+        let conns = d.fed.as_ref().unwrap().conns.lock().unwrap();
+        assert_eq!(conns.get("phoenix").map(|c| c.instance), Some(first_instance),
+            "the FIRST connection must still be the registered one");
+        drop(conns);
+        assert!(events.try_recv().is_err(),
+            "dropping the refused second connection must not emit any Federation down event");
     }
 
     // ---- ack exactly-once (state-guard replay) -----------------------------

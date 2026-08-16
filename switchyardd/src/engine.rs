@@ -725,8 +725,9 @@ fn reject(
 /// received over a live peer connection (`fed::conn::run_conn`) into a
 /// SINGLE named local route's fan-out. Runs its own gate order (design §5,
 /// Task 4 controller ruling on priority): signature chain -> trust level
-/// -> hop cap -> TTL clamp -> `target_route` must be one of
-/// `federation.ingress_routes` -> dedup (by envelope id, preserved
+/// -> replay-window bound (signed `created_at` vs local `max_ttl_secs`,
+/// final-review I-1) -> hop cap -> TTL clamp -> `target_route` must be one
+/// of `federation.ingress_routes` -> dedup (by envelope id, preserved
 /// end-to-end across hops) -> per-sender limits -> [accept: dedup record,
 /// fan-out, `FED_INGRESS` metric].
 ///
@@ -791,6 +792,28 @@ pub fn fed_ingress(
     let level_str = level.as_deref().unwrap_or("unknown");
     if trust_rank(level_str) < trust_rank(&fed_cfg.accept_from) {
         return reject(d, &env, &target_route, peer_node_id, "TRUST_DENIED", Persistence::NoPersist);
+    }
+
+    // Replay-window bound (final-review I-1, SPEC §113.5): effective expiry
+    // is computed from the SIGNED `created_at` + this accept side's OWN
+    // `max_ttl_secs` -- NEVER from the envelope's `expires_at`/TTL claim,
+    // which is deliberately unsigned (any on-path relay can rewrite it) and
+    // therefore worthless as a replay defense. The in-memory dedup below is
+    // only a within-window guard: it's TTL-bounded (`dedup_ttl_secs`) and
+    // cleared on restart, so without this check a trusted-but-hostile relay
+    // could replay a captured, genuinely-signed envelope after the dedup
+    // window or after this daemon reboots. This bounds the replay window to
+    // `max_ttl_secs` regardless of dedup state. A far-future `created_at`
+    // is rejected too (clock-skew abuse: a window that only STARTS later
+    // would outlive the bound); honest inter-node skew gets a small fixed
+    // allowance. Post-trust, so `Persistence::Persist` (dead_letter row) --
+    // reachable only by a peer that already cleared the trust gate.
+    const MAX_CREATED_AT_SKEW_SECS: i64 = 300;
+    let ingress_now = Utc::now();
+    let stale = env.created_at + CDuration::seconds(fed_cfg.max_ttl_secs as i64) < ingress_now;
+    let far_future = env.created_at > ingress_now + CDuration::seconds(MAX_CREATED_AT_SKEW_SECS);
+    if stale || far_future {
+        return reject(d, &env, &target_route, peer_node_id, "EXPIRED", Persistence::Persist);
     }
 
     if env.hops >= fed_cfg.max_hops {
@@ -4563,6 +4586,116 @@ routes:
             "the replay must not create any additional delivery rows");
     }
 
+    // ==== replay window (final-review I-1) =================================
+
+    /// A signed envelope with caller-chosen `created_at`/`expires_at` --
+    /// `created_at` IS covered by the origin signature (canonical bytes),
+    /// `expires_at` deliberately is NOT (any on-path relay can rewrite it),
+    /// which is exactly the asymmetry these tests exercise.
+    fn signed_envelope_with_times(
+        identity: &crate::node_identity::NodeIdentity, body: &str,
+        created_at: DateTime<Utc>, expires_at: DateTime<Utc>,
+    ) -> Envelope {
+        let mut env = Envelope::new(
+            Endpoint { protocol: "mock".into(), endpoint: "origin-chan".into() },
+            Sender { native_ref: "!origin-sender".into() },
+            "text".into(), body.to_string(), created_at, expires_at, 8,
+        );
+        env.origin = Some(fed::sign::sign_origin(&env, identity));
+        env
+    }
+
+    /// The replay-window bound itself: a captured envelope whose SIGNED
+    /// `created_at` is older than the accept side's `max_ttl_secs` must be
+    /// rejected `EXPIRED` even though its (unsigned, attacker-rewritten)
+    /// `expires_at` claims it's still fresh -- and even though the dedup
+    /// cache has no entry for it (this daemon is fresh, exactly the
+    /// post-restart replay scenario). Post-trust, so it persists as a
+    /// dead_letter row.
+    #[test]
+    fn fed_ingress_created_at_older_than_max_ttl_is_dead_lettered_expired_despite_fresh_expires_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 3600); // 1 hour replay window
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        let now = Utc::now();
+        let env = signed_envelope_with_times(
+            &identity, "stale replay", now - CDuration::hours(2), now + CDuration::days(100));
+        assert_eq!(fed::sign::verify_chain(&env), Ok(()),
+            "the replayed envelope's signature is genuine -- only its age gives it away");
+
+        let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("EXPIRED"));
+
+        let store = d.store.lock().unwrap();
+        assert_eq!(store.queue_counts().unwrap(), vec![("dead_letter".to_string(), 1)],
+            "EXPIRED is post-trust: it must dead_letter, never silently vanish or deliver");
+    }
+
+    /// Just inside the window: `created_at` within `max_ttl_secs` of now is
+    /// still accepted (the bound must not reject legitimate traffic).
+    #[test]
+    fn fed_ingress_created_at_just_inside_max_ttl_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 3600);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        let now = Utc::now();
+        let env = signed_envelope_with_times(
+            &identity, "nearly stale", now - CDuration::seconds(3500), now + CDuration::hours(1));
+        let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+        assert!(matches!(outcome, FedIngressOutcome::Accepted(_)),
+            "an envelope inside the replay window must still be delivered, got {outcome:?}");
+    }
+
+    /// Far-future `created_at` (clock-skew abuse): a peer stamping
+    /// `created_at` ahead of real time would otherwise mint an envelope
+    /// whose replay window only STARTS in the future -- capped at a small
+    /// skew allowance, beyond which it's rejected `EXPIRED` too.
+    #[test]
+    fn fed_ingress_far_future_created_at_is_rejected_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 3600);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        let now = Utc::now();
+        let env = signed_envelope_with_times(
+            &identity, "from the future", now + CDuration::seconds(3600), now + CDuration::hours(2));
+        let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("EXPIRED"));
+
+        let store = d.store.lock().unwrap();
+        assert_eq!(store.queue_counts().unwrap(), vec![("dead_letter".to_string(), 1)]);
+    }
+
+    /// Ordinary clock skew between honest peers (seconds, not hours) must
+    /// pass: `created_at` slightly ahead of now, within the allowance.
+    #[test]
+    fn fed_ingress_created_at_within_clock_skew_allowance_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 3600);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        let now = Utc::now();
+        let env = signed_envelope_with_times(
+            &identity, "slightly ahead", now + CDuration::seconds(200), now + CDuration::hours(1));
+        let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+        assert!(matches!(outcome, FedIngressOutcome::Accepted(_)),
+            "a few seconds of clock skew must not reject honest traffic, got {outcome:?}");
+    }
+
     #[test]
     fn fed_ingress_per_sender_limit_denies_second_message_without_dead_lettering() {
         let dir = tempfile::tempdir().unwrap();
@@ -4606,7 +4739,7 @@ routes:
         let (tx, rx) = mpsc::channel(8);
         d.fed.as_ref().unwrap().conns.lock().unwrap().insert(
             peer_name.to_string(),
-            crate::fed::conn::PeerConn { tx, node_id: node_id.to_string(), connected_at: Utc::now() },
+            crate::fed::conn::PeerConn::new(tx, node_id.to_string(), Utc::now()),
         );
         rx
     }
@@ -4783,9 +4916,7 @@ routes:
         tx.try_send(fed::wire::Fed::Ping {}).unwrap(); // fill the connection's one slot
         d.fed.as_ref().unwrap().conns.lock().unwrap().insert(
             "phoenix".to_string(),
-            crate::fed::conn::PeerConn {
-                tx, node_id: format!("rf:{}", "44".repeat(32)), connected_at: Utc::now(),
-            },
+            crate::fed::conn::PeerConn::new(tx, format!("rf:{}", "44".repeat(32)), Utc::now()),
         );
 
         let env = local_env("!ref", "hello");
