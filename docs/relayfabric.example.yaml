@@ -71,6 +71,20 @@ plugins:
   #       zone1: {index: 0, topic_channel: "general"}
   #       zone2: {index: 1, topic_channel: "tactics"}
 
+  # meshcore:
+  #   enabled: true
+  #   # Runs under sh -c, so it needs an absolute path and the venv's
+  #   # python (a bare `relayfabric-meshcore` isn't on PATH and the script's
+  #   # shebang won't see venv deps). venv must have run:
+  #   #   pip install -r plugins/meshcore/requirements.txt
+  #   command: /path/to/RelayFabric/.venv/bin/python /path/to/RelayFabric/plugins/meshcore/relayfabric-meshcore
+  #   config:
+  #     connection: serial:///dev/ttyUSB0
+  #     max_text_bytes: 160
+  #     channels:
+  #       primary: {index: 0}
+  #       secondary: {index: 1}
+
 routes:
   - name: demo
     sources: ["mqtt:chat/a", "mqtt:chat/b"]

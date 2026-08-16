@@ -7,21 +7,21 @@ message-processing layer while delegating protocol-specific behavior to
 plugins — initial target networks include Reticulum/LXMF, Signal,
 Meshtastic, MeshCore, Bitchat, Nostr, and MQTT.
 
-**Status:** v0.1 complete: MQTT, LXMF, Signal + Meshtastic plugins with
-attachments/voice. Public-node groundwork underway for v0.2: node identity,
-public-service gating, sender/queue/transport quotas, and priority
-scheduling, all exposed through the admin API.
+**Status:** v0.2 in progress: MeshCore joins MQTT, LXMF, Signal + Meshtastic.
+Public-node groundwork: node identity, public-service gating, quotas, priority
+scheduling through the admin API.
 
 ## Components
 
 - `switchyardd` — the core daemon: routing, deduplication, policy
   enforcement, persistence, and an admin API, all headless.
-- `switchyardctl` — a thin CLI client for the admin API (status, plugins,
-  routes, queue, message trace).
+- `switchyardctl` — CLI client for the admin API (status, plugins, routes,
+  queue, trace).
 - Plugins — separate processes speaking a small CBOR-over-Unix-socket IPC
-  protocol to the daemon. MQTT, LXMF, Signal, and Meshtastic plugins available; see
-  [LXMF](plugins/lxmf/README.md), [Signal](plugins/signal/README.md), or
-  [Meshtastic](plugins/meshtastic/README.md) docs for configuration.
+  protocol to the daemon. MQTT, LXMF, Signal, Meshtastic, and MeshCore plugins
+  available; see [LXMF](plugins/lxmf/README.md), [Signal](plugins/signal/README.md),
+  [Meshtastic](plugins/meshtastic/README.md), or [MeshCore](plugins/meshcore/README.md)
+  docs for configuration.
 
 ## Build
 
@@ -29,8 +29,7 @@ scheduling, all exposed through the admin API.
 cargo build -j2 --release
 ```
 
-Binaries land in `target/release/`: `switchyardd`, `switchyardctl`, and
-`relayfabric-mqtt`.
+Binaries in `target/release/`.
 
 ## Quick start
 
