@@ -77,3 +77,4 @@ stay separate from route management (correlation data is more sensitive).
 - `GET /v1/events` — SSE: ingress, delivery, plugin, link_verified, config_applied
 - `GET /v1/routes` — per-route identity_mode, render knobs, matched policies
 - `GET /v1/plugins` — per-plugin connection state, capabilities, gauges
+- `GET /v1/federation` — peers: name, node_id, trust, connected, last_seen (no addr)

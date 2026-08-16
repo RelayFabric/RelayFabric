@@ -176,6 +176,27 @@ policies:
 #   lxmf:
 #     messages_per_minute: 200
 
+# Federation (switchyardd-to-switchyardd, cycle F — docs/SPEC.md §30/§31/
+# §33/§85-87/§112.6-112.7): authenticated Noise links between daemons,
+# signed envelopes with a gateway attestation chain, a persistent trust
+# store, and route destinations that egress to peers
+# (fed:<peer_name>/<remote_route>). Absent entirely (as here) = the whole
+# feature is off; every v0.1/v0.2 config keeps loading unchanged.
+# federation:
+#   listen: "127.0.0.1:47000"        # optional; absent = outbound-only node
+#   accept_from: verified            # verified|trusted
+#   max_hops: 4                      # inbound envelopes at/over this are dead_lettered HOP_LIMIT
+#   max_ttl_secs: 86400              # inbound TTL clamped down to this
+#   identity_exposure: pseudonymous  # pseudonymous|full — outbound source ref handling
+#   ingress_routes: [regional-chat]  # local routes federated peers may inject into (default: none)
+#   peers:
+#     - name: phoenix
+#       node_id: "rf:<64hex>"
+#       addr: "10.0.0.2:47000"
+#       trust: trusted               # optional; default verified
+#   trusted: []                      # extra node_ids
+#   blocked: []
+
 # TTLs and limits (seconds)
 ttl_default_secs: 86400
 dedup_ttl_secs: 86400

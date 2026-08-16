@@ -1083,3 +1083,274 @@ async fn config_apply_reload_and_events_full_workflow() {
         "a message on the rolled-back route's endpoint was bridged anyway"
     );
 }
+
+// ---- federation: two real daemons, bidirectional, trust-denied, loop -----
+
+/// Pre-generates an Ed25519 node identity and writes it directly to
+/// `<data_dir>/identity/node.key` in the exact format `node_identity::
+/// NodeIdentity::load_or_create` expects (hex-encoded 32-byte seed, 0600) --
+/// so this daemon's node_id is known to the TEST before it ever boots.
+/// Federation config requires every peer's `node_id` up front
+/// (`federation.peers[].node_id`), and the test below has THREE mutually-
+/// referencing daemons: A needs B's node_id, B needs A's, C needs A's --
+/// there's no boot order that lets every config be written only after
+/// every node_id is first learned live via `/v1/status`. Returns the
+/// node_id ("rf:" + 64 hex chars), exactly what `node_identity::
+/// NodeIdentity::node_id` would compute for the same seed.
+fn precreate_node_identity(data_dir: &Path) -> String {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let identity_dir = data_dir.join("identity");
+    std::fs::create_dir_all(&identity_dir).unwrap();
+    let seed: [u8; 32] = rand::random();
+    let mut f = std::fs::OpenOptions::new()
+        .write(true).create_new(true).mode(0o600)
+        .open(identity_dir.join("node.key")).unwrap();
+    f.write_all(hex::encode(seed).as_bytes()).unwrap();
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    format!("rf:{}", hex::encode(signing_key.verifying_key().to_bytes()))
+}
+
+/// Binds an ephemeral TCP port, reads back the OS-assigned port, then
+/// immediately drops the listener -- the federation config text needs a
+/// concrete, currently-free port to template into `federation.listen`
+/// before the daemon that will actually bind it has even been spawned.
+/// Small race window between the drop here and the daemon's own bind
+/// (another process could in principle grab the same port in between);
+/// acceptable for a test.
+fn free_tcp_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+/// Sums every value in the `{state: count}` aggregate `GET /v1/queue` body
+/// -- used by the loop-guard scenario below to assert the TOTAL delivery
+/// row count across every state settles to a small, non-growing number,
+/// without needing to enumerate every state name up front.
+fn total_queue_count(body: &str) -> i64 {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    v.as_object().unwrap().values().map(|n| n.as_i64().unwrap()).sum()
+}
+
+/// Design §Testing's two-real-daemon federation e2e. Noise identity binding
+/// itself is T1/T4's job (`fed::noise`/`fed::conn`'s own unit + in-memory
+/// duplex tests) -- this test starts from an already-authenticated pair and
+/// focuses on what only a REAL two-process round trip can prove: daemon A
+/// listens, daemon B dials out to A (each with its own mock plugin and a
+/// route whose destinations include a `fed:` leg into the other's
+/// `federation.ingress_routes`); a message A -> B and the reverse B -> A
+/// each arrive rendered (pseudonymous alias tag, never the raw native ref)
+/// and drive both the sender-side delivery row to `delivered` (via the
+/// receiver's `Fed::Ack`, independent of the receiving mock plugin's own
+/// `DeliveryResult`) and A's SSE feed (`federation` up + `delivery`
+/// events); a third daemon C, dialing A but never listed in A's
+/// `federation.peers`/`trusted`, completes the Noise handshake fine but has
+/// its envelope `TRUST_DENIED` -- per Task 4's binding ruling this is a
+/// `Persistence::NoPersist` rejection (nothing written to storage), so it's
+/// asserted via `FED_REJECTED` ticking up on `GET /metrics` plus a bounded
+/// negative (the message never reaches A's mock plugin), never via
+/// `/v1/queue?state=dead_letter`; and a loop config (A's own `loop` route
+/// federates only to B, B's federates back to A, both list `loop` in their
+/// own `ingress_routes`) sends one inbound message that reaches B's mock
+/// plugin exactly once and settles to a small, non-growing total
+/// delivery-row count on both sides -- proving the dedup/hop-cap loop guard
+/// (design §5, already unit-proven at the `fed_ingress` level for the
+/// exact-hop-cap-boundary and dedup-replay cases) also holds over a REAL
+/// two-daemon round trip, not just in-process.
+#[tokio::test]
+async fn federation_two_daemons_bidirectional_with_trust_and_loop_guards() {
+    // ---- 0. identities + the one real TCP port this test needs ------------
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let dir_c = tempfile::tempdir().unwrap();
+    let data_a = dir_a.path().join("data");
+    let data_b = dir_b.path().join("data");
+    let data_c = dir_c.path().join("data");
+    let node_id_a = precreate_node_identity(&data_a);
+    let node_id_b = precreate_node_identity(&data_b);
+    let _node_id_c = precreate_node_identity(&data_c); // deliberately unused by A's config
+
+    let a_port = free_tcp_port();
+    let a_addr = format!("127.0.0.1:{a_port}");
+
+    // ---- 1. daemon A: listener, federates "a-in"/"loop" from b ------------
+    let config_a = format!(
+        r#"
+node:
+  name: e2e-fed-a
+  data_dir: DATA_DIR
+plugins:
+  mocka:
+    enabled: true
+routes:
+  - name: a-out
+    sources: ["mocka:outchan"]
+    destinations: ["fed:b/b-in"]
+  - name: a-in
+    sources: []
+    destinations: ["mocka:inchan"]
+  - name: loop
+    sources: ["mocka:loopchan"]
+    destinations: ["fed:b/loop"]
+federation:
+  listen: "{a_addr}"
+  ingress_routes: [a-in, loop]
+  peers:
+    - name: b
+      node_id: "{node_id_b}"
+      addr: "127.0.0.1:1"
+"#
+    );
+    let d_a = start_daemon_with_config(dir_a, &config_a);
+    wait_for(&d_a.plugin_sock()).await;
+    wait_for(&d_a.admin_sock()).await;
+    let (mut ra, mut wa) = connect_plugin(&d_a.plugin_sock(), "mocka").await;
+
+    // Open A's SSE stream BEFORE B ever connects, so the "federation up"
+    // event for peer b lands in the buffer this test polls below.
+    let mut sse_a = open_events_stream(&d_a.admin_sock()).await;
+    let mut sse_a_buf = String::new();
+
+    // ---- 2. daemon B: dials A, federates "b-in"/"loop" from a -------------
+    let config_b = format!(
+        r#"
+node:
+  name: e2e-fed-b
+  data_dir: DATA_DIR
+plugins:
+  mockb:
+    enabled: true
+routes:
+  - name: b-out
+    sources: ["mockb:outchan"]
+    destinations: ["fed:a/a-in"]
+  - name: b-in
+    sources: []
+    destinations: ["mockb:inchan"]
+  - name: loop
+    sources: []
+    destinations: ["mockb:loopchan", "fed:a/loop"]
+federation:
+  ingress_routes: [b-in, loop]
+  peers:
+    - name: a
+      node_id: "{node_id_a}"
+      addr: "{a_addr}"
+"#
+    );
+    let d_b = start_daemon_with_config(dir_b, &config_b);
+    wait_for(&d_b.plugin_sock()).await;
+    wait_for(&d_b.admin_sock()).await;
+    let (mut rb, mut wb) = connect_plugin(&d_b.plugin_sock(), "mockb").await;
+
+    // B's outbound dialer connects to A on its first (zero-delay) attempt;
+    // wait for A to see it live before driving any federated traffic.
+    poll_until_contains(&d_a.admin_sock(), "/v1/federation", "\"connected\":true").await;
+
+    poll_stream_until_contains(&mut sse_a, &mut sse_a_buf, "event: federation").await;
+    assert!(sse_a_buf.contains("\"peer\":\"b\""), "sse: {sse_a_buf}");
+    assert!(sse_a_buf.contains("\"up\":true"), "sse: {sse_a_buf}");
+
+    // ---- 3. A -> B: rendered at B, pseudonymous, A's delivery marked -------
+    // delivered by B's Fed::Ack (independent of B's own mock plugin's
+    // DeliveryResult, which only settles B's LOCAL "b-in" row).
+    inbound(&mut wa, "outchan", "!a-secret", "hello from a to b via fed", chrono::Utc::now()).await;
+    let (corr_b, endpoint_b, body_b, _) = expect_send(&mut rb).await;
+    assert_eq!(endpoint_b, "inchan");
+    assert!(body_b.starts_with("[MOCK"), "body was: {body_b}");
+    assert!(body_b.contains("hello from a to b via fed"), "body was: {body_b}");
+    assert!(!body_b.contains("!a-secret"), "native ref leaked across federation: {body_b}");
+    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
+        corr: corr_b, delivered: true, detail: None,
+    }).await.unwrap();
+
+    poll_until_contains(&d_a.admin_sock(), "/v1/queue?state=delivered", "\"route\":\"a-out\"").await;
+
+    poll_stream_until_contains(&mut sse_a, &mut sse_a_buf, "event: delivery").await;
+    assert!(sse_a_buf.contains("\"route\":\"a-out\""), "sse: {sse_a_buf}");
+    assert!(sse_a_buf.contains("\"state\":\"delivered\""), "sse: {sse_a_buf}");
+
+    // ---- 4. B -> A: the reverse direction -----------------------------------
+    inbound(&mut wb, "outchan", "!b-secret", "hello from b to a via fed", chrono::Utc::now()).await;
+    let (corr_a, endpoint_a, body_a, _) = expect_send(&mut ra).await;
+    assert_eq!(endpoint_a, "inchan");
+    assert!(body_a.starts_with("[MOCK"), "body was: {body_a}");
+    assert!(body_a.contains("hello from b to a via fed"), "body was: {body_a}");
+    assert!(!body_a.contains("!b-secret"), "native ref leaked across federation: {body_a}");
+    write_frame(&mut wa, &PluginToDaemon::DeliveryResult {
+        corr: corr_a, delivered: true, detail: None,
+    }).await.unwrap();
+
+    poll_until_contains(&d_b.admin_sock(), "/v1/queue?state=delivered", "\"route\":\"b-out\"").await;
+
+    // ---- 5. trust-denied: daemon C dials A but is never listed as A's ------
+    // peer -- handshake succeeds (Noise identity binding is orthogonal to
+    // policy trust), envelope TRUST_DENIED. Per Task 4's binding ruling this
+    // is Persistence::NoPersist -- nothing written to storage -- so this is
+    // asserted via FED_REJECTED on GET /metrics + a bounded negative, never
+    // via /v1/queue?state=dead_letter.
+    let config_c = format!(
+        r#"
+node:
+  name: e2e-fed-c
+  data_dir: DATA_DIR
+plugins:
+  mockc:
+    enabled: true
+routes:
+  - name: c-out
+    sources: ["mockc:outchan"]
+    destinations: ["fed:a/a-in"]
+federation:
+  peers:
+    - name: a
+      node_id: "{node_id_a}"
+      addr: "{a_addr}"
+"#
+    );
+    let d_c = start_daemon_with_config(dir_c, &config_c);
+    wait_for(&d_c.plugin_sock()).await;
+    let (_rc, mut wc) = connect_plugin(&d_c.plugin_sock(), "mockc").await;
+
+    inbound(&mut wc, "outchan", "!c-untrusted", "this must never reach a mock plugin",
+        chrono::Utc::now()).await;
+
+    poll_until_contains(&d_a.admin_sock(), "/metrics", "relayfabric_federation_rejected_total 1").await;
+    assert!(
+        timeout(Duration::from_secs(2), read_frame::<_, DaemonToPlugin>(&mut ra)).await.is_err(),
+        "a trust-denied peer's envelope was bridged anyway"
+    );
+
+    // ---- 6. loop guard: A federates "loop" only to b, b's "loop" delivers --
+    // locally (the terminal mock, exactly once) AND federates back to a; the
+    // echo must die (dedup and/or hop cap -- both already unit-proven at the
+    // fed_ingress level; this proves the WIRING doesn't storm over a real
+    // two-daemon round trip) rather than bouncing forever.
+    inbound(&mut wa, "loopchan", "!loop-secret", "unique-loop-body-xyz", chrono::Utc::now()).await;
+    let (corr_loop, endpoint_loop, body_loop, _) = expect_send(&mut rb).await;
+    assert_eq!(endpoint_loop, "loopchan");
+    assert!(body_loop.contains("unique-loop-body-xyz"), "body was: {body_loop}");
+    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
+        corr: corr_loop, delivered: true, detail: None,
+    }).await.unwrap();
+
+    // bounded negative: no SECOND Send for the loop message reaches B's
+    // mock plugin -- the echo must not re-deliver locally a second time.
+    assert!(
+        timeout(Duration::from_secs(2), read_frame::<_, DaemonToPlugin>(&mut rb)).await.is_err(),
+        "the loop's echo was delivered to the terminal mock plugin a second time"
+    );
+
+    // bounded total: let any in-flight echo/ack traffic settle, then confirm
+    // the total delivery row count on EACH daemon is both small and STABLE
+    // across two samples -- a genuine storm would keep growing.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let a_queue_1 = total_queue_count(&admin_get(&d_a.admin_sock(), "/v1/queue").await);
+    let b_queue_1 = total_queue_count(&admin_get(&d_b.admin_sock(), "/v1/queue").await);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let a_queue_2 = total_queue_count(&admin_get(&d_a.admin_sock(), "/v1/queue").await);
+    let b_queue_2 = total_queue_count(&admin_get(&d_b.admin_sock(), "/v1/queue").await);
+    assert_eq!(a_queue_1, a_queue_2, "daemon A's total delivery row count kept growing -- storm");
+    assert_eq!(b_queue_1, b_queue_2, "daemon B's total delivery row count kept growing -- storm");
+    assert!(a_queue_1 <= 12, "daemon A's total delivery rows unexpectedly large: {a_queue_1}");
+    assert!(b_queue_1 <= 12, "daemon B's total delivery rows unexpectedly large: {b_queue_1}");
+}
