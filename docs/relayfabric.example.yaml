@@ -52,6 +52,22 @@ plugins:
   #     attachment_dir: ~/.local/share/signal-cli/attachments  # signal-cli's download dir
   #     max_attachment_bytes: 8000000  # per-attachment cap, applied both ways
 
+  # meshtastic:
+  #   enabled: true
+  #   # Runs under sh -c, so it needs an absolute path and the venv's
+  #   # python (a bare `relayfabric-meshtastic` isn't on PATH and the script's
+  #   # shebang won't see venv deps). venv must have run:
+  #   #   pip install -r plugins/meshtastic/requirements.txt
+  #   command: /path/to/RelayFabric/.venv/bin/python /path/to/RelayFabric/plugins/meshtastic/relayfabric-meshtastic
+  #   config:
+  #     broker: mqtt://127.0.0.1:1883
+  #     topic_root: msh/2/json
+  #     gateway_id: null                # null = accept all gateways; set to filter by hex ID
+  #     max_text_bytes: 200             # daemon truncates upstream text
+  #     channels:
+  #       zone1: {index: 0, topic_channel: "general"}
+  #       zone2: {index: 1, topic_channel: "tactics"}
+
 routes:
   - name: demo
     sources: ["mqtt:chat/a", "mqtt:chat/b"]

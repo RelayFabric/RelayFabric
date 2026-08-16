@@ -7,7 +7,7 @@ message-processing layer while delegating protocol-specific behavior to
 plugins — initial target networks include Reticulum/LXMF, Signal,
 Meshtastic, MeshCore, Bitchat, Nostr, and MQTT.
 
-**Status:** v0.1: MQTT, LXMF + Signal plugins with attachments/voice; Meshtastic next.
+**Status:** v0.1 complete: MQTT, LXMF, Signal + Meshtastic plugins with attachments/voice.
 
 ## Components
 
@@ -16,9 +16,9 @@ Meshtastic, MeshCore, Bitchat, Nostr, and MQTT.
 - `switchyardctl` — a thin CLI client for the admin API (status, plugins,
   routes, queue, message trace).
 - Plugins — separate processes speaking a small CBOR-over-Unix-socket IPC
-  protocol to the daemon. MQTT, LXMF, and Signal plugins available; see
-  [LXMF](plugins/lxmf/README.md) or [Signal](plugins/signal/README.md) docs for
-  configuration.
+  protocol to the daemon. MQTT, LXMF, Signal, and Meshtastic plugins available; see
+  [LXMF](plugins/lxmf/README.md), [Signal](plugins/signal/README.md), or
+  [Meshtastic](plugins/meshtastic/README.md) docs for configuration.
 
 ## Build
 
