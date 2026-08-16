@@ -204,7 +204,10 @@ impl Daemon {
     /// at startup and never re-bound), swaps in `new`, then -- OUTSIDE the
     /// write lock, so this never holds `cfg` while taking another lock --
     /// rebuilds `sender_limiter` from the new per-sender numbers, resets
-    /// `budget_limiter`'s windows, and pushes the new dedup TTL into
+    /// `budget_limiter`'s windows (both the `transport_budgets` protocol
+    /// keys AND `process_due_fed`'s "fed/<peer_name>" keys -- one shared
+    /// instance, one unconditional reset, design §5 Task 3), and pushes the
+    /// new dedup TTL into
     /// `dedup` via `set_ttl` (affects only entries recorded from this point
     /// on; entries already recorded keep aging out under whatever TTL was
     /// in effect when they were recorded -- see `dedup::Dedup::set_ttl`).
@@ -1684,6 +1687,48 @@ async fn process_due_fed(d: &Arc<Daemon>, del: storage::Delivery, env: Envelope,
         warn_if_mark_failed(del.id, "pending", result);
         return;
     };
+
+    // Federation egress budget (design §5, carried from cycle F's review:
+    // the many-distinct-senders flood gap -- a peer fed from many distinct
+    // local native_refs never individually trips any per-sender limit, so
+    // this caps the PEER'S LINK as a whole instead). Keyed "fed/<peer_name>"
+    // in the SAME `BudgetLimiter` instance `process_due`'s transport-budget
+    // check uses (above, non-fed branch) -- distinct key namespace
+    // ("fed/" prefix) so a peer named the same as a plugin protocol can
+    // never collide with that protocol's own transport budget. Checked
+    // BEFORE any of the pseudonymization/signing work below, so a deferred
+    // send never pays for work that's about to be thrown away.
+    //
+    // NO priority-based bypass here, UNLIKE the transport-budget check
+    // above (which lets priority-0/emergency sends skip it entirely): the
+    // cycle-F priority ruling is that federation egress has no emergency
+    // lane at all -- an emergency envelope routed over a fed destination
+    // still queues behind this peer's budget like every other send, full
+    // stop. `messages_per_minute: 0` (absent/default, `PeerConfig`'s doc
+    // comment) is unlimited and never touches `budget_limiter`'s map at
+    // all (`BudgetLimiter::allow`'s own `per_minute == 0` fast path).
+    //
+    // Rebuild-on-apply: `Daemon::apply_config` resets `budget_limiter` to
+    // a fresh `BudgetLimiter::new()` unconditionally on EVERY apply (not
+    // conditioned on `federation` having changed) -- so a "fed/<peer_name>"
+    // key clears exactly when every `transport_budgets` key does, with no
+    // separate reset plumbing needed here (verified directly,
+    // `fed_egress_budget_resets_on_apply_config` below).
+    let per_minute = d.cfg_snapshot(|c| {
+        c.federation.as_ref()
+            .and_then(|f| f.peers.iter().find(|p| p.name == peer_name))
+            .map(|p| p.messages_per_minute)
+            .unwrap_or(0)
+    });
+    let allowed = d.budget_limiter.lock().unwrap()
+        .allow(&format!("fed/{peer_name}"), per_minute, Instant::now());
+    if !allowed {
+        metrics::inc(&metrics::BUDGET_DEFERRED);
+        let result = d.store.lock().unwrap()
+            .mark_retry(del.id, now + CDuration::seconds(5));
+        warn_if_mark_failed(del.id, "pending", result);
+        return;
+    }
 
     let identity_exposure = d.cfg_snapshot(|c| {
         c.federation.as_ref().map(|f| f.identity_exposure.clone())
@@ -4980,6 +5025,195 @@ routes:
         assert!(after.next_attempt >= now + CDuration::seconds(5));
         assert_eq!(after.attempt_count, 1,
             "mark_attempting still ran once (before the send was even attempted)");
+    }
+
+    // ==== process_due_fed egress budget (design §5, Task 3) ================
+
+    #[tokio::test]
+    async fn process_due_fed_budget_defers_the_second_send_and_bumps_metric() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        let node_id = format!("rf:{}", "55".repeat(32));
+        let mut peer = fed_peer_cfg("phoenix", &node_id, "verified");
+        peer.messages_per_minute = 1;
+        fed_cfg.peers = vec![peer];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+        let mut rx = register_fed_conn(&d, "phoenix", &node_id);
+
+        let env = local_env("!a", "one");
+        let first_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
+        let second_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
+        let now = Utc::now();
+        let before = metrics::BUDGET_DEFERRED.load(std::sync::atomic::Ordering::Relaxed);
+
+        let del1 = d.store.lock().unwrap().deliveries_for_id(first_id).unwrap();
+        process_due(&d, del1, now).await;
+        let del2 = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
+        process_due(&d, del2, now).await;
+
+        let after = metrics::BUDGET_DEFERRED.load(std::sync::atomic::Ordering::Relaxed);
+        // process-global counter (same "monotonic-only" reasoning as every
+        // other BUDGET_DEFERRED assertion in this file) -- the real,
+        // race-free proof is the exactly-one-Send check below.
+        assert!(after > before, "the second fed send within the minute must be budget-deferred");
+
+        rx.try_recv().expect("the first send must go through");
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "the budget-deferred second send must never have called try_send");
+
+        let first_after = d.store.lock().unwrap().deliveries_for_id(first_id).unwrap();
+        assert_eq!(first_after.state, "attempting");
+        let second_after = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
+        assert_eq!(second_after.state, "pending", "deferred, not attempted");
+        assert!(second_after.next_attempt >= now + CDuration::seconds(5));
+    }
+
+    /// `messages_per_minute: 0` (also `PeerConfig`'s own default for a peer
+    /// with no explicit budget) is unlimited -- design §5's "0/absent =
+    /// unlimited" -- and per `BudgetLimiter::allow`'s own fast path never
+    /// even touches the limiter's map, so this also proves an unconfigured/
+    /// unlimited peer's fed key never accumulates state.
+    #[tokio::test]
+    async fn process_due_fed_zero_messages_per_minute_is_unlimited() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        let node_id = format!("rf:{}", "66".repeat(32));
+        let mut peer = fed_peer_cfg("phoenix", &node_id, "verified");
+        peer.messages_per_minute = 0;
+        fed_cfg.peers = vec![peer];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+        let mut rx = register_fed_conn(&d, "phoenix", &node_id);
+
+        let env = local_env("!a", "hi");
+        let now = Utc::now();
+        for _ in 0..5 {
+            let id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
+            let del = d.store.lock().unwrap().deliveries_for_id(id).unwrap();
+            process_due(&d, del, now).await;
+        }
+        for _ in 0..5 {
+            rx.try_recv().expect("an unlimited (messages_per_minute: 0) peer must never be budget-deferred");
+        }
+        assert!(d.budget_limiter.lock().unwrap().allow("fed/phoenix", 0, Instant::now()),
+            "the 0 fast path never accumulates per-key state (mirrors BudgetLimiter::allow's own contract)");
+    }
+
+    /// The cycle-F priority ruling this task's brief calls out explicitly:
+    /// UNLIKE the transport-budget check above (which lets priority-0/
+    /// emergency deliveries skip the check entirely, `del.priority > 0`),
+    /// federation egress has NO emergency lane at all -- an emergency
+    /// envelope routed over a fed destination must still queue behind its
+    /// peer's budget exactly like a normal-priority one.
+    #[tokio::test]
+    async fn process_due_fed_budget_has_no_priority_bypass_unlike_transport_budgets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        let node_id = format!("rf:{}", "88".repeat(32));
+        let mut peer = fed_peer_cfg("phoenix", &node_id, "verified");
+        peer.messages_per_minute = 1;
+        fed_cfg.peers = vec![peer];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+        let mut rx = register_fed_conn(&d, "phoenix", &node_id);
+
+        let env = local_env("!a", "one");
+        // First send (queue_fed_delivery's normal priority, 2) consumes the
+        // peer's one-per-minute budget slot.
+        let first_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
+        // Second send, EMERGENCY priority (0) -- queue_fed_delivery always
+        // hardcodes priority 2, so this row is built directly.
+        let dest = Endpoint { protocol: FED_PROTOCOL.to_string(), endpoint: "phoenix/regional-chat".to_string() };
+        let second_id = {
+            let store = d.store.lock().unwrap();
+            store.insert_message(&env).unwrap();
+            store.insert_delivery(env.id, "outbound", &dest, Utc::now(), env.expires_at, 0).unwrap()
+        };
+
+        let now = Utc::now();
+        let del1 = d.store.lock().unwrap().deliveries_for_id(first_id).unwrap();
+        process_due(&d, del1, now).await;
+        let del2 = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
+        assert_eq!(del2.priority, 0, "sanity: this really is an emergency-priority row");
+        process_due(&d, del2, now).await;
+
+        rx.try_recv().expect("the first (normal-priority) send goes through");
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "an emergency-priority fed send must STILL be budget-deferred -- federation egress has \
+             no emergency bypass lane (cycle-F priority ruling)");
+
+        let second_after = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
+        assert_eq!(second_after.state, "pending", "deferred even at priority 0");
+    }
+
+    /// Rebuild-on-apply (design §5 Task 3 binding): `Daemon::apply_config`
+    /// resets `budget_limiter` to a fresh `BudgetLimiter::new()`
+    /// unconditionally on every apply -- the SAME shared instance
+    /// `process_due_fed`'s "fed/<peer_name>" keys live in, so a peer
+    /// deferred in one window immediately gets a clean budget after any
+    /// config apply, without needing `federation` itself to have changed.
+    #[tokio::test]
+    async fn fed_egress_budget_resets_on_apply_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        let node_id = format!("rf:{}", "77".repeat(32));
+        let mut peer = fed_peer_cfg("phoenix", &node_id, "verified");
+        peer.messages_per_minute = 1;
+        fed_cfg.peers = vec![peer];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+        let mut rx = register_fed_conn(&d, "phoenix", &node_id);
+
+        let env = local_env("!a", "one");
+        let first_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
+        let second_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
+        let now = Utc::now();
+
+        let del1 = d.store.lock().unwrap().deliveries_for_id(first_id).unwrap();
+        process_due(&d, del1, now).await;
+        let del2 = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
+        process_due(&d, del2, now).await;
+
+        let deferred = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
+        assert_eq!(deferred.state, "pending", "must be deferred before the reset");
+        rx.try_recv().expect("first send");
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+
+        // Re-apply the SAME config: the point is that apply_config resets
+        // budget_limiter unconditionally, not conditioned on `federation`
+        // itself having changed.
+        let cfg = d.cfg_snapshot(|c| c.clone());
+        d.apply_config(cfg);
+
+        let del2_again = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
+        process_due(&d, del2_again, now).await;
+        rx.try_recv().expect(
+            "after apply_config resets the budget, the previously-deferred send must go through");
+        let final_state = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
+        assert_eq!(final_state.state, "attempting");
+    }
+
+    /// The sliding-window semantics `process_due_fed`'s budget check relies
+    /// on, exercised directly against `d.budget_limiter` under the EXACT
+    /// "fed/<peer_name>" key shape that check constructs
+    /// (`format!("fed/{peer_name}")`) -- same posture as `transport_budgets`'
+    /// own window-rollover coverage in `limits.rs`
+    /// (`budget_limiter_allows_n_then_denies_then_reallows_after_expiry`):
+    /// real time never advances 61s inside a unit test, so this drives the
+    /// limiter with synthetic `Instant`s instead of a real sleep -- exactly
+    /// the same reason `process_due_fed`'s own budget check calls
+    /// `Instant::now()` inline with no injectable clock, mirroring the
+    /// pre-existing transport-budget check right above it in this file.
+    #[test]
+    fn fed_egress_budget_key_reallows_after_a_minute_rolls_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let t0 = Instant::now();
+        let key = "fed/phoenix";
+        assert!(d.budget_limiter.lock().unwrap().allow(key, 1, t0));
+        assert!(!d.budget_limiter.lock().unwrap().allow(key, 1, t0),
+            "second send within the same window must be denied");
+        assert!(
+            d.budget_limiter.lock().unwrap().allow(key, 1, t0 + std::time::Duration::from_secs(61)),
+            "a full minute later, the window must have rolled over"
+        );
     }
 
     /// The binding integration test the brief calls for: an egress row

@@ -684,7 +684,13 @@ fn advert_scope_allows(d: &Daemon, peer_node_id: &str) -> bool {
 /// `advert_scope_allows` already keeps disabled-mode callers from ever
 /// reaching this, so the two independently agree rather than one relying
 /// on the other.
-fn build_signed_advert(d: &Daemon) -> Option<Advert> {
+///
+/// `pub(crate)` (not private): Task 3's `GET /v1/discovery` (`admin.rs`)
+/// reuses this directly for the response's `our_advert` field, rather
+/// than re-implementing "build + sign from cfg" a second time -- admin
+/// must never show a DIFFERENT advert than what this daemon actually
+/// sends peers over the wire.
+pub(crate) fn build_signed_advert(d: &Daemon) -> Option<Advert> {
     let unsigned = d.cfg_snapshot(|c| advert::build_from_config(c, &d.node_id, Utc::now()))?;
     Some(advert::sign(unsigned, &d.identity))
 }

@@ -26,6 +26,7 @@ fn request_for(args: &[String]) -> Result<(&'static str, String, Option<String>)
         },
         Some("identities") => Ok(("GET", "/v1/identities".into(), None)),
         Some("federation") => Ok(("GET", "/v1/federation".into(), None)),
+        Some("discovery") => Ok(("GET", "/v1/discovery".into(), None)),
         Some("link") => {
             let (requester, target, name_parts) = (args.get(1), args.get(2), args.get(3..));
             match (requester, target, name_parts) {
@@ -58,7 +59,7 @@ fn request_for(args: &[String]) -> Result<(&'static str, String, Option<String>)
             _ => Err("usage: switchyardctl config show|validate <file>|apply <file>|rollback".into()),
         },
         _ => Err("usage: switchyardctl [--socket <path>] \
-                  status|plugins|routes|queue|trace <id>|identities|federation|\
+                  status|plugins|routes|queue|trace <id>|identities|federation|discovery|\
                   link <requester> <target> <display_name...>|unlink <id>|\
                   config show|validate <file>|apply <file>|rollback|events".into()),
     }
@@ -247,6 +248,8 @@ mod tests {
             ("GET", "/v1/identities".into(), None));
         assert_eq!(request_for(&["federation".into()]).unwrap(),
             ("GET", "/v1/federation".into(), None));
+        assert_eq!(request_for(&["discovery".into()]).unwrap(),
+            ("GET", "/v1/discovery".into(), None));
         assert!(request_for(&[]).is_err());
         assert!(request_for(&["trace".into()]).is_err());
         assert!(request_for(&["bogus".into()]).is_err());

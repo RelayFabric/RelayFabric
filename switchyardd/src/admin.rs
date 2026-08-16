@@ -1,6 +1,7 @@
 use crate::config::IDENTITY_ROUTE;
 use crate::engine::{self, Daemon};
 use crate::events::Event;
+use crate::fed::advert::{self, Advert};
 use crate::fed::conn::PeerConn;
 use crate::identity_links;
 use crate::metrics;
@@ -69,6 +70,7 @@ pub fn router(d: Arc<Daemon>, config_path: PathBuf) -> Router {
         .route("/v1/identities/link/{id}", delete(delete_link))
         .route("/v1/identities/challenges", get(challenges))
         .route("/v1/federation", get(federation))
+        .route("/v1/discovery", get(discovery))
         .route("/v1/events", get(events_stream))
         .route("/metrics", get(metrics_text))
         .with_state(state)
@@ -716,6 +718,102 @@ fn federation_peer_json(
         "connected": conn.is_some(),
         "last_seen": last_seen,
     })
+}
+
+/// `GET /v1/discovery` (design §6, Task 3): this node's own advert -- built
+/// fresh and signed from the live config snapshot via
+/// `fed::conn::build_signed_advert`, the EXACT function the real fed wire
+/// exchange calls on connection-up/refresh, so this surface can never show
+/// an advert different from what peers actually receive -- `null` when
+/// discovery is off (that function's own `mode == "disabled"` check).
+/// `mode` echoes `cfg.discovery.mode` verbatim (`Config::discovery` always
+/// has a value via its `#[serde(default)]`, so there's no separate
+/// "block absent" state to report).
+///
+/// `peers` is every stored, unexpired advert (`Store::list_peer_adverts`),
+/// each RE-VERIFIED against its own signature here (design §3's "verify on
+/// serve" invariant) rather than trusted just because it's in the table --
+/// defense against direct DB tampering, independent of the receive-path
+/// verification `fed::conn::receive_advert` already performed once before
+/// the row was ever written. `advert::verify` only proves an advert is
+/// SELF-consistent (its `sig` matches its OWN embedded `node_id`); it says
+/// nothing about whether that embedded `node_id` equals the `peer_adverts`
+/// ROW KEY the record came back under, so this ALSO requires
+/// `peer_advert.node_id == node_id` (the row key) -- fix round 1 (review
+/// finding): without this, a DB-write-capable attacker with no victim
+/// private key could insert a row keyed to a victim's `node_id` whose
+/// `advert_cbor` is validly self-signed under the attacker's OWN keypair,
+/// and `advert::verify` alone would pass it straight through as that
+/// victim. This is the exact same binding the receive path enforces
+/// (`fed::conn::receive_advert`'s `advert.node_id != peer_node_id` check)
+/// re-checked here for the same "trust nothing not re-derived from the row
+/// itself" reason. A row whose `advert_cbor` fails to decode, decodes but
+/// fails `advert::verify`, or decodes+verifies but carries a DIFFERENT
+/// embedded `node_id` than its row key, is DROPPED from the response
+/// (never served half-trusted, and never served under either node_id) with
+/// one warn -- and deliberately left in storage, not deleted: this is a
+/// read path, and the hourly `purge_expired_adverts` sweep remains the
+/// only thing that ever removes a `peer_adverts` row.
+///
+/// `name` is served from the FRESHLY-DECODED advert, re-sanitized via
+/// `fed::conn::sanitize_advert_name` -- NEVER the raw decoded `.name`.
+/// `advert_cbor` stores the peer's ORIGINAL signed bytes verbatim
+/// (`Store::upsert_peer_advert`'s contract), so decoding it here recovers
+/// whatever raw name the peer originally sent, control characters and all;
+/// re-sanitizing before it ever reaches this response is the entire reason
+/// that function is `pub(crate)` rather than private.
+async fn discovery(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
+    let mode = d.cfg_snapshot(|c| c.discovery.mode.clone());
+    let our_advert = crate::fed::conn::build_signed_advert(&d);
+
+    let now = Utc::now();
+    let rows = d.store.lock().unwrap().list_peer_adverts(now).unwrap_or_default();
+    let mut peers: Vec<serde_json::Value> = Vec::new();
+    for (node_id, advert_cbor, received_at) in rows {
+        let decoded: Option<Advert> = ciborium::from_reader(advert_cbor.as_slice()).ok();
+        match decoded {
+            // Fix round 1 (review Important finding): `advert::verify` only
+            // proves the advert is SELF-consistent -- its `sig` matches its
+            // OWN embedded `node_id`. It says nothing about whether that
+            // embedded `node_id` matches the `peer_adverts` ROW KEY this
+            // record was stored/looked-up under. Without this third check,
+            // a DB-write-capable attacker (no victim private key needed)
+            // could insert a row keyed `node_id: "rf:<victim>"` whose
+            // `advert_cbor` is validly self-signed under the ATTACKER's own
+            // keypair (embedded `node_id: "rf:<attacker>"`) -- `verify()`
+            // passes, and without this check the response would serve
+            // `node_id: "rf:<victim>"` with attacker-chosen name/services: a
+            // full identity spoof of a trusted node. The receive path
+            // already enforces this exact binding (`fed/conn.rs`'s
+            // `advert.node_id != peer_node_id` check in `receive_advert`);
+            // this is that same invariant, re-checked here because the
+            // whole point of "verify on serve" is to trust nothing about a
+            // stored row that isn't re-derived from the row itself.
+            // Serving `peer_advert.node_id` instead (the attacker's REAL
+            // id) would still surface an attacker-injected row, just under
+            // a non-spoofed key -- dropping the row entirely is correct.
+            Some(peer_advert)
+                if advert::verify(&peer_advert).is_ok() && peer_advert.node_id == node_id =>
+            {
+                peers.push(json!({
+                    "node_id": node_id,
+                    "name": crate::fed::conn::sanitize_advert_name(&peer_advert.name),
+                    "services": peer_advert.services,
+                    "protocols": peer_advert.protocols,
+                    "security": peer_advert.security,
+                    "expires": peer_advert.expires,
+                    "received_at": received_at,
+                }));
+            }
+            _ => {
+                warn!(node_id = %crate::fed::short_node_id(&node_id),
+                    "stored peer advert failed re-verification on serve (tampered, corrupt, or \
+                     row-key/embedded-node_id mismatch); dropped from GET /v1/discovery");
+            }
+        }
+    }
+
+    Json(json!({ "mode": mode, "our_advert": our_advert, "peers": peers }))
 }
 
 /// Builds the `GET /v1/events` (design §4) SSE stream from a live broadcast
@@ -1480,6 +1578,238 @@ policies:
         let (_, body) = get(router(d), "/v1/federation").await;
         assert!(!body.contains("addr"), "response must never surface a peer's dial address: {body}");
         assert!(!body.contains("203.0.113.7"), "response must never surface a peer's dial address: {body}");
+    }
+
+    // ---- discovery (design §6, Task 3) -------------------------------------
+
+    fn daemon_with_discovery_mode(mode: &str) -> Arc<Daemon> {
+        let dir = tempfile::tempdir().unwrap();
+        let d = crate::engine::tests_support::test_daemon(dir.path());
+        d.cfg.write().unwrap().discovery.mode = mode.to_string();
+        std::mem::forget(dir);
+        Arc::new(d)
+    }
+
+    #[tokio::test]
+    async fn discovery_endpoint_reports_disabled_mode_and_null_our_advert_by_default() {
+        let d = daemon(); // discovery: DiscoveryConfig::default() => mode "disabled"
+        let (code, body) = get(router(d), "/v1/discovery").await;
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["mode"], "disabled");
+        assert!(v["our_advert"].is_null(),
+            "discovery disabled must report our_advert: null, got {body}");
+        assert_eq!(v["peers"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn discovery_endpoint_reports_our_advert_when_enabled() {
+        let d = daemon_with_discovery_mode("federation");
+        let (code, body) = get(router(d.clone()), "/v1/discovery").await;
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["mode"], "federation");
+        let our = &v["our_advert"];
+        assert!(!our.is_null(), "discovery enabled must produce a non-null our_advert: {body}");
+        assert_eq!(our["node_id"], d.node_id);
+        assert_eq!(our["name"], "t", "test_daemon's node.name fixture");
+        assert_eq!(our["services"]["federation"], true);
+    }
+
+    /// Builds and signs a standalone peer advert (own throwaway identity,
+    /// never the daemon-under-test's own) for the storage-tampering tests
+    /// below -- mirrors `fed::advert`'s own `fixed_advert`/`sign` test
+    /// fixtures rather than going through `fed::conn`'s wire path, since
+    /// these tests are exercising `GET /v1/discovery`'s serve-side
+    /// re-verification directly against hand-inserted `peer_adverts` rows.
+    fn signed_peer_advert(
+        dir: &std::path::Path, key_name: &str, advert_name: &str, expires: chrono::DateTime<Utc>,
+    ) -> Advert {
+        let identity = crate::node_identity::NodeIdentity::load_or_create(&dir.join(key_name)).unwrap();
+        let mut services = BTreeMap::new();
+        services.insert("federation".to_string(), true);
+        let unsigned = Advert {
+            rf_version: 1,
+            node_id: identity.node_id(),
+            name: advert_name.to_string(),
+            services,
+            protocols: BTreeMap::new(),
+            security: crate::fed::advert::SecurityCaps { translate: true, signed: true, opaque: false },
+            expires: expires.timestamp(),
+            sig: Vec::new(),
+        };
+        advert::sign(unsigned, &identity)
+    }
+
+    #[tokio::test]
+    async fn discovery_endpoint_lists_a_stored_peer_advert_with_the_documented_shape() {
+        let d = daemon();
+        let dir = tempfile::tempdir().unwrap();
+        let expires = Utc::now() + chrono::Duration::hours(1);
+        let signed = signed_peer_advert(dir.path(), "peer1", "Phoenix", expires);
+        let mut raw = Vec::new();
+        ciborium::into_writer(&signed, &mut raw).unwrap();
+        d.store.lock().unwrap()
+            .upsert_peer_advert(&signed.node_id, &raw, "Phoenix", expires, Utc::now())
+            .unwrap();
+
+        let (code, body) = get(router(d), "/v1/discovery").await;
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let peers = v["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0]["node_id"], signed.node_id);
+        assert_eq!(peers[0]["name"], "Phoenix");
+        assert_eq!(peers[0]["services"]["federation"], true);
+        assert_eq!(peers[0]["expires"], signed.expires);
+        assert!(!peers[0]["received_at"].is_null());
+        assert!(peers[0].get("security").is_some(), "shape must include security: {body}");
+        assert!(peers[0].get("protocols").is_some(), "shape must include protocols: {body}");
+    }
+
+    /// The brief's exact tamper scenario: garbage bytes written straight
+    /// into `advert_cbor`, simulating direct DB tampering rather than
+    /// anything that ever passed the receive path's own verification.
+    #[tokio::test]
+    async fn discovery_endpoint_drops_a_row_whose_stored_cbor_is_garbage() {
+        let d = daemon();
+        let node_id = format!("rf:{}", "ee".repeat(32));
+        d.store.lock().unwrap()
+            .upsert_peer_advert(&node_id, b"not-valid-cbor-at-all", "Tampered",
+                Utc::now() + chrono::Duration::hours(1), Utc::now())
+            .unwrap();
+
+        let (code, body) = get(router(d), "/v1/discovery").await;
+        assert_eq!(code, 200, "a tampered row must not crash the endpoint: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["peers"], serde_json::json!([]),
+            "a row that fails re-verification on serve must be dropped, not served: {body}");
+    }
+
+    /// The sibling tamper case: valid CBOR shape (decodes fine) but a
+    /// field was mutated after signing, so the signature no longer matches
+    /// -- design §3/§6's "verify on serve" must catch this too, not just
+    /// outright-unparseable bytes.
+    #[tokio::test]
+    async fn discovery_endpoint_drops_a_row_whose_cbor_decodes_but_fails_signature_reverification() {
+        let d = daemon();
+        let dir = tempfile::tempdir().unwrap();
+        let mut signed = signed_peer_advert(
+            dir.path(), "peer2", "Seattle", Utc::now() + chrono::Duration::hours(1));
+        signed.name.push('!'); // mutate AFTER signing: valid CBOR, bad signature
+        let mut raw = Vec::new();
+        ciborium::into_writer(&signed, &mut raw).unwrap();
+        d.store.lock().unwrap()
+            .upsert_peer_advert(&signed.node_id, &raw, "Seattle!",
+                Utc::now() + chrono::Duration::hours(1), Utc::now())
+            .unwrap();
+
+        let (code, body) = get(router(d), "/v1/discovery").await;
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["peers"], serde_json::json!([]),
+            "a row whose stored CBOR fails signature re-verification must be dropped: {body}");
+    }
+
+    /// Fix round 1 (review Important finding): `advert::verify` only
+    /// proves an advert is SELF-consistent -- its `sig` matches its OWN
+    /// embedded `node_id` -- it says nothing about whether that embedded
+    /// `node_id` matches the `peer_adverts` ROW KEY it's stored under. A
+    /// DB-write-capable attacker needs no victim private key at all: sign a
+    /// perfectly valid advert under their OWN keypair (embedded
+    /// `node_id: "rf:<attacker>"`), then insert it keyed to the VICTIM's
+    /// `node_id`. `advert::verify` alone passes this straight through,
+    /// which -- before this fix -- the handler would then serve as
+    /// `node_id: "rf:<victim>"` with attacker-chosen name/services: a full
+    /// identity spoof of a trusted node, no signing key compromise needed.
+    /// This asserts that row is dropped entirely (not served under EITHER
+    /// node_id), while a sibling row whose key matches its embedded
+    /// node_id still serves normally -- proving the fix doesn't just drop
+    /// everything.
+    #[tokio::test]
+    async fn discovery_endpoint_drops_a_row_whose_embedded_node_id_does_not_match_its_storage_key() {
+        let d = daemon();
+        let dir = tempfile::tempdir().unwrap();
+
+        // The spoofed row: validly self-signed under the ATTACKER's own
+        // keypair, but inserted keyed to a DIFFERENT (victim) node_id --
+        // exactly the "no victim private key needed" attack the review
+        // finding describes.
+        let victim_node_id = format!("rf:{}", "ff".repeat(32));
+        let attacker_signed = signed_peer_advert(
+            dir.path(), "attacker", "Attacker-Controlled Name",
+            Utc::now() + chrono::Duration::hours(1));
+        assert_ne!(attacker_signed.node_id, victim_node_id, "sanity: distinct identities");
+        let mut attacker_raw = Vec::new();
+        ciborium::into_writer(&attacker_signed, &mut attacker_raw).unwrap();
+        d.store.lock().unwrap()
+            .upsert_peer_advert(&victim_node_id, &attacker_raw, "Attacker-Controlled Name",
+                Utc::now() + chrono::Duration::hours(1), Utc::now())
+            .unwrap();
+
+        // A legitimate sibling row (key == embedded node_id) must still be
+        // served -- this fix must not turn into "drop every row".
+        let legit_signed = signed_peer_advert(
+            dir.path(), "legit", "Legit", Utc::now() + chrono::Duration::hours(1));
+        let mut legit_raw = Vec::new();
+        ciborium::into_writer(&legit_signed, &mut legit_raw).unwrap();
+        d.store.lock().unwrap()
+            .upsert_peer_advert(&legit_signed.node_id, &legit_raw, "Legit",
+                Utc::now() + chrono::Duration::hours(1), Utc::now())
+            .unwrap();
+
+        let (code, body) = get(router(d), "/v1/discovery").await;
+        assert_eq!(code, 200);
+        assert!(!body.contains(&victim_node_id),
+            "the victim's node_id must never appear in the response -- spoofed row must be fully dropped: {body}");
+        assert!(!body.contains(&attacker_signed.node_id),
+            "the row must not be served under the attacker's real node_id either -- dropping means \
+             dropping, not re-keying: {body}");
+        assert!(!body.contains("Attacker-Controlled Name"), "spoofed content must not leak: {body}");
+
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let peers = v["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 1, "only the legitimate row must survive: {body}");
+        assert_eq!(peers[0]["node_id"], legit_signed.node_id);
+        assert_eq!(peers[0]["name"], "Legit");
+    }
+
+    /// Task 3 binding note: `advert_cbor` carries the peer's ORIGINAL,
+    /// unsanitized `name` inside the signed bytes -- decoding it fresh on
+    /// every serve (as re-verification requires) recovers whatever raw
+    /// name the peer actually sent, control characters and all. This
+    /// writes a properly-signed advert whose `.name` has raw control
+    /// characters DIRECTLY into `advert_cbor` (bypassing `fed::conn::
+    /// receive_advert`'s sanitize-before-store step entirely, and giving
+    /// the `name` COLUMN a deliberately different, equally-unsanitized
+    /// value) and asserts the served name is clean regardless -- proving
+    /// the handler re-sanitizes the DECODED name itself rather than
+    /// leaning on the (in this test, useless) stored column.
+    #[tokio::test]
+    async fn discovery_endpoint_always_serves_a_sanitized_name_even_when_the_raw_stored_advert_carries_control_chars() {
+        let d = daemon();
+        let dir = tempfile::tempdir().unwrap();
+        let malicious_name = "\x1b[31mRED\x1b[0m\nline2\x00null";
+        let signed = signed_peer_advert(
+            dir.path(), "peer3", malicious_name, Utc::now() + chrono::Duration::hours(1));
+        let mut raw = Vec::new();
+        ciborium::into_writer(&signed, &mut raw).unwrap();
+        d.store.lock().unwrap()
+            .upsert_peer_advert(&signed.node_id, &raw, "unused-column-value-also-messy\x00",
+                Utc::now() + chrono::Duration::hours(1), Utc::now())
+            .unwrap();
+
+        let (code, body) = get(router(d), "/v1/discovery").await;
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let peers = v["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 1);
+        let served_name = peers[0]["name"].as_str().unwrap();
+        assert_eq!(served_name, crate::fed::conn::sanitize_advert_name(malicious_name));
+        assert!(
+            !served_name.contains('\x1b') && !served_name.contains('\n') && !served_name.contains('\0'),
+            "served name must never carry control characters: {served_name:?}"
+        );
     }
 
     // ---- secret reference redaction (design §2 / SPEC §51, §59) -----------
