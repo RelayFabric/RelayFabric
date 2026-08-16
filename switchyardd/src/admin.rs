@@ -501,6 +501,39 @@ mod tests {
             "target ref must never leak in the 409 body: {resp_body}");
     }
 
+    /// RULING 1 (Task 3/4), surfaced through the HTTP layer: a global-queue-
+    /// cap rejection from `engine::initiate_link` folds into the same 409 the
+    /// capability-rejection case uses (see `create_link`'s doc comment), but
+    /// with "queue full" in the body so the WebUI can branch on the two
+    /// distinct 409 causes by text — mirrors engine.rs's own
+    /// `initiate_link_over_global_queue_cap_dead_letters_and_returns_queue_full`
+    /// at the admin-router level.
+    #[tokio::test]
+    async fn post_identities_link_returns_409_with_queue_full_when_global_queue_is_saturated() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = crate::engine::tests_support::test_daemon_with_limits(dir.path(), crate::config::Limits {
+            global: crate::config::GlobalLimits { queue_max: 1, ..Default::default() },
+            ..Default::default()
+        });
+        std::mem::forget(dir);
+        let d = Arc::new(d);
+        let _rx = crate::engine::tests_support::register_direct_plugin(&d, "mockb");
+
+        // saturate the global queue with an ordinary routed message first.
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+
+        let body = serde_json::json!({
+            "requester": "mocka:!req",
+            "target": "mockb:!target-secret",
+            "display_name": "X",
+        }).to_string();
+        let (code, resp_body) = req(router(d), "POST", "/v1/identities/link", Some(&body)).await;
+        assert_eq!(code, 409, "body was: {resp_body}");
+        assert!(resp_body.contains("queue full"), "409 body must be distinguishable as queue-full: {resp_body}");
+        assert!(!resp_body.contains("target-secret"), "target ref must never leak in the 409 body: {resp_body}");
+    }
+
     #[tokio::test]
     async fn post_identities_link_returns_400_on_malformed_json() {
         let (code, _) = req(router(daemon()), "POST", "/v1/identities/link", Some("not json")).await;

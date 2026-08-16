@@ -413,7 +413,8 @@ fn enqueue_identity_send(
         {
             warn!(error = %e, "failed to record queue-full identity delivery");
         }
-        warn!(destination = %dest, "queue full, identity delivery rejected");
+        warn!(destination = %format!("{}:{}", dest.protocol, identity_links::mask_ref(&dest.endpoint)),
+              "queue full, identity delivery rejected");
         return Err("queue full".to_string());
     }
     if let Err(e) = store.insert_delivery(env.id, IDENTITY_ROUTE, &dest, now, expires,
