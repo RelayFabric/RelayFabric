@@ -6,6 +6,7 @@ use alias::Aliaser;
 use chrono::{DateTime, Duration as CDuration, Utc};
 use relay_core::{AttachmentMeta, Capabilities, Endpoint, Envelope, Sender};
 use relay_ipc::{DaemonToPlugin, IpcAttachment};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
@@ -86,28 +87,27 @@ pub fn handle_inbound(
 ) {
     metrics::inc(&metrics::INGRESS);
 
-    let mut metas: Vec<AttachmentMeta> = Vec::new();
-    let mut shas: Vec<String> = Vec::new();
-    let mut notes = String::new();
-    for att in attachments {
-        let size = att.data.len() as u64;
-        if size > d.cfg.max_attachment_bytes {
-            notes.push_str(&format!(
-                "\n[dropped {}: {size} B over {} B limit]",
-                att.filename, d.cfg.max_attachment_bytes
-            ));
-            continue;
-        }
-        match d.cas.put(&att.data) {
-            Ok(sha) => {
-                shas.push(sha.clone());
-                metas.push(AttachmentMeta { filename: att.filename, mime: att.mime, size, sha256: sha });
-            }
-            Err(e) => warn!(error = %e, size, "failed to store attachment, dropping it"),
-        }
-    }
+    // Hash every attachment up front — a bare in-memory digest, no CAS I/O —
+    // so the dedup key can be sensitive to the *full* attachment set,
+    // including ones that will end up dropped for being oversize (two sends
+    // differing only in which oversize attachment got dropped must not
+    // dedup-collide). Nothing is written to the CAS yet: a message that
+    // turns out to be a duplicate or unroutable must not write attachment
+    // bytes to disk, because it never gets an `insert_attachment_refs` row,
+    // which means the GC in `purge_terminal` could never find and reclaim
+    // that blob again — a permanent leak, not just a stale one.
+    struct Hashed { att: IpcAttachment, sha: String, oversize: bool }
+    let hashed: Vec<Hashed> = attachments
+        .into_iter()
+        .map(|att| {
+            let oversize = att.data.len() as u64 > d.cfg.max_attachment_bytes;
+            let sha = hex::encode(Sha256::digest(&att.data));
+            Hashed { att, sha, oversize }
+        })
+        .collect();
+    let all_shas: Vec<String> = hashed.iter().map(|h| h.sha.clone()).collect();
 
-    let key = dedup::key(plugin, &sender, &endpoint, &body, created_at, &shas);
+    let key = dedup::key(plugin, &sender, &endpoint, &body, created_at, &all_shas);
     if !d.dedup.lock().unwrap().check(&key, Instant::now()) {
         metrics::inc(&metrics::DUPLICATES);
         return;
@@ -122,6 +122,34 @@ pub fn handle_inbound(
         metrics::inc(&metrics::DROPPED);
         warn!(%source, "dropping unrouted message (deny by default)");
         return;
+    }
+
+    // Message is accepted (not a duplicate, has at least one route): only
+    // now do in-cap attachments actually get written to the CAS.
+    let mut metas: Vec<AttachmentMeta> = Vec::new();
+    let mut shas: Vec<String> = Vec::new();
+    let mut notes = String::new();
+    for h in hashed {
+        let size = h.att.data.len() as u64;
+        if h.oversize {
+            notes.push_str(&format!(
+                "\n[dropped {}: {size} B over {} B limit]",
+                h.att.filename, d.cfg.max_attachment_bytes
+            ));
+            continue;
+        }
+        match d.cas.put(&h.att.data) {
+            Ok(sha) => {
+                shas.push(sha.clone());
+                metas.push(AttachmentMeta {
+                    filename: h.att.filename, mime: h.att.mime, size, sha256: sha,
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, size, "failed to store attachment, dropping it");
+                notes.push_str(&format!("\n[attachment {} unavailable]", h.att.filename));
+            }
+        }
     }
     let body = format!("{body}{notes}");
     let mut env = Envelope::new(
@@ -482,8 +510,6 @@ mod tests {
 
     #[test]
     fn inbound_drops_oversize_attachment_stores_accepted_one_and_notes_the_drop() {
-        use sha2::{Digest, Sha256};
-
         let dir = tempfile::tempdir().unwrap();
         let mut d = test_daemon(dir.path());
         d.cfg.max_attachment_bytes = 16;
@@ -520,5 +546,131 @@ mod tests {
 
         // the accepted attachment's bytes actually landed in the CAS
         assert_eq!(d.cas.get(&expected_sha).unwrap(), b"tiny");
+    }
+
+    /// An unrouted (deny-by-default) inbound must never write attachment
+    /// bytes to the CAS: it never gets an `insert_attachment_refs` row, so a
+    /// blob written for it would be a permanent, un-GC-able leak.
+    #[test]
+    fn unrouted_inbound_with_attachment_never_touches_the_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+
+        let att = IpcAttachment {
+            filename: "orphan-risk.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: b"never stored".to_vec(),
+        };
+        let sha = hex::encode(Sha256::digest(&att.data));
+
+        // "elsewhere" is not a configured route source for test_daemon.
+        handle_inbound(&d, "mocka", "elsewhere".into(), "!a".into(), "text".into(),
+                       "hi".into(), None, vec![att]);
+
+        assert!(d.cas.get(&sha).is_err(),
+            "unrouted message must not write attachment bytes to the CAS");
+        let entries: Vec<_> = std::fs::read_dir(dir.path().join("attachments"))
+            .unwrap().collect();
+        assert!(entries.is_empty(),
+            "CAS dir must contain no files for a dropped/unrouted message");
+    }
+
+    /// Companion to storage.rs's
+    /// `purge_terminal_keeps_a_sha_shared_by_a_surviving_message`, but
+    /// end-to-end through `handle_inbound` and the real CAS: two messages
+    /// with byte-identical (so content-addressed to the same sha) attachments
+    /// must not have that blob removed while either message is still alive.
+    #[test]
+    fn purge_and_gc_keeps_a_shared_attachment_alive_until_both_messages_are_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+
+        let shared = IpcAttachment {
+            filename: "shared.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: b"shared bytes".to_vec(),
+        };
+        let sha = hex::encode(Sha256::digest(&shared.data));
+
+        // two independent messages (different bodies, so dedup doesn't
+        // collapse them) carrying an attachment with identical bytes.
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "first".into(), None, vec![shared.clone()]);
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "second".into(), None, vec![shared]);
+        assert_eq!(d.cas.get(&sha).unwrap(), b"shared bytes");
+
+        let now = Utc::now();
+        let (id1, id2) = {
+            let store = d.store.lock().unwrap();
+            let due = store.due_deliveries(now, 10).unwrap();
+            assert_eq!(due.len(), 2);
+            (due[0].id, due[1].id)
+        };
+
+        // terminate + purge only the FIRST message; the second is still
+        // pending and still references the same sha.
+        {
+            let store = d.store.lock().unwrap();
+            store.mark_attempting(id1).unwrap();
+            store.mark_delivered(id1).unwrap();
+        }
+        let (purged1, orphans1) =
+            d.store.lock().unwrap().purge_terminal(now + CDuration::hours(1)).unwrap();
+        assert_eq!(purged1, 1);
+        assert!(orphans1.is_empty(),
+            "sha still referenced by the second (pending) message must survive: {orphans1:?}");
+        for s in &orphans1 {
+            d.cas.remove(s).unwrap();
+        }
+        assert_eq!(d.cas.get(&sha).unwrap(), b"shared bytes",
+            "CAS blob must survive: a live message still references it");
+
+        // now finish off the second message too and purge again: nothing
+        // references the sha anymore, so it must come back as orphaned and
+        // be removable.
+        {
+            let store = d.store.lock().unwrap();
+            store.mark_attempting(id2).unwrap();
+            store.mark_delivered(id2).unwrap();
+        }
+        let (purged2, orphans2) =
+            d.store.lock().unwrap().purge_terminal(now + CDuration::hours(1)).unwrap();
+        assert_eq!(purged2, 1);
+        assert_eq!(orphans2, vec![sha.clone()]);
+        for s in &orphans2 {
+            d.cas.remove(s).unwrap();
+        }
+        assert!(d.cas.get(&sha).is_err(), "now-truly-orphaned blob must be removable");
+    }
+
+    /// Two inbound sends that are identical except for which oversize
+    /// (dropped) attachment they carry must not be treated as duplicates:
+    /// the dedup key must be sensitive to every attachment's sha, not just
+    /// the ones that made it past the size cap.
+    #[test]
+    fn dedup_key_is_sensitive_to_dropped_attachments_not_just_accepted_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.cfg.max_attachment_bytes = 16;
+
+        let a = IpcAttachment {
+            filename: "a.bin".into(), mime: "application/octet-stream".into(),
+            data: vec![0u8; 64], // oversize -> dropped
+        };
+        let b = IpcAttachment {
+            filename: "b.bin".into(), mime: "application/octet-stream".into(),
+            data: vec![1u8; 64], // different bytes, also oversize -> dropped
+        };
+        let same_created_at = Utc::now();
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), Some(same_created_at), vec![a]);
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), Some(same_created_at), vec![b]);
+
+        let counts = d.store.lock().unwrap().queue_counts().unwrap();
+        assert_eq!(counts, vec![("pending".to_string(), 2)],
+            "differing dropped attachments must not dedup-collide: {counts:?}");
     }
 }

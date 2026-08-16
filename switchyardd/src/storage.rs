@@ -219,10 +219,16 @@ impl Store {
     ///
     /// Also GCs `message_attachments`: any row whose `message_id` no longer
     /// exists in `messages` (i.e. the message was just purged above, or had
-    /// no deliveries at all) is deleted, and the *distinct* shas it referenced
-    /// are returned so the caller (the pump) can remove the now-unreferenced
-    /// blobs from the CAS. A sha still referenced by any surviving message
-    /// (e.g. a pending delivery) is never returned or deleted here.
+    /// no deliveries at all) is deleted. The *distinct* shas that are truly
+    /// unreferenced — no surviving message has a ref row for them, even if
+    /// some *other*, now-dead message shared the same sha (e.g. the same
+    /// file forwarded into two separate messages) — are returned so the
+    /// caller (the pump) can remove the now-unreferenced blobs from the CAS.
+    /// This is a `GROUP BY sha256` / `HAVING` check rather than a per-row
+    /// `NOT IN`: a naive per-row anti-join would report a sha as orphaned
+    /// the moment *any one* of its referencing messages was purged, even
+    /// while another message sharing that same sha is still alive — which
+    /// would have the pump delete a blob a live message still depends on.
     pub fn purge_terminal(
         &self,
         older_than: DateTime<Utc>,
@@ -239,8 +245,10 @@ impl Store {
         )?;
         let orphans: Vec<String> = {
             let mut stmt = self.conn.prepare(
-                "SELECT DISTINCT sha256 FROM message_attachments
-                 WHERE message_id NOT IN (SELECT id FROM messages)",
+                "SELECT sha256 FROM message_attachments
+                 GROUP BY sha256
+                 HAVING SUM(CASE WHEN message_id IN (SELECT id FROM messages)
+                                 THEN 1 ELSE 0 END) = 0",
             )?;
             let rows = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
             rows
@@ -485,6 +493,53 @@ mod tests {
             "orphaned attachment ref row must be deleted, not just reported");
         assert_eq!(attachment_shas_for(&s, pending_msg.id), vec!["surviving-sha".to_string()],
             "a pending message's attachment ref must survive purge");
+    }
+
+    /// Regression test for a real data-loss bug: a naive per-row
+    /// `message_id NOT IN (SELECT id FROM messages)` anti-join reports a sha
+    /// as orphaned the instant *any one* of the (possibly several) messages
+    /// referencing it is purged — even while another message sharing that
+    /// same sha (e.g. the same file forwarded twice) is still alive. That
+    /// would have the pump `cas.remove` a blob a live message still depends
+    /// on. `purge_terminal` must only ever report a sha once *no* surviving
+    /// message references it, regardless of how many dead messages did.
+    #[test]
+    fn purge_terminal_keeps_a_sha_shared_by_a_surviving_message() {
+        let (_d, s) = store();
+        let now = Utc::now();
+
+        // two independent messages that happen to reference the SAME sha.
+        let msg1 = env();
+        s.insert_message(&msg1).unwrap();
+        s.insert_attachment_refs(msg1.id, &["shared-sha".to_string()]).unwrap();
+        let id1 = s.insert_delivery(msg1.id, "general", &dest(), now, msg1.expires_at).unwrap();
+
+        let msg2 = env();
+        s.insert_message(&msg2).unwrap();
+        s.insert_attachment_refs(msg2.id, &["shared-sha".to_string()]).unwrap();
+        let id2 = s.insert_delivery(msg2.id, "general", &dest(), now, msg2.expires_at).unwrap();
+
+        // terminate + purge msg1 only. msg2 (and its ref to the same sha) is
+        // still alive: the shared sha must NOT be reported as orphaned, and
+        // msg2's ref row for it must remain untouched.
+        s.mark_attempting(id1).unwrap();
+        s.mark_delivered(id1).unwrap();
+        let (purged1, orphans1) = s.purge_terminal(now + Duration::hours(1)).unwrap();
+        assert_eq!(purged1, 1);
+        assert!(orphans1.is_empty(),
+            "sha still referenced by msg2 must not be reported as orphaned: {orphans1:?}");
+        assert!(s.get_message(msg1.id).unwrap().is_none(), "msg1 must be purged");
+        assert!(s.get_message(msg2.id).unwrap().is_some(), "msg2 must survive");
+        assert_eq!(attachment_shas_for(&s, msg2.id), vec!["shared-sha".to_string()],
+            "msg2's ref row for the shared sha must remain");
+
+        // now finish off msg2 too and purge again: nothing references the
+        // sha anymore, so it must now come back as orphaned.
+        s.mark_attempting(id2).unwrap();
+        s.mark_delivered(id2).unwrap();
+        let (purged2, orphans2) = s.purge_terminal(now + Duration::hours(1)).unwrap();
+        assert_eq!(purged2, 1);
+        assert_eq!(orphans2, vec!["shared-sha".to_string()]);
     }
 
     #[test]
