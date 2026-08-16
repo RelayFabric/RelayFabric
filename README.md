@@ -16,8 +16,9 @@ Meshtastic, MeshCore, Bitchat, Nostr, and MQTT.
 - `switchyardctl` — a thin CLI client for the admin API (status, plugins,
   routes, queue, message trace).
 - Plugins — separate processes speaking a small CBOR-over-Unix-socket IPC
-  protocol to the daemon. MQTT and LXMF plugins available; see
-  [LXMF plugin docs](plugins/lxmf/README.md) for configuration.
+  protocol to the daemon. MQTT, LXMF, and Signal plugins available; see
+  [LXMF](plugins/lxmf/README.md) or [Signal](plugins/signal/README.md) docs for
+  configuration.
 
 ## Build
 
