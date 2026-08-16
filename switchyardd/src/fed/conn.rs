@@ -937,6 +937,7 @@ mod tests {
         cfg.peers = vec![PeerConfig {
             name: "phoenix".into(), node_id: node_id.clone(),
             addr: "10.0.0.2:47000".into(), trust: "verified".into(),
+            messages_per_minute: 0,
         }];
         let d = Arc::new(test_daemon_with_federation(dir.path(), cfg));
 

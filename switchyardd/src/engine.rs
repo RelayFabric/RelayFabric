@@ -222,7 +222,9 @@ impl Daemon {
     /// (rebinding the Noise listener, tearing down/renegotiating already-
     /// connected peers whose config just changed) is deferred to a later
     /// cycle; this cycle a federation config edit only takes effect on the
-    /// next daemon start.
+    /// next daemon start. `discovery` (design §1/§4, cycle G) gets the
+    /// same "daemon" restart treatment for the same reason -- live advert
+    /// re-issue on a mode/ttl change is a later cycle-G task.
     ///
     /// CALLERS MUST CONSTRUCT `new` VIA `config::load_from_str`, never a
     /// bare parse: the restart-required diff below compares `cfg.plugins`
@@ -263,6 +265,9 @@ impl Daemon {
                 restart_required.push("daemon".to_string());
             }
             if cfg.federation != new.federation {
+                restart_required.push("daemon".to_string());
+            }
+            if cfg.discovery != new.discovery {
                 restart_required.push("daemon".to_string());
             }
             let old_names: BTreeSet<&String> = cfg.plugins.keys().collect();
@@ -1890,6 +1895,7 @@ pub mod tests_support {
             limits,
             transport_budgets,
             federation,
+            discovery: crate::config::DiscoveryConfig::default(),
         };
         Daemon::new(cfg, dir).unwrap()
     }
@@ -3636,6 +3642,32 @@ mod tests {
         assert!(outcome.restart_required.is_empty(), "outcome was: {outcome:?}");
     }
 
+    /// Design §1/§4, cycle G: `discovery` gets the same `"daemon"`
+    /// restart-required treatment as `federation` -- `test_daemon` starts
+    /// with `discovery: DiscoveryConfig::default()` (`mode: "disabled"`),
+    /// so turning it on is a real diff.
+    #[test]
+    fn apply_config_discovery_mode_change_is_restart_required_under_daemon_pseudo_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.discovery.mode = "federation".to_string();
+        let outcome = d.apply_config(new_cfg);
+        assert_eq!(outcome.restart_required, vec!["daemon".to_string()]);
+    }
+
+    /// Re-applying an UNCHANGED discovery block must not report a restart.
+    #[test]
+    fn apply_config_discovery_unchanged_has_no_restart_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().discovery.mode = "federation".to_string();
+
+        let new_cfg = d.cfg.read().unwrap().clone();
+        let outcome = d.apply_config(new_cfg);
+        assert!(outcome.restart_required.is_empty(), "outcome was: {outcome:?}");
+    }
+
     #[test]
     fn apply_config_multiple_changes_are_all_reported_sorted_and_deduped() {
         let dir = tempfile::tempdir().unwrap();
@@ -4222,6 +4254,7 @@ routes:
         crate::config::PeerConfig {
             name: name.into(), node_id: node_id.into(),
             addr: "10.0.0.2:47000".into(), trust: trust.into(),
+            messages_per_minute: 0,
         }
     }
 

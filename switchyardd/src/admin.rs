@@ -1372,6 +1372,7 @@ policies:
         crate::config::PeerConfig {
             name: name.into(), node_id: node_id.into(),
             addr: "10.0.0.2:47000".into(), trust: "verified".into(),
+            messages_per_minute: 0,
         }
     }
 

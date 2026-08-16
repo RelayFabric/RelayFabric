@@ -9,7 +9,14 @@
 //! (both cross-cutting, so they aren't under `fed/`). Verified-ingress
 //! dispatch (`fed_ingress`) lives in `engine.rs`, alongside the plugin
 //! ingress path it shares a fan-out helper with.
+//!
+//! RFDP discovery (design doc, cycle G, SPEC §111): `advert` defines the
+//! signed Node Advertisement document and builds one from `Config` at
+//! load time (SPEC §111.4 privacy sourcing rule). Exchange over live fed
+//! connections (`Advert`/`AdvertReq` wire frames, refresh timer, receive-
+//! path verification) and storage are later cycle-G tasks.
 
+pub mod advert;
 pub mod conn;
 pub mod domains;
 pub mod noise;

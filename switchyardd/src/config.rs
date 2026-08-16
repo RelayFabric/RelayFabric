@@ -62,6 +62,15 @@ pub struct Config {
     /// render/identity_mode.
     #[serde(default)]
     pub federation: Option<FederationConfig>,
+    /// RFDP discovery (design §111/§112, cycle G): absent entirely (every
+    /// pre-cycle-G config) defaults to `DiscoveryConfig::default()` --
+    /// `mode: "disabled"` -- matching today's no-advertisement behavior
+    /// exactly. `apply_config` (engine.rs) treats ANY change to this
+    /// block as `"daemon"` restart-required, the same posture as
+    /// `federation` above: advert content/exchange only takes effect on
+    /// the next daemon start this cycle.
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
 }
 
 fn default_ttl() -> u64 { 86_400 }
@@ -269,10 +278,55 @@ pub struct PeerConfig {
     /// verified").
     #[serde(default = "default_peer_trust")]
     pub trust: String,
+    /// Aggregate egress budget for this peer's fed link, per minute
+    /// (design §5, carried from the cycle-F review: the many-distinct-
+    /// senders flood gap -- per-sender limits don't cap a peer sending
+    /// from many distinct senders). 0 (default) = unlimited. No
+    /// `validate()` constraint beyond its type: unlike
+    /// `transport_budgets` (where 0 IS an error -- that block has no
+    /// "omit for unlimited" escape hatch), a per-peer 0 legitimately
+    /// means "no limit", the same posture `limits.*` fields already take.
+    /// Enforcement (keyed `"fed/<peer_name>"` in the existing
+    /// `BudgetLimiter`) is a later cycle-G task.
+    #[serde(default)]
+    pub messages_per_minute: u32,
 }
 
 fn default_peer_trust() -> String {
     "verified".to_string()
+}
+
+/// RFDP discovery policy (design §1/§4, SPEC §111.5/§112.2, cycle G).
+/// `PartialEq`/`Eq` power `Daemon::apply_config`'s restart-required diff
+/// (see `Config::discovery`'s doc comment): any field change trips the
+/// `"daemon"` restart entry, same as `federation`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DiscoveryConfig {
+    /// "disabled" (default) | "federation" | "public" -- SPEC §111.5's
+    /// four scopes minus "local" (DEFERRED this cycle: no LAN transport
+    /// exists yet -- `validate()` rejects it with a "future cycle"
+    /// message rather than silently accepting a scope this build can't
+    /// actually implement).
+    #[serde(default = "default_discovery_mode")]
+    pub mode: String,
+    /// Seconds an issued advert stays valid before needing a refresh
+    /// (design §1: `expires = now + advert_ttl_secs`). Minimum 300 --
+    /// `validate()` rejects anything shorter as a churn/flood footgun.
+    #[serde(default = "default_advert_ttl_secs")]
+    pub advert_ttl_secs: u64,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        DiscoveryConfig { mode: default_discovery_mode(), advert_ttl_secs: default_advert_ttl_secs() }
+    }
+}
+
+fn default_discovery_mode() -> String {
+    "disabled".to_string()
+}
+fn default_advert_ttl_secs() -> u64 {
+    3600
 }
 
 /// Protocol name reserved for federation (design §4/§5): no plugin may
@@ -635,7 +689,45 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
     }
 
     validate_federation(cfg)?;
+    validate_discovery(cfg)?;
 
+    Ok(())
+}
+
+/// Design §1/§4 validation for `discovery` (SPEC §111.5/§112.2, cycle G).
+/// Unlike `federation`, `discovery` is never absent -- `Config::discovery`
+/// defaults to `DiscoveryConfig::default()` (`mode: "disabled"`) via
+/// `#[serde(default)]`, so this runs unconditionally; every pre-cycle-G
+/// config (no `discovery:` block at all) validates against those defaults
+/// and passes trivially.
+fn validate_discovery(cfg: &Config) -> Result<(), String> {
+    let d = &cfg.discovery;
+    match d.mode.as_str() {
+        "disabled" | "federation" | "public" => {}
+        "local" => {
+            return Err(
+                "discovery.mode 'local' is reserved for a future cycle (no LAN transport exists \
+                 yet); use \"disabled\", \"federation\", or \"public\""
+                    .to_string(),
+            );
+        }
+        other => {
+            return Err(format!(
+                "discovery.mode '{other}' is invalid (expected \"disabled\", \"federation\", or \"public\")"
+            ));
+        }
+    }
+    if d.advert_ttl_secs < 300 {
+        return Err(format!(
+            "discovery.advert_ttl_secs {} is below the minimum of 300",
+            d.advert_ttl_secs
+        ));
+    }
+    if d.mode == "public" && !cfg.node.public {
+        return Err(
+            "discovery.mode 'public' requires node.public: true (§112.2 pairing)".to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -1865,6 +1957,7 @@ federation:
         PeerConfig {
             name: name.into(), node_id: node_id.into(),
             addr: "10.0.0.2:47000".into(), trust: "verified".into(),
+            messages_per_minute: 0,
         }
     }
 
@@ -2011,5 +2104,115 @@ federation:
         let cfg: Config = serde_yaml::from_str(&raw).unwrap();
         assert!(cfg.federation.is_none());
         assert!(validate(&cfg).is_ok());
+    }
+
+    // ---- discovery (design §1/§4, SPEC §111.5/§112.2, cycle G) ------------
+
+    #[test]
+    fn discovery_block_absent_defaults_to_disabled_and_ttl_3600() {
+        // v0.1/v0.2/pre-cycle-G config has no `discovery:` key at all.
+        let cfg = parse(GOOD).unwrap();
+        assert_eq!(cfg.discovery.mode, "disabled");
+        assert_eq!(cfg.discovery.advert_ttl_secs, 3600);
+    }
+
+    #[test]
+    fn example_config_has_no_discovery_block_and_stays_valid() {
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/relayfabric.example.yaml"),
+        ).unwrap();
+        let cfg: Config = serde_yaml::from_str(&raw).unwrap();
+        assert_eq!(cfg.discovery.mode, "disabled");
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn discovery_mode_federation_is_valid() {
+        let yaml = format!("{GOOD}\ndiscovery:\n  mode: federation\n");
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.discovery.mode, "federation");
+    }
+
+    #[test]
+    fn discovery_mode_public_with_node_public_true_is_valid() {
+        let yaml = GOOD.replace(
+            "node:\n  name: test-node\n  data_dir: /tmp/relayfabric-test",
+            "node:\n  name: test-node\n  public: true\n  data_dir: /tmp/relayfabric-test",
+        ) + "\npublic_services:\n  - name: svc\n    type: chat\n    ingress: [mocka, mockb]\n    \
+           egress: [mocka, mockb]\ndiscovery:\n  mode: public\n";
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.discovery.mode, "public");
+        assert!(cfg.node.public);
+    }
+
+    #[test]
+    fn discovery_mode_public_without_node_public_is_rejected() {
+        let yaml = format!("{GOOD}\ndiscovery:\n  mode: public\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("public"), "err was: {err}");
+        assert!(err.contains("node.public"), "err was: {err}");
+    }
+
+    #[test]
+    fn discovery_mode_local_is_rejected_as_reserved_for_a_future_cycle() {
+        let yaml = format!("{GOOD}\ndiscovery:\n  mode: local\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("local"), "err was: {err}");
+        assert!(err.contains("future"), "err should say 'future': {err}");
+    }
+
+    #[test]
+    fn discovery_mode_garbage_is_rejected() {
+        let yaml = format!("{GOOD}\ndiscovery:\n  mode: nonsense\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("nonsense"), "err was: {err}");
+    }
+
+    #[test]
+    fn discovery_advert_ttl_secs_at_minimum_300_is_valid() {
+        let yaml = format!("{GOOD}\ndiscovery:\n  mode: federation\n  advert_ttl_secs: 300\n");
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.discovery.advert_ttl_secs, 300);
+    }
+
+    #[test]
+    fn discovery_advert_ttl_secs_below_300_is_rejected() {
+        let yaml = format!("{GOOD}\ndiscovery:\n  mode: federation\n  advert_ttl_secs: 299\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("advert_ttl_secs"), "err was: {err}");
+        assert!(err.contains("300"), "err was: {err}");
+    }
+
+    #[test]
+    fn discovery_default_ttl_when_mode_disabled_needs_no_ttl_key() {
+        // A discovery block that only sets `mode` still gets the 3600
+        // default ttl, which is >= 300 -- no separate ttl key required.
+        let yaml = format!("{GOOD}\ndiscovery:\n  mode: disabled\n");
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.discovery.advert_ttl_secs, 3600);
+    }
+
+    // ---- federation.peers[].messages_per_minute (carried from cycle F) ----
+
+    #[test]
+    fn peer_messages_per_minute_defaults_to_zero_unlimited() {
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{a}\"\n      \
+             addr: \"10.0.0.2:47000\"\n",
+            a = node_id_a(),
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.federation.unwrap().peers[0].messages_per_minute, 0);
+    }
+
+    #[test]
+    fn peer_messages_per_minute_explicit_value_is_accepted() {
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{a}\"\n      \
+             addr: \"10.0.0.2:47000\"\n      messages_per_minute: 1\n",
+            a = node_id_a(),
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.federation.unwrap().peers[0].messages_per_minute, 1);
     }
 }

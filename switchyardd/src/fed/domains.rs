@@ -29,3 +29,16 @@ pub const ENVELOPE_V1: &[u8] = b"relayfabric-envelope-v1:";
 /// fed/sign.rs: signs one attestation-chain link, over
 /// `digest(canonical) || prev_sig || ts_rfc3339` (design §2, §33).
 pub const ATTEST_V1: &[u8] = b"relayfabric-attest-v1:";
+
+/// fed/advert.rs: signs a Node Advertisement's canonical bytes (design
+/// §111.1, cycle G). Same confusion class as the two domains above: an
+/// advert's canonical CBOR tuple leads with `rf_version` (a small uint)
+/// and `node_id` (a `"rf:"`-prefixed string) -- structurally nothing like
+/// an envelope's or a Noise static key's signed bytes, but the domain
+/// prefix closes the confusion class outright regardless, the same way
+/// it does for every other signing context here.
+// Only `advert.rs` references this so far, and that whole module is
+// itself dead code until fed exchange (Task 2) and admin (Task 3) wire
+// it in -- see `advert.rs`'s module-level `allow(dead_code)`.
+#[allow(dead_code)]
+pub const ADVERT_V1: &[u8] = b"relayfabric-advert-v1:";
