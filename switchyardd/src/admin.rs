@@ -43,7 +43,7 @@ fn plugin_state(d: &Daemon) -> Vec<(String, bool)> {
 
 async fn status(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let plugins: BTreeMap<_, _> = plugin_state(&d).into_iter().collect();
-    Json(json!({ "node": d.cfg.node.name, "plugins": plugins, "queue": queue_map(&d) }))
+    Json(json!({ "node": d.cfg.node.name, "node_id": d.node_id, "plugins": plugins, "queue": queue_map(&d) }))
 }
 
 async fn plugins(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
@@ -147,6 +147,7 @@ mod tests {
         let (code, body) = get(router(d), "/v1/status").await;
         assert_eq!(code, 200);
         assert!(body.contains("\"node\":\"t\""));
+        assert!(body.contains("\"node_id\":\"rf:"));
         assert!(body.contains("\"pending\":1"));
     }
 

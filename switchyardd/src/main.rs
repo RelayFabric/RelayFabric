@@ -5,6 +5,7 @@ mod config;
 mod dedup;
 mod engine;
 mod metrics;
+mod node_identity;
 mod plugins;
 mod policy;
 mod queue;

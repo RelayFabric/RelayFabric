@@ -1,8 +1,9 @@
 use crate::cas::Cas;
 use crate::config::Config;
 use crate::storage::Store;
-use crate::{alias, dedup, metrics, policy, queue, routes, storage, transform};
+use crate::{alias, dedup, metrics, node_identity, policy, queue, routes, storage, transform};
 use alias::Aliaser;
+use node_identity::NodeIdentity;
 use chrono::{DateTime, Duration as CDuration, Utc};
 use relay_core::{AttachmentMeta, Capabilities, Endpoint, Envelope, Sender};
 use relay_ipc::{DaemonToPlugin, IpcAttachment, MAX_FRAME};
@@ -26,6 +27,8 @@ pub struct Daemon {
     pub store: Mutex<Store>,
     pub dedup: Mutex<dedup::Dedup>,
     pub aliaser: Aliaser,
+    pub identity: NodeIdentity,
+    pub node_id: String,
     pub plugins: Mutex<HashMap<String, PluginHandle>>,
     pub cas: Cas,
 }
@@ -56,6 +59,8 @@ impl Daemon {
             info!(recovered, "requeued in-flight deliveries from previous run");
         }
         let aliaser = Aliaser::load_or_create(&data_dir.join("alias.key"))?;
+        let identity = NodeIdentity::load_or_create(&data_dir.join("identity"))?;
+        let node_id = identity.node_id();
         let ttl = std::time::Duration::from_secs(cfg.dedup_ttl_secs);
         let cas = Cas::new(&data_dir.join("attachments"))?;
         Ok(Daemon {
@@ -63,6 +68,8 @@ impl Daemon {
             store: Mutex::new(store),
             dedup: Mutex::new(dedup::Dedup::new(ttl)),
             aliaser,
+            identity,
+            node_id,
             plugins: Mutex::new(HashMap::new()),
             cas,
         })
