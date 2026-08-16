@@ -219,7 +219,7 @@ class FanoutTracker:
     `delivery_result` dict exactly once, when the last member reaches a
     terminal state; every other call returns None.
 
-    # ponytail: at-least-one delivery semantics — the whole send counts as
+    # at-least-one delivery semantics — the whole send counts as
     # delivered as soon as *any* member received it (or a propagation node
     # took custody). Per-member delivery rows are the upgrade path if
     # finer-grained observability is ever needed.
@@ -517,7 +517,7 @@ class Bridge:
         if method == LXMF.LXMessage.DIRECT and self.has_propagation_node:
             RNS.log(f"Direct delivery to {dest_hex} failed, handing to "
                      f"propagation node", RNS.LOG_INFO)
-            # ponytail: a resubmitted PROPAGATED message's own delivery
+            # a resubmitted PROPAGATED message's own delivery
             # callback fires once the propagation node accepts custody, not
             # once the recipient fetches it. We treat that handoff as
             # delivered=True for this member since store-and-forward

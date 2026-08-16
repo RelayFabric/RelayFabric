@@ -33,7 +33,7 @@ impl Aliaser {
         mac.update(format!("{protocol}|{native_ref}|{scope}").as_bytes());
         let out = mac.finalize().into_bytes();
         let prefix: String = protocol.chars().take(4).collect::<String>().to_uppercase();
-        // ponytail: 16-bit alias space; collisions merge personas within a
+        // 16-bit alias space; collisions merge personas within a
         // scope. Widen to 6 hex chars if a deployment ever grows past ~hundreds
         // of senders per route.
         format!("{prefix}-{:02X}{:02X}", out[0], out[1])

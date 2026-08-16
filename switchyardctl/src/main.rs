@@ -1,5 +1,5 @@
 //! Thin client for the switchyardd admin API.
-// ponytail: hand-rolled HTTP/1.0 over UnixStream — zero client deps, and the
+// hand-rolled HTTP/1.0 over UnixStream — zero client deps, and the
 // server closes the connection after each response. Swap for a real client
 // only when the API needs POSTs with bodies.
 

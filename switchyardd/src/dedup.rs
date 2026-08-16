@@ -35,7 +35,7 @@ impl Dedup {
 
     /// True if new (and records it), false if already seen.
     pub fn check(&mut self, key: &str, now: Instant) -> bool {
-        // ponytail: O(n) prune per call, in-memory only (restart forgets the
+        // O(n) prune per call, in-memory only (restart forgets the
         // cache). Fine at gateway volumes; move to the sqlite dedup table if
         // restart-replay ever bites.
         self.seen.retain(|_, t| now.duration_since(*t) < self.ttl);

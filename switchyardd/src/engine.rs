@@ -299,8 +299,8 @@ pub async fn pump(d: Arc<Daemon>) {
         }
         if last_purge.elapsed() >= PURGE_INTERVAL {
             last_purge = Instant::now();
-            // ponytail: retention hardcoded to 24h; make retention
-            // configurable is the upgrade path once there's an actual
+            // retention is hardcoded to 24h; making it configurable
+            // is the upgrade path once there's an actual
             // disk-pressure signal to tune it by.
             let cutoff = now - CDuration::hours(24);
             let result = d.store.lock().unwrap().purge_terminal(cutoff);

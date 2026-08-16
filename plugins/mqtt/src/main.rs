@@ -72,7 +72,7 @@ impl DeliveryTracker {
     /// `Outgoing::Publish` with nothing pending (e.g. a pkid collision retry
     /// rumqttc reissues internally) is simply ignored.
     ///
-    /// ponytail: caps `awaiting_ack` at 1024 and evicts an arbitrary entry
+    /// Caps `awaiting_ack` at 1024 and evicts an arbitrary entry
     /// (a `HashMap` has no order, so "oldest" isn't cheaply tracked) if
     /// PubAcks never arrive for some entries — e.g. the broker goes down
     /// indefinitely. Capping bounds memory instead of leaking forever. It

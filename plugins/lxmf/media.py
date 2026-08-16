@@ -127,8 +127,8 @@ def codec2_to_wav(mode, data):
         with wave.open(buf, "wb") as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
-            # ponytail: 8 kHz for all modes; 450PWB is nominally 16 kHz and
-            # will play slow -- special-case it if anyone actually uses it
+            # 8 kHz for all modes; 450PWB is nominally 16 kHz and
+            # will play slow; special-case it if anyone actually uses it
             wav.setframerate(8000)
             wav.writeframes(bytes(pcm))
         return buf.getvalue()

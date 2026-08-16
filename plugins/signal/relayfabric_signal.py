@@ -153,7 +153,7 @@ class SentCache:
             return self._entries.pop((group_id, text), None) is not None
 
     def _prune(self, now):
-        # ponytail: O(n) prune per call, fine at gateway volumes
+        # O(n) prune per call, fine at gateway volumes
         for key in [k for k, t in self._entries.items() if now - t > self.ttl]:
             del self._entries[key]
 
@@ -324,7 +324,7 @@ class Bridge:
             paths = []
             if kept:
                 tmpdir = tempfile.mkdtemp(prefix="relayfabric-signal-att-")
-                # ponytail: same-basename attachments overwrite; prefix an
+                # same-basename attachments overwrite; prefix an
                 # index if that ever matters
                 for att in kept:
                     path = os.path.join(tmpdir, os.path.basename(att["filename"]))

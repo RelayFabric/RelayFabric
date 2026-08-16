@@ -56,7 +56,7 @@ pub struct Envelope {
     pub received_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub reply_to: Option<Uuid>,
-    // ponytail: hop fields carried but only meaningful once federation exists
+    // hop fields are carried but only meaningful once federation exists
     pub hop_count: u8,
     pub hop_limit: u8,
     #[serde(default)]
