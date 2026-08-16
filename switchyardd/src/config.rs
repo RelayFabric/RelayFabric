@@ -48,12 +48,6 @@ pub struct PublicService {
     pub egress: Vec<String>,
 }
 
-#[allow(dead_code)]
-fn protocol_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
-    let raw: Vec<String> = Vec::deserialize(d)?;
-    Ok(raw)
-}
-
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Limits {
     #[serde(default)]
@@ -249,13 +243,11 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             Some(p) if p.enabled => {}
             Some(_) => {
                 return Err(format!(
-                    "transport_budgets '{}' references disabled plugin '{}'; enable the plugin or remove the entry",
-                    proto, proto))
+                    "transport_budgets entry '{proto}' references a disabled plugin; enable the plugin or remove the entry"))
             }
             None => {
                 return Err(format!(
-                    "transport_budgets '{}' references unknown plugin '{}'; enable the plugin or remove the entry",
-                    proto, proto))
+                    "transport_budgets entry '{proto}' references an unknown plugin; enable the plugin or remove the entry"))
             }
         }
     }
