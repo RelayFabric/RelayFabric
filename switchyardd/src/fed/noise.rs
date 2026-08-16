@@ -7,9 +7,13 @@
 //! precedent). Identity binding rides in the final handshake message each
 //! side sends (payload is only encrypted-for-the-sender's-static from that
 //! point on): CBOR `{node_id, sig}` where `sig` is an Ed25519 signature (by
-//! the node's RelayFabric identity, cycle-A `NodeIdentity`) over the raw
-//! 32-byte X25519 static public key just transmitted. The receiver checks
-//! `get_remote_static()` against that signature before trusting the peer.
+//! the node's RelayFabric identity, cycle-A `NodeIdentity`) over
+//! `domains::NOISE_STATIC_V1 || <raw 32-byte X25519 static public key just
+//! transmitted>` — domain-separated (Task 1 review ruling, `fed/domains.rs`)
+//! so this signature can never be confused with a signature made for any
+//! other purpose in this codebase (e.g. an envelope origin signature). The
+//! receiver checks `get_remote_static()` against that signature before
+//! trusting the peer.
 //!
 //! This module is staged: nothing in main's runtime path calls it yet
 //! (consumed by fed/conn.rs, Tasks 4-5, which will own live connections).
@@ -171,16 +175,26 @@ async fn read_noise_msg<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Vec<u8>> 
     Ok(buf)
 }
 
+/// Domain-separated signing bytes for the identity-binding payload:
+/// `domains::NOISE_STATIC_V1 || static_pub` (Task 1 review ruling).
+fn domain_separated_static_pub(static_pub: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(super::domains::NOISE_STATIC_V1.len() + static_pub.len());
+    msg.extend_from_slice(super::domains::NOISE_STATIC_V1);
+    msg.extend_from_slice(static_pub);
+    msg
+}
+
 fn sign_static_pub(node_identity: &NodeIdentity, static_key: &StaticKey) -> IdentityPayload {
     let pubkey = static_key.public_bytes();
     IdentityPayload {
         node_id: node_identity.node_id(),
-        sig: node_identity.sign(&pubkey),
+        sig: node_identity.sign(&domain_separated_static_pub(&pubkey)),
     }
 }
 
 fn verify_peer_payload(payload: &IdentityPayload, remote_static: &[u8]) -> Result<(), NoiseError> {
-    if node_identity::verify(&payload.node_id, remote_static, &payload.sig) {
+    let msg = domain_separated_static_pub(remote_static);
+    if node_identity::verify(&payload.node_id, &msg, &payload.sig) {
         Ok(())
     } else {
         Err(NoiseError::BadSignature)
@@ -470,6 +484,39 @@ mod tests {
         let bad_payload = IdentityPayload {
             node_id: victim_id.node_id(),
             sig: bad_sig,
+        };
+        let payload_bytes = encode_payload(&bad_payload).unwrap();
+
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let responder_task =
+            tokio::spawn(
+                async move { fake_responder_with_payload(b, &resp_key, payload_bytes).await },
+            );
+
+        let result = handshake_initiator(a, &init_key, &init_id, None).await;
+        assert!(matches!(result, Err(NoiseError::BadSignature)));
+        responder_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn undomain_separated_signature_is_dropped() {
+        // A signature that's otherwise entirely genuine (right key, right
+        // pubkey bytes, right node_id) but computed WITHOUT the
+        // NOISE_STATIC_V1 domain prefix must still be rejected. This proves
+        // the domain separation is load-bearing, not decorative: an old
+        // (pre-domain-separation) signature format, or a signature lifted
+        // from a different signing context that happened to cover the same
+        // raw bytes, must not verify here.
+        let dir = tempfile::tempdir().unwrap();
+        let (init_key, init_id) = identity_pair(dir.path()).await;
+        let (resp_key, resp_id) = identity_pair(dir.path()).await;
+
+        // Sign the raw static pubkey directly -- no domain prefix -- the
+        // way the pre-Task-1-review code did.
+        let raw_sig = resp_id.sign(&resp_key.public_bytes());
+        let bad_payload = IdentityPayload {
+            node_id: resp_id.node_id(),
+            sig: raw_sig,
         };
         let payload_bytes = encode_payload(&bad_payload).unwrap();
 
