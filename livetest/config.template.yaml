@@ -1,0 +1,103 @@
+# RelayFabric live-test config template. Rendered by up.sh (sed-replaces
+# the repo-path and mqtt-port placeholder tokens below) into
+# run/config.yaml — do not edit the rendered copy by hand, edit this
+# template and re-run up.sh.
+#
+# Tier ladder (see livetest/README.md):
+#   tier 0 - mqtt loopback + nodeless meshtastic check (mqtt + meshtastic
+#            plugins below are enabled by default)
+#   tier 1 - LXMF/Sideband (flip `lxmf.enabled` to true, see
+#            plugins/lxmf/README.md)
+#   tier 2 - Signal (flip `signal.enabled` to true, see
+#            plugins/signal/README.md)
+#   tier 3 - Meshtastic hardware (same plugin as tier 0, real device instead
+#            of `mosquitto_pub`, see plugins/meshtastic/README.md)
+node:
+  name: livetest-gateway
+  data_dir: __REPO__/livetest/run/data
+
+plugins:
+  mqtt:
+    enabled: true
+    command: __REPO__/target/release/relayfabric-mqtt
+    config:
+      broker: mqtt://127.0.0.1:__MQTT_PORT__
+      topics: [chat/a, chat/b]
+
+  meshtastic:
+    enabled: true
+    command: __REPO__/.venv/bin/python __REPO__/plugins/meshtastic/relayfabric-meshtastic
+    config:
+      broker: mqtt://127.0.0.1:__MQTT_PORT__
+      topic_root: msh/US              # verify against your node with: mosquitto_sub -t 'msh/#' -v
+      gateway_id: null                # null = accept all gateways; set to filter by hex ID
+      max_text_bytes: 200
+      channels:
+        mesh: {index: 0, topic_channel: "general"}
+
+  # lxmf: disabled for tier 0. To run tier 1, see plugins/lxmf/README.md
+  # (install deps into .venv, flip enabled to true, uncomment the
+  # lxmf-bridge route below).
+  lxmf:
+    enabled: false
+    command: __REPO__/.venv/bin/python __REPO__/plugins/lxmf/relayfabric-lxmf
+    config:
+      display_name: "RelayFabric Live-Test Gateway"
+      storage: __REPO__/livetest/run/data/lxmf
+      rns_configdir: null            # null = default ~/.reticulum
+      announce_interval: 3600
+      stamp_cost: null
+      propagation_node: "auto"
+      max_attachment_bytes: 1000000
+      image_max_bytes: null
+      voice_to_codec2: null
+      channels:
+        - name: livetest
+          members: []                # operator-managed; empty + open lets /join in
+          open: true                 # lets a Sideband contact /join without a member entry
+
+  # signal: disabled for tier 2. To run tier 2, see plugins/signal/README.md
+  # (register/link signal-cli, start its daemon, flip enabled to true,
+  # uncomment the signal-bridge route below).
+  signal:
+    enabled: false
+    command: __REPO__/.venv/bin/python __REPO__/plugins/signal/relayfabric-signal
+    config:
+      account: "+1XXXXXXXXXX"        # gateway's phone number
+      rpc_url: http://127.0.0.1:7583 # signal-cli daemon URL
+      groups:
+        livetest: "REPLACE_WITH_GROUP_ID"  # from: signal-cli -a +1XXXXXXXXXX listGroups
+      allowed_users: null
+      attachment_dir: ~/.local/share/signal-cli/attachments
+      max_attachment_bytes: 8000000
+
+routes:
+  # Tier 0: MQTT loopback between two local topics.
+  - name: tier0
+    sources: ["mqtt:chat/a", "mqtt:chat/b"]
+    destinations: ["mqtt:chat/a", "mqtt:chat/b"]
+
+  # Tier 0/3: bridges the meshtastic "mesh" channel to mqtt:chat/a, so a
+  # publish on either side crosses to the other (tier0.sh exercises both
+  # directions without hardware; tier 3 swaps mosquitto_pub for a real node).
+  - name: mesh-bridge
+    sources: ["meshtastic:mesh", "mqtt:chat/a"]
+    destinations: ["meshtastic:mesh", "mqtt:chat/a"]
+
+  # Routes to lxmf/signal endpoints MUST stay commented out while those
+  # plugins are disabled above: config validation rejects a route that
+  # references a disabled plugin (switchyardd/src/config.rs, validate() ->
+  # "references disabled plugin"; run `--check-config` to confirm this
+  # still holds before relying on it). Uncomment the matching block only
+  # after flipping that plugin's `enabled` to true.
+  # - name: lxmf-bridge
+  #   sources: ["lxmf:livetest", "mqtt:chat/a"]
+  #   destinations: ["lxmf:livetest", "mqtt:chat/a"]
+  # - name: signal-bridge
+  #   sources: ["signal:livetest", "mqtt:chat/a"]
+  #   destinations: ["signal:livetest", "mqtt:chat/a"]
+
+ttl_default_secs: 86400
+dedup_ttl_secs: 86400
+hop_limit: 8
+max_attachment_bytes: 8000000
