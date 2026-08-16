@@ -1,7 +1,8 @@
 import io
 import unittest
 
-import relay_ipc
+from relayfabric_sdk import FakeSock
+from relayfabric_sdk import ipc as relay_ipc
 
 CANONICAL_HELLO_HEX = "000000a5a561746568656c6c6f66706c7567696e646c786d666776657273696f6e65302e312e307070726f746f636f6c5f76657273696f6e016c6361706162696c6974696573a96474657874f56f6469726563745f6d65737361676573f56667726f757073f56b6174746163686d656e7473f4686c6f636174696f6ef4697265616374696f6e73f4687265636569707473f46870726573656e6365f46b6d61785f7061796c6f6164f6"
 
@@ -103,6 +104,38 @@ class CodecTests(unittest.TestCase):
         msg = relay_ipc.inbound("chan", "s", "hi", attachments=[att])
         relay_ipc.write_frame(buf, msg)
         self.assertEqual(buf.getvalue().hex(), CANONICAL_INBOUND_ATTACHMENT_HEX)
+
+
+class FakeSockTests(unittest.TestCase):
+    """FakeSock exercised against one recorded exchange: a queued Hello
+    read followed by a written HelloAck, mirroring the real
+    handshake half of a plugin main loop.
+    """
+
+    def test_recorded_hello_exchange(self):
+        hello_frame = relay_ipc.hello("lxmf", "0.1.0", relay_ipc.capabilities())
+        sock = FakeSock(queued_frames=[hello_frame])
+
+        received = relay_ipc.read_frame(sock)
+        self.assertEqual(received, hello_frame)
+        with self.assertRaises(EOFError):
+            relay_ipc.read_frame(sock)
+
+        ack = {"t": "hello_ack", "error": None}
+        relay_ipc.write_frame(sock, ack)
+        self.assertEqual(sock.frames(), [ack])
+
+    def test_no_queued_frames_is_write_only_capture(self):
+        # Default construction matches the old per-plugin FakeSock: no
+        # readable frames, just an outbound capture buffer.
+        sock = FakeSock()
+        with self.assertRaises(EOFError):
+            relay_ipc.read_frame(sock)
+        relay_ipc.write_frame(sock, {"t": "delivery_result", "corr": 1,
+                                     "delivered": True, "detail": None})
+        self.assertEqual(sock.frames(),
+                         [{"t": "delivery_result", "corr": 1,
+                           "delivered": True, "detail": None}])
 
 
 if __name__ == "__main__":

@@ -3,9 +3,10 @@ via a signal-cli JSON-RPC/SSE daemon.
 
 Module top level is stdlib-only (json/logging/os/shutil/socket/sys/
 tempfile/threading/time/urllib.request) so the config/parser/backend
-helpers stay importable without cbor2 or rns. relay_ipc is imported
-lazily inside the methods/functions that need it (see Bridge and
-main()). Attachment bytes are never logged, only names/sizes/counts.
+helpers stay importable without cbor2 or rns. relayfabric_sdk (ipc and
+SentCache) is imported lazily inside the methods/functions that need it
+(see Bridge and main()). Attachment bytes are never logged, only
+names/sizes/counts.
 """
 
 import json
@@ -132,32 +133,6 @@ def cap_frame_budget(kept, budget):
     return kept_out, notes
 
 
-class SentCache:
-    """Loop guard for linked-device sync echoes of our own bridged posts."""
-
-    def __init__(self, ttl_secs=86400):
-        self.ttl = ttl_secs
-        self._entries = {}
-        self._lock = threading.Lock()
-
-    def record(self, group_id, text, now=None):
-        now = time.time() if now is None else now
-        with self._lock:
-            self._prune(now)
-            self._entries[(group_id, text)] = now
-
-    def match(self, group_id, text, now=None):
-        now = time.time() if now is None else now
-        with self._lock:
-            self._prune(now)
-            return self._entries.pop((group_id, text), None) is not None
-
-    def _prune(self, now):
-        # O(n) prune per call, fine at gateway volumes
-        for key in [k for k, t in self._entries.items() if now - t > self.ttl]:
-            del self._entries[key]
-
-
 class SignalCliBackend:
     """signal-cli JSON-RPC/SSE transport — the backend seam Bridge depends on.
 
@@ -235,6 +210,8 @@ class Bridge:
     """
 
     def __init__(self, cfg, backend, sock_file):
+        from relayfabric_sdk import SentCache
+
         self.cfg = cfg
         self.backend = backend
         self.sock_file = sock_file
@@ -244,7 +221,7 @@ class Bridge:
             group_id: name for name, group_id in cfg["groups"].items()}
 
     def _send_frame(self, obj):
-        import relay_ipc
+        from relayfabric_sdk import ipc as relay_ipc
 
         with self.write_lock:
             relay_ipc.write_frame(self.sock_file, obj)
@@ -271,7 +248,7 @@ class Bridge:
             log.warning(f"Dropping Signal message from unlisted user {source}")
             return
 
-        import relay_ipc
+        from relayfabric_sdk import ipc as relay_ipc
 
         # attachment bytes are never logged, only counts/sizes via notes
         loaded, load_notes = load_signal_attachments(
@@ -296,7 +273,7 @@ class Bridge:
     # ----- egress (daemon -> Signal); called from the main thread -----
 
     def handle_send(self, frame):
-        import relay_ipc
+        from relayfabric_sdk import ipc as relay_ipc
 
         corr = frame["corr"]
         endpoint = frame["endpoint"]
@@ -354,7 +331,7 @@ def main():
     raw_cfg = json.loads(os.environ.get("RELAYFABRIC_PLUGIN_CONFIG", "{}"))
     cfg = load_config(raw_cfg)
 
-    import relay_ipc
+    from relayfabric_sdk import ipc as relay_ipc
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(sock_path)

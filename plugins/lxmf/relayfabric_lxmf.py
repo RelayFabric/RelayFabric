@@ -3,8 +3,8 @@
 Module top level is stdlib-only (json/mimetypes/os/socket/sys/threading/
 time/concurrent.futures) plus media (itself stdlib-only at import time; see
 media.py) so the config/channel/command/attachment helpers above stay
-importable without rns, lxmf, or even cbor2 installed. relay_ipc and
-RNS/LXMF are imported lazily inside the functions/methods that need
+importable without rns, lxmf, or even cbor2 installed. relayfabric_sdk.ipc
+and RNS/LXMF are imported lazily inside the functions/methods that need
 them (see Bridge and main()).
 """
 
@@ -252,7 +252,7 @@ class FanoutTracker:
         self._reported = False
 
     def member_done(self, member, success):
-        import relay_ipc
+        from relayfabric_sdk import ipc as relay_ipc
 
         with self._lock:
             self._done += 1
@@ -375,7 +375,7 @@ class Bridge:
                 RNS.LOG_NOTICE)
 
     def _send_frame(self, obj):
-        import relay_ipc
+        from relayfabric_sdk import ipc as relay_ipc
 
         with self.write_lock:
             relay_ipc.write_frame(self.wfile, obj)
@@ -432,7 +432,7 @@ class Bridge:
             return  # truly empty message (no text, no attachments, nothing dropped)
         body = "\n".join(p for p in [text, *notes] if p)
 
-        import relay_ipc
+        from relayfabric_sdk import ipc as relay_ipc
         attachments = [
             relay_ipc.attachment(
                 name, mimetypes.guess_type(name)[0] or "application/octet-stream", data)
@@ -444,7 +444,7 @@ class Bridge:
     # ----- egress (daemon -> LXMF) -----
 
     def handle_send(self, corr, endpoint, body, attachments=None):
-        import relay_ipc
+        from relayfabric_sdk import ipc as relay_ipc
 
         channel = channel_by_name(self.cfg, endpoint)
         if channel is None:
@@ -480,7 +480,7 @@ class Bridge:
         No FanoutTracker -- that's for channel fan-out across members; a
         direct send has exactly one recipient and one terminal result.
         """
-        import relay_ipc
+        from relayfabric_sdk import ipc as relay_ipc
 
         if not looks_like_hex_ref(native_ref):
             self._send_frame(relay_ipc.delivery_result(corr, False, "invalid destination ref"))
@@ -490,7 +490,7 @@ class Bridge:
             lambda success: self._direct_done(corr, success))
 
     def _direct_done(self, corr, success):
-        import relay_ipc
+        from relayfabric_sdk import ipc as relay_ipc
 
         detail = None if success else "delivery failed"
         self._send_frame(relay_ipc.delivery_result(corr, success, detail))
@@ -589,7 +589,7 @@ def main():
     raw_cfg = json.loads(os.environ.get("RELAYFABRIC_PLUGIN_CONFIG", "{}"))
     cfg = load_config(raw_cfg)
 
-    import relay_ipc
+    from relayfabric_sdk import ipc as relay_ipc
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(sock_path)

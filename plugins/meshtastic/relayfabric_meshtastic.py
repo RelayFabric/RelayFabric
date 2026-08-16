@@ -2,8 +2,9 @@
 
 Module top level is stdlib-only (json/logging/os/queue/socket/sys/threading) so
 config/parser/loop-guard helpers stay importable without cbor2, paho-mqtt, or
-meshtastic/protobuf packages (GPL). relay_ipc and paho.mqtt.client are imported
-lazily inside the methods that need them (see MqttJsonBackend.__init__ and main()).
+meshtastic/protobuf packages (GPL). relayfabric_sdk (ipc and SentCache) and
+paho.mqtt.client are imported lazily inside the methods that need them (see
+MqttJsonBackend.__init__ and main()).
 Text bytes are never logged, only names/types.
 """
 
@@ -267,7 +268,7 @@ class Bridge:
     """
 
     def __init__(self, cfg, backend, sock_file):
-        from relayfabric_signal import SentCache
+        from relayfabric_sdk import SentCache
 
         self.cfg = cfg
         self.backend = backend
@@ -281,7 +282,7 @@ class Bridge:
         self.by_index = channels_by_index(cfg)
 
     def _send_frame(self, obj):
-        import relay_ipc
+        from relayfabric_sdk import ipc as relay_ipc
 
         with self.write_lock:
             relay_ipc.write_frame(self.sock_file, obj)
@@ -297,7 +298,7 @@ class Bridge:
         if self.sent_cache.match(name, text):
             return  # loop guard: node re-uplinked our own downlink verbatim
 
-        import relay_ipc
+        from relayfabric_sdk import ipc as relay_ipc
 
         self._send_frame(relay_ipc.inbound(name, sender, text, ts))
         log.info(f"Bridged Meshtastic message from {sender} to '{name}' "
@@ -306,7 +307,7 @@ class Bridge:
     # ----- egress (daemon -> Meshtastic); called from the main thread -----
 
     def handle_send(self, frame):
-        import relay_ipc
+        from relayfabric_sdk import ipc as relay_ipc
 
         corr = frame["corr"]
         endpoint = frame["endpoint"]
@@ -371,7 +372,7 @@ def main():
         print(f"relayfabric-meshtastic: invalid config: {e}", file=sys.stderr)
         sys.exit(1)
 
-    import relay_ipc
+    from relayfabric_sdk import ipc as relay_ipc
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(sock_path)

@@ -1,0 +1,16 @@
+[project]
+name = "relayfabric-sdk"
+version = "0.2.0"
+description = "RelayFabric Python plugin SDK: frame codec, sent-cache, and test harness shared by the plugin fleet."
+requires-python = ">=3.10"
+dependencies = ["cbor2"]
+
+# Not pip-installed by anything in-repo: plugins and their tests consume
+# this package via a sys.path insert to ../../sdk/python. `pip install -e
+# sdk/python` works for out-of-repo consumption but is not required.
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["relayfabric_sdk*"]

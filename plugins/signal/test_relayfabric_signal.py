@@ -4,11 +4,13 @@ import sys
 import tempfile
 from unittest import mock
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lxmf"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "sdk", "python"))
 
 import unittest
 
 import relayfabric_signal as plug
+from relayfabric_sdk import FakeSock, SentCache
 
 OWN = "+15550001111"
 
@@ -104,13 +106,13 @@ class ParserTests(unittest.TestCase):
 
 class SentCacheTests(unittest.TestCase):
     def test_match_consumes(self):
-        c = plug.SentCache(ttl_secs=60)
+        c = SentCache(ttl_secs=60)
         c.record("G", "body")
         self.assertTrue(c.match("G", "body"))
         self.assertFalse(c.match("G", "body"))
 
     def test_expiry_and_group_scoping(self):
-        c = plug.SentCache(ttl_secs=60)
+        c = SentCache(ttl_secs=60)
         c.record("G", "body", now=1000.0)
         self.assertFalse(c.match("H", "body", now=1001.0))
         self.assertFalse(c.match("G", "body", now=1061.0))
@@ -214,30 +216,6 @@ class FakeBackend:
             with open(p, "rb") as f:
                 captured.append((os.path.basename(p), f.read()))
         self.sent.append((group_id, text, captured))
-
-
-class FakeSock:
-    """Captures frames the bridge writes to the daemon."""
-    def __init__(self):
-        import io
-        self.buf = io.BytesIO()
-
-    def write(self, data):
-        self.buf.write(data)
-
-    def flush(self):
-        pass
-
-    def frames(self):
-        import io
-
-        import relay_ipc
-        out, rd = [], io.BytesIO(self.buf.getvalue())
-        while True:
-            try:
-                out.append(relay_ipc.read_frame(rd))
-            except EOFError:
-                return out
 
 
 class BridgeTests(unittest.TestCase):

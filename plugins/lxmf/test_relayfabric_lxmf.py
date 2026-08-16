@@ -2,13 +2,18 @@ import io
 import os
 import shutil
 import stat
+import sys
 import tempfile
 import threading
 import types
 import unittest
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "sdk", "python"))
+
 import media
 import relayfabric_lxmf as plug
+from relayfabric_sdk import FakeSock
 
 try:
     from PIL import Image
@@ -305,36 +310,6 @@ def _bare_bridge(cfg):
     bridge.write_lock = threading.Lock()
     bridge.pool = _ImmediatePool()
     return bridge
-
-
-class FakeSock:
-    """Captures frames the bridge writes to the daemon.
-
-    Copied from plugins/signal/test_relayfabric_signal.py's FakeSock (same
-    pattern across the plugin test suites): exercises the real _send_frame/
-    write_lock path instead of stubbing it out.
-    """
-
-    def __init__(self):
-        import io
-        self.buf = io.BytesIO()
-
-    def write(self, data):
-        self.buf.write(data)
-
-    def flush(self):
-        pass
-
-    def frames(self):
-        import io
-
-        import relay_ipc
-        out, rd = [], io.BytesIO(self.buf.getvalue())
-        while True:
-            try:
-                out.append(relay_ipc.read_frame(rd))
-            except EOFError:
-                return out
 
 
 def _bare_bridge_with_sock(cfg):

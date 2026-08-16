@@ -1,5 +1,9 @@
 """RelayFabric Plugin Protocol v1 codec: 4-byte BE length prefix + CBOR.
 
+Moved from plugins/lxmf/relay_ipc.py into the SDK so the fleet (lxmf,
+signal, meshtastic, meshcore) shares one copy instead of importing across
+plugin directories.
+
 Dict key order matters: frames must be byte-identical to the Rust
 relay-ipc encoding (locked by canonical_hello_frame_bytes_are_stable).
 """

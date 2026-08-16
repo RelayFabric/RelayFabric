@@ -2,9 +2,10 @@
 
 Module top level is stdlib-only (asyncio/json/logging/os/queue/socket/sys/
 threading/urllib.parse) so config/parser/event helpers stay importable
-without the meshcore or cbor2 packages. meshcore and relay_ipc are imported
-lazily inside the methods that need them (see MeshCoreBackend.start() and
-main()). Text bytes are never logged, only names/types.
+without the meshcore or cbor2 packages. meshcore and relayfabric_sdk (ipc
+and SentCache) are imported lazily inside the methods that need them (see
+MeshCoreBackend.start() and main()). Text bytes are never logged, only
+names/types.
 """
 
 import asyncio
@@ -360,7 +361,7 @@ class Bridge:
     """
 
     def __init__(self, cfg, backend, sock_file):
-        from relayfabric_signal import SentCache
+        from relayfabric_sdk import SentCache
 
         self.cfg = cfg
         self.backend = backend
@@ -374,7 +375,7 @@ class Bridge:
         self.by_index = channels_by_index(cfg)
 
     def _send_frame(self, obj):
-        import relay_ipc
+        from relayfabric_sdk import ipc as relay_ipc
 
         with self.write_lock:
             relay_ipc.write_frame(self.sock_file, obj)
@@ -390,7 +391,7 @@ class Bridge:
         if self.sent_cache.match(name, text):
             return  # loop guard: radio/firmware echoed our own downlink
 
-        import relay_ipc
+        from relayfabric_sdk import ipc as relay_ipc
 
         # ts (from sender_timestamp) is remote-sender-controlled, same trust
         # posture as meshtastic's uplink timestamp; the daemon is responsible
@@ -402,7 +403,7 @@ class Bridge:
     # ----- egress (daemon -> MeshCore); called from the main thread -----
 
     def handle_send(self, frame):
-        import relay_ipc
+        from relayfabric_sdk import ipc as relay_ipc
 
         corr = frame["corr"]
         endpoint = frame["endpoint"]
@@ -464,7 +465,7 @@ def main():
         print(f"relayfabric-meshcore: invalid config: {e}", file=sys.stderr)
         sys.exit(1)
 
-    import relay_ipc
+    from relayfabric_sdk import ipc as relay_ipc
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(sock_path)

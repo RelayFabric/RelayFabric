@@ -6,10 +6,11 @@ import types
 import unittest
 from unittest import mock
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lxmf"))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "signal"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "sdk", "python"))
 
 import relayfabric_meshcore as plug
+from relayfabric_sdk import FakeSock
 
 
 def _stop_and_close_loop(loop):
@@ -366,7 +367,7 @@ class HelloMaxPayloadTests(unittest.TestCase):
 
 class SentCacheSmokeTests(unittest.TestCase):
     def test_sent_cache_import(self):
-        from relayfabric_signal import SentCache
+        from relayfabric_sdk import SentCache
         c = SentCache(ttl_secs=60)
         c.record("test_group", "test_body")
         self.assertTrue(c.match("test_group", "test_body"))
@@ -574,36 +575,6 @@ class FakeBackend:
 
     def events(self):
         yield from self._scripted
-
-
-class FakeSock:
-    """Captures frames the bridge writes to the daemon.
-
-    Copied from plugins/meshtastic/test_relayfabric_meshtastic.py's FakeSock
-    (itself copied from plugins/signal's, same write-lock/_send_frame shape)
-    rather than imported, per house style of not sharing test code across
-    plugins.
-    """
-    def __init__(self):
-        import io
-        self.buf = io.BytesIO()
-
-    def write(self, data):
-        self.buf.write(data)
-
-    def flush(self):
-        pass
-
-    def frames(self):
-        import io
-
-        import relay_ipc
-        out, rd = [], io.BytesIO(self.buf.getvalue())
-        while True:
-            try:
-                out.append(relay_ipc.read_frame(rd))
-            except EOFError:
-                return out
 
 
 class BridgeTests(unittest.TestCase):
