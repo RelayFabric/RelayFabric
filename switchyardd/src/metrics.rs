@@ -1,5 +1,5 @@
 use chrono::Duration as CDuration;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -124,6 +124,26 @@ impl PluginGauges {
             }
         }
         out
+    }
+
+    /// Per-plugin gauge snapshot for admin `GET /v1/plugins` (design §2):
+    /// `name -> (value, age_secs)`, filtered by the same staleness rule as
+    /// `render` (age > `GAUGE_STALE_AFTER` excluded). Staleness is tracked
+    /// per SNAPSHOT (i.e. per plugin, matching `record`'s "each frame fully
+    /// replaces the last" semantics), not per individual gauge name --
+    /// so this returns an empty map for a plugin that never reported
+    /// gauges, and also for one whose only snapshot has gone stale, rather
+    /// than a partial/mixed-freshness result.
+    pub fn for_plugin(&self, plugin: &str, now: Instant) -> BTreeMap<String, (f64, u64)> {
+        let store = self.inner.lock().unwrap();
+        let Some((gauges, at)) = store.get(plugin) else {
+            return BTreeMap::new();
+        };
+        let age = now.saturating_duration_since(*at);
+        if age > GAUGE_STALE_AFTER {
+            return BTreeMap::new();
+        }
+        gauges.iter().map(|(name, value)| (name.clone(), (*value, age.as_secs()))).collect()
     }
 }
 
@@ -380,6 +400,45 @@ mod tests {
             "only the finite value may survive record(): {out}");
         assert!(!out.to_lowercase().contains("inf"), "no inf/-inf token may reach render output: {out}");
         assert!(!out.to_lowercase().contains("nan"), "no NaN token may reach render output: {out}");
+    }
+
+    // ---- per-plugin gauge accessor (design §2: admin GET /v1/plugins) ----
+
+    #[test]
+    fn for_plugin_returns_values_with_age_secs() {
+        let g = PluginGauges::new();
+        let mut vals = std::collections::BTreeMap::new();
+        vals.insert("rssi".to_string(), -71.5);
+        g.record("mocka", vals);
+        let now = Instant::now() + Duration::from_secs(5);
+        let out = g.for_plugin("mocka", now);
+        assert_eq!(out.get("rssi"), Some(&(-71.5, 5)), "out was: {out:?}");
+    }
+
+    #[test]
+    fn for_plugin_returns_empty_for_a_plugin_that_never_reported_gauges() {
+        let g = PluginGauges::new();
+        assert!(g.for_plugin("never-reported", Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn for_plugin_excludes_a_stale_snapshot() {
+        let g = PluginGauges::new();
+        let mut vals = std::collections::BTreeMap::new();
+        vals.insert("rssi".to_string(), -71.5);
+        g.record("mocka", vals);
+        let far_future = Instant::now() + GAUGE_STALE_AFTER + Duration::from_secs(1);
+        assert!(g.for_plugin("mocka", far_future).is_empty());
+    }
+
+    #[test]
+    fn for_plugin_keeps_a_snapshot_just_under_the_stale_window() {
+        let g = PluginGauges::new();
+        let mut vals = std::collections::BTreeMap::new();
+        vals.insert("rssi".to_string(), -71.5);
+        g.record("mocka", vals);
+        let almost_stale = Instant::now() + GAUGE_STALE_AFTER - Duration::from_secs(1);
+        assert!(!g.for_plugin("mocka", almost_stale).is_empty());
     }
 
     #[test]

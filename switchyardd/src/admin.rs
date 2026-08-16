@@ -22,6 +22,7 @@ pub fn router(d: Arc<Daemon>) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/plugins", get(plugins))
         .route("/v1/routes", get(routes))
+        .route("/v1/config", get(config_yaml))
         .route("/v1/queue", get(queue))
         .route("/v1/messages/{id}", get(trace))
         .route("/v1/public", get(public))
@@ -116,17 +117,43 @@ async fn limits(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     }))
 }
 
+/// `GET /v1/plugins` (design §2): `capabilities` (full `Capabilities`
+/// object, `null` when never connected) and `gauges` (latest finite
+/// values + age_secs, `{}` when the plugin never reported any or its
+/// snapshot has gone stale -- see `PluginGauges::for_plugin`).
+///
+/// LOCK DISCIPLINE: `connected`/`capabilities` are copied out of the
+/// `plugins` guard inside this block, which drops the guard before
+/// `d.gauges` (a separate lock) is ever touched -- never hold one Daemon
+/// lock while acquiring another.
 async fn plugins(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let enabled_names: Vec<String> = d.cfg_snapshot(|c| {
         c.plugins.iter().filter(|(_, p)| p.enabled).map(|(name, _)| name.clone()).collect()
     });
-    let handles = d.plugins.lock().unwrap();
-    let out: BTreeMap<String, serde_json::Value> = enabled_names.into_iter()
-        .map(|name| {
-            let h = handles.get(&name);
+    let states: Vec<(String, bool, Option<serde_json::Value>)> = {
+        let handles = d.plugins.lock().unwrap();
+        enabled_names.into_iter()
+            .map(|name| {
+                let h = handles.get(&name);
+                let connected = h.map(|h| h.connected).unwrap_or(false);
+                let capabilities = h.map(|h| serde_json::to_value(&h.capabilities).unwrap());
+                (name, connected, capabilities)
+            })
+            .collect()
+    };
+    let now = std::time::Instant::now();
+    let out: BTreeMap<String, serde_json::Value> = states.into_iter()
+        .map(|(name, connected, capabilities)| {
+            let gauges: BTreeMap<String, serde_json::Value> = d.gauges.for_plugin(&name, now)
+                .into_iter()
+                .map(|(gauge_name, (value, age_secs))| {
+                    (gauge_name, json!({ "value": value, "age_secs": age_secs }))
+                })
+                .collect();
             let entry = json!({
-                "connected": h.map(|h| h.connected).unwrap_or(false),
-                "capabilities": h.map(|h| serde_json::to_value(&h.capabilities).unwrap()),
+                "connected": connected,
+                "capabilities": capabilities,
+                "gauges": gauges,
             });
             (name, entry)
         })
@@ -134,14 +161,63 @@ async fn plugins(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     Json(out)
 }
 
+/// Policy names "applying to" `route`, mirroring `policy::evaluate`'s own
+/// per-delivery matching rule: each delivery is evaluated against its
+/// single destination endpoint's protocol, so a policy applies to a route
+/// if its `match.destination_protocol` is empty (matches every protocol,
+/// same "no restriction" reading `policy::evaluate` gives an empty list)
+/// or intersects the set of protocols among the route's OWN destinations.
+/// Order follows `cfg.policies`' declaration order (same as evaluate's
+/// iteration), not `route.destinations`' order.
+fn policies_for_route<'a>(
+    route: &crate::config::RouteConfig,
+    policies: &'a [crate::config::Policy],
+) -> Vec<&'a str> {
+    let dest_protocols: std::collections::BTreeSet<&str> =
+        route.destinations.iter().map(|e| e.protocol.as_str()).collect();
+    policies.iter()
+        .filter(|p| {
+            p.r#match.destination_protocol.is_empty()
+                || p.r#match.destination_protocol.iter()
+                    .any(|proto| dest_protocols.contains(proto.as_str()))
+        })
+        .map(|p| p.name.as_str())
+        .collect()
+}
+
+/// `GET /v1/routes` (design §2): per-route detail beyond name/sources/
+/// destinations -- `identity_mode`, `render` knobs, and the policy names
+/// that apply (see `policies_for_route`). Source/destination endpoints
+/// render as configured: they're operator-written protocol:channel
+/// strings (already visible in `/v1/config`), not native user refs, so no
+/// masking applies here -- masking (RULING 2's compound form) is reserved
+/// for identity refs like `/v1/identities` and `/v1/messages/{id}`
+/// deliveries on the `@identity` route.
 async fn routes(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
-    Json(d.cfg_snapshot(|c| {
-        c.routes.iter().map(|r| json!({
-            "name": r.name,
-            "sources": r.sources.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
-            "destinations": r.destinations.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>()
+    Json(json!({
+        "routes": d.cfg_snapshot(|c| {
+            c.routes.iter().map(|r| json!({
+                "name": r.name,
+                "sources": r.sources.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+                "destinations": r.destinations.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+                "identity_mode": r.identity_mode,
+                "render": { "tag": r.render.tag, "max_chars": r.render.max_chars },
+                "policies": policies_for_route(r, &c.policies),
+            })).collect::<Vec<_>>()
+        })
     }))
+}
+
+/// `GET /v1/config` (design §2): the loaded config as YAML text, secrets
+/// UNRESOLVED. Serves `Config.raw_yaml` byte-verbatim -- that field is
+/// captured straight from the loaded file's text, before parsing/
+/// resolution touch anything, and is never mutated except by
+/// `apply_config` storing a newly-applied config's own raw text -- so
+/// byte-fidelity to whatever's actually loaded and zero secret exposure
+/// both fall out of "just don't re-serialize anything".
+async fn config_yaml(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
+    let yaml = d.cfg_snapshot(|c| c.raw_yaml.clone());
+    (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/yaml")], yaml)
 }
 
 async fn queue(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
@@ -503,6 +579,139 @@ mod tests {
             "ordinary route destination must still render in full: {body2}");
     }
 
+    // ---- read surface completion (design §2) --------------------------
+
+    /// A route with no `identity_mode`/`render`/policies configured must
+    /// still surface the same defaults `RouteConfig`'s own deserializer
+    /// applies (`pseudonymous` / `{tag: "alias", max_chars: 0}`), and an
+    /// empty `policies` list when `cfg.policies` is empty -- `daemon()`'s
+    /// fixture route is exactly this default case.
+    #[tokio::test]
+    async fn routes_endpoint_reports_identity_mode_render_defaults_and_empty_policies() {
+        let (code, body) = get(router(daemon()), "/v1/routes").await;
+        assert_eq!(code, 200);
+        assert!(body.starts_with("{\"routes\":["), "response must be wrapped in a routes object: {body}");
+        assert!(body.contains("\"name\":\"general\""), "body was: {body}");
+        assert!(body.contains("\"identity_mode\":\"pseudonymous\""), "body was: {body}");
+        assert!(body.contains("\"tag\":\"alias\""), "body was: {body}");
+        assert!(body.contains("\"max_chars\":0"), "body was: {body}");
+        assert!(body.contains("\"policies\":[]"), "body was: {body}");
+    }
+
+    /// The route -> policy mapping mirrors `policy::evaluate`'s own
+    /// matching rule (each delivery is evaluated against its single
+    /// destination endpoint's protocol): a policy "applies to" a route if
+    /// its `match.destination_protocol` is empty (matches every protocol)
+    /// or intersects the set of protocols among the route's destinations.
+    /// `meshtastic-only` matches neither of `general`'s destinations
+    /// (`mocka`, `mockb`) and must be excluded.
+    #[tokio::test]
+    async fn routes_endpoint_lists_only_policies_whose_match_intersects_route_destination_protocols() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let yaml = format!(
+            r#"
+node:
+  name: t
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan"]
+    destinations: ["mockb:chan"]
+    identity_mode: linked
+    render:
+      tag: none
+      max_chars: 40
+policies:
+  - name: mockb-policy
+    match:
+      destination_protocol: ["mockb"]
+    rules:
+      max_payload: 500
+  - name: catch-all-policy
+    match: {{}}
+    rules:
+      max_payload: 1000
+  - name: meshtastic-only
+    match:
+      destination_protocol: ["meshtastic"]
+    rules:
+      deny: true
+"#,
+            data_dir.display()
+        );
+        let cfg_path = dir.path().join("relayfabric.yaml");
+        std::fs::write(&cfg_path, &yaml).unwrap();
+        let cfg = crate::config::load(&cfg_path).unwrap();
+        let d = Arc::new(crate::engine::Daemon::new(cfg, &data_dir).unwrap());
+        std::mem::forget(dir);
+
+        let (code, body) = get(router(d), "/v1/routes").await;
+        assert_eq!(code, 200);
+        assert!(body.contains("\"identity_mode\":\"linked\""), "body was: {body}");
+        assert!(body.contains("\"tag\":\"none\""), "body was: {body}");
+        assert!(body.contains("\"max_chars\":40"), "body was: {body}");
+        assert!(body.contains("\"policies\":[\"mockb-policy\",\"catch-all-policy\"]"),
+            "matching policies (in declared order) missing or wrong: {body}");
+        assert!(!body.contains("meshtastic-only"),
+            "a policy whose match doesn't intersect the route's destination protocols must be excluded: {body}");
+    }
+
+    /// `GET /v1/plugins` (design §2): each entry grows a `gauges` object
+    /// keyed by gauge name -> `{value, age_secs}`; a plugin that never
+    /// reported gauges gets `{}`, matching `PluginGauges::for_plugin`'s
+    /// staleness/absence rule.
+    #[tokio::test]
+    async fn plugins_endpoint_includes_gauges_and_empty_object_when_none_reported() {
+        let d = daemon();
+        let _rx = crate::engine::tests_support::register_plugin(&d, "mocka", false);
+        let mut vals = std::collections::BTreeMap::new();
+        vals.insert("rssi".to_string(), -71.5);
+        d.gauges.record("mocka", vals);
+
+        let (code, body) = get(router(d), "/v1/plugins").await;
+        assert_eq!(code, 200);
+        assert!(body.contains("\"rssi\""), "mocka's gauge missing: {body}");
+        assert!(body.contains("\"value\":-71.5"), "gauge value missing: {body}");
+        assert!(body.contains("\"age_secs\":0"), "gauge age missing: {body}");
+        // mockb is enabled (test_daemon's fixture) but never reported gauges.
+        assert!(body.contains("\"mockb\":{\"capabilities\":null,\"connected\":false,\"gauges\":{}}"),
+            "mockb must report an empty gauges object: {body}");
+    }
+
+    /// `GET /v1/config` (design §2): serves `Config.raw_yaml` byte-verbatim
+    /// with `Content-Type: text/yaml` -- secrets stay in their unresolved
+    /// `${...}` form since resolution never touches `raw_yaml` at all.
+    #[tokio::test]
+    async fn config_endpoint_serves_raw_yaml_verbatim_with_text_yaml_content_type() {
+        let sentinel = "sentinel-config-yaml-leak-1a2b";
+        let d = daemon_with_plugin_secret("RF_ADMIN_TEST_SECRET_CONFIG_YAML", sentinel);
+        let expected_yaml = d.cfg_snapshot(|c| c.raw_yaml.clone());
+        assert!(!expected_yaml.is_empty(), "test fixture sanity: raw_yaml must be populated");
+
+        let resp = router(d)
+            .oneshot(Request::builder().uri("/v1/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "text/yaml",
+            "wrong content-type"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8_lossy(&body);
+        assert_eq!(body_str, expected_yaml, "raw yaml not served byte-verbatim");
+        assert!(body_str.contains("${env:RF_ADMIN_TEST_SECRET_CONFIG_YAML}"),
+            "unresolved reference form must be present: {body_str}");
+        assert!(!body_str.contains(sentinel), "resolved secret leaked in /v1/config: {body_str}");
+    }
+
     #[tokio::test]
     async fn metrics_render() {
         let (code, body) = get(router(daemon()), "/metrics").await;
@@ -678,8 +887,15 @@ mod tests {
     /// `config::resolve_secrets` -- the exact pipeline production runs.
     /// `mocka`'s config carries a secret reference resolving to `sentinel`;
     /// callers assert `sentinel` never appears in an admin response.
-    fn daemon_with_plugin_secret(sentinel: &str) -> Arc<Daemon> {
-        std::env::set_var("RF_ADMIN_TEST_SECRET", sentinel);
+    ///
+    /// `var_name` must be unique per call site: `std::env::set_var`/
+    /// `remove_var` mutate real process-global state, and Rust runs
+    /// `#[tokio::test]`s concurrently within one process, so two callers
+    /// sharing a var name can race (one's `remove_var` firing between the
+    /// other's `set_var` and `config::load`) and spuriously fail with
+    /// "unset or empty".
+    fn daemon_with_plugin_secret(var_name: &str, sentinel: &str) -> Arc<Daemon> {
+        std::env::set_var(var_name, sentinel);
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("data");
         let yaml = format!(
@@ -691,7 +907,7 @@ plugins:
   mocka:
     enabled: true
     config:
-      token: "${{env:RF_ADMIN_TEST_SECRET}}"
+      token: "${{env:{var_name}}}"
   mockb:
     enabled: true
 routes:
@@ -710,26 +926,31 @@ routes:
             cfg.plugins["mocka"].config.get("token").unwrap().as_str().unwrap(),
             sentinel,
         );
-        std::env::remove_var("RF_ADMIN_TEST_SECRET");
+        std::env::remove_var(var_name);
         let d = crate::engine::Daemon::new(cfg, &data_dir).unwrap();
         std::mem::forget(dir);
         Arc::new(d)
     }
 
-    /// Design §2's redaction invariant, defensively: `/v1/routes`,
-    /// `/v1/plugins`, and `/v1/status` don't render plugin `config:` at all
-    /// today (they only echo route endpoints / connection state /
-    /// capabilities), so this test is a regression guard rather than proof
-    /// of active redaction logic -- if any of these handlers ever start
-    /// surfacing plugin config, they must read `Config::raw_plugin_configs`
-    /// (the unresolved snapshot), never `cfg.plugins[_].config` (resolved,
-    /// IPC-bound). See `config.rs`'s `raw_plugin_configs_retains_unresolved_
-    /// form_for_display` for the unit-level half of this invariant.
+    /// Design §2's redaction invariant, binding the three read-surface
+    /// endpoints this task completes: `/v1/routes` and `/v1/plugins` don't
+    /// render plugin `config:` at all (they only echo route endpoints/
+    /// identity_mode/render/policy names, or connection state/capabilities/
+    /// gauges) -- a regression guard, not proof of active redaction, for
+    /// those two. `/v1/config` is the one live case: it serves
+    /// `Config.raw_yaml` verbatim, which is captured BEFORE
+    /// `resolve_secrets` ever runs, so the resolved sentinel can never
+    /// appear there by construction (only the `${...}` reference form).
+    /// If any handler ever starts surfacing plugin config directly, it
+    /// must read `Config::raw_plugin_configs` (the unresolved snapshot),
+    /// never `cfg.plugins[_].config` (resolved, IPC-bound). See
+    /// `config.rs`'s `raw_plugin_configs_retains_unresolved_form_for_
+    /// display` for the unit-level half of this invariant.
     #[tokio::test]
     async fn admin_responses_never_contain_a_resolved_secret_value() {
         let sentinel = "sentinel-admin-leak-9f21";
-        let d = daemon_with_plugin_secret(sentinel);
-        for path in ["/v1/routes", "/v1/plugins", "/v1/status"] {
+        let d = daemon_with_plugin_secret("RF_ADMIN_TEST_SECRET", sentinel);
+        for path in ["/v1/routes", "/v1/plugins", "/v1/config"] {
             let (code, body) = get(router(d.clone()), path).await;
             assert_eq!(code, 200, "path {path} status");
             assert!(!body.contains(sentinel), "resolved secret leaked from {path}: {body}");
