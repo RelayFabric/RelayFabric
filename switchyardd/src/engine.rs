@@ -542,11 +542,13 @@ fn load_attachments(
 #[cfg(test)]
 pub mod tests_support {
     use super::*;
-    use crate::config::{Budget, Config, Limits, NodeConfig, PluginConfig, RouteConfig};
+    use crate::config::{
+        Budget, Config, Limits, NodeConfig, PluginConfig, PublicService, RouteConfig,
+    };
     use std::collections::BTreeMap;
 
     pub fn test_daemon(dir: &std::path::Path) -> Daemon {
-        test_daemon_full(dir, Limits::default(), BTreeMap::new())
+        test_daemon_full(dir, Limits::default(), BTreeMap::new(), false, vec![])
     }
 
     /// Like `test_daemon`, but with a caller-supplied `Limits` baked into the
@@ -558,7 +560,7 @@ pub mod tests_support {
     /// — rather than re-read live from `d.cfg` on every call the way the
     /// queue-cap checks are.
     pub fn test_daemon_with_limits(dir: &std::path::Path, limits: Limits) -> Daemon {
-        test_daemon_full(dir, limits, BTreeMap::new())
+        test_daemon_full(dir, limits, BTreeMap::new(), false, vec![])
     }
 
     /// Like `test_daemon`, but with caller-supplied `transport_budgets`.
@@ -569,11 +571,24 @@ pub mod tests_support {
     pub fn test_daemon_with_budgets(
         dir: &std::path::Path, transport_budgets: BTreeMap<String, Budget>,
     ) -> Daemon {
-        test_daemon_full(dir, Limits::default(), transport_budgets)
+        test_daemon_full(dir, Limits::default(), transport_budgets, false, vec![])
+    }
+
+    /// Like `test_daemon`, but with caller-supplied `node.public` and
+    /// `public_services` — for admin `/v1/public` tests. `config::validate`
+    /// is not run here (these build the `Config` literal directly, the way
+    /// every other `test_daemon_*` helper does), so unlike a config loaded
+    /// from disk, `public: true` with services that don't actually cover
+    /// the fixture's `general` route is accepted at construction time.
+    pub fn test_daemon_with_public(
+        dir: &std::path::Path, public: bool, services: Vec<PublicService>,
+    ) -> Daemon {
+        test_daemon_full(dir, Limits::default(), BTreeMap::new(), public, services)
     }
 
     fn test_daemon_full(
         dir: &std::path::Path, limits: Limits, transport_budgets: BTreeMap<String, Budget>,
+        public: bool, public_services: Vec<PublicService>,
     ) -> Daemon {
         let mut plugins = BTreeMap::new();
         for name in ["mocka", "mockb"] {
@@ -582,7 +597,7 @@ pub mod tests_support {
             });
         }
         let cfg = Config {
-            node: NodeConfig { name: "t".into(), data_dir: dir.to_path_buf(), public: false },
+            node: NodeConfig { name: "t".into(), data_dir: dir.to_path_buf(), public },
             plugins,
             routes: vec![RouteConfig {
                 name: "general".into(),
@@ -594,7 +609,7 @@ pub mod tests_support {
             dedup_ttl_secs: 3600,
             hop_limit: 8,
             max_attachment_bytes: 8 * 1024 * 1024,
-            public_services: vec![],
+            public_services,
             limits,
             transport_budgets,
         };

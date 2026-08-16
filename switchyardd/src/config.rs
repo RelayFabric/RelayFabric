@@ -43,8 +43,7 @@ pub struct NodeConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PublicService {
     pub name: String,
-    #[allow(dead_code)]
-    pub r#type: String,  // consumed by Task 5 (request routing); remove allow when used
+    pub r#type: String, // echoed verbatim by GET /v1/public
     pub ingress: Vec<String>,
     pub egress: Vec<String>,
 }

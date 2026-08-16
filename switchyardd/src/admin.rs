@@ -17,6 +17,8 @@ pub fn router(d: Arc<Daemon>) -> Router {
         .route("/v1/routes", get(routes))
         .route("/v1/queue", get(queue))
         .route("/v1/messages/{id}", get(trace))
+        .route("/v1/public", get(public))
+        .route("/v1/limits", get(limits))
         .route("/metrics", get(metrics_text))
         .with_state(d)
 }
@@ -43,7 +45,51 @@ fn plugin_state(d: &Daemon) -> Vec<(String, bool)> {
 
 async fn status(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let plugins: BTreeMap<_, _> = plugin_state(&d).into_iter().collect();
-    Json(json!({ "node": d.cfg.node.name, "node_id": d.node_id, "plugins": plugins, "queue": queue_map(&d) }))
+    Json(json!({
+        "node": d.cfg.node.name,
+        "node_id": d.node_id,
+        "public": d.cfg.node.public,
+        "plugins": plugins,
+        "queue": queue_map(&d),
+    }))
+}
+
+/// spec §112.3: which services this node exposes publicly, and their
+/// ingress/egress protocol coverage — the WebUI (and, later, RFDP
+/// discovery) read this rather than parsing the raw config.
+async fn public(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
+    let services: Vec<_> = d.cfg.public_services.iter().map(|s| json!({
+        "name": s.name,
+        "type": s.r#type,
+        "ingress": s.ingress,
+        "egress": s.egress,
+    })).collect();
+    Json(json!({ "public": d.cfg.node.public, "services": services }))
+}
+
+/// Configured quotas and transport budgets (spec §112.8/§45/§79) — a config
+/// echo, not live counter state: an operator diagnosing "why is this
+/// getting rate-limited" starts from what's configured, and the in-memory
+/// limiter windows aren't worth exposing (they reset on restart and aren't
+/// meaningful without matching request context anyway).
+async fn limits(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
+    let transport_budgets: BTreeMap<_, _> = d.cfg.transport_budgets.iter()
+        .map(|(proto, b)| (proto.clone(), json!({ "messages_per_minute": b.messages_per_minute })))
+        .collect();
+    Json(json!({
+        "per_sender": {
+            "messages_per_minute": d.cfg.limits.per_sender.messages_per_minute,
+            "bytes_per_hour": d.cfg.limits.per_sender.bytes_per_hour,
+        },
+        "per_route": {
+            "queue_max": d.cfg.limits.per_route.queue_max,
+        },
+        "global": {
+            "queue_max": d.cfg.limits.global.queue_max,
+            "cas_max_bytes": d.cfg.limits.global.cas_max_bytes,
+        },
+        "transport_budgets": transport_budgets,
+    }))
 }
 
 async fn plugins(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
@@ -149,6 +195,91 @@ mod tests {
         assert!(body.contains("\"node\":\"t\""));
         assert!(body.contains("\"node_id\":\"rf:"));
         assert!(body.contains("\"pending\":1"));
+        assert!(body.contains("\"public\":false"), "status was: {body}");
+    }
+
+    fn daemon_with_public(public: bool, services: Vec<crate::config::PublicService>) -> Arc<Daemon> {
+        let dir = tempfile::tempdir().unwrap();
+        let d = crate::engine::tests_support::test_daemon_with_public(dir.path(), public, services);
+        std::mem::forget(dir);
+        Arc::new(d)
+    }
+
+    #[tokio::test]
+    async fn status_reports_public_true_when_configured() {
+        let d = daemon_with_public(true, vec![]);
+        let (code, body) = get(router(d), "/v1/status").await;
+        assert_eq!(code, 200);
+        assert!(body.contains("\"public\":true"), "status was: {body}");
+    }
+
+    #[tokio::test]
+    async fn public_endpoint_reports_disabled_and_no_services_by_default() {
+        let d = daemon_with_public(false, vec![]);
+        let (code, body) = get(router(d), "/v1/public").await;
+        assert_eq!(code, 200);
+        assert!(body.contains("\"public\":false"), "body was: {body}");
+        assert!(body.contains("\"services\":[]"), "body was: {body}");
+    }
+
+    #[tokio::test]
+    async fn public_endpoint_reports_configured_services() {
+        let d = daemon_with_public(true, vec![crate::config::PublicService {
+            name: "regional-chat".into(),
+            r#type: "chat".into(),
+            ingress: vec!["mocka".into()],
+            egress: vec!["mockb".into()],
+        }]);
+        let (code, body) = get(router(d), "/v1/public").await;
+        assert_eq!(code, 200);
+        assert!(body.contains("\"public\":true"), "body was: {body}");
+        assert!(body.contains("\"name\":\"regional-chat\""), "body was: {body}");
+        assert!(body.contains("\"type\":\"chat\""), "body was: {body}");
+        assert!(body.contains("\"ingress\":[\"mocka\"]"), "body was: {body}");
+        assert!(body.contains("\"egress\":[\"mockb\"]"), "body was: {body}");
+    }
+
+    #[tokio::test]
+    async fn limits_endpoint_echoes_configured_limits() {
+        let d = daemon();
+        let (code, body) = get(router(d), "/v1/limits").await;
+        assert_eq!(code, 200);
+        // test_daemon's Config uses Limits::default() -- every field 0
+        // (unlimited), which is the v0.1-compat default (see config.rs's
+        // v0_1_style_config_parses_with_all_defaults).
+        assert!(body.contains("\"messages_per_minute\":0"), "body was: {body}");
+        assert!(body.contains("\"bytes_per_hour\":0"), "body was: {body}");
+        assert!(body.contains("\"queue_max\":0"), "body was: {body}");
+        assert!(body.contains("\"cas_max_bytes\":0"), "body was: {body}");
+        assert!(body.contains("\"transport_budgets\":{}"), "body was: {body}");
+    }
+
+    #[tokio::test]
+    async fn limits_endpoint_echoes_nonzero_limits_and_transport_budgets() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = crate::engine::tests_support::test_daemon_with_limits(dir.path(), crate::config::Limits {
+            per_sender: crate::config::PerSender { messages_per_minute: 10, bytes_per_hour: 50_000 },
+            per_route: crate::config::PerRoute { queue_max: 5_000 },
+            global: crate::config::GlobalLimits { queue_max: 50_000, cas_max_bytes: 1_000_000_000 },
+        });
+        std::mem::forget(dir);
+        let (code, body) = get(router(Arc::new(d)), "/v1/limits").await;
+        assert_eq!(code, 200);
+        assert!(body.contains("\"messages_per_minute\":10"), "body was: {body}");
+        assert!(body.contains("\"bytes_per_hour\":50000"), "body was: {body}");
+        assert!(body.contains("\"queue_max\":5000"), "body was: {body}");
+        assert!(body.contains("\"queue_max\":50000"), "body was: {body}");
+        assert!(body.contains("\"cas_max_bytes\":1000000000"), "body was: {body}");
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut budgets = std::collections::BTreeMap::new();
+        budgets.insert("mockb".to_string(), crate::config::Budget { messages_per_minute: 30 });
+        let d2 = crate::engine::tests_support::test_daemon_with_budgets(dir2.path(), budgets);
+        std::mem::forget(dir2);
+        let (code, body) = get(router(Arc::new(d2)), "/v1/limits").await;
+        assert_eq!(code, 200);
+        assert!(body.contains("\"transport_budgets\":{\"mockb\":{\"messages_per_minute\":30}}"),
+            "body was: {body}");
     }
 
     #[tokio::test]

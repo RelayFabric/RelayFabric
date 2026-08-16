@@ -50,6 +50,27 @@ routes:
     destinations: ["mockb:achan", "mockc:achan"]
 "#;
 
+// spec §112.8: a per-sender budget of 1 message/minute on the same "general"
+// route shape as CONFIG (minus mockc/attach, which this test doesn't need).
+const RATE_LIMITED_CONFIG: &str = r#"
+node:
+  name: e2e-ratelimit
+  data_dir: DATA_DIR
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan"]
+    destinations: ["mockb:chan"]
+limits:
+  per_sender:
+    messages_per_minute: 1
+    bytes_per_hour: 0
+"#;
+
 // keep test output pristine: the daemon logs via tracing to stdout/stderr,
 // which is irrelevant noise for these tests and must not pollute `cargo test`
 // output.
@@ -64,9 +85,13 @@ fn spawn_daemon(cfg_path: &Path) -> Child {
 }
 
 fn start_daemon(dir: tempfile::TempDir) -> TestDaemon {
+    start_daemon_with_config(dir, CONFIG)
+}
+
+fn start_daemon_with_config(dir: tempfile::TempDir, config: &str) -> TestDaemon {
     let data = dir.path().join("data");
     let cfg_path = dir.path().join("relayfabric.yaml");
-    std::fs::write(&cfg_path, CONFIG.replace("DATA_DIR", data.to_str().unwrap())).unwrap();
+    std::fs::write(&cfg_path, config.replace("DATA_DIR", data.to_str().unwrap())).unwrap();
     let child = spawn_daemon(&cfg_path);
     TestDaemon { child, dir }
 }
@@ -412,4 +437,78 @@ async fn rejects_unknown_plugin_name() {
     }).await.unwrap();
     let DaemonToPlugin::HelloAck { error: Some(_), .. } = read_frame(&mut r).await.unwrap()
     else { panic!("unknown plugin was accepted") };
+}
+
+/// Covers spec §112.3's public-gating validation at the binary level (not
+/// just `config::validate`'s unit tests): a `node.public: true` config whose
+/// `general` route has a destination protocol ("mockb") not covered by any
+/// `public_services` egress must make `--check-config` fail loudly — exit 1
+/// with stderr naming the uncovered route and protocol — rather than the
+/// daemon silently starting in a misconfigured, non-compliant public state.
+#[test]
+fn check_config_rejects_a_public_node_with_an_uncovered_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let cfg_path = dir.path().join("relayfabric.yaml");
+    let config = format!(
+        r#"
+node:
+  name: e2e-public-gating
+  public: true
+  data_dir: {}
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+public_services:
+  - name: partial-coverage
+    type: chat
+    ingress: [mocka]
+    egress: []
+routes:
+  - name: general
+    sources: ["mocka:chan"]
+    destinations: ["mockb:chan"]
+"#,
+        data.to_str().unwrap()
+    );
+    std::fs::write(&cfg_path, config).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_switchyardd"))
+        .arg("--config").arg(&cfg_path)
+        .arg("--check-config")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "check-config must exit 1 on an uncovered route");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("general"), "stderr should name the route: {stderr}");
+    assert!(stderr.contains("mockb"), "stderr should name the uncovered protocol: {stderr}");
+}
+
+/// Covers spec §112.8's per-sender rate limit end to end: with
+/// `messages_per_minute: 1` configured, a second inbound from the SAME
+/// sender within the same minute must never produce a `Send` to the
+/// destination mock — it's dropped at ingress (`engine::handle_inbound`),
+/// before routing ever runs, distinct from a queued-but-undelivered message.
+#[tokio::test]
+async fn sender_rate_limit_drops_the_second_inbound_from_the_same_sender() {
+    let d = start_daemon_with_config(tempfile::tempdir().unwrap(), RATE_LIMITED_CONFIG);
+    wait_for(&d.plugin_sock()).await;
+    let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
+    let (mut rb, _wb) = connect_plugin(&d.plugin_sock(), "mockb").await;
+
+    inbound(&mut wa, "chan", "!abcd1234", "first", chrono::Utc::now()).await;
+    let (_, _, body, _) = expect_send(&mut rb).await;
+    assert!(body.contains("first"), "body was: {body}");
+
+    // second message, same sender, within the same 1/minute window: must
+    // never arrive as a Send.
+    inbound(&mut wa, "chan", "!abcd1234", "second", chrono::Utc::now()).await;
+    assert!(
+        timeout(Duration::from_secs(2), read_frame::<_, DaemonToPlugin>(&mut rb))
+            .await.is_err(),
+        "rate-limited message was bridged anyway"
+    );
 }
