@@ -1,7 +1,10 @@
 import os
+import queue
 import sys
+import types
 import unittest
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lxmf"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "signal"))
 
 import relayfabric_meshcore as plug
@@ -349,6 +352,242 @@ class SentCacheSmokeTests(unittest.TestCase):
         c.record("test_group", "test_body")
         self.assertTrue(c.match("test_group", "test_body"))
         self.assertFalse(c.match("test_group", "test_body"))
+
+
+class ChannelEventToDictTests(unittest.TestCase):
+    """channel_event_to_dict is a pure function over a meshcore
+    CHANNEL_MSG_RECV Event.payload dict -- testable without importing
+    meshcore (see module docstring: no meshcore/cbor2 required)."""
+
+    def test_normalizes_payload(self):
+        payload = {"channel_idx": 2, "text": "hello", "sender_timestamp": 1700000000}
+        ev = plug.channel_event_to_dict(payload)
+        self.assertEqual(ev["kind"], "channel_msg")
+        self.assertEqual(ev["channel_idx"], 2)
+        self.assertEqual(ev["text"], "hello")
+        self.assertEqual(ev["ts"], 1700000000)
+        self.assertEqual(ev["sender"], f"mc:{1700000000:08x}")
+
+    def test_missing_timestamp_uses_placeholder_sender(self):
+        payload = {"channel_idx": 0, "text": "hi"}
+        ev = plug.channel_event_to_dict(payload)
+        self.assertEqual(ev["sender"], "mc:00000000")
+        self.assertIsNone(ev["ts"])
+
+
+class MeshCoreBackendTests(unittest.TestCase):
+    """MeshCoreBackend tests that don't require importing meshcore: __init__
+    only calls parse_connection (module-level pure helper); start() is the
+    only method that lazily imports meshcore, so it's exercised only in the
+    manual field test (see README), not here."""
+
+    def test_init_accepts_valid_connection_url(self):
+        backend = plug.MeshCoreBackend("serial:///dev/ttyUSB0")
+        self.assertEqual(backend.connection_url, "serial:///dev/ttyUSB0")
+
+    def test_init_rejects_bad_connection_url(self):
+        with self.assertRaises(ValueError):
+            plug.MeshCoreBackend("http://nope")
+
+    def test_send_channel_before_start_raises_runtime_error(self):
+        backend = plug.MeshCoreBackend("serial:///dev/ttyUSB0")
+        with self.assertRaises(RuntimeError):
+            backend.send_channel(0, "hi")
+
+    def test_on_channel_msg_normalizes_and_queues(self):
+        backend = plug.MeshCoreBackend("serial:///dev/ttyUSB0")
+        fake_event = types.SimpleNamespace(
+            payload={"channel_idx": 0, "text": "hi", "sender_timestamp": 1700000000}
+        )
+        backend._on_channel_msg(fake_event)
+        ev = backend._queue.get_nowait()
+        self.assertEqual(ev, {
+            "kind": "channel_msg", "channel_idx": 0, "text": "hi",
+            "ts": 1700000000, "sender": f"mc:{1700000000:08x}",
+        })
+
+    def test_on_channel_msg_drops_without_raising_when_queue_full(self):
+        backend = plug.MeshCoreBackend("serial:///dev/ttyUSB0")
+        backend._queue = queue.Queue(maxsize=1)
+        backend._queue.put(plug.channel_event_to_dict(
+            {"channel_idx": 0, "text": "first", "sender_timestamp": 1}))
+        fake_event = types.SimpleNamespace(
+            payload={"channel_idx": 0, "text": "second", "sender_timestamp": 2}
+        )
+        backend._on_channel_msg(fake_event)  # must not raise/block on Full
+        self.assertEqual(backend._queue.qsize(), 1)
+        self.assertEqual(backend._queue.get_nowait()["text"], "first")
+
+    def test_events_yields_from_queue(self):
+        backend = plug.MeshCoreBackend("serial:///dev/ttyUSB0")
+        backend._queue.put({"kind": "channel_msg", "channel_idx": 0,
+                             "sender": "mc:1", "text": "hi", "ts": 1})
+        gen = backend.events()
+        self.assertEqual(next(gen)["text"], "hi")
+
+    def test_queue_is_bounded(self):
+        backend = plug.MeshCoreBackend("serial:///dev/ttyUSB0")
+        self.assertEqual(backend._queue.maxsize, 256)
+
+
+def base_cfg(**overrides):
+    cfg = {
+        "connection": "serial:///dev/ttyUSB0",
+        "channels": {
+            "primary": {"index": 0},
+            "secondary": {"index": 1},
+        },
+    }
+    cfg.update(overrides)
+    return plug.load_config(cfg)
+
+
+def channel_event(text="hello", channel_idx=0, sender="mc:deadbeef", ts=1755280000):
+    return {"kind": "channel_msg", "channel_idx": channel_idx, "sender": sender,
+            "text": text, "ts": ts}
+
+
+class FakeBackend:
+    """Captures channel sends; events() replays a scripted list of
+    already-normalized event dicts, the shape MeshCoreBackend.events() would
+    yield after channel_event_to_dict()."""
+
+    def __init__(self, scripted_events=None):
+        self.sent = []
+        self.fail_with = None
+        self._scripted = scripted_events or []
+
+    def send_channel(self, idx, text):
+        if self.fail_with:
+            raise self.fail_with
+        self.sent.append((idx, text))
+
+    def events(self):
+        yield from self._scripted
+
+
+class FakeSock:
+    """Captures frames the bridge writes to the daemon.
+
+    Copied from plugins/meshtastic/test_relayfabric_meshtastic.py's FakeSock
+    (itself copied from plugins/signal's, same write-lock/_send_frame shape)
+    rather than imported, per house style of not sharing test code across
+    plugins.
+    """
+    def __init__(self):
+        import io
+        self.buf = io.BytesIO()
+
+    def write(self, data):
+        self.buf.write(data)
+
+    def flush(self):
+        pass
+
+    def frames(self):
+        import io
+
+        import relay_ipc
+        out, rd = [], io.BytesIO(self.buf.getvalue())
+        while True:
+            try:
+                out.append(relay_ipc.read_frame(rd))
+            except EOFError:
+                return out
+
+
+class BridgeTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = base_cfg()
+        self.backend = FakeBackend()
+        self.sock = FakeSock()
+        self.bridge = plug.Bridge(self.cfg, self.backend, self.sock)
+
+    def test_sent_cache_ttl_is_one_hour(self):
+        # design mandate: 1h, not SentCache's 86400s default (mirrors
+        # meshtastic's radio-echo loop guard window).
+        self.assertEqual(self.bridge.sent_cache.ttl, 3600)
+
+    def test_inbound_mapped_channel_bridges(self):
+        self.bridge.handle_event(channel_event())
+        frames = self.sock.frames()
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["t"], "inbound")
+        self.assertEqual(frames[0]["endpoint"], "primary")
+        self.assertEqual(frames[0]["sender"], "mc:deadbeef")
+        self.assertEqual(frames[0]["body"], "hello")
+
+    def test_deny_unmapped_channel_dropped(self):
+        self.bridge.handle_event(channel_event(channel_idx=9))
+        self.assertEqual(self.sock.frames(), [])
+
+    def test_deny_non_channel_msg_dropped(self):
+        ev = {"kind": "advert", "channel_idx": 0, "sender": "mc:deadbeef",
+              "text": "hello", "ts": 1}
+        self.bridge.handle_event(ev)
+        self.assertEqual(self.sock.frames(), [])
+
+    def test_loop_guard_drops_reechoed_own_text(self):
+        # our own downlink send records (endpoint, body) in the loop guard
+        self.bridge.handle_send({"corr": 1, "endpoint": "primary", "body": "out"})
+        self.assertEqual(len(self.sock.frames()), 1)  # only the delivery_result
+        # the radio (or firmware) echoes our own send back as a channel_msg
+        self.bridge.handle_event(channel_event(text="out"))
+        self.assertEqual(len(self.sock.frames()), 1)  # still just the delivery_result
+
+    def test_loop_guard_different_text_still_flows(self):
+        self.bridge.handle_send({"corr": 1, "endpoint": "primary", "body": "out"})
+        self.bridge.handle_event(channel_event(text="different"))
+        frames = self.sock.frames()
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[-1]["t"], "inbound")
+        self.assertEqual(frames[-1]["body"], "different")
+
+    def test_send_channel_call_args(self):
+        self.bridge.handle_send({"corr": 2, "endpoint": "secondary", "body": "ping"})
+        self.assertEqual(self.backend.sent, [(1, "ping")])
+
+    def test_send_success_delivered_true(self):
+        self.bridge.handle_send({"corr": 3, "endpoint": "primary", "body": "hi"})
+        frames = self.sock.frames()
+        self.assertEqual(frames[-1],
+                         {"t": "delivery_result", "corr": 3,
+                          "delivered": True, "detail": None})
+
+    def test_send_unknown_endpoint_delivered_false(self):
+        self.bridge.handle_send({"corr": 4, "endpoint": "nope", "body": "hi"})
+        frames = self.sock.frames()
+        self.assertFalse(frames[-1]["delivered"])
+        self.assertEqual(self.backend.sent, [])
+
+    def test_send_backend_failure_delivered_false_with_detail(self):
+        self.backend.fail_with = RuntimeError("radio busy")
+        self.bridge.handle_send({"corr": 5, "endpoint": "primary", "body": "hi"})
+        frames = self.sock.frames()
+        self.assertFalse(frames[-1]["delivered"])
+        self.assertIn("radio busy", frames[-1]["detail"])
+
+    def test_send_failure_does_not_poison_loop_guard(self):
+        # A failed send must not record into SentCache: it never actually
+        # went out over the radio, so a later channel_msg of the same text
+        # is a real (not echoed) message and must still bridge.
+        self.backend.fail_with = RuntimeError("radio busy")
+        self.bridge.handle_send({"corr": 5, "endpoint": "primary", "body": "out"})
+        self.backend.fail_with = None
+        self.bridge.handle_event(channel_event(text="out"))
+        frames = self.sock.frames()
+        self.assertEqual(len(frames), 2)  # failed delivery_result + inbound
+        self.assertEqual(frames[-1]["t"], "inbound")
+        self.assertEqual(frames[-1]["body"], "out")
+
+    def test_oversize_body_defensive_drop(self):
+        cfg = base_cfg(max_text_bytes=5)
+        bridge = plug.Bridge(cfg, self.backend, self.sock)
+        bridge.handle_send({"corr": 6, "endpoint": "primary", "body": "way too long"})
+        frames = self.sock.frames()
+        self.assertFalse(frames[-1]["delivered"])
+        self.assertIsNotNone(frames[-1]["detail"])
+        self.assertEqual(self.backend.sent, [])
 
 
 if __name__ == "__main__":

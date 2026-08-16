@@ -1,11 +1,23 @@
 """RelayFabric MeshCore plugin: bridges MeshCore text events over Plugin Protocol v1.
 
-Module top level is stdlib-only (urllib.parse) so config/parser/event
-helpers stay importable without meshcore package. Text bytes are never logged,
-only names/types.
+Module top level is stdlib-only (asyncio/json/logging/os/queue/socket/sys/
+threading/urllib.parse) so config/parser/event helpers stay importable
+without the meshcore or cbor2 packages. meshcore and relay_ipc are imported
+lazily inside the methods that need them (see MeshCoreBackend.start() and
+main()). Text bytes are never logged, only names/types.
 """
 
+import asyncio
+import json
+import logging
+import os
+import queue
+import socket
+import sys
+import threading
 import urllib.parse
+
+log = logging.getLogger(__name__)
 
 PLUGIN_VERSION = "0.1.0"
 
@@ -164,6 +176,219 @@ def normalize_event(ev, by_index):
     return name, sender, text, ts
 
 
+def channel_event_to_dict(payload):
+    """Normalize a meshcore CHANNEL_MSG_RECV Event.payload into the Task-1
+    event dict shape {kind, channel_idx, sender, text, ts}.
+
+    payload keys, per the installed meshcore 2.3.8 library's
+    meshcore/reader.py (PacketType.CHANNEL_MSG_RECV / _V3 branches):
+    channel_idx (int), sender_timestamp (int, seconds, sender-controlled),
+    text (str). Unlike CONTACT_MSG_RECV, a MeshCore channel packet carries
+    NO pubkey_prefix / per-node sender identity at the protocol level --
+    channels are pre-shared-key group broadcasts, confirmed by reading the
+    reader.py packet parser. `sender` is therefore synthesized as
+    "mc:<hex>" from sender_timestamp: a stable-per-message but NOT a
+    verified per-node identity. This is a documented assumption (see the
+    plugin README's field-test checklist), not a resolved sender id.
+    """
+    ts = payload.get("sender_timestamp")
+    sender_hex = f"{ts:08x}" if isinstance(ts, int) else "00000000"
+    return {
+        "kind": "channel_msg",
+        "channel_idx": payload.get("channel_idx"),
+        "sender": f"mc:{sender_hex}",
+        "text": payload.get("text"),
+        "ts": ts,
+    }
+
+
+class MeshCoreBackend:
+    """meshcore-library transport (native Companion Radio Protocol) -- the
+    backend seam Bridge depends on (swappable for FakeBackend in tests, per
+    the fleet's MqttJsonBackend/SignalCliBackend precedent).
+
+    The meshcore library (2.3.8, MIT) is asyncio-native throughout:
+    MeshCore.create_serial/create_tcp/create_ble are async classmethods,
+    CommandHandler.send_chan_msg() is an async coroutine, and inbound events
+    are delivered through an EventDispatcher whose internal asyncio.Queue is
+    bound to a running loop (dispatcher.start() creates it lazily inside the
+    loop). None of that composes with the synchronous Bridge/main() thread,
+    so this backend owns a private event loop on a dedicated daemon thread
+    (asyncio.new_event_loop() + run_forever()) and crosses threads two ways:
+      - inbound: the meshcore.subscribe() callback (invoked on the loop
+        thread) normalizes the event via channel_event_to_dict() and
+        queue.Queue.put_nowait()s it, dropping (with a debug log) on Full
+        rather than blocking the loop thread; events() (called from the
+        bridge's reader thread) blocks on queue.get().
+      - outbound: send_channel() (called from main()'s read loop, i.e. the
+        main thread) uses asyncio.run_coroutine_threadsafe(coro, loop)
+        .result(timeout=30) to run the library's send coroutine on the loop
+        thread and get the result back synchronously, raising RuntimeError
+        on timeout or failure.
+    """
+
+    def __init__(self, connection_url):
+        # parse_connection is a pure stdlib-only helper: validating the URL
+        # here (like meshtastic's MqttJsonBackend.__init__ -> parse_broker_url)
+        # surfaces a malformed connection string immediately at construction,
+        # not deferred into the background asyncio thread.
+        self.connection_url = connection_url
+        self._kind, self._target, self._opts = parse_connection(connection_url)
+        self._queue = queue.Queue(maxsize=256)
+        self._loop = None
+        self._mc = None
+
+    def start(self):
+        import meshcore  # lazy: keeps module import stdlib-only (see module docstring)
+
+        self._loop = asyncio.new_event_loop()
+        ready = threading.Event()
+        self._start_error = None
+
+        def _run():
+            asyncio.set_event_loop(self._loop)
+            try:
+                self._loop.run_until_complete(self._connect(meshcore))
+            except Exception as e:  # noqa: BLE001 - surfaced to start() via _start_error
+                self._start_error = e
+            finally:
+                ready.set()
+            if self._start_error is None:
+                self._loop.run_forever()
+
+        threading.Thread(target=_run, daemon=True).start()
+        ready.wait(timeout=30)
+        if self._start_error is not None:
+            raise RuntimeError(f"meshcore connect failed: {self._start_error}") from self._start_error
+
+    async def _connect(self, meshcore_mod):
+        if self._kind == "serial":
+            mc = await meshcore_mod.MeshCore.create_serial(
+                self._target, baudrate=self._opts["baud"])
+        elif self._kind == "tcp":
+            host, port = self._target
+            mc = await meshcore_mod.MeshCore.create_tcp(host, port)
+        elif self._kind == "ble":
+            mc = await meshcore_mod.MeshCore.create_ble(address=self._target)
+        else:
+            raise ValueError(f"unsupported connection kind: {self._kind!r}")
+        if mc is None:
+            raise RuntimeError("meshcore: no response from node")
+        mc.subscribe(meshcore_mod.EventType.CHANNEL_MSG_RECV, self._on_channel_msg)
+        self._mc = mc
+
+    def _on_channel_msg(self, event):
+        ev = channel_event_to_dict(event.payload)
+        try:
+            self._queue.put_nowait(ev)
+        except queue.Full:
+            log.debug("Dropping meshcore channel event: event queue full")
+
+    def events(self):
+        """Yield normalized event dicts from the queue forever."""
+        while True:
+            yield self._queue.get()
+
+    def send_channel(self, idx, text):
+        if self._loop is None or self._mc is None:
+            raise RuntimeError("meshcore backend not started")
+        fut = asyncio.run_coroutine_threadsafe(
+            self._mc.commands.send_chan_msg(idx, text), self._loop)
+        try:
+            result = fut.result(timeout=30)
+        except Exception as e:
+            # normalize timeout/failure to RuntimeError per the backend contract
+            raise RuntimeError(f"meshcore channel send failed: {e}") from e
+        if result is None or result.is_error():
+            detail = getattr(result, "payload", None)
+            raise RuntimeError(f"meshcore channel send failed: {detail}")
+
+
+class Bridge:
+    """Bridges parsed MeshCore channel events <-> Plugin Protocol frames.
+
+    Mirrors plugins/meshtastic's Bridge exactly (write lock, _send_frame,
+    SentCache loop guard, deny-by-default, oversize defensive drop).
+    handle_event runs on the backend's reader thread; handle_send runs on
+    the main thread; all daemon-socket writes go through _send_frame,
+    serialized by one lock.
+    """
+
+    def __init__(self, cfg, backend, sock_file):
+        from relayfabric_signal import SentCache
+
+        self.cfg = cfg
+        self.backend = backend
+        self.sock_file = sock_file
+        self.write_lock = threading.Lock()
+        # 1h, not SentCache's 86400s default: mirrors meshtastic's radio-echo
+        # loop guard window -- bounds how long a lost echo can leave a stale
+        # entry able to swallow one genuine identical-text message (see
+        # README's one-swallow caveat).
+        self.sent_cache = SentCache(ttl_secs=3600)
+        self.by_index = channels_by_index(cfg)
+
+    def _send_frame(self, obj):
+        import relay_ipc
+
+        with self.write_lock:
+            relay_ipc.write_frame(self.sock_file, obj)
+
+    # ----- inbound (MeshCore -> daemon); called from the backend's reader thread -----
+
+    def handle_event(self, ev):
+        parsed = normalize_event(ev, self.by_index)
+        if parsed is None:
+            return
+        name, sender, text, ts = parsed
+
+        if self.sent_cache.match(name, text):
+            return  # loop guard: radio/firmware echoed our own downlink
+
+        import relay_ipc
+
+        self._send_frame(relay_ipc.inbound(name, sender, text, ts))
+        log.info(f"Bridged MeshCore message from {sender} to '{name}' "
+                 f"({len(text)} chars)")
+
+    # ----- egress (daemon -> MeshCore); called from the main thread -----
+
+    def handle_send(self, frame):
+        import relay_ipc
+
+        corr = frame["corr"]
+        endpoint = frame["endpoint"]
+        body = frame["body"]
+        channel_spec = self.cfg["channels"].get(endpoint)
+        if channel_spec is None:
+            log.warning(f"MeshCore send to unknown endpoint {endpoint!r}")
+            self._send_frame(relay_ipc.delivery_result(corr, False, "unknown endpoint"))
+            return
+
+        body_bytes = len(body.encode("utf-8"))
+        max_bytes = self.cfg["max_text_bytes"]
+        if body_bytes > max_bytes:
+            # defensive: the daemon should have already truncated to our
+            # advertised capabilities.max_payload before it ever sends us
+            # this frame.
+            detail = f"body {body_bytes} B exceeds max_text_bytes {max_bytes} B"
+            log.warning(f"MeshCore send to '{endpoint}' dropped: {detail}")
+            self._send_frame(relay_ipc.delivery_result(corr, False, detail))
+            return
+
+        try:
+            self.backend.send_channel(channel_spec["index"], body)
+        except Exception as e:  # noqa: BLE001 - report the failure, don't crash
+            log.warning(f"MeshCore send to '{endpoint}' failed: {e}")
+            self._send_frame(relay_ipc.delivery_result(corr, False, str(e)))
+            return
+        # delivered = send accepted by the backend (spec Sec70), not a
+        # radio-level delivery ACK.
+        self.sent_cache.record(endpoint, body)
+        self._send_frame(relay_ipc.delivery_result(corr, True))
+        log.info(f"Sent MeshCore message to '{endpoint}' ({body_bytes} B)")
+
+
 def hello_max_payload(cfg):
     """Advertised Hello capabilities.max_payload for this config.
 
@@ -176,3 +401,60 @@ def hello_max_payload(cfg):
     one can never loosen it past 160.
     """
     return min(MESHCORE_MAX_PAYLOAD, cfg["max_text_bytes"])
+
+
+def main():
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+
+    sock_path = os.environ["RELAYFABRIC_SOCKET"]
+    plugin_name = os.environ.get("RELAYFABRIC_PLUGIN_NAME", "meshcore")
+    raw_cfg = json.loads(os.environ.get("RELAYFABRIC_PLUGIN_CONFIG", "{}"))
+    try:
+        cfg = load_config(raw_cfg)
+    except (ValueError, TypeError) as e:
+        print(f"relayfabric-meshcore: invalid config: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    import relay_ipc
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(sock_path)
+    rfile = sock.makefile("rb")
+    wfile = sock.makefile("wb")
+
+    caps = relay_ipc.capabilities(groups=True, max_payload=hello_max_payload(cfg))
+    relay_ipc.write_frame(wfile, relay_ipc.hello(plugin_name, PLUGIN_VERSION, caps))
+    ack = relay_ipc.read_frame(rfile)
+    if ack.get("t") != "hello_ack" or ack.get("error"):
+        print(f"relayfabric-meshcore: hello rejected: {ack.get('error')}",
+             file=sys.stderr)
+        sys.exit(1)
+
+    backend = MeshCoreBackend(cfg["connection"])
+    bridge = Bridge(cfg, backend, wfile)
+    backend.start()
+
+    def reader_loop():
+        for ev in backend.events():
+            try:
+                bridge.handle_event(ev)
+            except Exception as e:  # noqa: BLE001 - one bad event must not kill the reader
+                log.error(f"MeshCore event handler error: {e}")
+
+    threading.Thread(target=reader_loop, daemon=True).start()
+
+    while True:
+        try:
+            frame = relay_ipc.read_frame(rfile)
+        except (EOFError, OSError, ValueError) as e:
+            # ValueError: oversize/corrupt frame (relay_ipc.read_frame's own
+            # MAX_FRAME check). The stream is desynced at that point, so exit
+            # rather than continue -- there is no way to resume mid-frame.
+            log.error(f"Daemon connection lost, exiting: {e}")
+            sys.exit(1)
+        kind = frame.get("t")
+        if kind == "send":
+            bridge.handle_send(frame)
+        elif kind == "shutdown":
+            sys.exit(0)
