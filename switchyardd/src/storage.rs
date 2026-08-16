@@ -22,6 +22,32 @@ pub struct Delivery {
     pub expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // consumed by message routing and admin API (Tasks 2-3); remove allow when used
+pub struct Challenge {
+    pub id: i64,
+    pub code: String,
+    pub target_protocol: String,
+    pub target_ref: String,
+    pub requester_protocol: String,
+    pub requester_ref: String,
+    pub display_name: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // consumed by rendering and admin API (Tasks 2-3); remove allow when used
+pub struct Link {
+    pub id: i64,
+    pub a_protocol: String,
+    pub a_ref: String,
+    pub b_protocol: String,
+    pub b_ref: String,
+    pub display_name: String,
+    pub verified_at: DateTime<Utc>,
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
@@ -49,6 +75,22 @@ CREATE TABLE IF NOT EXISTS message_attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
   ON message_attachments(message_id);
+CREATE TABLE IF NOT EXISTS identity_links (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  a_protocol TEXT NOT NULL, a_ref TEXT NOT NULL,
+  b_protocol TEXT NOT NULL, b_ref TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  verified_at TEXT NOT NULL,
+  UNIQUE(a_protocol, a_ref, b_protocol, b_ref)
+);
+CREATE TABLE IF NOT EXISTS link_challenges (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL,
+  target_protocol TEXT NOT NULL, target_ref TEXT NOT NULL,
+  requester_protocol TEXT NOT NULL, requester_ref TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  created_at TEXT NOT NULL, expires_at TEXT NOT NULL
+);
 ";
 
 /// Brings a pre-Task-4 database (created before `deliveries.priority`
@@ -383,6 +425,166 @@ impl Store {
             .ok()?
             .query_row(params![id], Self::delivery_from_row)
             .ok()
+    }
+
+    /// Creates a new challenge. If a challenge already exists for this target,
+    /// it is deleted first (single active challenge per target invariant).
+    #[allow(dead_code)] // consumed by admin API (Task 2); remove allow when used
+    #[allow(clippy::too_many_arguments)] // interface per task brief
+    pub fn create_challenge(
+        &self,
+        code: &str,
+        target_protocol: &str,
+        target_ref: &str,
+        requester_protocol: &str,
+        requester_ref: &str,
+        display_name: &str,
+        now: DateTime<Utc>,
+        expires: DateTime<Utc>,
+    ) -> rusqlite::Result<i64> {
+        // Delete any existing challenge for this target first
+        self.conn.execute(
+            "DELETE FROM link_challenges WHERE target_protocol = ?1 AND target_ref = ?2",
+            params![target_protocol, target_ref],
+        )?;
+
+        self.conn.execute(
+            "INSERT INTO link_challenges
+             (code, target_protocol, target_ref, requester_protocol, requester_ref, display_name, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![code, target_protocol, target_ref, requester_protocol, requester_ref, display_name, ts(now), ts(expires)],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Finds an active challenge matching the target and code.
+    /// Returns None if no matching challenge exists, if it has expired,
+    /// or if the code doesn't match.
+    #[allow(dead_code)] // consumed by message routing (Task 2); remove allow when used
+    pub fn find_active_challenge(
+        &self,
+        target_protocol: &str,
+        target_ref: &str,
+        code: &str,
+        now: DateTime<Utc>,
+    ) -> rusqlite::Result<Option<Challenge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, code, target_protocol, target_ref, requester_protocol, requester_ref,
+                    display_name, created_at, expires_at
+             FROM link_challenges
+             WHERE target_protocol = ?1 AND target_ref = ?2 AND code = ?3 AND expires_at > ?4"
+        )?;
+        let mut rows = stmt.query(params![target_protocol, target_ref, code, ts(now)])?;
+        match rows.next()? {
+            Some(row) => {
+                let challenge = Challenge {
+                    id: row.get(0)?,
+                    code: row.get(1)?,
+                    target_protocol: row.get(2)?,
+                    target_ref: row.get(3)?,
+                    requester_protocol: row.get(4)?,
+                    requester_ref: row.get(5)?,
+                    display_name: row.get(6)?,
+                    created_at: parse_ts(&row.get::<_, String>(7)?),
+                    expires_at: parse_ts(&row.get::<_, String>(8)?),
+                };
+                Ok(Some(challenge))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Deletes a challenge by id.
+    #[allow(dead_code)] // consumed by message routing (Task 2); remove allow when used
+    pub fn delete_challenge(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM link_challenges WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Inserts a new identity link. If a link with the same (a_protocol, a_ref, b_protocol, b_ref)
+    /// already exists, the verified_at is updated to now.
+    #[allow(dead_code)] // consumed by message routing (Task 2); remove allow when used
+    pub fn insert_link(
+        &self,
+        a_protocol: &str,
+        a_ref: &str,
+        b_protocol: &str,
+        b_ref: &str,
+        display_name: &str,
+        verified_at: DateTime<Utc>,
+    ) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO identity_links (a_protocol, a_ref, b_protocol, b_ref, display_name, verified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(a_protocol, a_ref, b_protocol, b_ref) DO UPDATE SET verified_at = ?6",
+            params![a_protocol, a_ref, b_protocol, b_ref, display_name, ts(verified_at)],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Deletes a link by id. Returns true if a row was deleted, false otherwise.
+    #[allow(dead_code)] // consumed by admin API (Task 3); remove allow when used
+    pub fn delete_link(&self, id: i64) -> rusqlite::Result<bool> {
+        let rows_affected = self.conn.execute("DELETE FROM identity_links WHERE id = ?1", params![id])?;
+        Ok(rows_affected > 0)
+    }
+
+    /// Finds a link by either side (a_protocol/a_ref OR b_protocol/b_ref).
+    #[allow(dead_code)] // consumed by rendering (Task 3); remove allow when used
+    pub fn link_for_identity(&self, protocol: &str, reference: &str) -> rusqlite::Result<Option<Link>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, a_protocol, a_ref, b_protocol, b_ref, display_name, verified_at
+             FROM identity_links
+             WHERE (a_protocol = ?1 AND a_ref = ?2) OR (b_protocol = ?1 AND b_ref = ?2)
+             LIMIT 1"
+        )?;
+        let mut rows = stmt.query(params![protocol, reference])?;
+        match rows.next()? {
+            Some(row) => {
+                let link = Link {
+                    id: row.get(0)?,
+                    a_protocol: row.get(1)?,
+                    a_ref: row.get(2)?,
+                    b_protocol: row.get(3)?,
+                    b_ref: row.get(4)?,
+                    display_name: row.get(5)?,
+                    verified_at: parse_ts(&row.get::<_, String>(6)?),
+                };
+                Ok(Some(link))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Lists all identity links.
+    #[allow(dead_code)] // consumed by admin API (Task 2); remove allow when used
+    pub fn list_links(&self) -> rusqlite::Result<Vec<Link>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, a_protocol, a_ref, b_protocol, b_ref, display_name, verified_at
+             FROM identity_links ORDER BY id"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Link {
+                id: row.get(0)?,
+                a_protocol: row.get(1)?,
+                a_ref: row.get(2)?,
+                b_protocol: row.get(3)?,
+                b_ref: row.get(4)?,
+                display_name: row.get(5)?,
+                verified_at: parse_ts(&row.get::<_, String>(6)?),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Purges expired challenges (those where expires_at < now).
+    /// Returns the number of rows deleted.
+    #[allow(dead_code)] // consumed by hourly pump (Task 3); remove allow when used
+    pub fn purge_expired_challenges(&self, now: DateTime<Utc>) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "DELETE FROM link_challenges WHERE expires_at < ?1",
+            params![ts(now)],
+        )
     }
 }
 
@@ -803,5 +1005,317 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         drop(s);
         let s2 = Store::open(&path).unwrap();
         assert_eq!(s2.due_deliveries(now + Duration::seconds(1), 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_challenge_basic() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        let expires = now + Duration::minutes(15);
+
+        let id = s
+            .create_challenge("123456", "signal", "+1234567890", "lxmf", "abc123", "Jascha", now, expires)
+            .unwrap();
+
+        assert!(id > 0);
+
+        // Verify it can be found
+        let challenge = s.find_active_challenge("signal", "+1234567890", "123456", now).unwrap();
+        assert!(challenge.is_some());
+        let c = challenge.unwrap();
+        assert_eq!(c.code, "123456");
+        assert_eq!(c.target_protocol, "signal");
+        assert_eq!(c.target_ref, "+1234567890");
+        assert_eq!(c.requester_protocol, "lxmf");
+        assert_eq!(c.requester_ref, "abc123");
+        assert_eq!(c.display_name, "Jascha");
+    }
+
+    #[test]
+    fn create_challenge_single_active_per_target() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        let expires = now + Duration::minutes(15);
+
+        // Create first challenge
+        let _id1 = s
+            .create_challenge("111111", "signal", "+1234567890", "lxmf", "abc123", "Jascha", now, expires)
+            .unwrap();
+
+        // Create second challenge for same target (should delete first)
+        let _id2 = s
+            .create_challenge("222222", "signal", "+1234567890", "lxmf", "xyz789", "Alice", now, expires)
+            .unwrap();
+
+        // Old code should not be found
+        let old = s.find_active_challenge("signal", "+1234567890", "111111", now).unwrap();
+        assert!(old.is_none());
+
+        // New code should be found
+        let new = s.find_active_challenge("signal", "+1234567890", "222222", now).unwrap();
+        assert!(new.is_some());
+        assert_eq!(new.unwrap().code, "222222");
+    }
+
+    #[test]
+    fn find_active_challenge_respects_expiry() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        let expires = now + Duration::minutes(15);
+
+        s.create_challenge("123456", "signal", "+1234567890", "lxmf", "abc123", "Jascha", now, expires)
+            .unwrap();
+
+        // Should be found before expiry
+        assert!(s.find_active_challenge("signal", "+1234567890", "123456", now).unwrap().is_some());
+
+        // Should not be found after expiry
+        let after_expiry = expires + Duration::seconds(1);
+        assert!(s
+            .find_active_challenge("signal", "+1234567890", "123456", after_expiry)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn find_active_challenge_requires_exact_code() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        let expires = now + Duration::minutes(15);
+
+        s.create_challenge("123456", "signal", "+1234567890", "lxmf", "abc123", "Jascha", now, expires)
+            .unwrap();
+
+        // Wrong code
+        assert!(s
+            .find_active_challenge("signal", "+1234567890", "654321", now)
+            .unwrap()
+            .is_none());
+
+        // Correct code
+        assert!(s
+            .find_active_challenge("signal", "+1234567890", "123456", now)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn find_active_challenge_requires_correct_target() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        let expires = now + Duration::minutes(15);
+
+        s.create_challenge("123456", "signal", "+1234567890", "lxmf", "abc123", "Jascha", now, expires)
+            .unwrap();
+
+        // Different target protocol
+        assert!(s
+            .find_active_challenge("lxmf", "+1234567890", "123456", now)
+            .unwrap()
+            .is_none());
+
+        // Different target ref
+        assert!(s
+            .find_active_challenge("signal", "+9876543210", "123456", now)
+            .unwrap()
+            .is_none());
+
+        // Correct target
+        assert!(s
+            .find_active_challenge("signal", "+1234567890", "123456", now)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn delete_challenge() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        let expires = now + Duration::minutes(15);
+
+        let id = s
+            .create_challenge("123456", "signal", "+1234567890", "lxmf", "abc123", "Jascha", now, expires)
+            .unwrap();
+
+        // Should exist
+        assert!(s.find_active_challenge("signal", "+1234567890", "123456", now).unwrap().is_some());
+
+        // Delete it
+        s.delete_challenge(id).unwrap();
+
+        // Should no longer exist
+        assert!(s
+            .find_active_challenge("signal", "+1234567890", "123456", now)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn purge_expired_challenges() {
+        let (_d, s) = store();
+        let now = Utc::now();
+
+        // Create one expired challenge
+        let expires_old = now - Duration::minutes(1);
+        s.create_challenge("111111", "signal", "+1111111111", "lxmf", "a", "A", now - Duration::minutes(16), expires_old)
+            .unwrap();
+
+        // Create one active challenge
+        let expires_new = now + Duration::minutes(15);
+        s.create_challenge("222222", "signal", "+2222222222", "lxmf", "b", "B", now, expires_new)
+            .unwrap();
+
+        // Purge
+        let deleted = s.purge_expired_challenges(now).unwrap();
+        assert_eq!(deleted, 1);
+
+        // Old challenge gone
+        assert!(s
+            .find_active_challenge("signal", "+1111111111", "111111", now)
+            .unwrap()
+            .is_none());
+
+        // New challenge still exists
+        assert!(s
+            .find_active_challenge("signal", "+2222222222", "222222", now)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn insert_link_basic() {
+        let (_d, s) = store();
+        let now = Utc::now();
+
+        let id = s
+            .insert_link("signal", "+1234567890", "lxmf", "abc123", "Jascha", now)
+            .unwrap();
+
+        assert!(id > 0);
+
+        let link = s.link_for_identity("signal", "+1234567890").unwrap();
+        assert!(link.is_some());
+        let l = link.unwrap();
+        assert_eq!(l.a_protocol, "signal");
+        assert_eq!(l.a_ref, "+1234567890");
+        assert_eq!(l.b_protocol, "lxmf");
+        assert_eq!(l.b_ref, "abc123");
+        assert_eq!(l.display_name, "Jascha");
+    }
+
+    #[test]
+    fn insert_link_unique_replace() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        let later = now + Duration::seconds(10);
+
+        // Insert a link
+        let _id1 = s
+            .insert_link("signal", "+1234567890", "lxmf", "abc123", "Jascha", now)
+            .unwrap();
+
+        // Insert the same link with new verified_at (should replace)
+        let _id2 = s
+            .insert_link("signal", "+1234567890", "lxmf", "abc123", "Jascha Updated", later)
+            .unwrap();
+
+        // Should only have one link
+        let links = s.list_links().unwrap();
+        assert_eq!(links.len(), 1);
+
+        let link = s.link_for_identity("signal", "+1234567890").unwrap().unwrap();
+        assert!(link.verified_at > now);
+    }
+
+    #[test]
+    fn link_for_identity_a_side() {
+        let (_d, s) = store();
+        let now = Utc::now();
+
+        s.insert_link("signal", "+1234567890", "lxmf", "abc123", "Jascha", now)
+            .unwrap();
+
+        let link = s.link_for_identity("signal", "+1234567890").unwrap();
+        assert!(link.is_some());
+        assert_eq!(link.unwrap().display_name, "Jascha");
+    }
+
+    #[test]
+    fn link_for_identity_b_side() {
+        let (_d, s) = store();
+        let now = Utc::now();
+
+        s.insert_link("signal", "+1234567890", "lxmf", "abc123", "Jascha", now)
+            .unwrap();
+
+        let link = s.link_for_identity("lxmf", "abc123").unwrap();
+        assert!(link.is_some());
+        assert_eq!(link.unwrap().display_name, "Jascha");
+    }
+
+    #[test]
+    fn link_for_identity_no_match() {
+        let (_d, s) = store();
+        let now = Utc::now();
+
+        s.insert_link("signal", "+1234567890", "lxmf", "abc123", "Jascha", now)
+            .unwrap();
+
+        let link = s.link_for_identity("unknown", "notfound").unwrap();
+        assert!(link.is_none());
+    }
+
+    #[test]
+    fn delete_link() {
+        let (_d, s) = store();
+        let now = Utc::now();
+
+        let id = s
+            .insert_link("signal", "+1234567890", "lxmf", "abc123", "Jascha", now)
+            .unwrap();
+
+        // Should exist
+        assert!(s.link_for_identity("signal", "+1234567890").unwrap().is_some());
+
+        // Delete it
+        let deleted = s.delete_link(id).unwrap();
+        assert!(deleted);
+
+        // Should not exist
+        assert!(s.link_for_identity("signal", "+1234567890").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_link_returns_false_for_nonexistent() {
+        let (_d, s) = store();
+        let deleted = s.delete_link(9999).unwrap();
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn list_links() {
+        let (_d, s) = store();
+        let now = Utc::now();
+
+        // Add multiple links
+        s.insert_link("signal", "+1111111111", "lxmf", "a", "Alice", now)
+            .unwrap();
+        s.insert_link("signal", "+2222222222", "lxmf", "b", "Bob", now)
+            .unwrap();
+        s.insert_link("matrix", "@charlie:example.com", "telegram", "charlie_bot", "Charlie", now)
+            .unwrap();
+
+        let links = s.list_links().unwrap();
+        assert_eq!(links.len(), 3);
+        assert_eq!(links[0].display_name, "Alice");
+        assert_eq!(links[1].display_name, "Bob");
+        assert_eq!(links[2].display_name, "Charlie");
+    }
+
+    #[test]
+    fn list_links_empty() {
+        let (_d, s) = store();
+        let links = s.list_links().unwrap();
+        assert!(links.is_empty());
     }
 }

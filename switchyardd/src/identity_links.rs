@@ -1,0 +1,92 @@
+use rand::Rng;
+
+/// Generates a 6-digit verification code using OS randomness.
+/// Uses rand::rngs::OsRng for cryptographically secure randomness.
+#[allow(dead_code)] // consumed by admin API (Task 2); remove allow when used
+pub fn generate_code() -> String {
+    let mut rng = rand::rngs::OsRng;
+    let code: u32 = rng.gen_range(0..=999_999);
+    format!("{:06}", code)
+}
+
+/// Masks a reference by keeping first 2 and last 4 chars for refs longer than 8,
+/// otherwise returns "****".
+///
+/// Examples:
+/// - "signal:+14155551234" (18 chars) -> "si****1234"
+/// - "lxmf:aabbccdd" (12 chars) -> "lx****ccdd"
+/// - "short" (5 chars) -> "****"
+#[allow(dead_code)] // consumed by admin API responses (Task 2); remove allow when used
+pub fn mask_ref(s: &str) -> String {
+    if s.len() > 8 {
+        let first = &s[..2];
+        let last = &s[s.len() - 4..];
+        format!("{}****{}", first, last)
+    } else {
+        "****".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_code_returns_6_digits() {
+        for _ in 0..100 {
+            let code = generate_code();
+            assert_eq!(code.len(), 6, "code should be exactly 6 characters");
+            assert!(code.chars().all(|c| c.is_numeric()), "code should contain only digits");
+        }
+    }
+
+    #[test]
+    fn generate_code_range_is_000000_to_999999() {
+        let mut min = u32::MAX;
+        let mut max = u32::MIN;
+        for _ in 0..1000 {
+            let code = generate_code();
+            let num = code.parse::<u32>().unwrap();
+            min = min.min(num);
+            max = max.max(num);
+        }
+        // With 1000 samples, we expect to see values spread across the range.
+        // Very loose check: just verify we see both small and large values.
+        assert!(min < 100_000, "should see some codes in lower range");
+        assert!(max > 900_000, "should see some codes in upper range");
+    }
+
+    #[test]
+    fn mask_ref_long_strings() {
+        assert_eq!(mask_ref("signal:+14155551234"), "si****1234");
+        assert_eq!(mask_ref("lxmf:aabbccdd"), "lx****ccdd");
+        assert_eq!(mask_ref("protocol:reference_data"), "pr****data");
+    }
+
+    #[test]
+    fn mask_ref_short_strings() {
+        assert_eq!(mask_ref("short"), "****");
+        assert_eq!(mask_ref("1234567"), "****");
+        assert_eq!(mask_ref("12345678"), "****");
+        assert_eq!(mask_ref(""), "****");
+        assert_eq!(mask_ref("a"), "****");
+    }
+
+    #[test]
+    fn mask_ref_exactly_9_chars() {
+        // Exactly 9 chars is > 8, so should be masked (first 2 + last 4)
+        assert_eq!(mask_ref("123456789"), "12****6789");
+    }
+
+    #[test]
+    fn mask_ref_unicode_handling() {
+        // Test with unicode characters (each char may be multiple bytes)
+        let s = "signal:📱📱📱📱📱📱"; // 18 bytes total
+        let masked = mask_ref(s);
+        // For "signal:📱📱📱📱📱📱", first 2 bytes are "si" (first 2 chars of "signal:")
+        // last 4 bytes would be 4 emoji bytes
+        // The exact masking depends on UTF-8 byte boundaries, but the function should
+        // handle it without panicking
+        assert!(masked.contains("****"), "should contain mask pattern");
+    }
+}
