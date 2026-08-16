@@ -12,15 +12,18 @@ pub fn generate_code() -> String {
 /// Masks a reference by keeping first 2 and last 4 chars for refs longer than 8,
 /// otherwise returns "****".
 ///
+/// Operates on chars, not bytes, to safely handle multi-byte UTF-8 sequences.
+///
 /// Examples:
 /// - "signal:+14155551234" (18 chars) -> "si****1234"
 /// - "lxmf:aabbccdd" (12 chars) -> "lx****ccdd"
 /// - "short" (5 chars) -> "****"
 #[allow(dead_code)] // consumed by admin API responses (Task 2); remove allow when used
 pub fn mask_ref(s: &str) -> String {
-    if s.len() > 8 {
-        let first = &s[..2];
-        let last = &s[s.len() - 4..];
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() > 8 {
+        let first: String = chars[..2].iter().collect();
+        let last: String = chars[chars.len() - 4..].iter().collect();
         format!("{}****{}", first, last)
     } else {
         "****".to_string()
@@ -79,14 +82,19 @@ mod tests {
     }
 
     #[test]
-    fn mask_ref_unicode_handling() {
-        // Test with unicode characters (each char may be multiple bytes)
-        let s = "signal:📱📱📱📱📱📱"; // 18 bytes total
-        let masked = mask_ref(s);
-        // For "signal:📱📱📱📱📱📱", first 2 bytes are "si" (first 2 chars of "signal:")
-        // last 4 bytes would be 4 emoji bytes
-        // The exact masking depends on UTF-8 byte boundaries, but the function should
-        // handle it without panicking
-        assert!(masked.contains("****"), "should contain mask pattern");
+    fn mask_ref_non_ascii_char_boundary_safety() {
+        // Test with non-ASCII at char boundaries. These would panic with byte-slicing at char boundaries.
+        // "aαbcdefgh" is 9 chars: a(1 byte) α(2 bytes) b-h(1 byte each)
+        // Byte slicing [..2] would hit middle of α, causing panic; char-safe slicing works.
+        assert_eq!(mask_ref("aαbcdefgh"), "aα****efgh");
+
+        // Test with emoji that takes 4 bytes. 9 chars total: "😀12345678"
+        // First 2 chars: "😀1", last 4: "5678"
+        assert_eq!(mask_ref("😀12345678"), "😀1****5678");
+
+        // Test with mixed: ASCII + multi-byte. 10 chars: "signal:abc😀"
+        // First 2 chars: "si", last 4: "abc😀"
+        let result = mask_ref("signal:abc😀");
+        assert_eq!(result, "si****abc😀");
     }
 }

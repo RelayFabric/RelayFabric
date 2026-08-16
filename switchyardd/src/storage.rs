@@ -502,7 +502,7 @@ impl Store {
     }
 
     /// Inserts a new identity link. If a link with the same (a_protocol, a_ref, b_protocol, b_ref)
-    /// already exists, the verified_at is updated to now.
+    /// already exists, the verified_at is updated to now. Returns the id of the inserted or updated row.
     #[allow(dead_code)] // consumed by message routing (Task 2); remove allow when used
     pub fn insert_link(
         &self,
@@ -513,13 +513,14 @@ impl Store {
         display_name: &str,
         verified_at: DateTime<Utc>,
     ) -> rusqlite::Result<i64> {
-        self.conn.execute(
+        self.conn.query_row(
             "INSERT INTO identity_links (a_protocol, a_ref, b_protocol, b_ref, display_name, verified_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(a_protocol, a_ref, b_protocol, b_ref) DO UPDATE SET verified_at = ?6",
+             ON CONFLICT(a_protocol, a_ref, b_protocol, b_ref) DO UPDATE SET verified_at = ?6
+             RETURNING id",
             params![a_protocol, a_ref, b_protocol, b_ref, display_name, ts(verified_at)],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+            |row| row.get(0),
+        )
     }
 
     /// Deletes a link by id. Returns true if a row was deleted, false otherwise.
@@ -530,12 +531,14 @@ impl Store {
     }
 
     /// Finds a link by either side (a_protocol/a_ref OR b_protocol/b_ref).
+    /// Returns the most-recently inserted/verified link (ORDER BY id DESC).
     #[allow(dead_code)] // consumed by rendering (Task 3); remove allow when used
     pub fn link_for_identity(&self, protocol: &str, reference: &str) -> rusqlite::Result<Option<Link>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, a_protocol, a_ref, b_protocol, b_ref, display_name, verified_at
              FROM identity_links
              WHERE (a_protocol = ?1 AND a_ref = ?2) OR (b_protocol = ?1 AND b_ref = ?2)
+             ORDER BY id DESC
              LIMIT 1"
         )?;
         let mut rows = stmt.query(params![protocol, reference])?;
@@ -1210,21 +1213,30 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let later = now + Duration::seconds(10);
 
         // Insert a link
-        let _id1 = s
+        let id1 = s
             .insert_link("signal", "+1234567890", "lxmf", "abc123", "Jascha", now)
             .unwrap();
 
-        // Insert the same link with new verified_at (should replace)
-        let _id2 = s
+        // Insert an unrelated link to bump the autoincrement counter
+        let _id_unrelated = s
+            .insert_link("signal", "+9999999999", "lxmf", "xyz", "Other", now)
+            .unwrap();
+
+        // Replace the original link with new verified_at (should return the SAME id, not a new one)
+        let id_replaced = s
             .insert_link("signal", "+1234567890", "lxmf", "abc123", "Jascha Updated", later)
             .unwrap();
 
-        // Should only have one link
+        // CRITICAL: RETURNING id must give us the original link's id, not the unrelated link's id
+        assert_eq!(id_replaced, id1, "replace-path must return the updated row's id, not a new row id");
+
+        // Should only have two links (original + unrelated)
         let links = s.list_links().unwrap();
-        assert_eq!(links.len(), 1);
+        assert_eq!(links.len(), 2);
 
         let link = s.link_for_identity("signal", "+1234567890").unwrap().unwrap();
         assert!(link.verified_at > now);
+        assert_eq!(link.id, id1);
     }
 
     #[test]
