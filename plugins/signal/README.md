@@ -1,9 +1,8 @@
 # relayfabric-signal
 
 Bridges Signal groups into RelayFabric as a Plugin Protocol v1 plugin. Each
-configured group maps to a channel: messages from group members land on the
-channel, and messages sent to the channel fan out as Signal group messages to
-all configured groups. Text only. Uses a signal-cli JSON-RPC/SSE daemon.
+configured group maps to a channel: messages from group members land on the channel, and messages sent to the channel are delivered to the mapped group (one endpoint, one group; fan-out is the daemon's routing concern).
+Text only. Uses a signal-cli JSON-RPC/SSE daemon.
 
 ## Install
 
@@ -16,7 +15,7 @@ pip install -r plugins/signal/requirements.txt
 Register or link an account and start the daemon on the gateway host:
 
 ```
-signal-cli -a +1234567890 register           # or: link --legacy
+signal-cli -a +1234567890 register           # or: signal-cli link -n "relayfabric"
 signal-cli -a +1234567890 daemon --http 127.0.0.1:7583
 ```
 
@@ -46,8 +45,8 @@ plugins:
 
 ## Linked-account note
 
-If the account is a linked device, sync messages from the primary are handled:
-echoes of the gateway's own posts are filtered, and DMs (no group) are dropped.
+If the account is a linked device, sync messages from the primary are handled: echoes of the gateway's own posts are filtered, and DMs (no group) are dropped.
+If `allowed_users` is set, include the account's own UUID in the list, or the operator's own phone posts will be dropped by the ACL.
 
 ## Manual e2e smoke test
 

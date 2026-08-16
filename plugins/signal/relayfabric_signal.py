@@ -121,7 +121,12 @@ class SignalCliBackend:
             try:
                 req = urllib.request.Request(
                     url, headers={"Accept": "text/event-stream"})
-                with urllib.request.urlopen(req) as resp:
+                # Generous timeout: a wedged-but-still-open connection would
+                # otherwise deafen inbound forever while egress keeps working.
+                # Reconnecting drops any event that arrives during the gap, so
+                # the timeout trades a bounded blind spot for eventually
+                # recovering a wedged signal-cli within 10 minutes.
+                with urllib.request.urlopen(req, timeout=600) as resp:
                     log.info("Connected to signal-cli event stream")
                     for raw in resp:
                         line = raw.decode("utf-8", "replace").strip()
@@ -131,7 +136,10 @@ class SignalCliBackend:
                             yield json.loads(line[len("data:"):])
                         except ValueError:
                             continue
-            except Exception as e:  # noqa: BLE001 - daemon must survive and reconnect
+            except Exception as e:  # noqa: BLE001 - daemon must survive and reconnect;
+                # this also catches socket.timeout/TimeoutError from the
+                # urlopen timeout above (TimeoutError is an OSError subclass,
+                # and socket.timeout is an alias for it on Python 3.10+).
                 log.warning(f"Signal SSE stream error, reconnecting in 5s: {e}")
                 time.sleep(5)
 
@@ -178,7 +186,7 @@ class Bridge:
             return
 
         allowed = self.cfg["allowed_users"]
-        if allowed and source not in allowed:
+        if allowed is not None and source not in allowed:
             log.warning(f"Dropping Signal message from unlisted user {source}")
             return
 

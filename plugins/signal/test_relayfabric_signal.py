@@ -153,6 +153,12 @@ class BridgeTests(unittest.TestCase):
         bridge.handle_event(data_event())
         self.assertEqual(self.sock.frames(), [])
 
+    def test_allowed_users_empty_list_denies_all(self):
+        self.cfg["allowed_users"] = []
+        bridge = plug.Bridge(self.cfg, self.backend, self.sock)
+        bridge.handle_event(data_event())
+        self.assertEqual(self.sock.frames(), [])
+
     def test_send_success_records_loop_guard(self):
         self.bridge.handle_send({"corr": 5, "endpoint": "pas", "body": "out"})
         self.assertEqual(self.backend.sent, [("GRP==", "out")])
