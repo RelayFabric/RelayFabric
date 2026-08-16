@@ -855,3 +855,59 @@ plugins:
     assert!(!captured.contains("${env:"),
         "the unresolved reference form must never cross into the plugin's env: {captured:?}");
 }
+
+/// SSE over HTTP/1.0 (design §4's ctl transport choice): proves the core
+/// assumption switchyardctl's `events` command (switchyardctl/src/main.rs)
+/// relies on -- that axum/hyper flushes a `Content-Length`-less streaming
+/// body to an HTTP/1.0 client INCREMENTALLY, as `/v1/events`'s underlying
+/// broadcast stream produces frames, rather than buffering everything until
+/// the connection closes (which never happens on its own here: `/v1/events`
+/// streams for as long as the daemon is alive). switchyardctl is a separate
+/// binary crate with no access to switchyardd's internals (see
+/// `admin_request`'s doc comment above), so this reproduces the same wire
+/// framing directly against a live daemon instead of exercising the
+/// `switchyardctl events` binary itself. Reads with a bounded per-attempt
+/// timeout instead of `read_to_string`-to-EOF (unlike every other
+/// `admin_request` caller in this file) precisely because EOF is never
+/// reached while this test holds the connection open.
+#[tokio::test]
+async fn events_stream_over_http_1_0_flushes_incrementally_not_buffered_to_eof() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let d = start_daemon(tempfile::tempdir().unwrap());
+    wait_for(&d.plugin_sock()).await;
+    wait_for(&d.admin_sock()).await;
+    let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
+
+    let mut s = UnixStream::connect(&d.admin_sock()).await.unwrap();
+    s.write_all(b"GET /v1/events HTTP/1.0\r\nhost: x\r\n\r\n").await.unwrap();
+
+    // Drive a real ingress event through the live daemon AFTER the request
+    // is already on the wire.
+    inbound(&mut wa, "chan", "!e2e-sender", "hello over sse", chrono::Utc::now()).await;
+
+    // Read incrementally with a bounded timeout per attempt: this must NOT
+    // hang waiting for EOF, since the connection never closes on its own
+    // while `d` is alive -- a buffer-until-EOF read (like `admin_request`'s)
+    // would hang here forever.
+    let mut buf = [0u8; 4096];
+    let mut collected = String::new();
+    for _ in 0..100 {
+        match timeout(Duration::from_millis(100), s.read(&mut buf)).await {
+            Ok(Ok(0)) => break, // EOF
+            Ok(Ok(n)) => {
+                collected.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if collected.contains("event: ingress") {
+                    break;
+                }
+            }
+            Ok(Err(e)) => panic!("read error: {e}"),
+            Err(_) => continue, // no bytes ready yet this tick -- keep polling
+        }
+    }
+
+    assert!(collected.contains("event: ingress"), "stream: {collected}");
+    assert!(collected.contains("\"routes\":[\"general\"]"), "stream: {collected}");
+    assert!(!collected.contains("!e2e-sender"), "full native ref leaked: {collected}");
+    assert!(!collected.contains("hello over sse"), "message body leaked: {collected}");
+}

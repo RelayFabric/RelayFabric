@@ -20,6 +20,7 @@ hex.workspace = true
 rand.workspace = true
 ed25519-dalek.workspace = true
 axum.workspace = true
+tokio-stream.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

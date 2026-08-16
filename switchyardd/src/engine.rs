@@ -1,5 +1,6 @@
 use crate::cas::{self, Cas};
 use crate::config::{Config, RouteConfig, IDENTITY_ROUTE};
+use crate::events::Event;
 use crate::limits::{BudgetLimiter, SenderLimiter};
 use crate::storage::Store;
 use crate::{
@@ -17,7 +18,7 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 pub struct PluginHandle {
@@ -77,6 +78,17 @@ pub struct Daemon {
     /// consistent with EACH OTHER, regardless of which call that turns out
     /// to be.
     apply_lock: Mutex<()>,
+    /// Live event feed (design §4): `GET /v1/events` (admin.rs) and
+    /// `switchyardctl events` both `subscribe()` here. Capacity 256 -- a
+    /// deliberately small ring buffer, since SSE is advisory (the REST
+    /// surface stays the source of truth): a subscriber that falls behind
+    /// just skips ahead on its next read (`RecvError::Lagged`, handled in
+    /// admin.rs's stream adapter, never fatal) rather than the daemon
+    /// growing an unbounded backlog for one slow/stalled UI tab. Never sent
+    /// to directly outside this module -- every call site goes through
+    /// `emit_event`, which is what makes emission near-zero-cost when
+    /// nobody's subscribed (design §4's "must cost ~nothing" requirement).
+    pub events: broadcast::Sender<Event>,
 }
 
 /// Creates `data_dir` (and any missing parents) with owner-only permissions
@@ -111,6 +123,13 @@ impl Daemon {
         let cas = Cas::new(&data_dir.join("attachments"), cfg.limits.global.cas_max_bytes)?;
         let sender_limiter = SenderLimiter::new(
             cfg.limits.per_sender.messages_per_minute, cfg.limits.per_sender.bytes_per_hour);
+        // The initial `Receiver` `channel()` hands back is discarded
+        // immediately: a broadcast channel works fine with zero live
+        // receivers (every `send` from `emit_event` is already gated on
+        // `receiver_count() > 0`), and every real subscriber (`GET
+        // /v1/events`, `switchyardctl events`) calls `events.subscribe()`
+        // fresh, later.
+        let (events, _initial_events_rx) = broadcast::channel(256);
         Ok(Daemon {
             cfg: RwLock::new(cfg),
             store: Mutex::new(store),
@@ -124,7 +143,25 @@ impl Daemon {
             budget_limiter: Mutex::new(BudgetLimiter::new()),
             gauges: metrics::PluginGauges::new(),
             apply_lock: Mutex::new(()),
+            events,
         })
+    }
+
+    /// Best-effort emission for the design §4 live event feed: `f` builds
+    /// the `Event` (typically a couple of small string clones/`format!`
+    /// calls -- see e.g. `Event::Ingress`'s `sender_masked`) and is only
+    /// ever CALLED when at least one subscriber is currently attached, so
+    /// the ordinary case -- nobody listening -- costs one atomic load
+    /// (`receiver_count`) and nothing else, satisfying design §4's "must
+    /// cost ~nothing" requirement with zero subscribers. `send`'s own
+    /// result is discarded: a subscriber that disconnects in the gap
+    /// between the count check and the send just means the event reaches
+    /// nobody, which is exactly SSE's advisory posture here, never an error
+    /// worth surfacing to the caller.
+    pub fn emit_event(&self, f: impl FnOnce() -> Event) {
+        if self.events.receiver_count() > 0 {
+            let _ = self.events.send(f());
+        }
     }
 
     /// Clones the current config's snapshot for route `name`, if any --
@@ -217,7 +254,16 @@ impl Daemon {
         self.dedup.lock().unwrap().set_ttl(std::time::Duration::from_secs(dedup_ttl_secs));
         restart_required.sort();
         restart_required.dedup();
-        ApplyOutcome { restart_required }
+        let outcome = ApplyOutcome { restart_required };
+        // Emitted from INSIDE apply_config, not by its callers (design §4):
+        // both `PUT /v1/config` and `POST /v1/config/rollback` call this
+        // method, so emitting here -- once -- covers both without either
+        // admin.rs handler needing its own copy of this logic.
+        self.emit_event(|| Event::ConfigApplied {
+            restart_required: outcome.restart_required.clone(),
+            ts: Utc::now(),
+        });
+        outcome
     }
 }
 
@@ -438,6 +484,18 @@ pub fn handle_inbound(
             warn!(error = %e, "failed to enqueue delivery");
         }
     }
+    // design §4: emitted post-accept, once the fan-out route list is known
+    // -- `id` is the internal message UUID (safe to expose; names nothing
+    // about sender or content), `sender_masked` is the established
+    // "protocol:masked_ref" compound form, never the raw native ref.
+    d.emit_event(|| Event::Ingress {
+        id: env.id,
+        protocol: env.source.protocol.clone(),
+        sender_masked: format!(
+            "{}:{}", env.source.protocol, identity_links::mask_ref(&env.sender.native_ref)),
+        routes: targets.iter().map(|(r, _)| r.clone()).collect(),
+        ts: now,
+    });
     info!(id = %env.id, source = %env.source, targets = targets.len(),
           attachments = env.attachments.len(), "message accepted");
 }
@@ -576,7 +634,7 @@ fn enqueue_identity_send(
 /// enqueues best-effort confirmation notices to both parties via
 /// `IDENTITY_ROUTE`. The confirming message itself is never routed further.
 fn confirm_link(d: &Daemon, challenge: storage::Challenge, now: DateTime<Utc>) {
-    {
+    let link_id = {
         let store = d.store.lock().unwrap();
         // Consume first: whatever happens below, this code must not be
         // usable a second time.
@@ -597,15 +655,18 @@ fn confirm_link(d: &Daemon, challenge: storage::Challenge, now: DateTime<Utc>) {
             }
         }
 
-        if let Err(e) = store.insert_link(
+        match store.insert_link(
             &challenge.target_protocol, &challenge.target_ref,
             &challenge.requester_protocol, &challenge.requester_ref,
             &challenge.display_name, now,
         ) {
-            warn!(error = %e, "failed to persist identity link");
-            return;
+            Ok(id) => id,
+            Err(e) => {
+                warn!(error = %e, "failed to persist identity link");
+                return;
+            }
         }
-    }
+    };
 
     metrics::inc(&metrics::LINKS_VERIFIED);
     // RULING 2: unify on the same compound "protocol:masked_ref" convention
@@ -616,6 +677,9 @@ fn confirm_link(d: &Daemon, challenge: storage::Challenge, now: DateTime<Utc>) {
           requester = %format!("{}:{}", challenge.requester_protocol,
                                 identity_links::mask_ref(&challenge.requester_ref)),
           "identity link verified");
+    // design §4: deliberately carries nothing but the opaque link id -- no
+    // protocol, no ref (masked or otherwise), no display_name.
+    d.emit_event(|| Event::LinkVerified { link_id, ts: now });
 
     let masked_requester = format!("{}:{}", challenge.requester_protocol,
         identity_links::mask_ref(&challenge.requester_ref));
@@ -658,6 +722,14 @@ fn warn_if_mark_failed(delivery: i64, state: &str, result: rusqlite::Result<()>)
 
 pub fn handle_result(d: &Daemon, corr: i64, delivered: bool, detail: Option<String>) {
     let store = d.store.lock().unwrap();
+    // Fetched once, up front, and reused by both branches below: the
+    // `delivered` branch already needed `route`/`message_id` (for the
+    // metrics lookups just below) and the other branch already needed
+    // `attempt_count` (to decide retry vs. dead-letter) -- a second,
+    // redundant `deliveries_for_id` call used to run in that second branch;
+    // design §4's `delivery` event needs `route`/`message_id` in EITHER
+    // branch, which this single fetch now covers for both.
+    let delivery = store.deliveries_for_id(corr);
     if delivered {
         metrics::inc(&metrics::EGRESS);
         // Route counter + delivery latency (design §3): looked up from the
@@ -667,7 +739,7 @@ pub fn handle_result(d: &Daemon, corr: i64, delivered: bool, detail: Option<Stri
         // ack that the guard silently ignores still bumps these, exactly
         // as it already bumps EGRESS) -- not worth a second query to
         // detect that rare, harmless double-count.
-        if let Some(delivery) = store.deliveries_for_id(corr) {
+        if let Some(delivery) = &delivery {
             metrics::inc_route(&delivery.route);
             if let Ok(Some(env)) = store.get_message(delivery.message_id) {
                 // Fabric-internal latency only: `created_at` is whatever the
@@ -682,23 +754,44 @@ pub fn handle_result(d: &Daemon, corr: i64, delivered: bool, detail: Option<Stri
         }
         warn_if_mark_failed(corr, "delivered", store.mark_delivered(corr));
         info!(delivery = corr, "delivered");
+        drop(store);
+        emit_delivery_event(d, delivery.as_ref(), "delivered");
         return;
     }
     // look up attempt count to decide retry vs dead-letter
-    let attempts = store
-        .deliveries_for_id(corr)
-        .map(|del| del.attempt_count)
-        .unwrap_or(queue::MAX_ATTEMPTS);
-    if attempts >= queue::MAX_ATTEMPTS {
+    let attempts = delivery.as_ref().map(|del| del.attempt_count).unwrap_or(queue::MAX_ATTEMPTS);
+    let state = if attempts >= queue::MAX_ATTEMPTS {
         warn_if_mark_failed(corr, "dead_letter",
             store.mark_terminal(corr, "dead_letter", "RETRY_EXHAUSTED"));
         warn!(delivery = corr, detail = detail.as_deref().unwrap_or(""), "dead-lettered");
+        "dead_letter"
     } else {
         let next = Utc::now()
             + CDuration::from_std(queue::backoff(attempts)).unwrap_or(CDuration::seconds(5));
         warn_if_mark_failed(corr, "pending", store.mark_retry(corr, next));
         info!(delivery = corr, attempts, "delivery failed, will retry");
-    }
+        "retry"
+    };
+    drop(store);
+    emit_delivery_event(d, delivery.as_ref(), state);
+}
+
+/// Shared by both branches of `handle_result` above (design §4's `delivery`
+/// event): a no-op when `delivery` is `None` -- a delivery row that vanished
+/// between the `deliveries_for_id` lookup and here has no `route`/
+/// `message_id` to report, and that shouldn't happen anyway (`corr` only
+/// ever comes from a plugin's `DeliveryResult` for a row this daemon itself
+/// just sent). `state` is the design §4 semantic label (`delivered` |
+/// `dead_letter` | `retry`), not necessarily the literal `deliveries.state`
+/// column value the caller just wrote (a retry is stored as `pending`).
+fn emit_delivery_event(d: &Daemon, delivery: Option<&storage::Delivery>, state: &str) {
+    let Some(delivery) = delivery else { return };
+    d.emit_event(|| Event::Delivery {
+        id: delivery.message_id,
+        route: delivery.route.clone(),
+        state: state.to_string(),
+        ts: Utc::now(),
+    });
 }
 
 const PURGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -3033,5 +3126,221 @@ routes:
             assert_eq!(pending, 2,
                 "cfg ended up with the loose limit but the limiter rate-limited the second message");
         }
+    }
+
+    // ---- events (design §4: SSE live event feed) --------------------------
+
+    /// design §4's "must cost ~nothing" with zero subscribers, from the
+    /// behavioral side: `broadcast::Sender::send` never buffers anything for
+    /// a receiver that didn't exist at send time, so a subscriber that joins
+    /// AFTER the action ran sees nothing from it. This is also why every
+    /// other test below subscribes BEFORE driving the action under test.
+    #[test]
+    fn emit_event_with_no_subscribers_at_send_time_reaches_a_later_subscriber_never() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+        let mut rx = d.events.subscribe();
+        assert!(rx.try_recv().is_err(), "a late subscriber must not see a pre-subscription event");
+    }
+
+    #[test]
+    fn handle_inbound_emits_ingress_with_masked_sender_and_the_fan_out_route_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut rx = d.events.subscribe();
+
+        handle_inbound(&d, "mocka", "chan".into(), "+15551234567".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+
+        let ev = rx.try_recv().expect("handle_inbound must emit an Ingress event on accept");
+        match ev {
+            Event::Ingress { protocol, sender_masked, routes, .. } => {
+                assert_eq!(protocol, "mocka");
+                assert_eq!(sender_masked, "mocka:+1****4567",
+                    "sender must appear only in the masked \"protocol:masked_ref\" compound form");
+                assert_eq!(routes, vec!["general".to_string()]);
+            }
+            other => panic!("expected Ingress, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one Ingress event per accepted message");
+    }
+
+    #[test]
+    fn handle_inbound_emits_no_ingress_event_for_a_dropped_unrouted_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut rx = d.events.subscribe();
+        handle_inbound(&d, "mocka", "elsewhere".into(), "!a".into(), "text".into(),
+                       "hi".into(), None, vec![], None);
+        assert!(rx.try_recv().is_err(),
+            "an unrouted (deny-by-default) message must not emit Ingress -- design §4 says \"post-accept\"");
+    }
+
+    fn deliver_one_message(d: &Daemon) -> (i64, uuid::Uuid) {
+        handle_inbound(d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+        let store = d.store.lock().unwrap();
+        let due = store.due_deliveries(Utc::now(), 10).unwrap();
+        store.mark_attempting(due[0].id).unwrap();
+        let message_id = store.deliveries_for_id(due[0].id).unwrap().message_id;
+        (due[0].id, message_id)
+    }
+
+    #[test]
+    fn handle_result_emits_delivery_event_state_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let (delivery_id, message_id) = deliver_one_message(&d);
+
+        let mut rx = d.events.subscribe();
+        handle_result(&d, delivery_id, true, None);
+
+        let ev = rx.try_recv().expect("handle_result(delivered) must emit a Delivery event");
+        let Event::Delivery { id, route, state, .. } = ev else {
+            panic!("expected Delivery, got {ev:?}");
+        };
+        assert_eq!(id, message_id, "id must be the message UUID, correlating with its Ingress event");
+        assert_eq!(route, "general");
+        assert_eq!(state, "delivered");
+    }
+
+    #[test]
+    fn handle_result_emits_delivery_event_state_retry_before_max_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let (delivery_id, _message_id) = deliver_one_message(&d); // attempt_count -> 1
+
+        let mut rx = d.events.subscribe();
+        handle_result(&d, delivery_id, false, Some("boom".into()));
+
+        let ev = rx.try_recv().expect("handle_result(retry) must emit a Delivery event");
+        let Event::Delivery { route, state, .. } = ev else {
+            panic!("expected Delivery, got {ev:?}");
+        };
+        assert_eq!(route, "general");
+        assert_eq!(state, "retry",
+            "an in-budget failure must report the semantic \"retry\" label, \
+             not the raw \"pending\" deliveries.state column value");
+    }
+
+    #[test]
+    fn handle_result_emits_delivery_event_state_dead_letter_once_attempts_are_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+        let delivery_id = {
+            let store = d.store.lock().unwrap();
+            let due = store.due_deliveries(Utc::now(), 10).unwrap();
+            for _ in 0..queue::MAX_ATTEMPTS {
+                store.mark_attempting(due[0].id).unwrap();
+            }
+            due[0].id
+        };
+
+        let mut rx = d.events.subscribe();
+        handle_result(&d, delivery_id, false, Some("boom".into()));
+
+        let ev = rx.try_recv().expect("handle_result(dead_letter) must emit a Delivery event");
+        let Event::Delivery { route, state, .. } = ev else {
+            panic!("expected Delivery, got {ev:?}");
+        };
+        assert_eq!(route, "general");
+        assert_eq!(state, "dead_letter");
+    }
+
+    #[test]
+    fn confirm_link_emits_link_verified_with_only_the_opaque_link_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        seed_challenge(&d, ("mockb", "!target"), ("mocka", "!req"), "424242", "Jascha", Utc::now(), 15);
+
+        let mut rx = d.events.subscribe();
+        handle_inbound(&d, "mockb", "chan".into(), "!target".into(), "text".into(),
+                       "424242".into(), None, vec![], None);
+
+        let ev = rx.try_recv().expect("a matched confirm must emit a LinkVerified event");
+        let Event::LinkVerified { link_id, .. } = ev else {
+            panic!("expected LinkVerified, got {ev:?}");
+        };
+        let link = d.store.lock().unwrap().link_for_identity("mockb", "!target").unwrap().unwrap();
+        assert_eq!(link_id, link.id);
+        assert!(rx.try_recv().is_err(),
+            "the confirming message itself must not also emit an Ingress event (it's never routed)");
+    }
+
+    #[test]
+    fn apply_config_emits_config_applied_with_the_outcomes_restart_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.plugins.get_mut("mockb").unwrap().command = Some("new-command".into());
+
+        let mut rx = d.events.subscribe();
+        let outcome = d.apply_config(new_cfg);
+
+        let ev = rx.try_recv().expect("apply_config must emit a ConfigApplied event");
+        let Event::ConfigApplied { restart_required, .. } = ev else {
+            panic!("expected ConfigApplied, got {ev:?}");
+        };
+        assert_eq!(restart_required, outcome.restart_required);
+        assert_eq!(restart_required, vec!["mockb".to_string()]);
+    }
+
+    /// Design §Security invariants: a full realistic sequence (an inbound
+    /// message carrying a sentinel body/native-ref, its delivery result, and
+    /// an identity-link confirmation carrying a sentinel code/display_name)
+    /// must never leak ANY of those sentinels into ANY captured event's JSON
+    /// serialization -- across the whole stream, not just the one event
+    /// that "should" logically carry that data.
+    #[test]
+    fn sse_privacy_full_sequence_never_leaks_body_ref_code_or_display_name() {
+        const SENTINEL_BODY: &str = "the quick brown fox jumps SECRET-BODY-CONTENT";
+        const SENTINEL_REF: &str = "+15551234999";
+        const SENTINEL_CODE: &str = "993377";
+        const SENTINEL_NAME: &str = "Sentinel Display Name Zyx";
+
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut rx = d.events.subscribe();
+
+        // leg 1+2: ingress + a delivered delivery
+        handle_inbound(&d, "mocka", "chan".into(), SENTINEL_REF.into(), "text".into(),
+                       SENTINEL_BODY.into(), None, vec![], None);
+        let delivery_id = {
+            let store = d.store.lock().unwrap();
+            let due = store.due_deliveries(Utc::now(), 10).unwrap();
+            store.mark_attempting(due[0].id).unwrap();
+            due[0].id
+        };
+        handle_result(&d, delivery_id, true, None);
+
+        // leg 3: identity-link confirm
+        seed_challenge(&d, ("mockb", "!privacy-target"), ("mocka", "!privacy-req"),
+                       SENTINEL_CODE, SENTINEL_NAME, Utc::now(), 15);
+        handle_inbound(&d, "mockb", "chan".into(), "!privacy-target".into(), "text".into(),
+                       SENTINEL_CODE.into(), None, vec![], None);
+
+        let mut captured = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            captured.push(ev);
+        }
+        assert_eq!(captured.len(), 3, "expected exactly ingress+delivery+link_verified: {captured:?}");
+
+        let corpus: String =
+            captured.iter().map(|e| serde_json::to_string(e).unwrap()).collect::<Vec<_>>().join("\n");
+
+        assert!(!corpus.contains(SENTINEL_BODY), "message body leaked: {corpus}");
+        assert!(!corpus.contains(SENTINEL_REF), "full native ref leaked: {corpus}");
+        assert!(!corpus.contains(SENTINEL_CODE), "challenge code leaked: {corpus}");
+        assert!(!corpus.contains(SENTINEL_NAME), "display_name leaked: {corpus}");
+
+        // Positive control: proves the sentinel ref really was present to
+        // leak (in its masked form) -- so the negative assertions above are
+        // meaningful, not vacuously true because nothing matched anything.
+        assert!(corpus.contains("mocka:+1****4999"),
+            "expected the masked sender to appear in the ingress event: {corpus}");
     }
 }

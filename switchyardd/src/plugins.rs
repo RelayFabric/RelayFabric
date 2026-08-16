@@ -1,4 +1,6 @@
 use crate::engine::{self, Daemon, PluginHandle};
+use crate::events::Event;
+use chrono::Utc;
 use relay_ipc::{read_frame, write_frame, DaemonToPlugin, PluginToDaemon, PROTOCOL_VERSION};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -54,6 +56,7 @@ async fn handle_conn(
         tx, capabilities, connected: true,
     });
     info!(plugin, "plugin connected");
+    d.emit_event(|| Event::Plugin { name: plugin.clone(), up: true, ts: Utc::now() });
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -86,6 +89,7 @@ async fn handle_conn(
     }
     writer.abort();
     info!(plugin, "plugin disconnected");
+    d.emit_event(|| Event::Plugin { name: plugin.clone(), up: false, ts: Utc::now() });
     Err(result)
 }
 
@@ -164,6 +168,62 @@ mod tests {
         let rendered = d.gauges.render(std::time::Instant::now());
         assert_eq!(rendered, "relayfabric_plugin_gauge{plugin=\"mocka\",name=\"rssi\"} -71\n",
             "name must be sanitized (lowercased) and the value preserved");
+    }
+
+    /// design §4's two `plugins.rs` emission points: `up: true` right after
+    /// a successful `HelloAck` (before this connection does anything else),
+    /// `up: false` once the read loop exits and `connected` is flipped back
+    /// off. Subscribes BEFORE spawning `handle_conn` -- `emit_event` only
+    /// sends when a subscriber is already attached, so a subscription
+    /// registered any later could race the connect event.
+    #[tokio::test]
+    async fn handle_conn_emits_plugin_up_on_connect_and_down_on_disconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let mut rx = d.events.subscribe();
+        let (plugin_side, daemon_side) = UnixStream::pair().unwrap();
+
+        let conn = tokio::spawn(handle_conn(d.clone(), daemon_side));
+
+        let (mut r, mut w) = plugin_side.into_split();
+        write_frame(&mut w, &PluginToDaemon::Hello {
+            plugin: "mocka".into(),
+            version: "0.1.0".into(),
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: Capabilities::default(),
+        }).await.unwrap();
+        let ack: DaemonToPlugin = read_frame(&mut r).await.unwrap();
+        assert!(matches!(ack, DaemonToPlugin::HelloAck { error: None, .. }),
+            "hello must be accepted: {ack:?}");
+
+        let up_ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await.expect("timed out waiting for the connect event")
+            .expect("connect must emit a Plugin event");
+        match up_ev {
+            Event::Plugin { name, up, .. } => {
+                assert_eq!(name, "mocka");
+                assert!(up, "connect must report up: true");
+            }
+            other => panic!("expected Plugin, got {other:?}"),
+        }
+
+        // Dropping both halves closes the plugin side of the socket, so
+        // handle_conn's next read hits EOF and the spawned task returns —
+        // a deterministic completion signal instead of a sleep-based poll.
+        drop(w);
+        drop(r);
+        let _ = conn.await;
+
+        let down_ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await.expect("timed out waiting for the disconnect event")
+            .expect("disconnect must emit a Plugin event");
+        match down_ev {
+            Event::Plugin { name, up, .. } => {
+                assert_eq!(name, "mocka");
+                assert!(!up, "disconnect must report up: false");
+            }
+            other => panic!("expected Plugin, got {other:?}"),
+        }
     }
 
     #[tokio::test]

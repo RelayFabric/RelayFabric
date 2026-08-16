@@ -2,7 +2,7 @@
 // hand-rolled HTTP/1.0 over UnixStream — zero client deps, and the
 // server closes the connection after each response.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 
 /// Maps CLI args to an HTTP method, path, and (for POST/PUT) a body.
@@ -59,7 +59,7 @@ fn request_for(args: &[String]) -> Result<(&'static str, String, Option<String>)
         _ => Err("usage: switchyardctl [--socket <path>] \
                   status|plugins|routes|queue|trace <id>|identities|\
                   link <requester> <target> <display_name...>|unlink <id>|\
-                  config show|validate <file>|apply <file>|rollback".into()),
+                  config show|validate <file>|apply <file>|rollback|events".into()),
     }
 }
 
@@ -124,12 +124,87 @@ fn fetch(
     body_of(&raw, expected)
 }
 
+/// Consumes the HTTP status line + headers off `reader` (up to and
+/// including the blank-line separator), leaving it positioned at the start
+/// of the response body. Split out from `stream_events` so it's testable
+/// against a plain in-memory `Cursor`, without a real socket.
+fn skip_http_headers(reader: &mut impl BufRead) -> std::io::Result<()> {
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 || line == "\r\n" || line == "\n" {
+            return Ok(());
+        }
+    }
+}
+
+/// `switchyardctl events`'s core loop (design §4): reads `reader` line by
+/// line and, for every SSE `data:` line, writes its JSON payload (the
+/// `data:`/`data: ` prefix stripped, nothing else -- no `event:` line, no
+/// blank-line separators) to `out`, one JSON object per line. Returns once
+/// `reader` hits EOF (the daemon closed the connection). Takes `out` as a
+/// parameter rather than calling `println!` directly so this is unit-
+/// testable against an in-memory buffer.
+fn emit_data_lines(reader: &mut impl BufRead, out: &mut impl Write) -> std::io::Result<()> {
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            return Ok(()); // EOF: the daemon closed the stream
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if let Some(data) = trimmed.strip_prefix("data:") {
+            writeln!(out, "{}", data.trim_start())?;
+        }
+    }
+}
+
+/// `switchyardctl events` (design §4): unlike every other subcommand (which
+/// reads one full response into memory via `fetch`, blocking on EOF), this
+/// one is a long-lived stream with no natural end -- it prints each `data:`
+/// line AS IT ARRIVES, forever, until the daemon closes the connection or
+/// the operator hits Ctrl-C (no cleanup needed: the OS reclaims the socket
+/// on process exit). Still a bare HTTP/1.0 GET, same as every other request
+/// in this file: hyper (behind `axum::serve`) streams a body with no
+/// `Content-Length` as close-delimited under HTTP/1.0 exactly as it does
+/// under HTTP/1.1 chunked encoding -- frames are flushed to the socket as
+/// the SSE stream produces them, not buffered until the connection closes,
+/// which is what makes a live tail actually live rather than hanging until
+/// the daemon exits (verified against a real daemon in switchyardd's
+/// `events_stream_over_http_1_0_flushes_incrementally_not_buffered_to_eof`
+/// e2e test, since this crate has no access to switchyardd's internals to
+/// spin up a daemon in-process).
+fn stream_events(socket: &str) -> Result<(), String> {
+    let stream = UnixStream::connect(socket)
+        .map_err(|e| format!("cannot connect to {socket}: {e}"))?;
+    write!(&stream, "GET /v1/events HTTP/1.0\r\nhost: localhost\r\n\r\n")
+        .map_err(|e| e.to_string())?;
+
+    let mut reader = BufReader::new(&stream);
+    skip_http_headers(&mut reader).map_err(|e| e.to_string())?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    emit_data_lines(&mut reader, &mut out).map_err(|e| e.to_string())
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut socket = String::from("/var/lib/relayfabric/admin.sock");
     if args.first().map(String::as_str) == Some("--socket") {
         args.remove(0);
         socket = if args.is_empty() { socket } else { args.remove(0) };
+    }
+    // Special-cased ahead of `request_for` (design §4): every other
+    // subcommand maps onto a single (method, path, body) request/response
+    // round trip via `fetch`, but `events` is a long-lived stream with its
+    // own read loop (`stream_events`) -- it never "returns a body" the way
+    // `fetch` expects.
+    if args.first().map(String::as_str) == Some("events") {
+        if let Err(e) = stream_events(&socket) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
     }
     let (method, path, body) = match request_for(&args) {
         Ok(r) => r,
@@ -296,5 +371,60 @@ mod tests {
     fn body_of_accepts_204_with_empty_body() {
         let raw = "HTTP/1.0 204 No Content\r\n\r\n";
         assert_eq!(body_of(raw, "204").unwrap(), "");
+    }
+
+    // ---- events (design §4) --------------------------------------------
+
+    #[test]
+    fn events_requires_no_extra_usage_error_and_is_routed_before_request_for() {
+        // "events" is special-cased in `main` ahead of `request_for` (it has
+        // no single (method, path, body) shape), so `request_for` alone
+        // treats it like any other unrecognized token -- a usage error. This
+        // guards against `events` silently regaining a `request_for` arm
+        // that main's early dispatch would then always shadow.
+        assert!(request_for(&["events".into()]).is_err());
+    }
+
+    #[test]
+    fn skip_http_headers_stops_at_the_blank_line_leaving_the_body_at_the_cursor() {
+        let mut reader = std::io::Cursor::new(
+            "HTTP/1.0 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: {\"a\":1}\r\n\r\n".as_bytes(),
+        );
+        skip_http_headers(&mut reader).unwrap();
+        let mut rest = String::new();
+        std::io::Read::read_to_string(&mut reader, &mut rest).unwrap();
+        assert_eq!(rest, "data: {\"a\":1}\r\n\r\n");
+    }
+
+    #[test]
+    fn skip_http_headers_handles_bare_lf_blank_line_too() {
+        let mut reader = std::io::Cursor::new("HTTP/1.0 200 OK\nx: y\n\ndata: {}\n".as_bytes());
+        skip_http_headers(&mut reader).unwrap();
+        let mut rest = String::new();
+        std::io::Read::read_to_string(&mut reader, &mut rest).unwrap();
+        assert_eq!(rest, "data: {}\n");
+    }
+
+    #[test]
+    fn emit_data_lines_strips_the_prefix_and_ignores_everything_else() {
+        let input = concat!(
+            ": keep-alive\r\n",
+            "event: ingress\r\n",
+            "data: {\"a\":1}\r\n",
+            "\r\n",
+            "data:{\"b\":2}\n", // no space after the colon, and bare LF
+        );
+        let mut reader = std::io::Cursor::new(input.as_bytes());
+        let mut out = Vec::new();
+        emit_data_lines(&mut reader, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "{\"a\":1}\n{\"b\":2}\n");
+    }
+
+    #[test]
+    fn emit_data_lines_returns_cleanly_on_eof_with_no_data_lines_at_all() {
+        let mut reader = std::io::Cursor::new(": keep-alive\r\n\r\n".as_bytes());
+        let mut out = Vec::new();
+        emit_data_lines(&mut reader, &mut out).unwrap();
+        assert!(out.is_empty());
     }
 }

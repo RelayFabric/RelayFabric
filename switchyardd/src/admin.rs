@@ -1,10 +1,12 @@
 use crate::config::IDENTITY_ROUTE;
 use crate::engine::{self, Daemon};
+use crate::events::Event;
 use crate::identity_links;
 use crate::metrics;
 use axum::body::Bytes;
 use axum::extract::{FromRef, Path as AxPath, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -13,8 +15,12 @@ use relay_core::Endpoint;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::{Stream, StreamExt};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -61,6 +67,7 @@ pub fn router(d: Arc<Daemon>, config_path: PathBuf) -> Router {
         .route("/v1/identities/link", post(create_link))
         .route("/v1/identities/link/{id}", delete(delete_link))
         .route("/v1/identities/challenges", get(challenges))
+        .route("/v1/events", get(events_stream))
         .route("/metrics", get(metrics_text))
         .with_state(state)
 }
@@ -590,6 +597,41 @@ async fn challenges(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
         "expires_at": c.expires_at,
     })).collect();
     Json(json!({ "pending_count": out.len(), "challenges": out }))
+}
+
+/// Builds the `GET /v1/events` (design §4) SSE stream from a live broadcast
+/// receiver: `BroadcastStream` turns `Daemon.events.subscribe()` into a
+/// `Stream`, and `filter_map` both (a) converts each successful item into an
+/// SSE `Event` (`event:` = `event_name()`, `data:` = JSON) and (b) is what
+/// implements "lagged receivers skip missed events and continue" -- a
+/// `BroadcastStreamRecvError::Lagged` maps to `None`, which `filter_map`'s
+/// own `poll_next` loop (tokio_stream's implementation, not something this
+/// function has to drive itself) treats as "not an item, poll the inner
+/// stream again," never as end-of-stream. Split out from the handler below
+/// so it's unit-testable directly against a hand-built
+/// `broadcast::channel`, without going through axum/tower at all (see the
+/// `lagged_receiver_is_skipped_not_fatal` test).
+fn events_stream_from(rx: broadcast::Receiver<Event>) -> impl Stream<Item = Result<SseEvent, Infallible>> {
+    BroadcastStream::new(rx).filter_map(|item| {
+        item.ok().map(|event| {
+            Ok(SseEvent::default()
+                .event(event.event_name())
+                .data(serde_json::to_string(&event).unwrap_or_default()))
+        })
+    })
+}
+
+/// `GET /v1/events` (design §4): a live SSE feed of `Daemon.events`
+/// (`tokio::sync::broadcast`, capacity 256; see `events_stream_from`).
+/// `KeepAlive` (per-connection periodic `: comment` frames) keeps an
+/// otherwise silent long-lived connection from looking dead to an
+/// intermediary. SSE here is advisory -- the REST surface underneath
+/// remains the source of truth (design §4) -- so a lagged/slow subscriber
+/// simply misses events rather than the daemon buffering for it.
+async fn events_stream(
+    State(d): State<Arc<Daemon>>,
+) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+    Sse::new(events_stream_from(d.events.subscribe())).keep_alive(KeepAlive::default())
 }
 
 #[cfg(test)]
@@ -1782,5 +1824,87 @@ routes:
         assert!(!rbody.contains(sentinel), "rollback leaked secret: {rbody}");
 
         std::env::remove_var(var);
+    }
+
+    // ---- GET /v1/events (design §4) -----------------------------------
+
+    /// Tower-oneshot CAN drive this deterministically, despite the response
+    /// body being an unbounded stream: `events_stream`'s handler body has no
+    /// `.await` point of its own (`subscribe()`, `BroadcastStream::new`,
+    /// `filter_map`, `Sse::new`, `.keep_alive()` are all synchronous
+    /// constructors), so by the time `.oneshot(request).await` resolves to a
+    /// `Response`, the subscription is already registered on `d.events` --
+    /// sending an event from this same task right afterward, before the
+    /// body is ever polled, is race-free by construction, not a sleep-and-
+    /// hope. Reading the body then uses `BodyExt::frame` under a bounded
+    /// `tokio::time::timeout` (never `.collect()`, which would wait for
+    /// EOF -- this stream never reaches one while the router is alive).
+    #[tokio::test]
+    async fn get_v1_events_streams_a_driven_ingress_event_over_tower_oneshot() {
+        let d = daemon();
+        let resp = router(d.clone())
+            .oneshot(Request::builder().uri("/v1/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "text/event-stream",
+            "wrong content-type"
+        );
+
+        let id = uuid::Uuid::now_v7();
+        d.events.send(crate::events::Event::Ingress {
+            id,
+            protocol: "mocka".into(),
+            sender_masked: "mocka:si****1234".into(),
+            routes: vec!["general".into()],
+            ts: chrono::Utc::now(),
+        }).expect("send must succeed: the handler above has already subscribed");
+
+        let mut body = resp.into_body();
+        let mut collected = String::new();
+        for _ in 0..20 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+                .await
+                .expect("timed out waiting for an SSE frame")
+                .expect("body ended before yielding the driven event")
+                .unwrap();
+            if let Ok(data) = frame.into_data() {
+                collected.push_str(&String::from_utf8_lossy(&data));
+            }
+            if collected.contains("event: ingress") {
+                break;
+            }
+        }
+        assert!(collected.contains("event: ingress"), "stream was: {collected}");
+        assert!(collected.contains(&format!("\"id\":\"{id}\"")), "stream was: {collected}");
+        assert!(collected.contains("\"sender_masked\":\"mocka:si****1234\""), "stream was: {collected}");
+        assert!(collected.contains("\"routes\":[\"general\"]"), "stream was: {collected}");
+    }
+
+    /// Design §4: "lagged receivers skip missed events and continue" --
+    /// tested directly against `events_stream_from`, bypassing axum/tower
+    /// entirely (no HTTP machinery needed to prove the adapter's own
+    /// behavior). Overrunning the 256-capacity channel without reading
+    /// guarantees this receiver is lagged by the time it's finally polled;
+    /// the assertion is simply that the stream yields a real `Ok(_)` event
+    /// next, rather than erroring out or hanging.
+    #[tokio::test]
+    async fn lagged_receiver_is_skipped_not_fatal() {
+        let (tx, rx) = tokio::sync::broadcast::channel(256);
+        for i in 0..300u32 {
+            tx.send(crate::events::Event::Plugin {
+                name: format!("p{i}"), up: true, ts: chrono::Utc::now(),
+            }).unwrap();
+        }
+
+        let mut stream = super::events_stream_from(rx);
+        let item = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("must not hang skipping a lagged gap")
+            .expect("stream must not end just because the receiver lagged");
+        let _event: SseEvent =
+            item.expect("must yield a real event once the lagged gap is skipped, not an error");
     }
 }
