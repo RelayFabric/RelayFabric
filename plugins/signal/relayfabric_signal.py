@@ -1,17 +1,20 @@
 """RelayFabric Signal plugin: bridges Signal groups over Plugin Protocol v1
 via a signal-cli JSON-RPC/SSE daemon.
 
-Module top level is stdlib-only (json/logging/os/socket/sys/threading/
-time/urllib.request) so the config/parser/backend helpers stay importable
-without cbor2 or rns. relay_ipc is imported lazily inside the methods/
-functions that need it (see Bridge and main()).
+Module top level is stdlib-only (json/logging/os/shutil/socket/sys/
+tempfile/threading/time/urllib.request) so the config/parser/backend
+helpers stay importable without cbor2 or rns. relay_ipc is imported
+lazily inside the methods/functions that need it (see Bridge and
+main()). Attachment bytes are never logged, only names/sizes/counts.
 """
 
 import json
 import logging
 import os
+import shutil
 import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -19,6 +22,13 @@ import urllib.request
 log = logging.getLogger(__name__)
 
 PLUGIN_VERSION = "0.1.0"
+
+# Sanity cap on reading an attachment file into memory; ported from
+# rns-signal-gateway's Gateway.ATTACHMENT_LOAD_CAP (gateway.py:509). The
+# actual pass-through decision (drop with a note vs. forward) is made
+# separately by cap_attachments() against the smaller, configurable
+# max_attachment_bytes.
+ATTACHMENT_LOAD_CAP = 32_000_000
 
 
 def load_config(raw):
@@ -30,6 +40,8 @@ def load_config(raw):
     cfg["groups"] = dict(cfg["groups"])
     cfg.setdefault("rpc_url", "http://127.0.0.1:7583")
     cfg.setdefault("allowed_users", None)
+    cfg.setdefault("attachment_dir", "~/.local/share/signal-cli/attachments")
+    cfg.setdefault("max_attachment_bytes", 8_000_000)
     return cfg
 
 
@@ -40,7 +52,8 @@ def parse_signal_event(event, own_account):
     if sync:
         data = (envelope.get("syncMessage") or {}).get("sentMessage") or {}
     text = data.get("message") or ""
-    if not text:
+    attachments_raw = data.get("attachments") or []
+    if not text and not attachments_raw:
         return None
     source = (envelope.get("sourceUuid")
               or envelope.get("sourceNumber")
@@ -51,7 +64,51 @@ def parse_signal_event(event, own_account):
                      or envelope.get("source") == own_account):
         return None
     group_id = (data.get("groupInfo") or {}).get("groupId")
-    return source, group_id, text, envelope.get("timestamp")
+    return source, group_id, text, envelope.get("timestamp"), attachments_raw
+
+
+def load_signal_attachments(attachment_dir, attachments):
+    """Read attachment files signal-cli stored; returns (loaded, notes).
+
+    Ported from rns-signal-gateway's Gateway.load_signal_attachments
+    (gateway.py:511-529). `attachment_dir` is expanduser'd here (at use),
+    not at config-load time. Each descriptor's `id` is basename-sanitized
+    before joining, so an upstream-supplied id (e.g. "../../etc/passwd")
+    can never escape attachment_dir.
+    """
+    attachment_dir = os.path.expanduser(attachment_dir)
+    loaded, notes = [], []
+    for att in attachments:
+        aid = att.get("id")
+        name = att.get("filename") or aid or "file"
+        path = (os.path.join(attachment_dir, os.path.basename(aid))
+                if aid else None)
+        if not path or not os.path.isfile(path):
+            notes.append(f"[attachment {name} unavailable]")
+            continue
+        if os.path.getsize(path) > ATTACHMENT_LOAD_CAP:
+            notes.append(f"[dropped {name}: exceeds {ATTACHMENT_LOAD_CAP} B]")
+            continue
+        with open(path, "rb") as f:
+            loaded.append((name, att.get("contentType") or "", f.read()))
+    return loaded, notes
+
+
+def cap_attachments(loaded, max_bytes):
+    """Split [(name, content_type, data), ...] into (kept, notes) by size.
+
+    Anything over max_bytes is dropped with a note instead of being
+    forwarded; mirrors the drop-note format used by plugins/lxmf's
+    attachment_fields/lxmf_attachments.
+    """
+    kept, notes = [], []
+    for name, ctype, data in loaded:
+        if len(data) > max_bytes:
+            notes.append(f"[dropped {name}: {len(data)} B over "
+                         f"{max_bytes} B limit]")
+        else:
+            kept.append((name, ctype, data))
+    return kept, notes
 
 
 class SentCache:
@@ -91,11 +148,14 @@ class SignalCliBackend:
         self.rpc_url = rpc_url.rstrip("/")
         self.account = account
 
-    def send_group(self, group_id, text):
+    def send_group(self, group_id, text, attachment_paths=None):
+        params = {"account": self.account, "groupId": group_id,
+                  "message": text}
+        if attachment_paths:
+            params["attachments"] = attachment_paths
         body = json.dumps({
             "jsonrpc": "2.0", "id": 1, "method": "send",
-            "params": {"account": self.account, "groupId": group_id,
-                       "message": text},
+            "params": params,
         }).encode()
         req = urllib.request.Request(
             self.rpc_url + "/api/v1/rpc", data=body,
@@ -174,7 +234,7 @@ class Bridge:
         parsed = parse_signal_event(event, self.cfg["account"])
         if parsed is None:
             return
-        source, group_id, text, ts = parsed
+        source, group_id, text, ts, attachments_raw = parsed
 
         envelope = event.get("envelope") or {}
         if "syncMessage" in envelope and self.sent_cache.match(group_id, text):
@@ -190,11 +250,24 @@ class Bridge:
             log.warning(f"Dropping Signal message from unlisted user {source}")
             return
 
+        # attachment bytes are never logged, only counts/sizes via notes
+        loaded, load_notes = load_signal_attachments(
+            self.cfg["attachment_dir"], attachments_raw)
+        kept, cap_notes = cap_attachments(loaded, self.cfg["max_attachment_bytes"])
+        notes = load_notes + cap_notes
+        body = "\n".join(p for p in [text, *notes] if p)
+
         import relay_ipc
+        atts = [
+            relay_ipc.attachment(
+                os.path.basename(fname), ctype or "application/octet-stream", data)
+            for fname, ctype, data in kept
+        ]
         created = ts / 1000 if ts is not None else None
-        self._send_frame(relay_ipc.inbound(name, source, text, created))
+        self._send_frame(relay_ipc.inbound(
+            name, source, body, created, attachments=atts))
         log.info(f"Bridged Signal message from {source} to '{name}' "
-                 f"({len(text)} chars)")
+                 f"({len(text)} chars, {len(atts)} attachment(s))")
 
     # ----- egress (daemon -> Signal); called from the main thread -----
 
@@ -209,15 +282,43 @@ class Bridge:
             log.warning(f"Signal send to unknown endpoint {endpoint!r}")
             self._send_frame(relay_ipc.delivery_result(corr, False, "unknown group"))
             return
+
+        # attachment bytes are never logged, only counts/sizes via notes
+        max_bytes = self.cfg["max_attachment_bytes"]
+        kept, notes = [], []
+        for att in frame.get("attachments") or []:
+            data = att["data"]
+            if len(data) > max_bytes:
+                notes.append(f"[dropped {att['filename']}: {len(data)} B over "
+                             f"{max_bytes} B limit]")
+            else:
+                kept.append(att)
+        text = "\n".join(p for p in [body, *notes] if p)
+
+        tmpdir = None
         try:
-            self.backend.send_group(group_id, body)
+            paths = []
+            if kept:
+                tmpdir = tempfile.mkdtemp(prefix="relayfabric-signal-att-")
+                # ponytail: same-basename attachments overwrite; prefix an
+                # index if that ever matters
+                for att in kept:
+                    path = os.path.join(tmpdir, os.path.basename(att["filename"]))
+                    with open(path, "wb") as f:
+                        f.write(att["data"])
+                    paths.append(path)
+            self.backend.send_group(group_id, text, paths)
         except Exception as e:  # noqa: BLE001 - report the failure, don't crash
             log.warning(f"Signal send to '{endpoint}' failed: {e}")
             self._send_frame(relay_ipc.delivery_result(corr, False, str(e)))
             return
-        self.sent_cache.record(group_id, body)
+        finally:
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        self.sent_cache.record(group_id, text)
         self._send_frame(relay_ipc.delivery_result(corr, True))
-        log.info(f"Sent Signal message to '{endpoint}' ({len(body)} chars)")
+        log.info(f"Sent Signal message to '{endpoint}' "
+                 f"({len(text)} chars, {len(paths)} attachment(s))")
 
 
 def main():
@@ -236,7 +337,7 @@ def main():
     rfile = sock.makefile("rb")
     wfile = sock.makefile("wb")
 
-    caps = relay_ipc.capabilities(groups=True)
+    caps = relay_ipc.capabilities(groups=True, attachments=True)
     relay_ipc.write_frame(wfile, relay_ipc.hello(plugin_name, PLUGIN_VERSION, caps))
     ack = relay_ipc.read_frame(rfile)
     if ack.get("t") != "hello_ack" or ack.get("error"):
