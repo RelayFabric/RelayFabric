@@ -4,7 +4,7 @@ use crate::events::Event;
 use crate::identity_links;
 use crate::metrics;
 use axum::body::Bytes;
-use axum::extract::{FromRef, Path as AxPath, State};
+use axum::extract::{FromRef, Path as AxPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -459,8 +459,55 @@ async fn config_rollback(State(state): State<AdminState>) -> impl IntoResponse {
     (StatusCode::OK, Json(json!({"applied": true, "restart_required": outcome.restart_required})))
 }
 
-async fn queue(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
-    Json(queue_map(&d))
+/// Query params for `GET /v1/queue` (Finding 2, whole-branch review). Both
+/// optional: `state` absent keeps the endpoint's original aggregate-counts
+/// shape (compat -- the listing below only activates when it's present);
+/// `limit` defaults to 100 and is clamped to [1, 1000] regardless of what's
+/// requested, including 0 or an absurdly large value.
+#[derive(Deserialize)]
+struct QueueParams {
+    state: Option<String>,
+    limit: Option<usize>,
+}
+
+/// `GET /v1/queue` (design §Admin API) / `GET /v1/queue?state=<state>&limit=<n>`
+/// (Finding 2, whole-branch review, goal gate). Without `state`, returns the
+/// existing `{route: count}`-shaped aggregate UNCHANGED (every pre-existing
+/// caller -- `/v1/status`'s own `queue_map` call, `switchyardctl` -- keeps
+/// working). With `state`, returns a listing of individual delivery rows in
+/// that state instead: `{deliveries: [...]}`, newest first, capped at
+/// `limit`. spec §Security invariants: masked per the SAME rule `trace`
+/// (`GET /v1/messages/{id}`) uses -- an `@identity`-route row's destination
+/// carries the target's RAW native ref (see `enqueue_identity_send`), so it
+/// renders in the masked "protocol:masked_ref" compound form; an ordinary
+/// route's destination is a route endpoint, not an identity ref, and renders
+/// in full. No message body ever appears here (`list_deliveries`'s `SELECT`
+/// never even touches `messages.envelope`).
+async fn queue(State(d): State<Arc<Daemon>>, Query(params): Query<QueueParams>) -> impl IntoResponse {
+    let Some(state) = params.state else {
+        return Json(queue_map(&d)).into_response();
+    };
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000) as i64;
+    let deliveries = d.store.lock().unwrap().list_deliveries(Some(&state), limit).unwrap_or_default();
+    let out: Vec<_> = deliveries.iter().map(|del| {
+        let destination = if del.route == IDENTITY_ROUTE {
+            format!("{}:{}", del.destination.protocol,
+                identity_links::mask_ref(&del.destination.endpoint))
+        } else {
+            del.destination.to_string()
+        };
+        json!({
+            "message_id": del.message_id,
+            "route": del.route,
+            "destination": destination,
+            "state": del.state,
+            "reason": del.reason,
+            "attempts": del.attempt_count,
+            "created_at": del.created_at,
+            "updated_at": del.updated_at,
+        })
+    }).collect();
+    Json(json!({ "deliveries": out })).into_response()
 }
 
 async fn trace(
@@ -861,6 +908,90 @@ mod tests {
         assert_eq!(code2, 200);
         assert!(body2.contains("\"destination\":\"mockb:chan\""),
             "ordinary route destination must still render in full: {body2}");
+    }
+
+    /// Finding 2 (whole-branch review, goal gate): omitting `?state=` must
+    /// keep returning the pre-existing `{route: count}` aggregate shape
+    /// verbatim -- the listing behavior below is opt-in only, not a breaking
+    /// change to the endpoint every caller already uses.
+    #[tokio::test]
+    async fn queue_without_state_param_returns_aggregate_counts_shape_unchanged() {
+        let d = daemon();
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+        let (code, body) = get(router(d), "/v1/queue").await;
+        assert_eq!(code, 200);
+        assert!(body.contains("\"pending\":1"), "body was: {body}");
+        assert!(!body.contains("\"deliveries\""),
+            "omitting ?state= must keep the pre-existing aggregate-counts shape: {body}");
+    }
+
+    /// Finding 2 (whole-branch review, goal gate): `?state=dead_letter`
+    /// lists individual rows -- masked per the SAME rule `trace` uses for an
+    /// `@identity`-route destination, newest (highest id) first, no message
+    /// body anywhere, and `limit` respected.
+    #[tokio::test]
+    async fn queue_by_state_lists_deliveries_masked_newest_first_with_limit_clamp() {
+        let d = daemon();
+        let _rx = crate::engine::tests_support::register_direct_plugin(&d, "mockb");
+
+        const SENTINEL_BODY: &str = "queue-listing-secret-body";
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       SENTINEL_BODY.into(), None, vec![], None);
+        let id_a = {
+            let store = d.store.lock().unwrap();
+            let id = store.due_deliveries(Utc::now(), 10).unwrap()[0].id;
+            store.mark_terminal(id, "dead_letter", "POLICY_DENIED").unwrap();
+            id
+        };
+
+        // an @identity-route row with a KNOWN target ref, inserted after
+        // `id_a` above -- the higher id, so it's the "newest" row.
+        let requester: Endpoint = "mocka:!req".parse().unwrap();
+        let target: Endpoint = "mockb:+14155551234".parse().unwrap();
+        engine::initiate_link(&d, requester, target, "Jascha").unwrap();
+        let id_identity = {
+            let store = d.store.lock().unwrap();
+            let del = store.due_deliveries(Utc::now(), 10).unwrap().into_iter()
+                .find(|de| de.route == IDENTITY_ROUTE)
+                .expect("identity challenge delivery must be queued");
+            store.mark_terminal(del.id, "dead_letter", "QUEUE_FULL").unwrap();
+            del.id
+        };
+        assert!(id_identity > id_a, "identity delivery must be the newer row");
+
+        // limit=1 must clamp to exactly the newest row.
+        let (code, body) = get(router(d.clone()), "/v1/queue?state=dead_letter&limit=1").await;
+        assert_eq!(code, 200);
+        assert!(!body.contains(SENTINEL_BODY), "queue listing must never include message content: {body}");
+        assert!(!body.contains("+14155551234"), "full target ref leaked: {body}");
+        assert!(body.contains("\"destination\":\"mockb:+1****1234\""),
+            "masked identity-route destination missing: {body}");
+        assert!(body.contains("\"reason\":\"QUEUE_FULL\""), "body was: {body}");
+        assert_eq!(body.matches("\"message_id\"").count(), 1,
+            "limit=1 must clamp to exactly one row: {body}");
+
+        // default limit returns both, newest (identity row) first.
+        let (code2, body2) = get(router(d.clone()), "/v1/queue?state=dead_letter").await;
+        assert_eq!(code2, 200);
+        assert_eq!(body2.matches("\"message_id\"").count(), 2,
+            "default limit must return both dead_letter rows: {body2}");
+        let idx_identity = body2.find("QUEUE_FULL").expect("QUEUE_FULL reason missing");
+        let idx_a = body2.find("POLICY_DENIED").expect("POLICY_DENIED reason missing");
+        assert!(idx_identity < idx_a,
+            "newest (highest id) dead_letter row must come first: {body2}");
+
+        // out-of-range limits clamp rather than error: 0 -> 1, 5000 -> 1000.
+        let (code3, body3) =
+            get(router(d.clone()), "/v1/queue?state=dead_letter&limit=0").await;
+        assert_eq!(code3, 200);
+        assert_eq!(body3.matches("\"message_id\"").count(), 1,
+            "limit=0 must clamp up to one row: {body3}");
+        let (code4, body4) =
+            get(router(d), "/v1/queue?state=dead_letter&limit=5000").await;
+        assert_eq!(code4, 200);
+        assert_eq!(body4.matches("\"message_id\"").count(), 2,
+            "limit=5000 must clamp to 1000 and return all rows: {body4}");
     }
 
     // ---- read surface completion (design §2) --------------------------

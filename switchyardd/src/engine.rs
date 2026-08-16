@@ -222,6 +222,17 @@ impl Daemon {
     /// just one; that's safe specifically because `apply_lock` is never
     /// acquired from anywhere else, so there's no second call site that
     /// could ever try to take them in the opposite order.
+    ///
+    /// Finding 4 (whole-branch review): a delivery already `pending` for a
+    /// route this call renames or removes is NOT retried or rewritten here
+    /// -- it keeps its stored `route` string and rides out its existing TTL.
+    /// `process_due` resolves `route_cfg(&del.route)` fresh on every attempt
+    /// (never cached across an `apply_config` swap), so a miss there just
+    /// falls through to render's default/pseudonymous tag semantics instead
+    /// of the route's configured one, exactly as an always-unconfigured
+    /// route would. This is transient (the row still expires normally) and
+    /// loses no data -- only the display tag of any in-flight attempt made
+    /// during that window is affected.
     pub fn apply_config(&self, new: Config) -> ApplyOutcome {
         let _apply_guard = self.apply_lock.lock().unwrap();
         let mut restart_required = Vec::new();
@@ -452,6 +463,15 @@ pub fn handle_inbound(
     if let Err(e) = store.insert_attachment_refs(env.id, &shas) {
         warn!(error = %e, "failed to persist attachment refs");
     }
+    // Finding 1 (whole-branch review): every route that lands directly in
+    // dead_letter/QUEUE_FULL below needs its own Delivery event -- but
+    // `store` is held across the whole loop (every target needs fresh
+    // pending_count reads), so emission can't happen inline without
+    // violating "never emit while a store guard is live" (see
+    // `emit_delivery`'s doc comment). Collected here and emitted after
+    // `drop(store)`, alongside the Ingress event this function already
+    // sends post-loop.
+    let mut queue_full_routes: Vec<String> = Vec::new();
     for (route, dest) in &targets {
         // Queue quotas (spec §45): per-route checked first (the tighter,
         // more actionable signal), then the global ceiling — checked fresh
@@ -470,10 +490,9 @@ pub fn handle_inbound(
             && store.pending_count(None).unwrap_or(0) >= i64::from(global_max);
         if over_route || over_global {
             metrics::inc(&metrics::QUEUE_REJECTED);
-            if let Err(e) = store.insert_dead_delivery(
-                env.id, route, dest, now, env.expires_at, "QUEUE_FULL")
-            {
-                warn!(error = %e, "failed to record queue-full delivery");
+            match store.insert_dead_delivery(env.id, route, dest, now, env.expires_at, "QUEUE_FULL") {
+                Ok(_) => queue_full_routes.push(route.clone()),
+                Err(e) => warn!(error = %e, "failed to record queue-full delivery"),
             }
             warn!(route = %route, destination = %dest, "queue full, delivery rejected");
             continue;
@@ -483,6 +502,14 @@ pub fn handle_inbound(
         {
             warn!(error = %e, "failed to enqueue delivery");
         }
+    }
+    // Finding 3 (whole-branch review, minor): dropped explicitly BEFORE
+    // either emission below, mirroring `handle_result`'s `drop(store)`
+    // pattern -- emitting while this guard is still live would hold the
+    // store lock across `Daemon.events`'s broadcast send for no reason.
+    drop(store);
+    for route in &queue_full_routes {
+        emit_delivery(d, env.id, route.clone(), "dead_letter");
     }
     // design §4: emitted post-accept, once the fan-out route list is known
     // -- `id` is the internal message UUID (safe to expose; names nothing
@@ -608,13 +635,21 @@ fn enqueue_identity_send(
         && store.pending_count(None).unwrap_or(0) >= i64::from(global_max);
     if over_global {
         metrics::inc(&metrics::QUEUE_REJECTED);
-        if let Err(e) = store.insert_dead_delivery(
-            env.id, IDENTITY_ROUTE, &dest, now, expires, "QUEUE_FULL")
-        {
+        let inserted = store.insert_dead_delivery(
+            env.id, IDENTITY_ROUTE, &dest, now, expires, "QUEUE_FULL");
+        if let Err(e) = &inserted {
             warn!(error = %e, "failed to record queue-full identity delivery");
         }
         warn!(destination = %format!("{}:{}", dest.protocol, identity_links::mask_ref(&dest.endpoint)),
               "queue full, identity delivery rejected");
+        // Finding 1/3 (whole-branch review): emit only AFTER the store guard
+        // drops (mirrors `handle_result`'s `drop(store)` pattern), and only
+        // when the dead-letter row actually persisted -- an event reporting
+        // a state that never made it to disk would be worse than none.
+        drop(store);
+        if inserted.is_ok() {
+            emit_delivery(d, env.id, IDENTITY_ROUTE, "dead_letter");
+        }
         return Err("queue full".to_string());
     }
     if let Err(e) = store.insert_delivery(env.id, IDENTITY_ROUTE, &dest, now, expires,
@@ -786,11 +821,27 @@ pub fn handle_result(d: &Daemon, corr: i64, delivered: bool, detail: Option<Stri
 /// column value the caller just wrote (a retry is stored as `pending`).
 fn emit_delivery_event(d: &Daemon, delivery: Option<&storage::Delivery>, state: &str) {
     let Some(delivery) = delivery else { return };
+    emit_delivery(d, delivery.message_id, delivery.route.clone(), state);
+}
+
+/// Finding 1 (whole-branch review): the direct-parameter counterpart to
+/// `emit_delivery_event` above, for call sites (`process_due`,
+/// `process_due_identity`, `handle_inbound`, `enqueue_identity_send`) that
+/// already have `id`/`route` in hand from the write they just made and don't
+/// need `emit_delivery_event`'s extra `deliveries_for_id`-shaped lookup.
+/// `state` is the DB `deliveries.state` value as-is (design §4's `delivered
+/// | failed | dead_letter | retry`, PLUS `expired` -- a real terminal
+/// `deliveries.state` this daemon writes on TTL expiry that predates §4's
+/// four-state list; there's no more meaningful synonym for it, so it's
+/// surfaced verbatim rather than folded into `failed`).
+///
+/// Lock discipline: callers MUST hold no `store` (or other Daemon) guard
+/// when this runs -- mirror `handle_result`'s `drop(store)` pattern above.
+/// Emission itself never touches the store, but calling it while a guard is
+/// still live would defeat the point of separating write from notify.
+fn emit_delivery(d: &Daemon, id: uuid::Uuid, route: impl Into<String>, state: &str) {
     d.emit_event(|| Event::Delivery {
-        id: delivery.message_id,
-        route: delivery.route.clone(),
-        state: state.to_string(),
-        ts: Utc::now(),
+        id, route: route.into(), state: state.to_string(), ts: Utc::now(),
     });
 }
 
@@ -864,12 +915,14 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             let result = d.store.lock().unwrap()
                 .mark_terminal(del.id, "failed", "DESTINATION_UNKNOWN");
             warn_if_mark_failed(del.id, "failed", result);
+            emit_delivery(d, del.message_id, del.route.clone(), "failed");
             return;
         }
     };
     if env.is_expired(now) {
         let result = d.store.lock().unwrap().mark_terminal(del.id, "expired", "TTL_EXPIRED");
         warn_if_mark_failed(del.id, "expired", result);
+        emit_delivery(d, del.message_id, del.route.clone(), "expired");
         return;
     }
     if del.route == IDENTITY_ROUTE {
@@ -889,6 +942,7 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
                 .mark_terminal(del.id, "dead_letter", "POLICY_DENIED");
             warn_if_mark_failed(del.id, "dead_letter", result);
             info!(delivery = del.id, policy, "policy denied");
+            emit_delivery(d, del.message_id, del.route.clone(), "dead_letter");
         }
         policy::Decision::Allow { max_payload, attachments_allowed, max_attachment_bytes } => {
             // capability + policy limits combine to the tighter one
@@ -1107,6 +1161,7 @@ async fn process_due_identity(
             warn_if_mark_failed(del.id, "dead_letter", result);
             warn!(delivery = del.id, plugin = %del.destination.protocol,
                   "identity delivery dead-lettered: plugin connected but not direct-capable");
+            emit_delivery(d, del.message_id, del.route.clone(), "dead_letter");
             return;
         }
         Readiness::Disconnected => {
@@ -3342,5 +3397,191 @@ routes:
         // meaningful, not vacuously true because nothing matched anything.
         assert!(corpus.contains("mocka:+1****4999"),
             "expected the masked sender to appear in the ingress event: {corpus}");
+    }
+
+    // ---- Finding 1 (whole-branch review): the five previously-silent
+    // terminal-transition sites must each emit a Delivery event. -----------
+
+    #[tokio::test]
+    async fn process_due_emits_delivery_event_state_failed_on_destination_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("relayfabric.db");
+        let d = Arc::new(test_daemon(dir.path()));
+        let now = Utc::now();
+        let dest: Endpoint = "mockb:chan".parse().unwrap();
+
+        // same technique as `process_due_marks_failed_when_message_missing_
+        // without_deadlocking`: a delivery row whose message envelope JSON
+        // is unreadable, simulating the realistic "missing message" case.
+        let ghost_id = uuid::Uuid::now_v7();
+        {
+            let raw = rusqlite::Connection::open(&db_path).unwrap();
+            raw.execute(
+                "INSERT INTO messages (id, envelope, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![ghost_id.to_string(), "not valid json", now.to_rfc3339()],
+            ).unwrap();
+        }
+        let del = {
+            let store = d.store.lock().unwrap();
+            let delivery_id = store
+                .insert_delivery(ghost_id, "general", &dest, now, now + CDuration::hours(1), 2)
+                .unwrap();
+            store.deliveries_for_id(delivery_id).unwrap()
+        };
+
+        let mut rx = d.events.subscribe();
+        process_due(&d, del, now).await;
+
+        let ev = rx.try_recv()
+            .expect("process_due must emit a Delivery event on DESTINATION_UNKNOWN");
+        let Event::Delivery { route, state, .. } = ev else {
+            panic!("expected Delivery, got {ev:?}");
+        };
+        assert_eq!(route, "general");
+        assert_eq!(state, "failed");
+    }
+
+    #[tokio::test]
+    async fn process_due_emits_delivery_event_state_expired_on_ttl_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let now = Utc::now();
+        let env = Envelope::new(
+            "mocka:chan".parse().unwrap(), Sender { native_ref: "!a".into() },
+            "text".into(), "hello".into(),
+            now - CDuration::hours(2), now - CDuration::hours(1), 8,
+        );
+        let dest: Endpoint = "mockb:chan".parse().unwrap();
+        let del = {
+            let store = d.store.lock().unwrap();
+            store.insert_message(&env).unwrap();
+            let delivery_id =
+                store.insert_delivery(env.id, "general", &dest, now, env.expires_at, 2).unwrap();
+            store.deliveries_for_id(delivery_id).unwrap()
+        };
+
+        let mut rx = d.events.subscribe();
+        process_due(&d, del, now).await;
+
+        let ev = rx.try_recv().expect("process_due must emit a Delivery event on TTL_EXPIRED");
+        let Event::Delivery { route, state, .. } = ev else {
+            panic!("expected Delivery, got {ev:?}");
+        };
+        assert_eq!(route, "general");
+        assert_eq!(state, "expired",
+            "the DB state ('expired') must be emitted as-is, not folded into 'failed'");
+    }
+
+    #[tokio::test]
+    async fn process_due_emits_delivery_event_state_dead_letter_on_policy_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().policies = vec![crate::config::Policy {
+            name: "deny-b".into(),
+            r#match: crate::config::PolicyMatch { destination_protocol: vec!["mockb".into()] },
+            rules: crate::config::PolicyRules { deny: true, ..Default::default() },
+        }];
+        let d = Arc::new(d);
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+        let now = Utc::now();
+        let del = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+        };
+
+        let mut rx = d.events.subscribe();
+        process_due(&d, del, now).await;
+
+        let ev = rx.try_recv().expect("process_due must emit a Delivery event on POLICY_DENIED");
+        let Event::Delivery { route, state, .. } = ev else {
+            panic!("expected Delivery, got {ev:?}");
+        };
+        assert_eq!(route, "general");
+        assert_eq!(state, "dead_letter");
+    }
+
+    #[tokio::test]
+    async fn process_due_identity_emits_delivery_event_state_dead_letter_on_not_direct_capable() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let _rx_plugin = register_plugin(&d, "mockb", false); // connected, NOT direct-capable
+
+        let target: Endpoint = "mockb:!target".parse().unwrap();
+        let now = Utc::now();
+        let env = Envelope::new(
+            "identity:system".parse().unwrap(), Sender { native_ref: "@identity".into() },
+            "notice".into(), "code".into(), now, now + CDuration::minutes(15), 8,
+        );
+        d.store.lock().unwrap().insert_message(&env).unwrap();
+        let del = {
+            let store = d.store.lock().unwrap();
+            let delivery_id =
+                store.insert_delivery(env.id, IDENTITY_ROUTE, &target, now, env.expires_at, 2).unwrap();
+            store.deliveries_for_id(delivery_id).unwrap()
+        };
+
+        let mut rx = d.events.subscribe();
+        process_due(&d, del, now).await;
+
+        let ev = rx.try_recv()
+            .expect("process_due_identity must emit a Delivery event on NOT_DIRECT_CAPABLE");
+        let Event::Delivery { route, state, .. } = ev else {
+            panic!("expected Delivery, got {ev:?}");
+        };
+        assert_eq!(route, IDENTITY_ROUTE);
+        assert_eq!(state, "dead_letter");
+    }
+
+    #[test]
+    fn handle_inbound_emits_delivery_event_state_dead_letter_on_queue_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
+            per_route: crate::config::PerRoute { queue_max: 1 },
+            ..Default::default()
+        });
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "first".into(), None, vec![], None);
+
+        let mut rx = d.events.subscribe();
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "second".into(), None, vec![], None);
+
+        let mut saw_dead_letter = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let Event::Delivery { route, state, .. } = &ev {
+                assert_eq!(route, "general");
+                assert_eq!(state, "dead_letter");
+                saw_dead_letter = true;
+            }
+        }
+        assert!(saw_dead_letter, "queue-full must emit a Delivery(dead_letter) event");
+    }
+
+    #[test]
+    fn initiate_link_emits_delivery_event_state_dead_letter_on_global_queue_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
+            global: crate::config::GlobalLimits { queue_max: 1, ..Default::default() },
+            ..Default::default()
+        });
+        let _rx_plugin = register_direct_plugin(&d, "mockb");
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+
+        let requester: Endpoint = "mocka:!req".parse().unwrap();
+        let target: Endpoint = "mockb:!target".parse().unwrap();
+
+        let mut rx = d.events.subscribe();
+        let err = initiate_link(&d, requester, target, "Jascha").unwrap_err();
+        assert_eq!(err, "queue full");
+
+        let ev = rx.try_recv()
+            .expect("enqueue_identity_send must emit a Delivery event on QUEUE_FULL");
+        let Event::Delivery { route, state, .. } = ev else {
+            panic!("expected Delivery, got {ev:?}");
+        };
+        assert_eq!(route, IDENTITY_ROUTE);
+        assert_eq!(state, "dead_letter");
     }
 }

@@ -20,6 +20,14 @@ pub struct Delivery {
     pub reason: Option<String>,
     pub next_attempt: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    /// When this row was inserted (`insert_delivery`/`insert_dead_delivery`).
+    /// Backs `GET /v1/queue?state=` (Finding 2, whole-branch review) —
+    /// stamped once, at insert, and never touched again.
+    pub created_at: DateTime<Utc>,
+    /// When this row's `state`/`reason`/`attempt_count` was last written
+    /// (every `mark_*` transition below, plus insert). Also backs `GET
+    /// /v1/queue?state=`.
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Clone)]
@@ -95,7 +103,9 @@ CREATE TABLE IF NOT EXISTS deliveries (
   reason TEXT,
   next_attempt TEXT NOT NULL,
   attempted_at TEXT,
-  expires_at TEXT NOT NULL
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_deliveries_due ON deliveries(state, priority, next_attempt);
 CREATE TABLE IF NOT EXISTS message_attachments (
@@ -143,6 +153,28 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             "ALTER TABLE deliveries ADD COLUMN priority INTEGER NOT NULL DEFAULT 2;
              DROP INDEX IF EXISTS idx_deliveries_due;
              CREATE INDEX idx_deliveries_due ON deliveries(state, priority, next_attempt);",
+        )?;
+    }
+    // Finding 2 (whole-branch review): `GET /v1/queue?state=` needs
+    // per-row created_at/updated_at, added to `deliveries` after v0.1. A
+    // pre-existing row has no honest creation timestamp on hand, so it's
+    // backfilled from `next_attempt` -- exactly what every INSERT before
+    // this migration stamped it with at creation, before any retry ever had
+    // a chance to push it forward (see `insert_delivery`'s callers, which
+    // all pass "now" for a fresh row's `next_attempt`). Not perfectly
+    // accurate for a row that had already retried once by the time this
+    // migration ran, but far closer than leaving the column empty.
+    let has_created_at: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('deliveries') WHERE name = 'created_at'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_created_at == 0 {
+        conn.execute_batch(
+            "ALTER TABLE deliveries ADD COLUMN created_at TEXT NOT NULL DEFAULT '';
+             ALTER TABLE deliveries ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
+             UPDATE deliveries SET created_at = next_attempt, updated_at = next_attempt
+               WHERE created_at = '';",
         )?;
     }
     Ok(())
@@ -212,12 +244,14 @@ impl Store {
         expires_at: DateTime<Utc>,
         priority: u8,
     ) -> rusqlite::Result<i64> {
+        let now = ts(Utc::now());
         self.conn.execute(
             "INSERT INTO deliveries
-               (message_id, route, dest_protocol, dest_endpoint, next_attempt, expires_at, priority)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+               (message_id, route, dest_protocol, dest_endpoint, next_attempt, expires_at, priority,
+                created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
             params![message_id.to_string(), route, dest.protocol, dest.endpoint,
-                    ts(next_attempt), ts(expires_at), priority],
+                    ts(next_attempt), ts(expires_at), priority, now],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -236,13 +270,14 @@ impl Store {
         expires_at: DateTime<Utc>,
         reason: &str,
     ) -> rusqlite::Result<i64> {
+        let now = ts(Utc::now());
         self.conn.execute(
             "INSERT INTO deliveries
                (message_id, route, dest_protocol, dest_endpoint, next_attempt, expires_at,
-                state, reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'dead_letter', ?7)",
+                state, reason, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'dead_letter', ?7, ?8, ?8)",
             params![message_id.to_string(), route, dest.protocol, dest.endpoint,
-                    ts(next_attempt), ts(expires_at), reason],
+                    ts(next_attempt), ts(expires_at), reason, now],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -279,12 +314,14 @@ impl Store {
             reason: row.get(8)?,
             next_attempt: parse_ts(&row.get::<_, String>(9)?),
             expires_at: parse_ts(&row.get::<_, String>(10)?),
+            created_at: parse_ts(&row.get::<_, String>(11)?),
+            updated_at: parse_ts(&row.get::<_, String>(12)?),
         })
     }
 
     const DELIVERY_COLS: &'static str =
         "id, message_id, route, dest_protocol, dest_endpoint, priority, attempt_count,
-         state, reason, next_attempt, expires_at";
+         state, reason, next_attempt, expires_at, created_at, updated_at";
 
     /// Priority first (0=emergency ahead of 4=background), next_attempt as
     /// the tiebreaker within the same priority tier — spec §39's "low
@@ -310,7 +347,7 @@ impl Store {
     pub fn mark_attempting(&self, id: i64) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE deliveries SET state = 'attempting',
-                attempt_count = attempt_count + 1, attempted_at = ?2
+                attempt_count = attempt_count + 1, attempted_at = ?2, updated_at = ?2
              WHERE id = ?1",
             params![id, ts(Utc::now())],
         )?;
@@ -329,9 +366,9 @@ impl Store {
     /// modified again.
     pub fn mark_delivered(&self, id: i64) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE deliveries SET state = 'delivered'
+            "UPDATE deliveries SET state = 'delivered', updated_at = ?2
              WHERE id = ?1 AND state = 'attempting'",
-            params![id])?;
+            params![id, ts(Utc::now())])?;
         Ok(())
     }
 
@@ -343,9 +380,9 @@ impl Store {
     /// be reopened by a late retry signal.
     pub fn mark_retry(&self, id: i64, next_attempt: DateTime<Utc>) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE deliveries SET state = 'pending', next_attempt = ?2
+            "UPDATE deliveries SET state = 'pending', next_attempt = ?2, updated_at = ?3
              WHERE id = ?1 AND state IN ('pending', 'attempting')",
-            params![id, ts(next_attempt)],
+            params![id, ts(next_attempt), ts(Utc::now())],
         )?;
         Ok(())
     }
@@ -356,9 +393,9 @@ impl Store {
     /// exhaustion in `handle_result`), but never on a row already terminal.
     pub fn mark_terminal(&self, id: i64, state: &str, reason: &str) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE deliveries SET state = ?2, reason = ?3
+            "UPDATE deliveries SET state = ?2, reason = ?3, updated_at = ?4
              WHERE id = ?1 AND state IN ('pending', 'attempting')",
-            params![id, state, reason],
+            params![id, state, reason, ts(Utc::now())],
         )?;
         Ok(())
     }
@@ -454,6 +491,40 @@ impl Store {
             .ok()?
             .query_row(params![id], Self::delivery_from_row)
             .ok()
+    }
+
+    /// Backs `GET /v1/queue?state=` (Finding 2, whole-branch review): a
+    /// straight `SELECT` on `deliveries` -- no join, every field the
+    /// listing needs (`route`/`destination`/`state`/`reason`/`attempts`/
+    /// `created_at`/`updated_at`) already lives on this one table. `state`
+    /// optionally narrows to one literal `deliveries.state` value (the admin
+    /// handler is the one that decides whether to pass it); `None` lists
+    /// across every state. Newest first by `id` (monotonic autoincrement),
+    /// not `created_at` -- a fan-out to several routes in one
+    /// `handle_inbound` call stamps every row with the same wall-clock
+    /// second, so `id` is the only tiebreaker precise enough for a stable
+    /// ordering.
+    pub fn list_deliveries(&self, state: Option<&str>, limit: i64) -> rusqlite::Result<Vec<Delivery>> {
+        match state {
+            Some(s) => {
+                let sql = format!(
+                    "SELECT {} FROM deliveries WHERE state = ?1 ORDER BY id DESC LIMIT ?2",
+                    Self::DELIVERY_COLS
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows = stmt.query_map(params![s, limit], Self::delivery_from_row)?;
+                rows.collect()
+            }
+            None => {
+                let sql = format!(
+                    "SELECT {} FROM deliveries ORDER BY id DESC LIMIT ?1",
+                    Self::DELIVERY_COLS
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows = stmt.query_map(params![limit], Self::delivery_from_row)?;
+                rows.collect()
+            }
+        }
     }
 
     /// Creates a new challenge. If a challenge already exists for this target,
@@ -910,6 +981,131 @@ mod tests {
         let counts = s.queue_counts().unwrap();
         assert!(counts.contains(&("pending".to_string(), 1)));
         assert!(counts.contains(&("dead_letter".to_string(), 1)));
+    }
+
+    /// Finding 2 (whole-branch review): `insert_delivery`/`insert_dead_delivery`
+    /// must stamp both `created_at` and `updated_at` at insert (not leave
+    /// either at the zero-value `parse_ts` falls back to on a blank string).
+    #[test]
+    fn insert_delivery_and_insert_dead_delivery_stamp_created_and_updated_at() {
+        let (_d, s) = store();
+        let e = env();
+        let now = Utc::now();
+        s.insert_message(&e).unwrap();
+        let before = Utc::now();
+
+        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
+        let dead_id =
+            s.insert_dead_delivery(e.id, "general", &dest(), now, e.expires_at, "QUEUE_FULL").unwrap();
+
+        let del = s.deliveries_for_id(id).unwrap();
+        assert!(del.created_at >= before, "created_at must be stamped at insert time");
+        assert_eq!(del.created_at, del.updated_at,
+            "a freshly inserted row's created_at and updated_at must match");
+
+        let dead = s.deliveries_for_id(dead_id).unwrap();
+        assert!(dead.created_at >= before);
+        assert_eq!(dead.created_at, dead.updated_at);
+    }
+
+    /// `updated_at` must move forward on every state-mutating call
+    /// (`mark_attempting`/`mark_delivered`/`mark_retry`/`mark_terminal`),
+    /// while `created_at` stays fixed at the original insert time.
+    #[test]
+    fn mark_terminal_advances_updated_at_but_not_created_at() {
+        let (_d, s) = store();
+        let e = env();
+        let now = Utc::now();
+        s.insert_message(&e).unwrap();
+        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
+        let inserted = s.deliveries_for_id(id).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        s.mark_terminal(id, "dead_letter", "POLICY_DENIED").unwrap();
+        let after = s.deliveries_for_id(id).unwrap();
+
+        assert_eq!(after.created_at, inserted.created_at,
+            "created_at must never change after insert");
+        assert!(after.updated_at > inserted.created_at,
+            "updated_at must advance past the original created_at on a mark_terminal write");
+    }
+
+    #[test]
+    fn list_deliveries_filters_by_state_newest_first_and_respects_limit() {
+        let (_d, s) = store();
+        let e = env();
+        let now = Utc::now();
+        s.insert_message(&e).unwrap();
+
+        let pending_id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
+        let dead_id_1 =
+            s.insert_dead_delivery(e.id, "general", &dest(), now, e.expires_at, "QUEUE_FULL").unwrap();
+        let dead_id_2 =
+            s.insert_dead_delivery(e.id, "general", &dest(), now, e.expires_at, "POLICY_DENIED").unwrap();
+
+        let dead = s.list_deliveries(Some("dead_letter"), 100).unwrap();
+        assert_eq!(dead.len(), 2, "must only return dead_letter rows: {dead:?}");
+        assert_eq!(dead[0].id, dead_id_2, "newest (highest id) must come first");
+        assert_eq!(dead[1].id, dead_id_1);
+        assert!(dead.iter().all(|d| d.id != pending_id));
+
+        let capped = s.list_deliveries(Some("dead_letter"), 1).unwrap();
+        assert_eq!(capped.len(), 1, "limit must be respected");
+        assert_eq!(capped[0].id, dead_id_2);
+
+        let pending = s.list_deliveries(Some("pending"), 100).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, pending_id);
+
+        let all = s.list_deliveries(None, 100).unwrap();
+        assert_eq!(all.len(), 3, "state=None must list across every state");
+    }
+
+    /// Same shape as `store_open_migrates_a_pre_priority_database_without_
+    /// losing_existing_rows` above, but for the created_at/updated_at
+    /// migration this task adds: opens a DB that predates both `priority`
+    /// and `created_at`/`updated_at` (i.e. a genuine pre-Task-4 v0.1 file)
+    /// and confirms the existing row survives, migrated, with both new
+    /// columns backfilled from `next_attempt`.
+    #[test]
+    fn store_open_migrates_a_pre_created_at_database_without_losing_existing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("older.db");
+
+        let msg_id = Uuid::now_v7();
+        let now = Utc::now();
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(PRE_PRIORITY_SCHEMA).unwrap();
+            raw.execute(
+                "INSERT INTO messages (id, envelope, created_at) VALUES (?1, ?2, ?3)",
+                params![msg_id.to_string(), "{}", ts(now)],
+            ).unwrap();
+            raw.execute(
+                "INSERT INTO deliveries
+                   (message_id, route, dest_protocol, dest_endpoint, next_attempt, expires_at)
+                 VALUES (?1, 'general', 'mockb', 'chan', ?2, ?3)",
+                params![msg_id.to_string(), ts(now), ts(now + Duration::hours(1))],
+            ).unwrap();
+        }
+
+        let s = Store::open(&path).unwrap();
+
+        let has_created_at: i64 = s.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('deliveries') WHERE name = 'created_at'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(has_created_at, 1, "migration must add the created_at column");
+
+        let due = s.due_deliveries(now + Duration::seconds(1), 10).unwrap();
+        assert_eq!(due.len(), 1, "the row that existed before migration must survive it");
+        assert_eq!(due[0].created_at, now, "pre-existing rows must backfill created_at from next_attempt");
+        assert_eq!(due[0].updated_at, now, "pre-existing rows must backfill updated_at from next_attempt");
+
+        // idempotent re-open (daemon restart).
+        drop(s);
+        let s2 = Store::open(&path).unwrap();
+        assert_eq!(s2.due_deliveries(now + Duration::seconds(1), 10).unwrap().len(), 1);
     }
 
     #[test]

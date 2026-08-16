@@ -42,7 +42,11 @@ pub enum Event {
     /// (design §4) -- a semantic label, not necessarily the literal
     /// `deliveries.state` column value (e.g. a retry is stored as `pending`
     /// but reported here as `retry`, the more meaningful name for a live
-    /// feed).
+    /// feed) -- PLUS `expired` (Finding 1, whole-branch review): a genuine
+    /// terminal `deliveries.state` this daemon writes on TTL expiry
+    /// (`TTL_EXPIRED`) that predates design §4's four-state list. There is
+    /// no more meaningful synonym to fold it into, so it's emitted as the DB
+    /// state verbatim rather than reported as `failed`.
     Delivery {
         id: Uuid,
         route: String,
