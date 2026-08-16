@@ -2553,6 +2553,7 @@ Add:
 * Nostr
 * gateway federation
 * RelayFabric Discovery Protocol (RFDP, §111)
+* Public Node Profile (§112): node identities, trust levels, public_services, quotas, airtime policy
 * signed RelayFabric envelopes
 * origin signatures
 
@@ -2978,3 +2979,168 @@ Advertisements MAY later carry broad, coarse cost classes (`bandwidth_class`, `l
 ```
 
 Signed advertisements flowing between `switchyardd` peers give the decentralized intermesh **service discovery without a central directory**.
+
+---
+
+# 112. Public Node Profile
+
+*Added 2026-08-15. Pairs with RFDP (§111) and federation (§30, §85–87). Target: profile definition alongside v0.3 federation; quotas build on §45/§79.*
+
+Public-node operation SHALL be a first-class RelayFabric deployment mode — but a **public federation node** is not a **public open relay**. The first is desirable. The second is an abuse magnet.
+
+"Public" means: *other RelayFabric nodes and users may discover and use explicitly published services* — never "any anonymous person can route anything anywhere."
+
+## 112.1 Public-node roles
+
+A node MAY provide one or several of:
+
+| Role | Provides |
+|---|---|
+| **Public federation node** | accepts authenticated RelayFabric peers; carries allowed intermesh traffic |
+| **Public access node** | exposes selected local services (Reticulum, Meshtastic, MeshCore access) |
+| **Public gateway node** | controlled crossing into another network (Signal, Nostr, MQTT, Matrix, APRS) |
+
+## 112.2 Public discovery
+
+```yaml
+node:
+  name: "DX.PE Pasadena"
+  public: true
+
+discovery:
+  mode: public
+```
+
+publishes a signed, expiring RFDP advertisement describing **capabilities, not sensitive infrastructure**:
+
+```yaml
+node_id: rf:7fa219...
+name: DX.PE Pasadena
+services:
+  chat: true
+  store_forward: true
+  federation: true
+protocols:
+  lxmf:       { ingress: true,  egress: true }
+  meshtastic: { ingress: true,  egress: true }
+  signal:     { ingress: false, egress: true }
+privacy:
+  identities: pseudonymous
+security:
+  translate: true
+  signed: true
+```
+
+It SHALL NOT reveal: Signal accounts, phone numbers, internal IPs, RNode addresses, VPN topology, or identity mappings (§111.4 applies).
+
+## 112.3 Explicit published services
+
+**Plugin available ≠ publicly routable.** An operator must not be able to accidentally turn on Signal and thereby create a public Signal relay. Public exposure requires an explicit `public_services` entry:
+
+```yaml
+public_services:
+  - name: regional-chat
+    type: chat
+    ingress: [lxmf, meshtastic, meshcore]
+    egress:  [lxmf, meshtastic, meshcore]
+    identity_mode: pseudonymous
+```
+
+A plugin that is `enabled: true` but absent from `public_services` remains private.
+
+## 112.4 No unrestricted forwarding
+
+Public routes SHALL terminate at specific permitted destinations:
+
+```text
+Meshtastic Pasadena → RelayFabric → Signal group "Pasadena Emergency"     ✔
+Meshtastic          → RelayFabric → ANY Signal user                       ✘
+public radio        → RelayFabric → SMTP open relay                      ✘
+```
+
+This extends §38 and §80 to the public profile.
+
+## 112.5 Federation as the scalable public mechanism
+
+Nodes advertise services; peers learn *what is reachable through whom* without learning credentials:
+
+```text
+Pasadena learns: "Signal chat reachable via Phoenix"
+              — without learning Phoenix's Signal account.
+```
+
+Cross-fabric delivery (`Meshtastic user → Pasadena → federation → Phoenix → Signal community`) is the beginning of the intermesh.
+
+## 112.6 Node identities
+
+Every `switchyardd` instance SHALL generate a cryptographic node identity (Ed25519) on first startup under `/var/lib/relayfabric/identity/`, presented as `rf:<hex>`. It signs: discovery advertisements, federation handshakes, route advertisements, gateway attestations (§33). Trust policies bind to identities, not IP addresses:
+
+```yaml
+federation:
+  allow: [rf:a73c91..., rf:bb2107...]   # or: trust: community
+```
+
+## 112.7 Trust levels
+
+```text
+UNKNOWN → SEEN → VERIFIED → TRUSTED    (and BLOCKED)
+```
+
+A newly discovered node might be allowed basic chat but not administrative commands, identity linking, large files, or expensive gateways until trusted. **Discovery must never automatically become trust.**
+
+## 112.8 Quotas (built into switchyardd, not left to plugins)
+
+```yaml
+public_limits:
+  per_sender: { messages_per_minute: 10, bytes_per_hour: 50000 }
+  per_route:  { queue_max: 5000 }
+  global:     { disk_queue_max: 2GB }
+```
+
+Transport classes carry different budgets: Reticulum/IP generous, LoRa constrained, Signal controlled, satellite extremely restricted (extends §45, §46, §79).
+
+## 112.9 Radio airtime policy
+
+Hundreds of Internet users MUST NOT be able to saturate one 915 MHz channel. Public RF nodes treat airtime as a scarce resource, with queue scheduling:
+
+```text
+emergency → local radio → federated traffic → bulk/background
+```
+
+under hard airtime/rate budgets (extends §39).
+
+## 112.10 Store-and-forward
+
+A public node MAY advertise `store_forward: { enabled: true, max_ttl: 24h }` — queueing for currently-unreachable destinations (mobile Reticulum/LoRa users) per §40–44.
+
+## 112.11 Public privacy defaults
+
+Public mode SHALL ship:
+
+```yaml
+privacy:
+  identity_mode: pseudonymous
+  aliases: route_scoped
+  expose_native_identifiers: false
+  expose_location: false
+logging:
+  content: false
+  identifiers: hmac
+```
+
+A public operator must not accidentally create a correlation database.
+
+## 112.12 Operator experience (future)
+
+The WebUI (§89) should surface public operation as checkboxes (services published, federation peers by trust level, RF queue depth), and CLI init should make a community node buildable without RelayFabric expertise:
+
+```bash
+switchyardctl node init
+switchyardctl plugin enable lxmf
+switchyardctl plugin enable meshtastic
+switchyardctl public enable     # wizard: name, services, identity exposure
+```
+
+## 112.13 The larger model
+
+Communities contribute whatever connectivity they have — one node brings Reticulum + LoRa, another MeshCore + fiber, another Meshtastic + Nostr, another satellite + Reticulum. RelayFabric doesn't require everyone to deploy the same network; **people contribute capabilities rather than joining one monolithic system.** The Public Node Profile exists so that doing this is safe by default: discovery, federation, pseudonymity, quotas, RF airtime, store-and-forward, and service publishing all ship with safe defaults.
