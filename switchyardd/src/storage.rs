@@ -117,6 +117,51 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Inserts a delivery that lands directly in `dead_letter` with `reason`,
+    /// skipping `pending` entirely — the quota-rejection path (spec §45): a
+    /// message over a queue cap never gets a live delivery attempt, but it
+    /// still gets a row, so it's visible in `queue_counts`/admin status
+    /// exactly like any other dead-lettered delivery instead of vanishing.
+    pub fn insert_dead_delivery(
+        &self,
+        message_id: Uuid,
+        route: &str,
+        dest: &Endpoint,
+        next_attempt: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        reason: &str,
+    ) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO deliveries
+               (message_id, route, dest_protocol, dest_endpoint, next_attempt, expires_at,
+                state, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'dead_letter', ?7)",
+            params![message_id.to_string(), route, dest.protocol, dest.endpoint,
+                    ts(next_attempt), ts(expires_at), reason],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Count of deliveries still in flight (`pending` or `attempting`),
+    /// optionally scoped to one `route`. Used to enforce `limits.per_route`
+    /// and `limits.global` queue caps (spec §45) before a new delivery is
+    /// admitted.
+    pub fn pending_count(&self, route: Option<&str>) -> rusqlite::Result<i64> {
+        match route {
+            Some(r) => self.conn.query_row(
+                "SELECT COUNT(*) FROM deliveries
+                 WHERE route = ?1 AND state IN ('pending', 'attempting')",
+                params![r],
+                |row| row.get(0),
+            ),
+            None => self.conn.query_row(
+                "SELECT COUNT(*) FROM deliveries WHERE state IN ('pending', 'attempting')",
+                [],
+                |row| row.get(0),
+            ),
+        }
+    }
+
     fn delivery_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Delivery> {
         Ok(Delivery {
             id: row.get(0)?,
@@ -569,6 +614,51 @@ mod tests {
         s.mark_terminal(id2, "dead_letter", "POLICY_DENIED").unwrap();
         let counts = s.queue_counts().unwrap();
         assert!(counts.contains(&("pending".to_string(), 1)));
+        assert!(counts.contains(&("dead_letter".to_string(), 1)));
+    }
+
+    #[test]
+    fn pending_count_counts_pending_and_attempting_scoped_by_route() {
+        let (_d, s) = store();
+        let e = env();
+        let now = Utc::now();
+        s.insert_message(&e).unwrap();
+        let a = s.insert_delivery(e.id, "route-a", &dest(), now, e.expires_at).unwrap();
+        s.insert_delivery(e.id, "route-a", &dest(), now, e.expires_at).unwrap();
+        let b = s.insert_delivery(e.id, "route-b", &dest(), now, e.expires_at).unwrap();
+
+        assert_eq!(s.pending_count(Some("route-a")).unwrap(), 2);
+        assert_eq!(s.pending_count(Some("route-b")).unwrap(), 1);
+        assert_eq!(s.pending_count(Some("route-c")).unwrap(), 0, "unknown route counts zero");
+        assert_eq!(s.pending_count(None).unwrap(), 3, "global count sums every route");
+
+        // 'attempting' still counts as in-flight for both scopes.
+        s.mark_attempting(a).unwrap();
+        assert_eq!(s.pending_count(Some("route-a")).unwrap(), 2);
+        assert_eq!(s.pending_count(None).unwrap(), 3);
+
+        // a terminal state (here, dead_letter) drops out of both counts.
+        s.mark_terminal(b, "dead_letter", "QUEUE_FULL").unwrap();
+        assert_eq!(s.pending_count(Some("route-b")).unwrap(), 0);
+        assert_eq!(s.pending_count(None).unwrap(), 2);
+    }
+
+    #[test]
+    fn insert_dead_delivery_lands_directly_in_dead_letter_with_the_given_reason() {
+        let (_d, s) = store();
+        let e = env();
+        let now = Utc::now();
+        s.insert_message(&e).unwrap();
+        let id = s
+            .insert_dead_delivery(e.id, "general", &dest(), now, e.expires_at, "QUEUE_FULL")
+            .unwrap();
+
+        let d = s.deliveries_for_id(id).unwrap();
+        assert_eq!(d.state, "dead_letter");
+        assert_eq!(d.reason.as_deref(), Some("QUEUE_FULL"));
+        assert_eq!(s.pending_count(Some("general")).unwrap(), 0,
+            "a dead-lettered row must never count as in-flight");
+        let counts = s.queue_counts().unwrap();
         assert!(counts.contains(&("dead_letter".to_string(), 1)));
     }
 }

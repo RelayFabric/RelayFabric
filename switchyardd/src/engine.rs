@@ -1,5 +1,6 @@
-use crate::cas::Cas;
+use crate::cas::{self, Cas};
 use crate::config::Config;
+use crate::limits::{BudgetLimiter, SenderLimiter};
 use crate::storage::Store;
 use crate::{alias, dedup, metrics, node_identity, policy, queue, routes, storage, transform};
 use alias::Aliaser;
@@ -33,6 +34,10 @@ pub struct Daemon {
     pub node_id: String,
     pub plugins: Mutex<HashMap<String, PluginHandle>>,
     pub cas: Cas,
+    pub sender_limiter: Mutex<SenderLimiter>,
+    #[allow(dead_code)]
+    // consumed by transport budget scheduling (Task 4); remove allow when used
+    pub budget_limiter: Mutex<BudgetLimiter>,
 }
 
 /// Creates `data_dir` (and any missing parents) with owner-only permissions
@@ -64,7 +69,9 @@ impl Daemon {
         let identity = NodeIdentity::load_or_create(&data_dir.join("identity"))?;
         let node_id = identity.node_id();
         let ttl = std::time::Duration::from_secs(cfg.dedup_ttl_secs);
-        let cas = Cas::new(&data_dir.join("attachments"))?;
+        let cas = Cas::new(&data_dir.join("attachments"), cfg.limits.global.cas_max_bytes)?;
+        let sender_limiter = SenderLimiter::new(
+            cfg.limits.per_sender.messages_per_minute, cfg.limits.per_sender.bytes_per_hour);
         Ok(Daemon {
             cfg,
             store: Mutex::new(store),
@@ -74,6 +81,8 @@ impl Daemon {
             node_id,
             plugins: Mutex::new(HashMap::new()),
             cas,
+            sender_limiter: Mutex::new(sender_limiter),
+            budget_limiter: Mutex::new(BudgetLimiter::new()),
         })
     }
 }
@@ -121,6 +130,23 @@ pub fn handle_inbound(
         metrics::inc(&metrics::DUPLICATES);
         return;
     }
+
+    // Sender quota (spec §45 per-sender rate limiting): keyed on the
+    // (plugin, native_ref) pair, so distinct senders sharing a transport
+    // don't share a budget. Bytes cover the body plus every attachment as
+    // sent, including ones that will be dropped below for being oversize —
+    // those bytes still crossed the wire and consumed ingress capacity.
+    // Zero config (both dimensions 0, the default) always allows and never
+    // touches the limiter's per-key state (see `SenderLimiter::allow`).
+    let sender_bytes = body.len() as u64
+        + hashed.iter().map(|h| h.att.data.len() as u64).sum::<u64>();
+    let sender_key = format!("{plugin}|{sender}");
+    if !d.sender_limiter.lock().unwrap().allow(&sender_key, sender_bytes, Instant::now()) {
+        metrics::inc(&metrics::RATELIMITED);
+        let prefix: String = sender.chars().take(8).collect();
+        warn!(plugin, sender = %prefix, "sender rate limit exceeded, dropping message");
+        return;
+    }
     let now = Utc::now();
     let source = Endpoint { protocol: plugin.to_string(), endpoint };
     let targets: Vec<(String, Endpoint)> = routes::route(&d.cfg.routes, &source)
@@ -154,6 +180,13 @@ pub fn handle_inbound(
                     filename: h.att.filename, mime: h.att.mime, size, sha256: sha,
                 });
             }
+            Err(e) if cas::is_budget_exceeded(&e) => {
+                // Expected steady-state quota enforcement, not a failure —
+                // no warn (mirrors the oversize-attachment branch above,
+                // which also doesn't log): the filename is message content
+                // and only ever belongs in the body note, never a log line.
+                notes.push_str(&format!("\n[dropped {}: cas budget exceeded]", h.att.filename));
+            }
             Err(e) => {
                 warn!(error = %e, size, "failed to store attachment, dropping it");
                 notes.push_str(&format!("\n[attachment {} unavailable]", h.att.filename));
@@ -180,6 +213,33 @@ pub fn handle_inbound(
         warn!(error = %e, "failed to persist attachment refs");
     }
     for (route, dest) in &targets {
+        // Queue quotas (spec §45): per-route checked first (the tighter,
+        // more actionable signal), then the global ceiling — checked fresh
+        // for every target, so a message fanning out to several
+        // destinations on the same over-quota route can't slip more than
+        // one past the cap in a single call. A rejected delivery still gets
+        // a row, straight into dead_letter/QUEUE_FULL, so it's visible in
+        // queue_counts/admin status rather than silently vanishing the way
+        // a rate-limited message does — deliberate: a full queue is
+        // operationally interesting in a way a sender's own excess traffic
+        // isn't.
+        let route_max = d.cfg.limits.per_route.queue_max;
+        let global_max = d.cfg.limits.global.queue_max;
+        let over_route = route_max > 0
+            && store.pending_count(Some(route.as_str())).unwrap_or(0) >= i64::from(route_max);
+        let over_global = !over_route
+            && global_max > 0
+            && store.pending_count(None).unwrap_or(0) >= i64::from(global_max);
+        if over_route || over_global {
+            metrics::inc(&metrics::QUEUE_REJECTED);
+            if let Err(e) = store.insert_dead_delivery(
+                env.id, route, dest, now, env.expires_at, "QUEUE_FULL")
+            {
+                warn!(error = %e, "failed to record queue-full delivery");
+            }
+            warn!(route = %route, destination = %dest, "queue full, delivery rejected");
+            continue;
+        }
         if let Err(e) = store.insert_delivery(env.id, route, dest, now, env.expires_at) {
             warn!(error = %e, "failed to enqueue delivery");
         }
@@ -442,10 +502,22 @@ fn load_attachments(
 #[cfg(test)]
 pub mod tests_support {
     use super::*;
-    use crate::config::{Config, NodeConfig, PluginConfig, RouteConfig};
+    use crate::config::{Config, Limits, NodeConfig, PluginConfig, RouteConfig};
     use std::collections::BTreeMap;
 
     pub fn test_daemon(dir: &std::path::Path) -> Daemon {
+        test_daemon_with_limits(dir, Limits::default())
+    }
+
+    /// Like `test_daemon`, but with a caller-supplied `Limits` baked into the
+    /// `Config` before `Daemon::new` runs. Needed (rather than mutating
+    /// `d.cfg.limits` after construction, the way other tests tweak e.g.
+    /// `d.cfg.max_attachment_bytes`) for anything that's read once at
+    /// construction time and cached in daemon state — `sender_limiter`
+    /// (bakes in `messages_per_minute`/`bytes_per_hour`) and `cas`'s budget
+    /// — rather than re-read live from `d.cfg` on every call the way the
+    /// queue-cap checks are.
+    pub fn test_daemon_with_limits(dir: &std::path::Path, limits: Limits) -> Daemon {
         let mut plugins = BTreeMap::new();
         for name in ["mocka", "mockb"] {
             plugins.insert(name.to_string(), PluginConfig {
@@ -466,7 +538,7 @@ pub mod tests_support {
             hop_limit: 8,
             max_attachment_bytes: 8 * 1024 * 1024,
             public_services: vec![],
-            limits: Default::default(),
+            limits,
             transport_budgets: Default::default(),
         };
         Daemon::new(cfg, dir).unwrap()
@@ -476,7 +548,7 @@ pub mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tests_support::test_daemon;
+    use tests_support::{test_daemon, test_daemon_with_limits};
 
     #[test]
     fn inbound_routes_to_other_endpoint_and_dedups() {
@@ -975,5 +1047,109 @@ mod tests {
         let counts = d.store.lock().unwrap().queue_counts().unwrap();
         assert_eq!(counts, vec![("pending".to_string(), 2)],
             "differing dropped attachments must not dedup-collide: {counts:?}");
+    }
+
+    #[test]
+    fn inbound_over_per_route_queue_max_dead_letters_with_queue_full_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("relayfabric.db");
+        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
+            per_route: crate::config::PerRoute { queue_max: 1 },
+            ..Default::default()
+        });
+        let before = metrics::QUEUE_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "first".into(), None, vec![]);
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "second".into(), None, vec![]);
+
+        let after = metrics::QUEUE_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after - before, 1, "the second delivery must bump QUEUE_REJECTED");
+
+        let counts = d.store.lock().unwrap().queue_counts().unwrap();
+        assert!(counts.contains(&("pending".to_string(), 1)), "counts was {counts:?}");
+        assert!(counts.contains(&("dead_letter".to_string(), 1)),
+            "over-quota delivery must land dead_letter and stay visible in queue_counts: {counts:?}");
+
+        // the dead-lettered row must carry QUEUE_FULL specifically, not just
+        // any dead_letter reason.
+        let raw = rusqlite::Connection::open(&db_path).unwrap();
+        let reason: String = raw
+            .query_row("SELECT reason FROM deliveries WHERE state = 'dead_letter'", [],
+                       |r| r.get(0))
+            .unwrap();
+        assert_eq!(reason, "QUEUE_FULL");
+    }
+
+    #[test]
+    fn inbound_over_sender_per_minute_limit_drops_second_message_and_bumps_metric() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
+            per_sender: crate::config::PerSender { messages_per_minute: 1, bytes_per_hour: 0 },
+            ..Default::default()
+        });
+        let before = metrics::RATELIMITED.load(std::sync::atomic::Ordering::Relaxed);
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "first".into(), None, vec![]);
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "second".into(), None, vec![]);
+
+        let after = metrics::RATELIMITED.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after - before, 1,
+            "the second message from the same sender must bump RATELIMITED");
+
+        let counts = d.store.lock().unwrap().queue_counts().unwrap();
+        assert_eq!(counts, vec![("pending".to_string(), 1)],
+            "a rate-limited message must vanish entirely, not enqueue or dead-letter: {counts:?}");
+    }
+
+    /// A different sender on the same plugin must not share the rate-limited
+    /// sender's budget: the limiter key is (plugin, native_ref), not just
+    /// plugin.
+    #[test]
+    fn sender_rate_limit_does_not_bleed_across_senders() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
+            per_sender: crate::config::PerSender { messages_per_minute: 1, bytes_per_hour: 0 },
+            ..Default::default()
+        });
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "from a".into(), None, vec![]);
+        handle_inbound(&d, "mocka", "chan".into(), "!b".into(), "text".into(),
+                       "from b".into(), None, vec![]);
+
+        let counts = d.store.lock().unwrap().queue_counts().unwrap();
+        assert_eq!(counts, vec![("pending".to_string(), 2)],
+            "a different sender must get its own budget: {counts:?}");
+    }
+
+    #[test]
+    fn inbound_drops_attachment_over_cas_budget_and_notes_it_but_message_still_flows() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
+            global: crate::config::GlobalLimits { queue_max: 0, cas_max_bytes: 5 },
+            ..Default::default()
+        });
+
+        let att = IpcAttachment {
+            filename: "over-budget.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: vec![0u8; 20], // over the 5-byte CAS budget, under the ingress size cap
+        };
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![att]);
+
+        let store = d.store.lock().unwrap();
+        let due = store.due_deliveries(chrono::Utc::now(), 10).unwrap();
+        assert_eq!(due.len(), 1, "message must still flow despite the dropped attachment");
+        let env = store.get_message(due[0].message_id).unwrap().unwrap();
+        assert!(env.attachments.is_empty(), "the over-budget attachment must not get a meta");
+        assert!(
+            env.body.contains("[dropped over-budget.bin: cas budget exceeded]"),
+            "body was: {}", env.body
+        );
     }
 }

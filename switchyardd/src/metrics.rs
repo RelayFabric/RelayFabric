@@ -5,6 +5,8 @@ pub static EGRESS: AtomicU64 = AtomicU64::new(0);
 pub static DROPPED: AtomicU64 = AtomicU64::new(0);
 pub static DUPLICATES: AtomicU64 = AtomicU64::new(0);
 pub static POLICY_DENIALS: AtomicU64 = AtomicU64::new(0);
+pub static RATELIMITED: AtomicU64 = AtomicU64::new(0);
+pub static QUEUE_REJECTED: AtomicU64 = AtomicU64::new(0);
 
 pub fn inc(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
@@ -18,6 +20,8 @@ pub fn render(queue_counts: &[(String, i64)], plugin_up: &[(String, bool)]) -> S
         ("relayfabric_messages_dropped_total", &DROPPED),
         ("relayfabric_duplicate_messages_total", &DUPLICATES),
         ("relayfabric_policy_denials_total", &POLICY_DENIALS),
+        ("relayfabric_ratelimited_total", &RATELIMITED),
+        ("relayfabric_queue_rejected_total", &QUEUE_REJECTED),
     ];
     for (name, c) in counters {
         out.push_str(&format!("# TYPE {name} counter\n{name} {}\n", c.load(Ordering::Relaxed)));
@@ -52,5 +56,7 @@ mod tests {
         assert!(out.contains("relayfabric_plugin_up{plugin=\"mocka\"} 0"));
         // presence only: other tests in the same process may bump counters
         assert!(out.contains("relayfabric_policy_denials_total"));
+        assert!(out.contains("relayfabric_ratelimited_total"));
+        assert!(out.contains("relayfabric_queue_rejected_total"));
     }
 }

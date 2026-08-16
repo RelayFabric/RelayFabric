@@ -22,9 +22,8 @@ pub struct Config {
     pub max_attachment_bytes: u64,
     #[serde(default)]
     pub public_services: Vec<PublicService>,
-    #[allow(dead_code)]
     #[serde(default)]
-    pub limits: Limits,  // consumed by Task 3 (enforce limits); remove allow when used
+    pub limits: Limits,
     #[serde(default)]
     pub transport_budgets: BTreeMap<String, Budget>,
 }
@@ -58,37 +57,29 @@ fn protocol_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, 
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Limits {
-    #[allow(dead_code)]
     #[serde(default)]
-    pub per_sender: PerSender,  // consumed by Task 3 (enforce limits); remove allow when used
-    #[allow(dead_code)]
+    pub per_sender: PerSender,
     #[serde(default)]
-    pub per_route: PerRoute,  // consumed by Task 3 (enforce limits); remove allow when used
-    #[allow(dead_code)]
+    pub per_route: PerRoute,
     #[serde(default)]
-    pub global: GlobalLimits,  // consumed by Task 3 (enforce limits); remove allow when used
+    pub global: GlobalLimits,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PerSender {
-    #[allow(dead_code)]
-    pub messages_per_minute: u32,  // consumed by Task 3 (enforce limits); remove allow when used
-    #[allow(dead_code)]
-    pub bytes_per_hour: u64,  // consumed by Task 3 (enforce limits); remove allow when used
+    pub messages_per_minute: u32,
+    pub bytes_per_hour: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PerRoute {
-    #[allow(dead_code)]
-    pub queue_max: u32,  // consumed by Task 3 (enforce limits); remove allow when used
+    pub queue_max: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct GlobalLimits {
-    #[allow(dead_code)]
-    pub queue_max: u32,  // consumed by Task 3 (enforce limits); remove allow when used
-    #[allow(dead_code)]
-    pub cas_max_bytes: u64,  // consumed by Task 3 (enforce limits); remove allow when used
+    pub queue_max: u32,
+    pub cas_max_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

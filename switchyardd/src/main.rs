@@ -4,6 +4,7 @@ mod cas;
 mod config;
 mod dedup;
 mod engine;
+mod limits;
 mod metrics;
 mod node_identity;
 mod plugins;
