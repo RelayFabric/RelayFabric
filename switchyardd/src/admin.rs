@@ -1,13 +1,19 @@
-use crate::engine::Daemon;
+use crate::engine::{self, Daemon};
+use crate::identity_links;
 use crate::metrics;
+use axum::body::Bytes;
 use axum::extract::{Path as AxPath, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use chrono::Utc;
+use relay_core::Endpoint;
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use tracing::warn;
 use uuid::Uuid;
 
 pub fn router(d: Arc<Daemon>) -> Router {
@@ -19,6 +25,10 @@ pub fn router(d: Arc<Daemon>) -> Router {
         .route("/v1/messages/{id}", get(trace))
         .route("/v1/public", get(public))
         .route("/v1/limits", get(limits))
+        .route("/v1/identities", get(identities))
+        .route("/v1/identities/link", post(create_link))
+        .route("/v1/identities/link/{id}", delete(delete_link))
+        .route("/v1/identities/challenges", get(challenges))
         .route("/metrics", get(metrics_text))
         .with_state(d)
 }
@@ -158,6 +168,89 @@ async fn metrics_text(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     metrics::render(&q, &plugin_state(&d))
 }
 
+/// `GET /v1/identities` (design §Admin API / webui-notes): masked refs in
+/// every response — protocol stays visible, only the ref is masked
+/// (RULING 2's compound convention), full refs never leave this module.
+async fn identities(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
+    let links = d.store.lock().unwrap().list_links().unwrap_or_default();
+    let out: Vec<_> = links.iter().map(|l| json!({
+        "id": l.id,
+        "a": format!("{}:{}", l.a_protocol, identity_links::mask_ref(&l.a_ref)),
+        "b": format!("{}:{}", l.b_protocol, identity_links::mask_ref(&l.b_ref)),
+        "display_name": l.display_name,
+        "verified_at": l.verified_at,
+    })).collect();
+    Json(json!({ "links": out }))
+}
+
+#[derive(Deserialize)]
+struct LinkRequest {
+    requester: String,
+    target: String,
+    display_name: String,
+}
+
+/// `POST /v1/identities/link` (design §Admin API): 202 with a challenge id
+/// on success; 400 on a malformed body or an unparsable "proto:ref"; 409 on
+/// `engine::initiate_link`'s rejection — either the target plugin isn't
+/// direct-capable (naming which connected plugins are) or the global queue
+/// is full (RULING 1). Parsing is done by hand against raw `Bytes` rather
+/// than axum's `Json` extractor so every parse failure maps to exactly 400,
+/// not axum's default 415 (bad content-type) / 422 (well-formed JSON, wrong
+/// shape) split.
+async fn create_link(State(d): State<Arc<Daemon>>, body: Bytes) -> impl IntoResponse {
+    let req: LinkRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid request body: {e}")})));
+        }
+    };
+    let requester: Endpoint = match req.requester.parse() {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))),
+    };
+    let target: Endpoint = match req.target.parse() {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))),
+    };
+    match engine::initiate_link(&d, requester, target, &req.display_name) {
+        Ok(challenge_id) => (StatusCode::ACCEPTED, Json(json!({"challenge_id": challenge_id}))),
+        Err(e) => (StatusCode::CONFLICT, Json(json!({"error": e}))),
+    }
+}
+
+/// `DELETE /v1/identities/link/{id}` (design §Admin API / §22): 204 on
+/// success, 404 if no such link. §95's "unlink reverts aliases to
+/// pseudonyms immediately" regression is exercised at the rendering layer in
+/// engine.rs (rendering reads links live) — this endpoint just removes the
+/// row.
+async fn delete_link(State(d): State<Arc<Daemon>>, AxPath(id): AxPath<i64>) -> impl IntoResponse {
+    let deleted = match d.store.lock().unwrap().delete_link(id) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, id, "failed to delete identity link");
+            false
+        }
+    };
+    if deleted { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }
+}
+
+/// `GET /v1/identities/challenges` (design §Admin API): pending count plus
+/// masked targets and expiry — codes never leave `storage::Challenge`
+/// (design §Security invariants); this handler never reads the `code`
+/// field.
+async fn challenges(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
+    let now = Utc::now();
+    let list = d.store.lock().unwrap().list_challenges(now).unwrap_or_default();
+    let out: Vec<_> = list.iter().map(|c| json!({
+        "id": c.id,
+        "target": format!("{}:{}", c.target_protocol, identity_links::mask_ref(&c.target_ref)),
+        "expires_at": c.expires_at,
+    })).collect();
+    Json(json!({ "pending_count": out.len(), "challenges": out }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +269,24 @@ mod tests {
         let status = resp.status().as_u16();
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// Like `get`, but for the POST/DELETE identity-link endpoints: sets the
+    /// method and (when a body is given) a `content-type: application/json`
+    /// header, matching what the real ctl client sends.
+    async fn req(router: axum::Router, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+        let mut builder = Request::builder().method(method).uri(path);
+        let request_body = match body {
+            Some(b) => {
+                builder = builder.header("content-type", "application/json");
+                Body::from(b.to_string())
+            }
+            None => Body::empty(),
+        };
+        let resp = router.oneshot(builder.body(request_body).unwrap()).await.unwrap();
+        let status = resp.status().as_u16();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
     fn daemon() -> Arc<Daemon> {
@@ -319,5 +430,132 @@ mod tests {
         let (code, body) = get(router(daemon()), "/metrics").await;
         assert_eq!(code, 200);
         assert!(body.contains("relayfabric_messages_ingress_total"));
+    }
+
+    // ---- identity admin endpoints ------------------------------------------
+
+    /// Masking regression (design §Security invariants / webui-notes): a
+    /// full ref must never appear anywhere in the response body, and the
+    /// masked "protocol:masked_ref" compound form (RULING 2) must.
+    #[tokio::test]
+    async fn identities_lists_masked_links_and_never_leaks_full_refs() {
+        let d = daemon();
+        let now = Utc::now();
+        let id = d.store.lock().unwrap().insert_link(
+            "signal", "+14155551234", "lxmf", "aabbccddeeff", "Jascha", now,
+        ).unwrap();
+
+        let (code, body) = get(router(d), "/v1/identities").await;
+        assert_eq!(code, 200);
+        assert!(!body.contains("+14155551234"), "full requester ref leaked: {body}");
+        assert!(!body.contains("aabbccddeeff"), "full target ref leaked: {body}");
+        assert!(body.contains("\"a\":\"signal:+1****1234\""), "masked a-side missing: {body}");
+        assert!(body.contains("\"b\":\"lxmf:aa****eeff\""), "masked b-side missing: {body}");
+        assert!(body.contains(&format!("\"id\":{id}")), "body was: {body}");
+        assert!(body.contains("\"display_name\":\"Jascha\""), "body was: {body}");
+    }
+
+    #[tokio::test]
+    async fn identities_empty_by_default() {
+        let (code, body) = get(router(daemon()), "/v1/identities").await;
+        assert_eq!(code, 200);
+        assert!(body.contains("\"links\":[]"), "body was: {body}");
+    }
+
+    #[tokio::test]
+    async fn post_identities_link_returns_202_and_challenge_id_when_target_direct_capable() {
+        let d = daemon();
+        let _rx = crate::engine::tests_support::register_direct_plugin(&d, "mockb");
+        let body = serde_json::json!({
+            "requester": "mocka:!alice-secret",
+            "target": "mockb:!bob-secret",
+            "display_name": "Jascha",
+        }).to_string();
+
+        let (code, resp_body) = req(router(d), "POST", "/v1/identities/link", Some(&body)).await;
+        assert_eq!(code, 202, "body was: {resp_body}");
+        assert!(resp_body.contains("\"challenge_id\""), "body was: {resp_body}");
+        assert!(!resp_body.contains("!alice-secret"),
+            "the requester's full ref must never leak in the response: {resp_body}");
+    }
+
+    /// 409 case must name the direct-capable connected plugin(s) — mirrors
+    /// engine.rs's own `initiate_link_rejects_target_without_direct_messages_
+    /// and_names_direct_capable_plugins` at the HTTP layer.
+    #[tokio::test]
+    async fn post_identities_link_returns_409_naming_direct_capable_plugins() {
+        let d = daemon();
+        let _rx_a = crate::engine::tests_support::register_direct_plugin(&d, "mocka");
+        let _rx_b = crate::engine::tests_support::register_plugin(&d, "mockb", false);
+        let body = serde_json::json!({
+            "requester": "mockb:!req",
+            "target": "mockb:!target-secret",
+            "display_name": "X",
+        }).to_string();
+
+        let (code, resp_body) = req(router(d), "POST", "/v1/identities/link", Some(&body)).await;
+        assert_eq!(code, 409, "body was: {resp_body}");
+        assert!(resp_body.contains("mocka"),
+            "409 body must name the direct-capable plugin: {resp_body}");
+        assert!(!resp_body.contains("target-secret"),
+            "target ref must never leak in the 409 body: {resp_body}");
+    }
+
+    #[tokio::test]
+    async fn post_identities_link_returns_400_on_malformed_json() {
+        let (code, _) = req(router(daemon()), "POST", "/v1/identities/link", Some("not json")).await;
+        assert_eq!(code, 400);
+    }
+
+    #[tokio::test]
+    async fn post_identities_link_returns_400_on_unparsable_endpoint() {
+        let body = serde_json::json!({
+            "requester": "not-a-valid-endpoint",
+            "target": "mocka:!b",
+            "display_name": "X",
+        }).to_string();
+        let (code, _) = req(router(daemon()), "POST", "/v1/identities/link", Some(&body)).await;
+        assert_eq!(code, 400);
+    }
+
+    #[tokio::test]
+    async fn delete_identities_link_returns_204_then_404() {
+        let d = daemon();
+        let now = Utc::now();
+        let id = d.store.lock().unwrap()
+            .insert_link("signal", "+1234567890", "lxmf", "abc123", "X", now).unwrap();
+
+        let (code, _) = req(router(d.clone()), "DELETE", &format!("/v1/identities/link/{id}"), None).await;
+        assert_eq!(code, 204);
+
+        let (code2, _) = req(router(d), "DELETE", &format!("/v1/identities/link/{id}"), None).await;
+        assert_eq!(code2, 404);
+    }
+
+    /// Masking regression (challenges variant): the code must never appear
+    /// in the response, and the masked target must.
+    #[tokio::test]
+    async fn challenges_lists_masked_targets_and_never_leaks_code_or_full_ref() {
+        let d = daemon();
+        let now = Utc::now();
+        let expires = now + chrono::Duration::minutes(15);
+        d.store.lock().unwrap().create_challenge(
+            "424242", "signal", "+14155551234", "lxmf", "abc123def456", "Jascha", now, expires,
+        ).unwrap();
+
+        let (code, body) = get(router(d), "/v1/identities/challenges").await;
+        assert_eq!(code, 200);
+        assert!(!body.contains("424242"), "code leaked: {body}");
+        assert!(!body.contains("+14155551234"), "full target ref leaked: {body}");
+        assert!(body.contains("\"target\":\"signal:+1****1234\""), "masked target missing: {body}");
+        assert!(body.contains("\"pending_count\":1"), "body was: {body}");
+    }
+
+    #[tokio::test]
+    async fn challenges_empty_by_default() {
+        let (code, body) = get(router(daemon()), "/v1/identities/challenges").await;
+        assert_eq!(code, 200);
+        assert!(body.contains("\"pending_count\":0"), "body was: {body}");
+        assert!(body.contains("\"challenges\":[]"), "body was: {body}");
     }
 }

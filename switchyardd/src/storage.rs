@@ -36,28 +36,22 @@ pub struct Challenge {
     pub requester_protocol: String,
     pub requester_ref: String,
     pub display_name: String,
-    // consumed by admin API's GET /v1/identities/challenges (Task 4); remove
-    // allow when used
+    // GET /v1/identities/challenges (Task 4) surfaces expiry only, per the
+    // design's exact interface ("masked targets + expiry, NEVER codes") —
+    // created_at has no consumer yet.
     #[allow(dead_code)]
     pub created_at: DateTime<Utc>,
-    #[allow(dead_code)]
     pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Link {
     pub id: i64,
-    // consumed by admin API's GET /v1/identities (Task 4); remove allow when used
-    #[allow(dead_code)]
     pub a_protocol: String,
-    #[allow(dead_code)]
     pub a_ref: String,
-    #[allow(dead_code)]
     pub b_protocol: String,
-    #[allow(dead_code)]
     pub b_ref: String,
     pub display_name: String,
-    #[allow(dead_code)]
     pub verified_at: DateTime<Utc>,
 }
 
@@ -442,11 +436,6 @@ impl Store {
 
     /// Creates a new challenge. If a challenge already exists for this target,
     /// it is deleted first (single active challenge per target invariant).
-    // engine::initiate_link is its only caller, and that function's own
-    // caller (the admin API) doesn't land until Task 4 — so this is
-    // unreachable from `main` (hence dead_code) in a non-test build until
-    // then; remove allow when admin.rs wires initiate_link.
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)] // interface per task brief
     pub fn create_challenge(
         &self,
@@ -516,6 +505,35 @@ impl Store {
         Ok(())
     }
 
+    /// Lists currently-active (non-expired) challenges, oldest first. Backs
+    /// the admin API's `GET /v1/identities/challenges` (Task 4) — callers
+    /// MUST mask `target_ref` before rendering, and MUST NOT surface `code`;
+    /// it round-trips onto `Challenge` only for `find_active_challenge`'s SQL
+    /// match, never for display (design §Security invariants).
+    pub fn list_challenges(&self, now: DateTime<Utc>) -> rusqlite::Result<Vec<Challenge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, code, target_protocol, target_ref, requester_protocol, requester_ref,
+                    display_name, created_at, expires_at
+             FROM link_challenges
+             WHERE expires_at > ?1
+             ORDER BY id"
+        )?;
+        let rows = stmt.query_map(params![ts(now)], |row| {
+            Ok(Challenge {
+                id: row.get(0)?,
+                code: row.get(1)?,
+                target_protocol: row.get(2)?,
+                target_ref: row.get(3)?,
+                requester_protocol: row.get(4)?,
+                requester_ref: row.get(5)?,
+                display_name: row.get(6)?,
+                created_at: parse_ts(&row.get::<_, String>(7)?),
+                expires_at: parse_ts(&row.get::<_, String>(8)?),
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Inserts a new identity link. If a link with the same (a_protocol, a_ref, b_protocol, b_ref)
     /// already exists, the verified_at is updated to now. Returns the id of the inserted or updated row.
     pub fn insert_link(
@@ -572,7 +590,6 @@ impl Store {
     }
 
     /// Lists all identity links.
-    #[allow(dead_code)] // consumed by admin API (Task 4); remove allow when used
     pub fn list_links(&self) -> rusqlite::Result<Vec<Link>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, a_protocol, a_ref, b_protocol, b_ref, display_name, verified_at
@@ -1162,6 +1179,31 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
             .find_active_challenge("signal", "+1234567890", "123456", now)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn list_challenges_excludes_expired_and_orders_by_id() {
+        let (_d, s) = store();
+        let now = Utc::now();
+
+        s.create_challenge("111111", "signal", "+1111111111", "lxmf", "a", "Alice", now,
+            now + Duration::minutes(15)).unwrap();
+        s.create_challenge("222222", "matrix", "+2222222222", "lxmf", "b", "Bob", now,
+            now + Duration::minutes(15)).unwrap();
+        // already expired -- must not appear
+        s.create_challenge("333333", "signal", "+3333333333", "lxmf", "c", "Carol", now,
+            now - Duration::seconds(1)).unwrap();
+
+        let list = s.list_challenges(now).unwrap();
+        assert_eq!(list.len(), 2, "the expired challenge must be excluded: {list:?}");
+        assert_eq!(list[0].display_name, "Alice");
+        assert_eq!(list[1].display_name, "Bob");
+    }
+
+    #[test]
+    fn list_challenges_empty() {
+        let (_d, s) = store();
+        assert!(s.list_challenges(Utc::now()).unwrap().is_empty());
     }
 
     #[test]

@@ -2,10 +2,6 @@ use rand::Rng;
 
 /// Generates a 6-digit verification code using OS randomness.
 /// Uses rand::rngs::OsRng for cryptographically secure randomness.
-// engine::initiate_link is its only caller, and that function's own caller
-// (the admin API) doesn't land until Task 4 — unreachable from `main` in a
-// non-test build until then; remove allow when admin.rs wires initiate_link.
-#[allow(dead_code)]
 pub fn generate_code() -> String {
     let mut rng = rand::rngs::OsRng;
     let code: u32 = rng.gen_range(0..=999_999);

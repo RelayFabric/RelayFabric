@@ -306,11 +306,8 @@ pub fn handle_inbound(
 /// generates a 6-digit code, persists the challenge, and enqueues a
 /// best-effort `SendDirect` carrying it to the target. Returns the challenge
 /// id — NEVER the code itself, which only ever appears in the SendDirect
-/// body (see `identity_links::generate_code`'s callers).
-// Called by the admin API (Task 4), not yet wired in this worktree — hence
-// dead_code in a non-test build (test coverage below exercises it directly).
-// Remove allow when admin.rs's POST /v1/identities/link calls this.
-#[allow(dead_code)]
+/// body (see `identity_links::generate_code`'s callers). Called by the admin
+/// API's `POST /v1/identities/link` (Task 4).
 pub fn initiate_link(
     d: &Daemon,
     requester: Endpoint,
@@ -351,12 +348,19 @@ pub fn initiate_link(
 
     // Masked per design §Lifecycle step 1's exact body wording: the target
     // sees who is asking to link, but never the requester's full ref.
+    // RULING 2: protocol stays visible, only the ref is masked — "signal:****921A"
+    // style, not `mask_ref` applied to the whole "proto:ref" string.
     let masked_requester =
-        identity_links::mask_ref(&format!("{}:{}", requester.protocol, requester.endpoint));
+        format!("{}:{}", requester.protocol, identity_links::mask_ref(&requester.endpoint));
     let body = format!(
         "RelayFabric verification code: {code} — reply with this code to link {masked_requester}. Ignore to refuse."
     );
-    enqueue_identity_send(d, target, body, now, expires);
+    // RULING 1: the @identity route is reserved and exempt from the
+    // per-route cap, but not from the global one — a queue-full rejection
+    // here must surface to the caller rather than silently vanishing (the
+    // challenge row above already exists, but its delivery never reaches
+    // the target).
+    enqueue_identity_send(d, target, body, now, expires)?;
 
     Ok(challenge_id)
 }
@@ -369,13 +373,22 @@ pub fn initiate_link(
 /// `Send`/alias/render path — `dest.endpoint` is stored verbatim in
 /// `dest_endpoint` and reused as the SendDirect `native_ref`. Used for both
 /// challenge delivery (`initiate_link`) and confirmation notices
-/// (`confirm_link`); a persistence failure is logged and swallowed, matching
-/// the "best-effort" posture the design calls for on confirmation notices —
-/// by the time this runs, the challenge has already been consumed/created,
-/// so a failure here must not unwind that.
+/// (`confirm_link`); a message-persistence or delivery-insert failure is
+/// logged and swallowed (`Ok(())`), matching the "best-effort" posture the
+/// design calls for — by the time this runs the challenge has already been
+/// consumed/created, so a failure here must not unwind that.
+///
+/// RULING 1 (Task 3 review): the reserved `@identity` route is exempt from
+/// the PER-ROUTE queue cap (deliberately never checked here), but not from
+/// the GLOBAL one — the same `pending_count` comparison `handle_inbound`
+/// uses for its own global check. Over cap, the insert becomes a
+/// `dead_letter` row with reason `QUEUE_FULL` (still visible in
+/// `queue_counts`/admin status rather than vanishing) and this returns
+/// `Err("queue full")` so `initiate_link` can surface it to its caller;
+/// `confirm_link`'s best-effort calls simply discard the `Err`.
 fn enqueue_identity_send(
     d: &Daemon, dest: Endpoint, body: String, now: DateTime<Utc>, expires: DateTime<Utc>,
-) {
+) -> Result<(), String> {
     let env = Envelope::new(
         Endpoint { protocol: IDENTITY_ROUTE.trim_start_matches('@').to_string(), endpoint: "system".to_string() },
         Sender { native_ref: IDENTITY_ROUTE.to_string() },
@@ -388,13 +401,27 @@ fn enqueue_identity_send(
     let store = d.store.lock().unwrap();
     if let Err(e) = store.insert_message(&env) {
         warn!(error = %e, "failed to persist identity notice message");
-        return;
+        return Ok(());
+    }
+    let global_max = d.cfg.limits.global.queue_max;
+    let over_global = global_max > 0
+        && store.pending_count(None).unwrap_or(0) >= i64::from(global_max);
+    if over_global {
+        metrics::inc(&metrics::QUEUE_REJECTED);
+        if let Err(e) = store.insert_dead_delivery(
+            env.id, IDENTITY_ROUTE, &dest, now, expires, "QUEUE_FULL")
+        {
+            warn!(error = %e, "failed to record queue-full identity delivery");
+        }
+        warn!(destination = %dest, "queue full, identity delivery rejected");
+        return Err("queue full".to_string());
     }
     if let Err(e) = store.insert_delivery(env.id, IDENTITY_ROUTE, &dest, now, expires,
         relay_core::priority_rank(&env.priority))
     {
         warn!(error = %e, "failed to enqueue identity notice delivery");
     }
+    Ok(())
 }
 
 /// Handles an inbound reply whose trimmed body matched an active challenge
@@ -438,17 +465,25 @@ fn confirm_link(d: &Daemon, challenge: storage::Challenge, now: DateTime<Utc>) {
     }
 
     metrics::inc(&metrics::LINKS_VERIFIED);
-    info!(target = %identity_links::mask_ref(&challenge.target_ref),
-          requester = %identity_links::mask_ref(&challenge.requester_ref),
+    // RULING 2: unify on the same compound "protocol:masked_ref" convention
+    // as the response/notice bodies below — protocol stays visible, only
+    // the ref is masked. Codes still never appear in a log line.
+    info!(target = %format!("{}:{}", challenge.target_protocol,
+                             identity_links::mask_ref(&challenge.target_ref)),
+          requester = %format!("{}:{}", challenge.requester_protocol,
+                                identity_links::mask_ref(&challenge.requester_ref)),
           "identity link verified");
 
-    let masked_requester = identity_links::mask_ref(
-        &format!("{}:{}", challenge.requester_protocol, challenge.requester_ref));
-    let masked_target = identity_links::mask_ref(
-        &format!("{}:{}", challenge.target_protocol, challenge.target_ref));
+    let masked_requester = format!("{}:{}", challenge.requester_protocol,
+        identity_links::mask_ref(&challenge.requester_ref));
+    let masked_target = format!("{}:{}", challenge.target_protocol,
+        identity_links::mask_ref(&challenge.target_ref));
     let expires = now + CDuration::seconds(d.cfg.ttl_default_secs as i64);
 
-    enqueue_identity_send(
+    // Best-effort (design §Lifecycle step 2): a queue-full rejection here
+    // (RULING 1) dead-letters the notice but must not undo the link that
+    // was just confirmed, so the Result is deliberately discarded.
+    let _ = enqueue_identity_send(
         d,
         Endpoint { protocol: challenge.target_protocol.clone(), endpoint: challenge.target_ref.clone() },
         format!(
@@ -457,7 +492,7 @@ fn confirm_link(d: &Daemon, challenge: storage::Challenge, now: DateTime<Utc>) {
         ),
         now, expires,
     );
-    enqueue_identity_send(
+    let _ = enqueue_identity_send(
         d,
         Endpoint { protocol: challenge.requester_protocol.clone(), endpoint: challenge.requester_ref.clone() },
         format!(
@@ -934,12 +969,42 @@ pub mod tests_support {
         };
         Daemon::new(cfg, dir).unwrap()
     }
+
+    /// Registers a connected mock plugin with (optionally) the `attachments`
+    /// capability — shared by engine's own tests and admin.rs's Tower-oneshot
+    /// tests (identity-link admin endpoints need a way to stand up a
+    /// non-direct-capable plugin for the 409 rejection path).
+    pub fn register_plugin(d: &Daemon, name: &str, attachments: bool) -> mpsc::Receiver<DaemonToPlugin> {
+        let (tx, rx) = mpsc::channel(8);
+        d.plugins.lock().unwrap().insert(name.to_string(), PluginHandle {
+            tx,
+            capabilities: Capabilities { attachments, ..Capabilities::default() },
+            connected: true,
+        });
+        rx
+    }
+
+    /// Registers a connected mock plugin that advertises
+    /// `capabilities.direct_messages` — shared by engine's own tests and
+    /// admin.rs's Tower-oneshot tests for `POST /v1/identities/link`.
+    pub fn register_direct_plugin(d: &Daemon, name: &str) -> mpsc::Receiver<DaemonToPlugin> {
+        let (tx, rx) = mpsc::channel(8);
+        d.plugins.lock().unwrap().insert(name.to_string(), PluginHandle {
+            tx,
+            capabilities: Capabilities { direct_messages: true, ..Capabilities::default() },
+            connected: true,
+        });
+        rx
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tests_support::{test_daemon, test_daemon_with_budgets, test_daemon_with_limits};
+    use tests_support::{
+        register_direct_plugin, register_plugin, test_daemon, test_daemon_with_budgets,
+        test_daemon_with_limits,
+    };
 
     #[test]
     fn inbound_routes_to_other_endpoint_and_dedups() {
@@ -1235,31 +1300,9 @@ mod tests {
         assert!(d.cas.get(&sha).is_err(), "now-truly-orphaned blob must be removable");
     }
 
-    /// Registers a connected mock plugin with the given `attachments`
-    /// capability and a fresh channel, returning the receiving half so a
-    /// test can inspect the `Send` frame `process_due` produces for it.
-    fn register_plugin(d: &Daemon, name: &str, attachments: bool) -> mpsc::Receiver<DaemonToPlugin> {
-        let (tx, rx) = mpsc::channel(8);
-        d.plugins.lock().unwrap().insert(name.to_string(), PluginHandle {
-            tx,
-            capabilities: Capabilities { attachments, ..Capabilities::default() },
-            connected: true,
-        });
-        rx
-    }
-
-    /// Registers a connected mock plugin that advertises
-    /// `capabilities.direct_messages` — the identity-link challenge/confirm
-    /// machinery only ever dispatches `SendDirect` to plugins like this one.
-    fn register_direct_plugin(d: &Daemon, name: &str) -> mpsc::Receiver<DaemonToPlugin> {
-        let (tx, rx) = mpsc::channel(8);
-        d.plugins.lock().unwrap().insert(name.to_string(), PluginHandle {
-            tx,
-            capabilities: Capabilities { direct_messages: true, ..Capabilities::default() },
-            connected: true,
-        });
-        rx
-    }
+    // register_plugin/register_direct_plugin moved to tests_support (shared
+    // with admin.rs's Tower-oneshot tests for the identity-link admin
+    // endpoints); re-imported below via `use tests_support::{...}`.
 
     async fn recv_send(rx: &mut mpsc::Receiver<DaemonToPlugin>) -> DaemonToPlugin {
         tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
@@ -1749,6 +1792,73 @@ mod tests {
         let found = d.store.lock().unwrap()
             .find_active_challenge("mockb", "+15559876543", code, now).unwrap();
         assert!(found.is_some(), "the code in the SendDirect body must match the stored challenge");
+    }
+
+    /// RULING 1 (Task 3 review): `enqueue_identity_send` must respect the
+    /// GLOBAL queue cap exactly like `handle_inbound`'s own check — an
+    /// @identity delivery queued while the global queue is already at
+    /// capacity must dead-letter with QUEUE_FULL (visible, not silently
+    /// dropped) and `initiate_link` must surface the rejection instead of
+    /// claiming success. The per-route cap deliberately does not apply (the
+    /// route is reserved), so this only exercises the global one.
+    #[test]
+    fn initiate_link_over_global_queue_cap_dead_letters_and_returns_queue_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("relayfabric.db");
+        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
+            global: crate::config::GlobalLimits { queue_max: 1, ..Default::default() },
+            ..Default::default()
+        });
+        let _rx = register_direct_plugin(&d, "mockb");
+
+        // fill the global queue to its cap of 1 with an ordinary routed message
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+        assert_eq!(d.store.lock().unwrap().queue_counts().unwrap(),
+            vec![("pending".to_string(), 1)]);
+
+        let requester: Endpoint = "mocka:!req".parse().unwrap();
+        let target: Endpoint = "mockb:!target".parse().unwrap();
+        let err = initiate_link(&d, requester, target, "Jascha").unwrap_err();
+        assert_eq!(err, "queue full");
+
+        // the @identity delivery landed dead_letter with QUEUE_FULL, not
+        // silently dropped (same visibility contract as the per-route case).
+        let raw = rusqlite::Connection::open(&db_path).unwrap();
+        let reason: String = raw.query_row(
+            "SELECT reason FROM deliveries WHERE route = '@identity' AND state = 'dead_letter'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(reason, "QUEUE_FULL");
+    }
+
+    /// The same cap applies to `confirm_link`'s best-effort notices, but a
+    /// queue-full rejection there must not unwind the link that was just
+    /// verified — the link itself has nothing to do with delivery capacity.
+    #[test]
+    fn confirm_link_over_global_queue_cap_dead_letters_notices_but_still_confirms_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
+            global: crate::config::GlobalLimits { queue_max: 1, ..Default::default() },
+            ..Default::default()
+        });
+        let now = Utc::now();
+        seed_challenge(&d, ("mockb", "!target"), ("mocka", "!req"), "424242", "Jascha", now, 15);
+
+        // fill the global queue to its cap of 1
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+
+        handle_inbound(&d, "mockb", "chan".into(), "!target".into(), "text".into(),
+                       "424242".into(), None, vec![], None);
+
+        let link = d.store.lock().unwrap().link_for_identity("mockb", "!target").unwrap();
+        assert!(link.is_some(),
+            "the link must still be confirmed even when both notices are queue-capped");
+
+        let counts = d.store.lock().unwrap().queue_counts().unwrap();
+        assert!(counts.contains(&("dead_letter".to_string(), 2)),
+            "both best-effort confirmation notices must dead-letter with QUEUE_FULL: {counts:?}");
     }
 
     // ---- identity linking: confirm interception ----------------------------
