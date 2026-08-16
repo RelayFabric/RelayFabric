@@ -539,6 +539,34 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         ));
     }
 
+    // node.name (final cycle-G review finding): design §1's advert contract
+    // says a node's name is "validated <=64 chars, no newlines" -- but that
+    // was only ever enforced on a RECEIVED advert's name
+    // (`fed::conn::sanitize_advert_name`, run on every remote peer's
+    // advert before storage/serve/SSE). Our OWN `node.name` is embedded
+    // AND SIGNED into our own advert (`fed::advert::build_from_config` /
+    // `build_signed_advert`) and served at `GET /v1/discovery` + ctl
+    // `discovery` with no equivalent check -- a bad name never gets
+    // sanitized because it's never "received", so a control-char-laden or
+    // over-length `node.name` would be signed into a wire advert a
+    // third-party RFDP receiver trusts verbatim. Rejecting it HERE, at
+    // config load, closes that gap at the source: a config this function
+    // accepts can never produce a signed advert with an unsafe name.
+    let name_len = cfg.node.name.chars().count();
+    if name_len > 64 {
+        return Err(format!(
+            "node.name is {name_len} characters, over the 64-character limit (design §1: it is \
+             signed into this node's own RFDP advert)"
+        ));
+    }
+    if let Some(c) = cfg.node.name.chars().find(|&c| is_unsafe_advert_name_char(c)) {
+        return Err(format!(
+            "node.name contains an unsafe character ({c:?}) -- no control characters, newlines, \
+             or Unicode bidi-control/default-ignorable spoofing codepoints allowed (design §1: it \
+             is signed into this node's own RFDP advert)"
+        ));
+    }
+
     let mut names = BTreeSet::new();
     for r in &cfg.routes {
         if r.name == IDENTITY_ROUTE {
@@ -723,6 +751,18 @@ fn validate_discovery(cfg: &Config) -> Result<(), String> {
             d.advert_ttl_secs
         ));
     }
+    // Ceiling matches `fed::conn::ADVERT_MAX_FUTURE_SECS` (24h), the same
+    // bound a receiving peer clamps an incoming advert's `expires` down to
+    // (Task 1/3 review, carried minor): without this, a configured TTL
+    // above 24h would silently diverge from what every peer actually
+    // observes/serves on receipt, rather than being rejected up front.
+    if d.advert_ttl_secs > 86_400 {
+        return Err(format!(
+            "discovery.advert_ttl_secs {} is above the maximum of 86400 (24h -- matches the \
+             receive-side far-future clamp)",
+            d.advert_ttl_secs
+        ));
+    }
     if d.mode == "public" && !cfg.node.public {
         return Err(
             "discovery.mode 'public' requires node.public: true (§112.2 pairing)".to_string(),
@@ -858,6 +898,31 @@ fn is_valid_peer_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// Whether `c` is unsafe in a `node.name` (final cycle-G review finding --
+/// see `validate`'s `node.name` check for why this must be enforced at
+/// config load, not just on a received peer advert). Deliberately mirrors
+/// -- NOT shares -- `fed::conn::sanitize_advert_name`'s predicate
+/// (`char::is_control()` plus `fed::conn::is_display_spoofing`'s exact
+/// codepoint set): `config.rs` has no dependency on `fed` today and
+/// shouldn't grow one for a single character-class predicate, so this is
+/// intentionally duplicated rather than imported. Keep the two in sync if
+/// either changes: `char::is_control()` (C0 incl. ESC, DEL, C1) plus the
+/// same bidi-control (`\u{061C}`, `\u{200E}`-`\u{200F}`,
+/// `\u{202A}`-`\u{202E}`, `\u{2066}`-`\u{2069}`) and default-ignorable
+/// (`\u{200B}`-`\u{200D}`, `\u{FEFF}`, `\u{2060}`) codepoints
+/// `is_display_spoofing` blocks.
+fn is_unsafe_advert_name_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{061C}'
+                | '\u{200E}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{200B}'..='\u{200D}'
+                | '\u{FEFF}'
+                | '\u{2060}')
+}
+
 /// `"rf:" + 64 hex chars` format check (cycle-A node identity format, design
 /// §4/§112.6) -- the same shape `node_identity::verify` parses, duplicated
 /// here as a pure format check (config validation has no key material to
@@ -911,6 +976,69 @@ routes:
         resolve_secrets(&mut cfg)?;
         Ok(cfg)
     }
+
+    // ---- node.name (final cycle-G review finding) --------------------------
+
+    #[test]
+    fn node_name_within_limit_and_plain_ascii_is_valid() {
+        let good = GOOD.replace("name: test-node", "name: Regional Gateway 12");
+        let cfg = parse(&good).unwrap();
+        assert_eq!(cfg.node.name, "Regional Gateway 12");
+    }
+
+    #[test]
+    fn node_name_over_64_chars_is_rejected() {
+        let long_name = "x".repeat(65);
+        let bad = GOOD.replace("name: test-node", &format!("name: {long_name}"));
+        let err = parse(&bad).unwrap_err();
+        assert!(err.contains("node.name"), "err was: {err}");
+        assert!(err.contains("65"), "err should name the length: {err}");
+    }
+
+    #[test]
+    fn node_name_at_exactly_64_chars_is_valid() {
+        let name = "x".repeat(64);
+        let good = GOOD.replace("name: test-node", &format!("name: {name}"));
+        let cfg = parse(&good).unwrap();
+        assert_eq!(cfg.node.name.chars().count(), 64);
+    }
+
+    #[test]
+    fn node_name_with_a_control_char_is_rejected() {
+        // ESC (the byte that starts every ANSI/CSI escape sequence) embedded
+        // in an otherwise-normal name -- YAML double-quoted scalar so \x1b
+        // survives as a literal control byte in the parsed string.
+        let bad = GOOD.replace("name: test-node", "name: \"evil\\x1bname\"");
+        let err = parse(&bad).unwrap_err();
+        assert!(err.contains("node.name"), "err was: {err}");
+        assert!(err.contains("unsafe character"), "err was: {err}");
+    }
+
+    #[test]
+    fn node_name_with_a_newline_is_rejected() {
+        let bad = GOOD.replace("name: test-node", "name: \"line one\\nline two\"");
+        let err = parse(&bad).unwrap_err();
+        assert!(err.contains("node.name"), "err was: {err}");
+    }
+
+    #[test]
+    fn node_name_with_an_rlo_bidi_override_is_rejected() {
+        // U+202E RLO -- the same display-spoofing codepoint
+        // `fed::conn::is_display_spoofing` blocks on a RECEIVED advert's
+        // name; this proves our OWN node.name gets the same treatment
+        // before it's ever signed into a wire advert.
+        let bad = GOOD.replace("name: test-node", "name: \"evil\\u202Ename\"");
+        let err = parse(&bad).unwrap_err();
+        assert!(err.contains("node.name"), "err was: {err}");
+        assert!(err.contains("unsafe character"), "err was: {err}");
+    }
+
+    // The shipped `docs/relayfabric.example.yaml` node.name
+    // ("example-gateway") is already covered by
+    // `example_config_has_no_federation_block_and_stays_valid` and
+    // `example_config_has_no_discovery_block_and_stays_valid` below, both
+    // of which call `validate(&cfg)` end to end -- no separate test needed
+    // here, just confirmed by the final sweep's `--check-config` run too.
 
     // ---- raw_yaml (design §1: hot-reloadable config / admin GET /v1/config) --
 
@@ -2181,6 +2309,21 @@ federation:
         let err = parse(&yaml).unwrap_err();
         assert!(err.contains("advert_ttl_secs"), "err was: {err}");
         assert!(err.contains("300"), "err was: {err}");
+    }
+
+    #[test]
+    fn discovery_advert_ttl_secs_at_maximum_86400_is_valid() {
+        let yaml = format!("{GOOD}\ndiscovery:\n  mode: federation\n  advert_ttl_secs: 86400\n");
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.discovery.advert_ttl_secs, 86400);
+    }
+
+    #[test]
+    fn discovery_advert_ttl_secs_above_86400_is_rejected() {
+        let yaml = format!("{GOOD}\ndiscovery:\n  mode: federation\n  advert_ttl_secs: 86401\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("advert_ttl_secs"), "err was: {err}");
+        assert!(err.contains("86400"), "err was: {err}");
     }
 
     #[test]

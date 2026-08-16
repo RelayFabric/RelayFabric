@@ -919,10 +919,19 @@ impl Store {
     /// §3): a row already on hand for `node_id` with an `expires` at or
     /// past `expires` is left untouched -- a replay, or a peer's own
     /// retransmit of an advert this store already holds a fresher (or
-    /// equally fresh) copy of. `advert_cbor` is the caller's ORIGINAL,
-    /// still-signature-verifiable wire bytes (`fed::conn::receive_advert`
-    /// stores exactly what it verified, unmutated) -- deliberately NOT
-    /// re-encoded with a sanitized `name`, since mutating any signed field
+    /// equally fresh) copy of. `advert_cbor` is a fresh CBOR RE-ENCODE of
+    /// the verified `Advert` struct (`fed::conn::receive_advert` calls
+    /// `ciborium::into_writer` on the already-deserialized fields) --
+    /// correction (final-review finding): this is NOT the literal bytes
+    /// read off the wire, and a future gossip/forward path must not assume
+    /// byte-for-byte fidelity with what the peer actually sent over the
+    /// socket. It stays independently re-verifiable anyway:
+    /// `advert::verify` reconstructs the signed message from
+    /// `canonical_bytes(advert)` -- an explicit field tuple built from the
+    /// struct's VALUES, not from any particular CBOR encoding of them --
+    /// so any faithful re-encode, this one included, re-verifies exactly
+    /// like the bytes as received would. Deliberately NOT re-encoded with
+    /// a sanitized `name`, since mutating any signed field
     /// post-verification would make the stored signature meaningless to
     /// re-check later (Task 3's "verify on serve" invariant, design §3).
     /// `name` is its own column instead, holding the ALREADY-SANITIZED

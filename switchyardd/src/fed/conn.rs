@@ -803,8 +803,10 @@ fn reject_advert(peer_node_id: &str, reason: &str) {
 /// party is rejected -- gossip is future work) -> signature verify ->
 /// services/protocols key sanity -> expires freshness (stale rejected,
 /// far-future clamped) -> the same scope/trust gate sending uses ->
-/// sanitize `name` -> upsert. `advert_cbor` is stored EXACTLY as received
-/// (still signature-verifiable) -- see `Store::upsert_peer_advert`'s doc
+/// sanitize `name` -> upsert. `advert_cbor` is stored as a fresh CBOR
+/// re-encode of the verified struct, NOT the literal bytes read off the
+/// wire (still independently signature-verifiable regardless -- see
+/// `Store::upsert_peer_advert`'s doc comment for why) -- see that same
 /// comment for why `name` is sanitized into its own column instead of by
 /// mutating the stored document.
 fn receive_advert(d: &Daemon, peer_node_id: &str, advert: Advert) {
@@ -1780,13 +1782,17 @@ mod tests {
             other => panic!("expected Advert, got {other:?}"),
         }
 
-        // The stored advert_cbor is the ORIGINAL, still-verifiable bytes
-        // (Store::upsert_peer_advert's contract) -- proving Task 3's
-        // planned "verify on serve" re-check will succeed against it.
+        // The stored advert_cbor is a fresh CBOR re-encode of the verified
+        // struct (Store::upsert_peer_advert's contract), not the literal
+        // wire bytes -- but still independently re-verifiable, since the
+        // signature covers canonical_bytes(advert), not this particular
+        // CBOR encoding. Proving Task 3's planned "verify on serve"
+        // re-check will succeed against it.
         let stored = d.store.lock().unwrap().list_peer_adverts(Utc::now()).unwrap();
         assert_eq!(stored.len(), 1);
         let decoded: Advert = ciborium::from_reader(stored[0].1.as_slice()).unwrap();
-        assert_eq!(decoded.name, malicious_name, "advert_cbor stores the ORIGINAL bytes verbatim");
+        assert_eq!(decoded.name, malicious_name,
+            "advert_cbor's re-encode must preserve the original (unsanitized) name content");
         assert!(advert::verify(&decoded).is_ok(),
             "stored advert_cbor must remain independently re-verifiable");
     }

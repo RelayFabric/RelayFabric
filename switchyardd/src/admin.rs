@@ -757,11 +757,16 @@ fn federation_peer_json(
 ///
 /// `name` is served from the FRESHLY-DECODED advert, re-sanitized via
 /// `fed::conn::sanitize_advert_name` -- NEVER the raw decoded `.name`.
-/// `advert_cbor` stores the peer's ORIGINAL signed bytes verbatim
-/// (`Store::upsert_peer_advert`'s contract), so decoding it here recovers
-/// whatever raw name the peer originally sent, control characters and all;
-/// re-sanitizing before it ever reaches this response is the entire reason
-/// that function is `pub(crate)` rather than private.
+/// `advert_cbor` stores a fresh CBOR re-encode of the peer's verified
+/// advert, not its literal wire bytes (`Store::upsert_peer_advert`'s
+/// contract -- correction, final-review finding: it is a re-encode of the
+/// verified struct, re-verifiable because the signature covers
+/// `canonical_bytes`, not this CBOR encoding) -- but the re-encode
+/// preserves every field's VALUE unchanged, so decoding it here still
+/// recovers whatever raw name the peer originally sent, control
+/// characters and all; re-sanitizing before it ever reaches this response
+/// is the entire reason that function is `pub(crate)` rather than
+/// private.
 async fn discovery(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let mode = d.cfg_snapshot(|c| c.discovery.mode.clone());
     let our_advert = crate::fed::conn::build_signed_advert(&d);

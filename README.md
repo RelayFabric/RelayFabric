@@ -8,7 +8,7 @@ plugins. MeshCore uses the native MIT Companion Radio Protocol (spec §8's
 preferred style), while Meshtastic uses MQTT (licensing favors it). Initial
 target networks: Reticulum/LXMF, Signal, Meshtastic, MeshCore, Bitchat, Nostr.
 
-**Status:** v0.3 in progress: federation core landed.
+**Status:** v0.3 in progress: federation + RFDP discovery landed.
 
 ## Components
 

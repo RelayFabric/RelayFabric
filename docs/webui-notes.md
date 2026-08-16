@@ -78,3 +78,4 @@ stay separate from route management (correlation data is more sensitive).
 - `GET /v1/routes` — per-route identity_mode, render knobs, matched policies
 - `GET /v1/plugins` — per-plugin connection state, capabilities, gauges
 - `GET /v1/federation` — peers: name, node_id, trust, connected, last_seen (no addr)
+- `GET /v1/discovery` — mode, our_advert, peers: node_id/name/services/protocols/security/expires/received_at

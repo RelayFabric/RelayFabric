@@ -1514,3 +1514,254 @@ federation:
 
     poll_until_contains(&d_a.admin_sock(), "/v1/queue?state=delivered", "\"route\":\"a-out\"").await;
 }
+
+/// Bounded negative for admin-JSON polling (design §Testing's discovery e2e
+/// leg): unlike `poll_until_contains` (which polls until `needle` FIRST
+/// appears), this polls `ATTEMPTS` times, `INTERVAL` apart, asserting
+/// `needle` is absent from `path`'s body on EVERY read -- proving it never
+/// shows up across the whole window, not just that it hadn't yet at one
+/// point-in-time sample (which a late-arriving advert could slip past).
+async fn assert_stays_absent(sock: &Path, path: &str, needle: &str) {
+    const ATTEMPTS: usize = 8;
+    const INTERVAL: Duration = Duration::from_millis(150);
+    for _ in 0..ATTEMPTS {
+        let body = admin_get(sock, path).await;
+        assert!(!body.contains(needle), "{path} unexpectedly contains {needle:?}: {body}");
+        tokio::time::sleep(INTERVAL).await;
+    }
+}
+
+/// Design §Testing's discovery e2e leg (cycle G): extends the federation
+/// pairing pattern above (`precreate_node_identity`/`free_tcp_port`) with
+/// `discovery: {mode: federation}` on both A and B, each publishing one
+/// `public_services` chat entry so the exchanged advert carries a real
+/// service + protocol, not just the always-present `federation: true`
+/// (`fed::advert::build_from_config`). A learns B's advert (and vice versa)
+/// purely from the connection-up `AdvertReq`/`Advert` exchange (design
+/// §2) -- no message traffic needed here, unlike the bidirectional test
+/// above.
+///
+/// A third daemon C dials A (same "untrusted third party" shape as
+/// `federation_two_daemons_bidirectional_with_trust_and_loop_guards`'s own
+/// C -- connects, completes the Noise handshake, but is never listed in
+/// A's `federation.peers`) with its OWN discovery enabled too, so this
+/// proves the scope gate actually DENIES an attempted exchange rather than
+/// merely observing "C never asked": `advert_scope_allows`'s "federation"
+/// arm fails A's `accept_from` check against C's unknown trust level in
+/// BOTH directions -- A never answers C's `AdvertReq`, and A never sends C
+/// one via its own post-connect `AdvertReq` either -- so neither daemon's
+/// `/v1/discovery` ever learns anything about the other
+/// (`assert_stays_absent` above, not a single point-in-time read, since a
+/// late-arriving advert would only show up after this test's own poll-
+/// driven positive assertions have already spent real wall-clock time).
+#[tokio::test]
+async fn federation_discovery_two_daemons_exchange_adverts_and_deny_untrusted_third_party() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let dir_c = tempfile::tempdir().unwrap();
+    let data_a = dir_a.path().join("data");
+    let data_b = dir_b.path().join("data");
+    let data_c = dir_c.path().join("data");
+    let node_id_a = precreate_node_identity(&data_a);
+    let node_id_b = precreate_node_identity(&data_b);
+    let node_id_c = precreate_node_identity(&data_c);
+
+    let a_port = free_tcp_port();
+    let a_addr = format!("127.0.0.1:{a_port}");
+
+    // ---- daemon A: listener, discovery on, publishes a chat service -------
+    let config_a = format!(
+        r#"
+node:
+  name: e2e-fed-disco-a
+  data_dir: DATA_DIR
+plugins:
+  mocka:
+    enabled: true
+public_services:
+  - name: a-chat
+    type: chat
+    ingress: [mocka]
+    egress: [mocka]
+discovery:
+  mode: federation
+federation:
+  listen: "{a_addr}"
+  peers:
+    - name: b
+      node_id: "{node_id_b}"
+      addr: "127.0.0.1:1"
+"#
+    );
+    let d_a = start_daemon_with_config(dir_a, &config_a);
+    wait_for(&d_a.admin_sock()).await;
+
+    // ---- daemon B: dials A, discovery on, publishes a chat service --------
+    let config_b = format!(
+        r#"
+node:
+  name: e2e-fed-disco-b
+  data_dir: DATA_DIR
+plugins:
+  mockb:
+    enabled: true
+public_services:
+  - name: b-chat
+    type: chat
+    ingress: [mockb]
+    egress: [mockb]
+discovery:
+  mode: federation
+federation:
+  peers:
+    - name: a
+      node_id: "{node_id_a}"
+      addr: "{a_addr}"
+"#
+    );
+    let d_b = start_daemon_with_config(dir_b, &config_b);
+    wait_for(&d_b.admin_sock()).await;
+
+    poll_until_contains(&d_a.admin_sock(), "/v1/federation", "\"connected\":true").await;
+
+    // ---- A learns B's advert: node_id, name, and the published service ----
+    let a_view_of_b = poll_until_contains(
+        &d_a.admin_sock(), "/v1/discovery", &format!("\"node_id\":\"{node_id_b}\"")).await;
+    assert!(a_view_of_b.contains("\"name\":\"e2e-fed-disco-b\""), "body: {a_view_of_b}");
+    assert!(a_view_of_b.contains("\"chat\":true"), "body: {a_view_of_b}");
+    assert!(a_view_of_b.contains("\"mockb\":{"), "body: {a_view_of_b}");
+
+    // ---- B learns A's advert: the reverse direction ------------------------
+    let b_view_of_a = poll_until_contains(
+        &d_b.admin_sock(), "/v1/discovery", &format!("\"node_id\":\"{node_id_a}\"")).await;
+    assert!(b_view_of_a.contains("\"name\":\"e2e-fed-disco-a\""), "body: {b_view_of_a}");
+    assert!(b_view_of_a.contains("\"chat\":true"), "body: {b_view_of_a}");
+    assert!(b_view_of_a.contains("\"mocka\":{"), "body: {b_view_of_a}");
+
+    // ---- daemon C: dials A too, discovery on, but never in A's peers[] -----
+    let config_c = format!(
+        r#"
+node:
+  name: e2e-fed-disco-c
+  data_dir: DATA_DIR
+discovery:
+  mode: federation
+federation:
+  peers:
+    - name: a
+      node_id: "{node_id_a}"
+      addr: "{a_addr}"
+"#
+    );
+    let d_c = start_daemon_with_config(dir_c, &config_c);
+    wait_for(&d_c.admin_sock()).await;
+    poll_until_contains(&d_c.admin_sock(), "/v1/federation", "\"connected\":true").await;
+
+    // ---- bounded negative: neither side ever learns the other's advert ----
+    assert_stays_absent(
+        &d_a.admin_sock(), "/v1/discovery", &format!("\"node_id\":\"{node_id_c}\"")).await;
+    assert_stays_absent(
+        &d_c.admin_sock(), "/v1/discovery", &format!("\"node_id\":\"{node_id_a}\"")).await;
+}
+
+/// Design §Testing's federation egress budget leg (design §5, carried from
+/// cycle F): `federation.peers[].messages_per_minute: 1` on A's peer entry
+/// for B caps A's `fed/b` link to one send per rolling minute
+/// (`engine::process_due_fed`, keyed exactly that way). Two inbound
+/// messages queued back-to-back on A are both due almost immediately
+/// (`engine::pump`'s 500ms tick, `due_deliveries(now, 32)`), so the budget
+/// check runs against both within a tick or two of each other: one send
+/// succeeds and consumes the minute's only slot, the other observes an
+/// exhausted limiter and defers (`mark_retry(+5s)` + `BUDGET_DEFERRED`, no
+/// priority bypass -- cycle-F's no-emergency-lane ruling for fed egress).
+/// This test only needs the cheap, bounded half of that story: the metric
+/// ticking to 1 well within the couple of seconds this test waits, long
+/// before the deferred message's own 5s retry could possibly produce a
+/// SECOND deferral -- no window-rollover timing to race. A sibling to
+/// `federation_discovery_two_daemons_exchange_adverts_and_deny_untrusted_third_party`
+/// above rather than a leg bolted onto it: discovery and the fed egress
+/// budget are independent knobs, and this needs live message traffic the
+/// discovery test deliberately has none of.
+#[tokio::test]
+async fn federation_budget_defers_the_second_message_to_a_rate_limited_peer() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let data_a = dir_a.path().join("data");
+    let data_b = dir_b.path().join("data");
+    let node_id_a = precreate_node_identity(&data_a);
+    let node_id_b = precreate_node_identity(&data_b);
+
+    let a_port = free_tcp_port();
+    let a_addr = format!("127.0.0.1:{a_port}");
+
+    let config_a = format!(
+        r#"
+node:
+  name: e2e-fed-budget-a
+  data_dir: DATA_DIR
+plugins:
+  mocka:
+    enabled: true
+routes:
+  - name: a-out
+    sources: ["mocka:outchan"]
+    destinations: ["fed:b/b-in"]
+federation:
+  listen: "{a_addr}"
+  peers:
+    - name: b
+      node_id: "{node_id_b}"
+      addr: "127.0.0.1:1"
+      messages_per_minute: 1
+"#
+    );
+    let d_a = start_daemon_with_config(dir_a, &config_a);
+    wait_for(&d_a.plugin_sock()).await;
+    wait_for(&d_a.admin_sock()).await;
+    let (_ra, mut wa) = connect_plugin(&d_a.plugin_sock(), "mocka").await;
+
+    let config_b = format!(
+        r#"
+node:
+  name: e2e-fed-budget-b
+  data_dir: DATA_DIR
+plugins:
+  mockb:
+    enabled: true
+routes:
+  - name: b-in
+    sources: []
+    destinations: ["mockb:inchan"]
+federation:
+  ingress_routes: [b-in]
+  peers:
+    - name: a
+      node_id: "{node_id_a}"
+      addr: "{a_addr}"
+"#
+    );
+    let d_b = start_daemon_with_config(dir_b, &config_b);
+    wait_for(&d_b.plugin_sock()).await;
+    let (mut rb, _wb) = connect_plugin(&d_b.plugin_sock(), "mockb").await;
+
+    poll_until_contains(&d_a.admin_sock(), "/v1/federation", "\"connected\":true").await;
+
+    // two quick messages, back-to-back -- due almost simultaneously.
+    inbound(&mut wa, "outchan", "!budget-1", "budget message one", chrono::Utc::now()).await;
+    inbound(&mut wa, "outchan", "!budget-2", "budget message two", chrono::Utc::now()).await;
+
+    // exactly one gets through promptly...
+    let (_corr, endpoint, body, _) = expect_send(&mut rb).await;
+    assert_eq!(endpoint, "inchan");
+    assert!(body.contains("budget message"), "body was: {body}");
+
+    // ...and no second Send follows within a couple of seconds -- the
+    // other message stayed deferred by the budget, not delivered too.
+    assert!(
+        timeout(Duration::from_secs(2), read_frame::<_, DaemonToPlugin>(&mut rb)).await.is_err(),
+        "a second message was delivered despite the peer's 1/minute budget"
+    );
+
+    // ...and the deferral shows up on the metric, not just as an absence.
+    poll_until_contains(&d_a.admin_sock(), "/metrics", "relayfabric_budget_deferred_total 1").await;
+}

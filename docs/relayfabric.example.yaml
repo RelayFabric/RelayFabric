@@ -194,8 +194,19 @@ policies:
 #       node_id: "rf:<64hex>"
 #       addr: "10.0.0.2:47000"
 #       trust: trusted               # optional; default verified
+#       messages_per_minute: 100     # optional; default 0 (unlimited) — aggregate egress cap for this peer's fed link
 #   trusted: []                      # extra node_ids
 #   blocked: []
+
+# RFDP discovery (cycle G — docs/SPEC.md §111/§112.2): signed, expiring node
+# advertisements exchanged over federation links (requires the federation
+# block above), describing the services/protocols this node publishes via
+# public_services. Absent entirely (as here) = disabled, matching every
+# pre-cycle-G config.
+# discovery:
+#   mode: federation                 # disabled (default) | federation | public
+#                                     # public requires node.public: true
+#   advert_ttl_secs: 3600            # default 3600; min 300, max 86400
 
 # TTLs and limits (seconds)
 ttl_default_secs: 86400
