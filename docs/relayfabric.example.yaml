@@ -33,6 +33,20 @@ plugins:
   #         members: ["a91d00aa..."] # lowercase LXMF destination hashes
   #         open: false              # closed: operator-managed membership only
 
+  # signal:
+  #   enabled: true
+  #   # Runs under sh -c, so it needs an absolute path and the venv's
+  #   # python (a bare `relayfabric-signal` isn't on PATH and the script's
+  #   # shebang won't see venv deps). venv must have run:
+  #   #   pip install -r plugins/signal/requirements.txt
+  #   command: /path/to/RelayFabric/.venv/bin/python /path/to/RelayFabric/plugins/signal/relayfabric-signal
+  #   config:
+  #     account: "+1234567890"       # your gateway's phone number
+  #     rpc_url: http://127.0.0.1:7583  # signal-cli daemon URL
+  #     groups:
+  #       pasadena: "GRP=="          # channel: group_id (from signal-cli listGroups)
+  #     allowed_users: null          # null = all members; list UUIDs to restrict
+
 routes:
   - name: demo
     sources: ["mqtt:chat/a", "mqtt:chat/b"]

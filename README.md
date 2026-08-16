@@ -7,7 +7,7 @@ message-processing layer while delegating protocol-specific behavior to
 plugins — initial target networks include Reticulum/LXMF, Signal,
 Meshtastic, MeshCore, Bitchat, Nostr, and MQTT.
 
-**Status:** v0.1: MQTT + LXMF plugins; Signal/Meshtastic next.
+**Status:** v0.1: MQTT, LXMF + Signal plugins; Meshtastic next.
 
 ## Components
 
