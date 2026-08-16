@@ -32,3 +32,10 @@ curve25519-dalek.workspace = true
 tempfile.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
+# test-util adds tokio::time::pause/advance and #[tokio::test(start_paused
+# = true)] (Task 4 review fix round 1: fake-clock coverage for run_conn's
+# I/O timeouts) -- a feature-only addition to the SAME tokio dependency
+# already in [dependencies] (Cargo unifies features across dependency
+# kinds for a shared package), so it only ever applies to test builds,
+# never a production `cargo build`, and pulls in no new crate.
+tokio = { version = "1", features = ["test-util"] }

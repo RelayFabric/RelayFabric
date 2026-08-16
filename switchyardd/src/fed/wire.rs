@@ -20,12 +20,9 @@
 //! `unknown_tag_with_unrecognized_fields_decodes_to_unknown` below, which
 //! deliberately includes fields no known variant has.
 //!
-//! This module is staged: nothing in main's runtime path sends/receives a
-//! `Fed` frame yet (consumed by `fed/conn.rs` Task 4 / engine egress/ingress
-//! Task 5, which drive `FedChannel::send_frame`/`recv_frame` with CBOR
-//! bytes of these variants). Silence dead_code at the module level until
-//! then, same as `fed/sign.rs`.
-#![allow(dead_code)]
+//! Consumed by `fed::conn` (Task 4), which drives
+//! `FedChannel::send_frame`/`recv_frame` with CBOR bytes of these variants
+//! on every live connection.
 
 use relay_core::Envelope;
 use serde::{Deserialize, Serialize};

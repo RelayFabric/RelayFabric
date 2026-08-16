@@ -4,7 +4,7 @@ use crate::events::Event;
 use crate::limits::{BudgetLimiter, SenderLimiter};
 use crate::storage::Store;
 use crate::{
-    alias, dedup, identity_links, metrics, node_identity, policy, queue, routes, storage,
+    alias, dedup, fed, identity_links, metrics, node_identity, policy, queue, routes, storage,
     transform,
 };
 use alias::Aliaser;
@@ -55,8 +55,6 @@ pub struct Daemon {
     pub store: Mutex<Store>,
     pub dedup: Mutex<dedup::Dedup>,
     pub aliaser: Aliaser,
-    #[allow(dead_code)]
-    // consumed when RFDP/federation lands; remove allow when used
     pub identity: NodeIdentity,
     pub node_id: String,
     pub plugins: Mutex<HashMap<String, PluginHandle>>,
@@ -89,6 +87,16 @@ pub struct Daemon {
     /// `emit_event`, which is what makes emission near-zero-cost when
     /// nobody's subscribed (design §4's "must cost ~nothing" requirement).
     pub events: broadcast::Sender<Event>,
+    /// Federation runtime state (design §1, cycle F): `None` when the
+    /// `federation` config block is absent (feature entirely off, the
+    /// `Daemon::new` default) or `Some(FedState::default())` when it's
+    /// present — `fed::conn::spawn_federation` populates `conns` as
+    /// connections come up; nothing else on `Daemon` mutates it. Fixed for
+    /// the lifetime of this `Daemon` instance regardless of a later
+    /// `apply_config` call (live fed reconfig is deferred to a later
+    /// cycle, same as `apply_config`'s own `"daemon"` restart-required
+    /// posture for this whole block — see its doc comment).
+    pub fed: Option<crate::fed::conn::FedState>,
 }
 
 /// Creates `data_dir` (and any missing parents) with owner-only permissions
@@ -130,6 +138,9 @@ impl Daemon {
         // /v1/events`, `switchyardctl events`) calls `events.subscribe()`
         // fresh, later.
         let (events, _initial_events_rx) = broadcast::channel(256);
+        let fed = cfg.federation.is_some().then(|| crate::fed::conn::FedState {
+            conns: Mutex::new(HashMap::new()),
+        });
         Ok(Daemon {
             cfg: RwLock::new(cfg),
             store: Mutex::new(store),
@@ -144,6 +155,7 @@ impl Daemon {
             gauges: metrics::PluginGauges::new(),
             apply_lock: Mutex::new(()),
             events,
+            fed,
         })
     }
 
@@ -483,38 +495,8 @@ pub fn handle_inbound(
     // `emit_delivery`'s doc comment). Collected here and emitted after
     // `drop(store)`, alongside the Ingress event this function already
     // sends post-loop.
-    let mut queue_full_routes: Vec<String> = Vec::new();
-    for (route, dest) in &targets {
-        // Queue quotas (spec §45): per-route checked first (the tighter,
-        // more actionable signal), then the global ceiling — checked fresh
-        // for every target, so a message fanning out to several
-        // destinations on the same over-quota route can't slip more than
-        // one past the cap in a single call. A rejected delivery still gets
-        // a row, straight into dead_letter/QUEUE_FULL, so it's visible in
-        // queue_counts/admin status rather than silently vanishing the way
-        // a rate-limited message does — deliberate: a full queue is
-        // operationally interesting in a way a sender's own excess traffic
-        // isn't.
-        let over_route = route_max > 0
-            && store.pending_count(Some(route.as_str())).unwrap_or(0) >= i64::from(route_max);
-        let over_global = !over_route
-            && global_max > 0
-            && store.pending_count(None).unwrap_or(0) >= i64::from(global_max);
-        if over_route || over_global {
-            metrics::inc(&metrics::QUEUE_REJECTED);
-            match store.insert_dead_delivery(env.id, route, dest, now, env.expires_at, "QUEUE_FULL") {
-                Ok(_) => queue_full_routes.push(route.clone()),
-                Err(e) => warn!(error = %e, "failed to record queue-full delivery"),
-            }
-            warn!(route = %route, destination = %dest, "queue full, delivery rejected");
-            continue;
-        }
-        if let Err(e) =
-            store.insert_delivery(env.id, route, dest, now, env.expires_at, priority_rank)
-        {
-            warn!(error = %e, "failed to enqueue delivery");
-        }
-    }
+    let queue_full_routes = fan_out_deliveries(
+        &store, env.id, env.expires_at, priority_rank, &targets, route_max, global_max, now);
     // Finding 3 (whole-branch review, minor): dropped explicitly BEFORE
     // either emission below, mirroring `handle_result`'s `drop(store)`
     // pattern -- emitting while this guard is still live would hold the
@@ -537,6 +519,368 @@ pub fn handle_inbound(
     });
     info!(id = %env.id, source = %env.source, targets = targets.len(),
           attachments = env.attachments.len(), "message accepted");
+}
+
+/// Per-route fan-out shared by `handle_inbound` (design §Routing, plugin
+/// ingress) and `fed_ingress` (design §5, federation ingress): given the
+/// envelope's already-persisted `env_id`/`expires_at`/resolved
+/// `priority_rank`, and an explicit list of `(route_name, destination)`
+/// pairs to fan out to, enqueues one delivery row per target — or, when a
+/// route or the global queue cap is already at capacity, a
+/// `dead_letter`/`QUEUE_FULL` row instead (still visible via
+/// `queue_counts`/admin status, matching every other queue-cap rejection
+/// in this codebase). Takes an already-held `store` guard (never acquires
+/// its own lock) so callers keep the exact lock-holding shape
+/// `handle_inbound` always had: one acquisition spanning
+/// `insert_message`/`insert_attachment_refs`/this loop, released once by
+/// the caller. Returns the route names that landed in `dead_letter` so the
+/// caller can emit a `Delivery` event for each, AFTER dropping `store`
+/// (Finding 1/3 whole-branch review precedent).
+///
+/// MECHANICAL EXTRACTION (Task 4, design §5 "reuse handle_inbound's
+/// per-route body by refactoring its fan-out loop into a callable that
+/// takes an explicit route list"): this is byte-for-byte the loop body
+/// `handle_inbound` ran inline before this task — only the route/target
+/// selection upstream of the call differs between callers
+/// (`routes::route`-matched targets for plugin ingress; a single
+/// federation `ingress_routes` route's own `destinations`, all under the
+/// SAME route name, for `fed_ingress`). Every existing `handle_inbound`
+/// test stays green unmodified against this extraction.
+#[allow(clippy::too_many_arguments)]
+fn fan_out_deliveries(
+    store: &storage::Store,
+    env_id: uuid::Uuid,
+    expires_at: DateTime<Utc>,
+    priority_rank: u8,
+    targets: &[(String, Endpoint)],
+    route_max: u32,
+    global_max: u32,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let mut queue_full_routes: Vec<String> = Vec::new();
+    for (route, dest) in targets {
+        // Queue quotas (spec §45): per-route checked first (the tighter,
+        // more actionable signal), then the global ceiling — checked fresh
+        // for every target, so a message fanning out to several
+        // destinations on the same over-quota route can't slip more than
+        // one past the cap in a single call. A rejected delivery still gets
+        // a row, straight into dead_letter/QUEUE_FULL, so it's visible in
+        // queue_counts/admin status rather than silently vanishing the way
+        // a rate-limited message does — deliberate: a full queue is
+        // operationally interesting in a way a sender's own excess traffic
+        // isn't.
+        let over_route = route_max > 0
+            && store.pending_count(Some(route.as_str())).unwrap_or(0) >= i64::from(route_max);
+        let over_global = !over_route
+            && global_max > 0
+            && store.pending_count(None).unwrap_or(0) >= i64::from(global_max);
+        if over_route || over_global {
+            metrics::inc(&metrics::QUEUE_REJECTED);
+            match store.insert_dead_delivery(env_id, route, dest, now, expires_at, "QUEUE_FULL") {
+                Ok(_) => queue_full_routes.push(route.clone()),
+                Err(e) => warn!(error = %e, "failed to record queue-full delivery"),
+            }
+            warn!(route = %route, destination = %dest, "queue full, delivery rejected");
+            continue;
+        }
+        if let Err(e) = store.insert_delivery(env_id, route, dest, now, expires_at, priority_rank) {
+            warn!(error = %e, "failed to enqueue delivery");
+        }
+    }
+    queue_full_routes
+}
+
+/// Outcome of `fed_ingress`, below — the caller (`fed::conn`'s read loop)
+/// only needs to know whether to send `Fed::Ack{id}` back on the
+/// connection (`Accepted` only) or not (every `Rejected` case). The
+/// `&'static str` on `Rejected` is a short reason for logs/tests, NOT
+/// necessarily the same string written to a `dead_letter` delivery row's
+/// `reason` column — see `fed_ingress`'s doc comment for which rejections
+/// get a dead_letter row (the four design-named reasons) versus a silent
+/// drop (`DUPLICATE`, `RATE_LIMITED`: no row at all, mirroring
+/// `handle_inbound`'s own pre-persistence dedup/rate-limit gates).
+#[derive(Debug, PartialEq, Eq)]
+pub enum FedIngressOutcome {
+    Accepted(uuid::Uuid),
+    Rejected(&'static str),
+}
+
+/// `unknown|seen|verified|trusted|blocked` (design §112.7) ordered by
+/// increasing trust, EXCEPT `blocked` which ranks below everything
+/// (including `unknown`) so it always fails an `accept_from` comparison
+/// regardless of how low `accept_from` is configured. Shared by
+/// `fed_ingress`'s trust gate (comparing a peer's stored level against
+/// `federation.accept_from`) below.
+fn trust_rank(level: &str) -> u8 {
+    match level {
+        "blocked" => 0,
+        "seen" => 2,
+        "verified" => 3,
+        "trusted" => 4,
+        _ => 1, // "unknown" (never actually stored as a row) or anything unrecognized
+    }
+}
+
+/// Whether a `reject()` call may write to storage (Task 4 review fix
+/// round 1, DoS hardening — binding controller ruling). `Persist` is for
+/// reasons that either already imply the sender passed the trust gate
+/// (`HOP_LIMIT`, `ROUTE_NOT_FEDERATED` — operationally useful and safe:
+/// only a peer this daemon has decided to trust could ever trigger them)
+/// or are a config-invariant violation this daemon's own operator caused,
+/// never an untrusted peer (`FED_CONFIG_MISSING`). `NoPersist` is for
+/// `BAD_SIGNATURE`/`TRUST_DENIED`, which ANY peer that merely completes a
+/// bare Noise handshake can trigger with zero trust established — an
+/// untrusted flood of garbage/unrecognized envelopes must not be able to
+/// write unbounded rows to SQLite (`messages`/`deliveries`); it gets a
+/// metric bump and a per-peer THROTTLED warn log line instead (see
+/// `warn_pre_trust_rejection`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Persistence {
+    Persist,
+    NoPersist,
+}
+
+/// Per-peer throttle for `NoPersist` rejections' warn log line (Task 4
+/// review fix round 1): at most one warn per peer per minute, so an
+/// untrusted flood can't also flood the log the way it's barred from
+/// flooding SQLite. Keyed by the FULL node_id (never truncated — a
+/// truncated key could conflate two distinct peers' throttles); unbounded
+/// key growth over the daemon's lifetime is an accepted trade-off for
+/// this fix round (peers are already rate-limited in practice by
+/// `fed::conn::MAX_INBOUND_CONNS` plus the cost of completing a fresh
+/// Noise handshake per distinct identity) rather than the eviction
+/// machinery `dedup`/`limits` use for their own attacker-mintable-key
+/// maps.
+static PRE_TRUST_REJECT_WARN_THROTTLE: std::sync::LazyLock<Mutex<HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const PRE_TRUST_REJECT_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn warn_pre_trust_rejection(peer_node_id: &str, reason: &str) {
+    let now = Instant::now();
+    let mut throttle = PRE_TRUST_REJECT_WARN_THROTTLE.lock().unwrap();
+    let should_warn = match throttle.get(peer_node_id) {
+        Some(last) => now.duration_since(*last) >= PRE_TRUST_REJECT_WARN_INTERVAL,
+        None => true,
+    };
+    if should_warn {
+        throttle.insert(peer_node_id.to_string(), now);
+    }
+    drop(throttle);
+    if should_warn {
+        warn!(peer = %fed::short_node_id(peer_node_id), reason,
+              "federation ingress rejected pre-trust (not persisted; further repeats from this \
+               peer are throttled to 1/min)");
+    }
+}
+
+/// Records a rejection: `Persistence::Persist` (design §5's `HOP_LIMIT`/
+/// `ROUTE_NOT_FEDERATED`, plus `FED_CONFIG_MISSING`) persists the envelope
+/// (so it's inspectable, same as any other dead-lettered message in this
+/// codebase), writes a `dead_letter` delivery row tagged `reason` under
+/// `target_route` addressed to a synthetic `fed:<node_short>` destination
+/// (there is no real per-destination target yet at this point in
+/// `fed_ingress`'s gate order -- rejection is a ROUTE-level decision,
+/// upstream of ever resolving a route's actual `destinations`), and emits
+/// the existing `Delivery` event (`enqueue_identity_send`'s
+/// drop-store-before-emit pattern). `Persistence::NoPersist`
+/// (`BAD_SIGNATURE`/`TRUST_DENIED`) touches storage NOT AT ALL — see
+/// `Persistence`'s doc comment for why. Either way, `FED_REJECTED` bumps
+/// unconditionally.
+fn reject(
+    d: &Daemon,
+    env: &Envelope,
+    target_route: &str,
+    peer_node_id: &str,
+    reason: &'static str,
+    persistence: Persistence,
+) -> FedIngressOutcome {
+    metrics::inc(&metrics::FED_REJECTED);
+    if persistence == Persistence::NoPersist {
+        warn_pre_trust_rejection(peer_node_id, reason);
+        return FedIngressOutcome::Rejected(reason);
+    }
+
+    let now = Utc::now();
+    let dest = Endpoint { protocol: "fed".to_string(), endpoint: crate::fed::short_node_id(peer_node_id) };
+    let store = d.store.lock().unwrap();
+    if let Err(e) = store.insert_message(env) {
+        warn!(error = %e, reason, "failed to persist rejected federated message");
+        drop(store);
+        return FedIngressOutcome::Rejected(reason);
+    }
+    let inserted = store.insert_dead_delivery(env.id, target_route, &dest, now, env.expires_at, reason);
+    drop(store);
+    match &inserted {
+        Ok(_) => {
+            warn!(reason, route = target_route, "federation ingress rejected");
+            emit_delivery(d, env.id, target_route.to_string(), "dead_letter");
+        }
+        Err(e) => warn!(error = %e, reason, "failed to record rejected federation delivery"),
+    }
+    FedIngressOutcome::Rejected(reason)
+}
+
+/// Federation ingress (design §5): dispatches a verified `Fed::Envelope`
+/// received over a live peer connection (`fed::conn::run_conn`) into a
+/// SINGLE named local route's fan-out. Runs its own gate order (design §5,
+/// Task 4 controller ruling on priority): signature chain -> trust level
+/// -> hop cap -> TTL clamp -> `target_route` must be one of
+/// `federation.ingress_routes` -> dedup (by envelope id, preserved
+/// end-to-end across hops) -> per-sender limits -> [accept: dedup record,
+/// fan-out, `FED_INGRESS` metric].
+///
+/// PERSISTENCE SPLIT (Task 4 review fix round 1, DoS hardening — binding
+/// controller ruling): `BAD_SIGNATURE`/`TRUST_DENIED` are reachable by ANY
+/// peer that merely completes a bare Noise handshake -- no trust
+/// established at all -- so they are a `Persistence::NoPersist` rejection:
+/// `FED_REJECTED` bumps and a per-peer THROTTLED warn logs, but NOTHING
+/// is written to `messages`/`deliveries`. An untrusted flood of garbage or
+/// unrecognized-signer envelopes must not be able to grow this daemon's
+/// SQLite database without bound. `HOP_LIMIT`/`ROUTE_NOT_FEDERATED` (both
+/// only reachable once a peer has ALREADY cleared the trust gate) and the
+/// defensive `FED_CONFIG_MISSING` (a config-invariant violation this
+/// daemon's own operator caused, never an untrusted peer) stay
+/// `Persistence::Persist`: a real `dead_letter` delivery row (visible via
+/// the existing `queue_counts`/DLQ admin surface), same as before this fix
+/// round. A dedup replay or a per-sender-limit denial is a separate,
+/// still-silent drop (no dead_letter row, no `FED_REJECTED` bump either --
+/// see their own call sites below) -- this mirrors `handle_inbound`'s own
+/// dedup/rate-limit gates, which run before anything is persisted and
+/// never dead_letter either.
+///
+/// CONTROLLER RULING (Task 2 review, binding on Task 4): federation
+/// ingress unconditionally STRIPS whatever `priority` the remote peer's
+/// envelope claims and re-stamps the design's default ("normal") before
+/// ANYTHING is persisted -- `priority` is deliberately unsigned (see
+/// `fed::sign::canonical_bytes`'s doc comment), so any on-path relay could
+/// otherwise set `priority: "emergency"` on a forwarded envelope to hit
+/// the local emergency transport-budget bypass
+/// (`process_due`'s `del.priority > 0` check) without invalidating the
+/// origin signature. Applied FIRST, before any gate below runs, so every
+/// persisted/dead-lettered copy of a federation-received envelope --
+/// accepted or rejected -- already carries the stripped value; delivery
+/// rows created on acceptance are inserted at `relay_core::priority_rank`
+/// of that stripped ("normal") value, i.e. the DEFAULT rank, never
+/// whatever the remote peer claimed.
+pub fn fed_ingress(
+    d: &Daemon,
+    peer_node_id: &str,
+    mut env: Envelope,
+    target_route: String,
+) -> FedIngressOutcome {
+    env.priority = "normal".to_string();
+
+    if fed::sign::verify_chain(&env).is_err() {
+        return reject(d, &env, &target_route, peer_node_id, "BAD_SIGNATURE", Persistence::NoPersist);
+    }
+
+    let fed_cfg = d.cfg_snapshot(|c| c.federation.clone());
+    let Some(fed_cfg) = fed_cfg else {
+        // Federation config vanished from under a live connection (e.g. a
+        // hot-swapped config that dropped the block entirely, or a test/
+        // caller bug) -- a config-invariant violation this daemon's own
+        // operator caused, never an untrusted peer, so it's still
+        // persisted (Persistence::Persist) under its own distinct reason
+        // -- `ROUTE_NOT_FEDERATED` is reserved for a genuine policy
+        // rejection, not this defensive branch (Task 4 review Minor).
+        return reject(d, &env, &target_route, peer_node_id, "FED_CONFIG_MISSING", Persistence::Persist);
+    };
+
+    let level = d.store.lock().unwrap().trust_level(peer_node_id).unwrap_or(None);
+    let level_str = level.as_deref().unwrap_or("unknown");
+    if trust_rank(level_str) < trust_rank(&fed_cfg.accept_from) {
+        return reject(d, &env, &target_route, peer_node_id, "TRUST_DENIED", Persistence::NoPersist);
+    }
+
+    if env.hops >= fed_cfg.max_hops {
+        return reject(d, &env, &target_route, peer_node_id, "HOP_LIMIT", Persistence::Persist);
+    }
+
+    // TTL clamp (design §4): the remote-claimed `expires_at` is clamped
+    // DOWN to `max_ttl_secs` from now -- never extended, and applied
+    // regardless of accept/reject outcome from this point forward, so
+    // every dead_letter row recorded after this line already reflects it.
+    let capped = Utc::now() + CDuration::seconds(fed_cfg.max_ttl_secs as i64);
+    if env.expires_at > capped {
+        env.expires_at = capped;
+    }
+
+    if !fed_cfg.ingress_routes.contains(&target_route) {
+        return reject(d, &env, &target_route, peer_node_id, "ROUTE_NOT_FEDERATED", Persistence::Persist);
+    }
+    let Some(route_cfg) = d.route_cfg(&target_route) else {
+        // Defensive: config validation guarantees every `ingress_routes`
+        // name resolves to a real route for whatever `cfg` currently
+        // holds (`validate_federation` checks this on every load/apply),
+        // so this should be unreachable in practice -- same
+        // `FED_CONFIG_MISSING` reason and Persist posture as the fed_cfg
+        // check above, for the same rationale (operator config bug, not
+        // an untrusted-peer-reachable path -- this point is only reached
+        // after the trust gate already passed).
+        return reject(d, &env, &target_route, peer_node_id, "FED_CONFIG_MISSING", Persistence::Persist);
+    };
+
+    // Dedup peek (design §5: "envelope id preserved end-to-end" — the
+    // dedup key IS the envelope id, not a content hash; a federation
+    // envelope's id never changes as it's forwarded hop to hop, which is
+    // exactly what makes id-based dedup work as the primary loop-killer,
+    // hop cap being only the backstop). Peek-only, same split as
+    // `handle_inbound`: a message that ends up rate-limited below must not
+    // be recorded as seen yet.
+    let dedup_key = env.id.to_string();
+    if d.dedup.lock().unwrap().is_duplicate(&dedup_key, Instant::now()) {
+        metrics::inc(&metrics::DUPLICATES);
+        return FedIngressOutcome::Rejected("DUPLICATE");
+    }
+
+    // Per-sender limits (design §5 / Task 4 exact sender key): reuses the
+    // SAME `SenderLimiter` (and therefore the SAME `limits.per_sender`
+    // config) plugin ingress uses, keyed `"fed|<node_id first 8 hex
+    // chars>:<env.sender.native_ref>"` so a federated sender's quota is
+    // independent of any local sender sharing the same native_ref on a
+    // different transport.
+    let node_short = fed::short_node_id(peer_node_id);
+    let sender_key = format!("fed|{node_short}:{}", env.sender.native_ref);
+    let sender_bytes =
+        env.body.len() as u64 + env.attachments.iter().map(|a| a.size).sum::<u64>();
+    if !d.sender_limiter.lock().unwrap().allow(&sender_key, sender_bytes, Instant::now()) {
+        metrics::inc(&metrics::RATELIMITED);
+        return FedIngressOutcome::Rejected("RATE_LIMITED");
+    }
+    // Accepted by both dedup and the rate limiter: record now, mirroring
+    // `handle_inbound`'s own ordering.
+    d.dedup.lock().unwrap().record(&dedup_key, Instant::now());
+
+    let now = Utc::now();
+    let priority_rank = relay_core::priority_rank(&env.priority);
+    let targets: Vec<(String, Endpoint)> = route_cfg
+        .destinations
+        .iter()
+        .map(|dest| (target_route.clone(), dest.clone()))
+        .collect();
+    let (route_max, global_max) =
+        d.cfg_snapshot(|c| (c.limits.per_route.queue_max, c.limits.global.queue_max));
+
+    let store = d.store.lock().unwrap();
+    if let Err(e) = store.insert_message(&env) {
+        warn!(error = %e, "failed to persist federated message");
+        drop(store);
+        return FedIngressOutcome::Rejected("STORAGE_ERROR");
+    }
+    let shas: Vec<String> = env.attachments.iter().map(|a| a.sha256.clone()).collect();
+    if let Err(e) = store.insert_attachment_refs(env.id, &shas) {
+        warn!(error = %e, "failed to persist federated attachment refs");
+    }
+    let queue_full_routes = fan_out_deliveries(
+        &store, env.id, env.expires_at, priority_rank, &targets, route_max, global_max, now);
+    drop(store);
+    for route in &queue_full_routes {
+        emit_delivery(d, env.id, route.clone(), "dead_letter");
+    }
+
+    metrics::inc(&metrics::FED_INGRESS);
+    FedIngressOutcome::Accepted(env.id)
 }
 
 /// Initiates an identity-link challenge (design §Lifecycle step 1, admin API
@@ -851,7 +1195,12 @@ fn emit_delivery_event(d: &Daemon, delivery: Option<&storage::Delivery>, state: 
 /// when this runs -- mirror `handle_result`'s `drop(store)` pattern above.
 /// Emission itself never touches the store, but calling it while a guard is
 /// still live would defeat the point of separating write from notify.
-fn emit_delivery(d: &Daemon, id: uuid::Uuid, route: impl Into<String>, state: &str) {
+///
+/// `pub(crate)` (not private): `fed::conn`'s Ack handler (design §5 egress:
+/// `Fed::Ack{id}` => delivered) reuses this exact helper once it marks a
+/// federation delivery row delivered, rather than re-implementing its own
+/// copy of the `Event::Delivery` construction.
+pub(crate) fn emit_delivery(d: &Daemon, id: uuid::Uuid, route: impl Into<String>, state: &str) {
     d.emit_event(|| Event::Delivery {
         id, route: route.into(), state: state.to_string(), ts: Utc::now(),
     });
@@ -1289,12 +1638,13 @@ fn load_attachments(
 pub mod tests_support {
     use super::*;
     use crate::config::{
-        Budget, Config, Limits, NodeConfig, PluginConfig, PublicService, RenderConfig, RouteConfig,
+        Budget, Config, FederationConfig, Limits, NodeConfig, PluginConfig, PublicService,
+        RenderConfig, RouteConfig,
     };
     use std::collections::BTreeMap;
 
     pub fn test_daemon(dir: &std::path::Path) -> Daemon {
-        test_daemon_full(dir, Limits::default(), BTreeMap::new(), false, vec![])
+        test_daemon_full(dir, Limits::default(), BTreeMap::new(), false, vec![], None)
     }
 
     /// Like `test_daemon`, but with a caller-supplied `Limits` baked into the
@@ -1306,7 +1656,7 @@ pub mod tests_support {
     /// — rather than re-read live from `d.cfg` on every call the way the
     /// queue-cap checks are.
     pub fn test_daemon_with_limits(dir: &std::path::Path, limits: Limits) -> Daemon {
-        test_daemon_full(dir, limits, BTreeMap::new(), false, vec![])
+        test_daemon_full(dir, limits, BTreeMap::new(), false, vec![], None)
     }
 
     /// Like `test_daemon`, but with caller-supplied `transport_budgets`.
@@ -1317,7 +1667,7 @@ pub mod tests_support {
     pub fn test_daemon_with_budgets(
         dir: &std::path::Path, transport_budgets: BTreeMap<String, Budget>,
     ) -> Daemon {
-        test_daemon_full(dir, Limits::default(), transport_budgets, false, vec![])
+        test_daemon_full(dir, Limits::default(), transport_budgets, false, vec![], None)
     }
 
     /// Like `test_daemon`, but with caller-supplied `node.public` and
@@ -1329,12 +1679,41 @@ pub mod tests_support {
     pub fn test_daemon_with_public(
         dir: &std::path::Path, public: bool, services: Vec<PublicService>,
     ) -> Daemon {
-        test_daemon_full(dir, Limits::default(), BTreeMap::new(), public, services)
+        test_daemon_full(dir, Limits::default(), BTreeMap::new(), public, services, None)
+    }
+
+    /// Like `test_daemon`, but with a caller-supplied `federation` block --
+    /// the `general` fixture route (sources/destinations `mocka:chan`/
+    /// `mockb:chan`) is otherwise unchanged, so a `federation.ingress_routes:
+    /// ["general"]` config gives `fed_ingress` tests a real route with two
+    /// local fan-out destinations to assert deliveries against, without
+    /// needing a bespoke route just for federation. Also seeds the trust
+    /// store from `federation` (`Store::seed_federation_trust`), the same
+    /// as `fed::conn::spawn_federation` does at real boot -- `Daemon::new`
+    /// itself does NOT do this (only `spawn_federation` owns that call
+    /// site in production), so a test driving `fed_ingress` directly
+    /// (bypassing `spawn_federation` entirely) needs it done here instead.
+    pub fn test_daemon_with_federation(dir: &std::path::Path, federation: FederationConfig) -> Daemon {
+        let d = test_daemon_full(dir, Limits::default(), BTreeMap::new(), false, vec![], Some(federation.clone()));
+        d.store.lock().unwrap().seed_federation_trust(&federation, Utc::now()).unwrap();
+        d
+    }
+
+    /// Like `test_daemon_with_federation`, but also with a caller-supplied
+    /// `Limits` (needed for the per-sender rate-limit test, same rationale
+    /// as `test_daemon_with_limits`: `sender_limiter` bakes in its numbers
+    /// at construction).
+    pub fn test_daemon_with_federation_and_limits(
+        dir: &std::path::Path, federation: FederationConfig, limits: Limits,
+    ) -> Daemon {
+        let d = test_daemon_full(dir, limits, BTreeMap::new(), false, vec![], Some(federation.clone()));
+        d.store.lock().unwrap().seed_federation_trust(&federation, Utc::now()).unwrap();
+        d
     }
 
     fn test_daemon_full(
         dir: &std::path::Path, limits: Limits, transport_budgets: BTreeMap<String, Budget>,
-        public: bool, public_services: Vec<PublicService>,
+        public: bool, public_services: Vec<PublicService>, federation: Option<FederationConfig>,
     ) -> Daemon {
         let mut plugins = BTreeMap::new();
         for name in ["mocka", "mockb"] {
@@ -1362,9 +1741,41 @@ pub mod tests_support {
             public_services,
             limits,
             transport_budgets,
-            federation: None,
+            federation,
         };
         Daemon::new(cfg, dir).unwrap()
+    }
+
+    /// A federated peer's Ed25519 identity for tests -- distinct from the
+    /// daemon's own `d.identity` (which speaks for the LOCAL node), this
+    /// is the identity of a simulated REMOTE origin gateway: whatever
+    /// `fed::sign::sign_origin`/`append_attestation` produce with it is
+    /// what `engine::fed_ingress`'s signature-chain gate verifies, and its
+    /// `node_id()` is what a test seeds into the trust store / passes as
+    /// `fed_ingress`'s `peer_node_id` param.
+    pub fn test_peer_identity(dir: &std::path::Path, name: &str) -> NodeIdentity {
+        NodeIdentity::load_or_create(&dir.join(name)).unwrap()
+    }
+
+    /// A signed, federation-ready envelope: origin-signed by `identity`
+    /// (a simulated remote gateway's own identity, e.g.
+    /// `test_peer_identity`), `hops` and `body` are the two knobs
+    /// `fed_ingress` tests actually vary; everything else is fixed
+    /// (arbitrary but valid) test data.
+    pub fn signed_test_envelope(identity: &NodeIdentity, body: &str, hops: u32) -> Envelope {
+        let now = Utc::now();
+        let mut env = Envelope::new(
+            Endpoint { protocol: "mock".into(), endpoint: "origin-chan".into() },
+            Sender { native_ref: "!origin-sender".into() },
+            "text".into(),
+            body.to_string(),
+            now,
+            now + CDuration::hours(1),
+            8,
+        );
+        env.hops = hops;
+        env.origin = Some(crate::fed::sign::sign_origin(&env, identity));
+        env
     }
 
     /// Registers a connected mock plugin with (optionally) the `attachments`
@@ -1399,8 +1810,9 @@ pub mod tests_support {
 mod tests {
     use super::*;
     use tests_support::{
-        register_direct_plugin, register_plugin, test_daemon, test_daemon_with_budgets,
-        test_daemon_with_limits,
+        register_direct_plugin, register_plugin, signed_test_envelope, test_daemon,
+        test_daemon_with_budgets, test_daemon_with_federation, test_daemon_with_federation_and_limits,
+        test_daemon_with_limits, test_peer_identity,
     };
 
     #[test]
@@ -3654,5 +4066,405 @@ routes:
         };
         assert_eq!(route, IDENTITY_ROUTE);
         assert_eq!(state, "dead_letter");
+    }
+
+    // ==== fed_ingress (design §5, Task 4) =================================
+
+    fn fed_peer_cfg(name: &str, node_id: &str, trust: &str) -> crate::config::PeerConfig {
+        crate::config::PeerConfig {
+            name: name.into(), node_id: node_id.into(),
+            addr: "10.0.0.2:47000".into(), trust: trust.into(),
+        }
+    }
+
+    /// `federation.ingress_routes: ["general"]`, `accept_from` and
+    /// `max_hops`/`max_ttl_secs` caller-supplied — the fixture's `general`
+    /// route (from `test_daemon_full`) has two destinations
+    /// (`mocka:chan`/`mockb:chan`), so a happy-path accept always produces
+    /// two delivery rows.
+    fn fed_config(accept_from: &str, max_hops: u32, max_ttl_secs: u64) -> crate::config::FederationConfig {
+        crate::config::FederationConfig {
+            listen: None,
+            accept_from: accept_from.into(),
+            max_hops,
+            max_ttl_secs,
+            identity_exposure: "pseudonymous".into(),
+            ingress_routes: vec!["general".into()],
+            peers: vec![],
+            trusted: vec![],
+            blocked: vec![],
+        }
+    }
+
+    #[test]
+    fn fed_ingress_happy_path_accepts_fans_out_and_increments_fed_ingress() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let fed = fed_config("verified", 4, 86_400);
+        let mut cfg = fed.clone();
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        let before = metrics::FED_INGRESS.load(std::sync::atomic::Ordering::Relaxed);
+        let env = signed_test_envelope(&identity, "hello federation", 0);
+        let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+        assert!(matches!(outcome, FedIngressOutcome::Accepted(_)), "expected Accepted, got {outcome:?}");
+        let after = metrics::FED_INGRESS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "FED_INGRESS must increment on accept");
+
+        let store = d.store.lock().unwrap();
+        let counts = store.queue_counts().unwrap();
+        assert_eq!(counts, vec![("pending".to_string(), 2)],
+            "both of general's destinations must get a delivery row");
+    }
+
+    /// Fix round 1 (DoS hardening): BAD_SIGNATURE/TRUST_DENIED are
+    /// `Persistence::NoPersist` -- reachable by ANY peer with zero trust
+    /// established, so they must never write to `messages`/`deliveries`.
+    #[test]
+    fn fed_ingress_bad_signature_is_not_persisted_but_still_bumps_fed_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        // No origin signature at all -- verify_chain must reject before
+        // anything else runs.
+        let env = {
+            let now = Utc::now();
+            Envelope::new(
+                Endpoint { protocol: "mock".into(), endpoint: "origin-chan".into() },
+                Sender { native_ref: "!origin-sender".into() },
+                "text".into(), "unsigned".into(), now, now + CDuration::hours(1), 8,
+            )
+        };
+        let env_id = env.id;
+
+        let before = metrics::FED_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+        let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("BAD_SIGNATURE"));
+        let after = metrics::FED_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "FED_REJECTED must increment on rejection even though nothing persists");
+
+        let store = d.store.lock().unwrap();
+        assert!(store.queue_counts().unwrap().is_empty(),
+            "BAD_SIGNATURE must never create a delivery row (pre-trust, DoS-hardening)");
+        assert!(store.get_message(env_id).unwrap().is_none(),
+            "BAD_SIGNATURE must never persist the message either");
+    }
+
+    /// A flood of DISTINCT bad-signature envelopes (an untrusted peer's
+    /// realistic attack shape) must leave storage completely untouched no
+    /// matter how many are sent -- the core DoS-hardening property, not
+    /// just "one rejection doesn't persist".
+    #[test]
+    fn fed_ingress_bad_signature_flood_writes_zero_rows_regardless_of_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let d = test_daemon_with_federation(dir.path(), fed_config("verified", 4, 86_400));
+
+        for i in 0..5 {
+            let now = Utc::now();
+            let env = Envelope::new(
+                Endpoint { protocol: "mock".into(), endpoint: "origin-chan".into() },
+                Sender { native_ref: "!origin-sender".into() },
+                "text".into(), format!("garbage {i}"), now, now + CDuration::hours(1), 8,
+            );
+            let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+            assert_eq!(outcome, FedIngressOutcome::Rejected("BAD_SIGNATURE"));
+        }
+
+        let store = d.store.lock().unwrap();
+        assert!(store.queue_counts().unwrap().is_empty(),
+            "a flood of unsigned envelopes must create zero delivery rows");
+    }
+
+    #[test]
+    fn fed_ingress_trust_denied_is_not_persisted_but_still_bumps_fed_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        // Peer is a configured peer at "verified", but accept_from requires
+        // "trusted" -- design's security invariant: "accept_from=trusted
+        // rejects verified".
+        let mut cfg = fed_config("trusted", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        let env = signed_test_envelope(&identity, "hello", 0);
+        let env_id = env.id;
+        let before = metrics::FED_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+        let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("TRUST_DENIED"));
+        assert!(metrics::FED_REJECTED.load(std::sync::atomic::Ordering::Relaxed) > before);
+
+        let store = d.store.lock().unwrap();
+        assert!(store.queue_counts().unwrap().is_empty(),
+            "TRUST_DENIED must never create a delivery row (pre-trust, DoS-hardening)");
+        assert!(store.get_message(env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn fed_ingress_trust_denied_for_an_unconfigured_unseen_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        // Peer never seeded/seen at all (no peers[]/trusted entry, no
+        // handshake ever recorded `seen`) -- trust_level() is None, which
+        // must gate the same as "unknown", failing the default
+        // accept_from="verified".
+        let d = test_daemon_with_federation(dir.path(), fed_config("verified", 4, 86_400));
+
+        let env = signed_test_envelope(&identity, "hello", 0);
+        let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("TRUST_DENIED"));
+    }
+
+    /// A flood of DISTINCT, VALIDLY-SIGNED-but-untrusted envelopes (the
+    /// realistic attack shape for a peer that discovered/guessed a
+    /// legitimate origin's canonical bytes are irrelevant -- signature
+    /// validity alone never earns trust) must also leave storage
+    /// completely untouched.
+    #[test]
+    fn fed_ingress_trust_denied_flood_writes_zero_rows_regardless_of_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let d = test_daemon_with_federation(dir.path(), fed_config("verified", 4, 86_400));
+
+        let before = metrics::FED_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+        for i in 0..5 {
+            let env = signed_test_envelope(&identity, &format!("flood {i}"), 0);
+            let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+            assert_eq!(outcome, FedIngressOutcome::Rejected("TRUST_DENIED"));
+        }
+        let after = metrics::FED_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after >= before + 5, "FED_REJECTED must bump once per rejected envelope: {before} -> {after}");
+
+        let store = d.store.lock().unwrap();
+        assert!(store.queue_counts().unwrap().is_empty(),
+            "a pre-trust flood of 5 distinct envelopes must create zero delivery rows");
+    }
+
+    #[test]
+    fn fed_ingress_hop_limit_rejects_at_exactly_max_hops_and_still_dead_letters() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        // exactly max_hops (4): design §4 "at or over this are dead_lettered".
+        let env = signed_test_envelope(&identity, "looped", 4);
+        let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("HOP_LIMIT"));
+
+        // HOP_LIMIT only fires once the sender already cleared the trust
+        // gate -- Persistence::Persist, so it still lands in dead_letter
+        // (operator-actionable), unlike the pre-trust NoPersist reasons.
+        let store = d.store.lock().unwrap();
+        assert_eq!(store.queue_counts().unwrap(), vec![("dead_letter".to_string(), 1)]);
+        drop(store);
+
+        // one under the limit: must be accepted.
+        let env_ok = signed_test_envelope(&identity, "not looped", 3);
+        let outcome_ok = fed_ingress(&d, &node_id, env_ok, "general".to_string());
+        assert!(matches!(outcome_ok, FedIngressOutcome::Accepted(_)));
+    }
+
+    #[test]
+    fn fed_ingress_route_not_federated_when_target_route_not_in_ingress_routes_and_still_dead_letters() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        // ingress_routes deliberately does NOT include "general".
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.ingress_routes = vec![];
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        let env = signed_test_envelope(&identity, "hello", 0);
+        let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("ROUTE_NOT_FEDERATED"));
+
+        // ROUTE_NOT_FEDERATED also only fires post-trust-gate -- Persist.
+        let store = d.store.lock().unwrap();
+        assert_eq!(store.queue_counts().unwrap(), vec![("dead_letter".to_string(), 1)]);
+    }
+
+    /// Fix round 1 Minor: the two defensive "should be unreachable"
+    /// branches (federation config absent; `ingress_routes` names a route
+    /// that doesn't actually exist in `cfg.routes`) get their own reason
+    /// `FED_CONFIG_MISSING`, distinct from `ROUTE_NOT_FEDERATED` -- a
+    /// config-invariant violation the daemon's own operator caused, not a
+    /// policy rejection, and still persisted (an untrusted peer can't
+    /// reach either branch: the first runs before any peer input matters,
+    /// the second only after the peer already cleared the trust gate).
+    #[test]
+    fn fed_ingress_missing_federation_config_uses_its_own_reason_and_still_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        // No federation block at all -- fed_ingress is never normally
+        // called this way in production (nothing wires it without
+        // federation configured), but the defensive branch must behave
+        // correctly if it ever is.
+        let d = test_daemon(dir.path());
+
+        let env = signed_test_envelope(&identity, "hello", 0);
+        let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("FED_CONFIG_MISSING"));
+
+        let store = d.store.lock().unwrap();
+        assert_eq!(store.queue_counts().unwrap(), vec![("dead_letter".to_string(), 1)]);
+    }
+
+    #[test]
+    fn fed_ingress_ingress_route_naming_a_nonexistent_route_uses_fed_config_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        // ingress_routes names a route that isn't in cfg.routes at all --
+        // config::validate_federation would normally reject this
+        // combination at load time; constructing it directly (bypassing
+        // validation, as every test_daemon_* helper does) exercises the
+        // defensive fallback on its own.
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.ingress_routes = vec!["ghost-route".into()];
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        let env = signed_test_envelope(&identity, "hello", 0);
+        let outcome = fed_ingress(&d, &node_id, env, "ghost-route".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("FED_CONFIG_MISSING"));
+    }
+
+    #[test]
+    fn fed_ingress_ttl_is_clamped_down_to_max_ttl_secs_never_extended() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 3600); // 1 hour cap
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        // signed_test_envelope's own TTL is 1 hour already (< the cap), so
+        // build one with a much longer remote-claimed TTL by hand.
+        let now = Utc::now();
+        let mut env = Envelope::new(
+            Endpoint { protocol: "mock".into(), endpoint: "origin-chan".into() },
+            Sender { native_ref: "!origin-sender".into() },
+            "text".into(), "long ttl".into(), now, now + CDuration::days(100), 8,
+        );
+        env.origin = Some(fed::sign::sign_origin(&env, &identity));
+
+        let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+        let FedIngressOutcome::Accepted(id) = outcome else { panic!("expected Accepted") };
+
+        let store = d.store.lock().unwrap();
+        let stored = store.get_message(id).unwrap().unwrap();
+        let delta = (stored.expires_at - Utc::now()).num_seconds();
+        assert!(delta <= 3600 && delta > 3500,
+            "expires_at must be clamped to ~max_ttl_secs from now, got delta={delta}s");
+    }
+
+    #[test]
+    fn fed_ingress_strips_remote_priority_to_default_rank_even_when_emergency_claimed() {
+        // CONTROLLER RULING (Task 2 review, binding on Task 4): a remote
+        // peer setting priority: "emergency" on a federated envelope must
+        // never reach the local emergency transport-budget bypass --
+        // priority is unsigned, so this can't be caught by verify_chain;
+        // fed_ingress must unconditionally re-stamp it before persisting.
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        // Build (and sign) an envelope, THEN tamper priority afterward --
+        // priority is deliberately unsigned, so this must still verify.
+        let mut env = signed_test_envelope(&identity, "urgent!!", 0);
+        env.priority = "emergency".to_string();
+        assert_eq!(fed::sign::verify_chain(&env), Ok(()),
+            "priority is unsigned by design -- tampering it must not break the signature");
+
+        let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+        assert!(matches!(outcome, FedIngressOutcome::Accepted(_)));
+
+        let store = d.store.lock().unwrap();
+        let due = store.due_deliveries(Utc::now(), 10).unwrap();
+        assert_eq!(due.len(), 2);
+        assert!(due.iter().all(|d| d.priority == relay_core::priority_rank("normal")),
+            "every delivery row must be at the DEFAULT rank, never emergency's rank 0: {due:?}");
+        let stored = store.get_message(due[0].message_id).unwrap().unwrap();
+        assert_eq!(stored.priority, "normal",
+            "the stored envelope's priority class itself must be re-stamped to \"normal\"");
+    }
+
+    #[test]
+    fn fed_ingress_dedup_replay_is_inert_no_new_delivery_rows_or_fed_ingress_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        let env = signed_test_envelope(&identity, "replay me", 0);
+        let env_replay = env.clone();
+        let first = fed_ingress(&d, &node_id, env, "general".to_string());
+        assert!(matches!(first, FedIngressOutcome::Accepted(_)));
+
+        // FED_INGRESS/DUPLICATES are process-globals shared with every other
+        // test in this binary's parallel run (`metrics.rs`'s own tests
+        // document the same constraint) -- only a monotonic ">" check on
+        // DUPLICATES is safe here; the authoritative "the replay did not
+        // re-accept/re-fan-out" proof is the delivery ROW COUNT below,
+        // which is per-Daemon (this test's own tempdir-backed store) and
+        // immune to cross-test interference.
+        let before_dup = metrics::DUPLICATES.load(std::sync::atomic::Ordering::Relaxed);
+        let second = fed_ingress(&d, &node_id, env_replay, "general".to_string());
+        assert_eq!(second, FedIngressOutcome::Rejected("DUPLICATE"));
+        assert!(metrics::DUPLICATES.load(std::sync::atomic::Ordering::Relaxed) > before_dup);
+
+        let store = d.store.lock().unwrap();
+        assert_eq!(store.queue_counts().unwrap(), vec![("pending".to_string(), 2)],
+            "the replay must not create any additional delivery rows");
+    }
+
+    #[test]
+    fn fed_ingress_per_sender_limit_denies_second_message_without_dead_lettering() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let limits = crate::config::Limits {
+            per_sender: crate::config::PerSender { messages_per_minute: 1, bytes_per_hour: 0 },
+            ..Default::default()
+        };
+        let d = test_daemon_with_federation_and_limits(dir.path(), cfg, limits);
+
+        let first = signed_test_envelope(&identity, "first", 0);
+        assert!(matches!(fed_ingress(&d, &node_id, first, "general".to_string()),
+            FedIngressOutcome::Accepted(_)));
+
+        let before = metrics::RATELIMITED.load(std::sync::atomic::Ordering::Relaxed);
+        let second = signed_test_envelope(&identity, "second, distinct body", 0);
+        let outcome = fed_ingress(&d, &node_id, second, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("RATE_LIMITED"));
+        assert!(metrics::RATELIMITED.load(std::sync::atomic::Ordering::Relaxed) > before);
+
+        let store = d.store.lock().unwrap();
+        // Only the first message's two deliveries -- the rate-limited
+        // second message gets no dead_letter row at all (silent drop,
+        // mirroring handle_inbound's own rate-limit gate).
+        assert_eq!(store.queue_counts().unwrap(), vec![("pending".to_string(), 2)]);
     }
 }

@@ -70,6 +70,20 @@ pub enum Event {
         restart_required: Vec<String>,
         ts: DateTime<Utc>,
     },
+    /// A federation connection came up or went down (design §5/§6, cycle
+    /// F): `peer` is either the configured peer `name` (an operator-chosen
+    /// `[a-z0-9-]` string, already safe) or, for a connection from a node
+    /// this daemon has no `peers[]` entry for, a SHORTENED `node_id` form
+    /// (`fed::display_peer_key`/`fed::short_node_id`) — the full 64-hex
+    /// `rf:` node_id never appears in an SSE payload, matching this
+    /// module's "no full identifier in a broadcast payload" posture even
+    /// though `node_id` isn't itself a secret (it's already exposed to
+    /// admins via config and, in a later cycle, `GET /v1/federation`).
+    Federation {
+        peer: String,
+        up: bool,
+        ts: DateTime<Utc>,
+    },
 }
 
 impl Event {
@@ -82,6 +96,7 @@ impl Event {
             Event::Plugin { .. } => "plugin",
             Event::LinkVerified { .. } => "link_verified",
             Event::ConfigApplied { .. } => "config_applied",
+            Event::Federation { .. } => "federation",
         }
     }
 }
@@ -114,6 +129,20 @@ mod tests {
             Event::ConfigApplied { restart_required: vec![], ts: ts() }.event_name(),
             "config_applied"
         );
+        assert_eq!(
+            Event::Federation { peer: "phoenix".into(), up: true, ts: ts() }.event_name(),
+            "federation"
+        );
+    }
+
+    #[test]
+    fn federation_json_has_no_variant_wrapper_and_carries_peer_and_up() {
+        let json = serde_json::to_value(Event::Federation {
+            peer: "phoenix".into(), up: true, ts: ts(),
+        }).unwrap();
+        assert_eq!(json["peer"], "phoenix");
+        assert_eq!(json["up"], true);
+        assert!(json.get("Federation").is_none());
     }
 
     /// The JSON `data:` payload must be the variant's own fields directly --

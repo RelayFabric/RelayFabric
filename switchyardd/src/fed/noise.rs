@@ -15,10 +15,10 @@
 //! receiver checks `get_remote_static()` against that signature before
 //! trusting the peer.
 //!
-//! This module is staged: nothing in main's runtime path calls it yet
-//! (consumed by fed/conn.rs, Tasks 4-5, which will own live connections).
-//! Silence dead_code at the module level until then.
-#![allow(dead_code)]
+//! Consumed by `fed::conn` (Task 4), which owns live connection lifecycle:
+//! `handshake_initiator`/`handshake_responder` drive each connection's
+//! handshake, and `FedChannel::send_frame`/`recv_frame` move CBOR `wire::Fed`
+//! frames once it completes.
 
 use crate::node_identity::{self, NodeIdentity};
 use serde::{Deserialize, Serialize};

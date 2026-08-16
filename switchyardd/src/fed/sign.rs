@@ -6,11 +6,10 @@
 //! signs at the origin gateway only (gateway provenance, §30); user-key
 //! origin signatures are v0.4.
 //!
-//! This module is staged: nothing in main's runtime path calls it yet
-//! (consumed by fed/conn.rs Task 4 / engine egress Task 5, which will sign
-//! outbound envelopes and verify inbound ones). Silence dead_code at the
-//! module level until then.
-#![allow(dead_code)]
+//! `verify_chain` is consumed by `engine::fed_ingress` (Task 4). `sign_origin`/
+//! `append_attestation` are consumed by federation egress (Task 5, not yet
+//! landed) — still `pub` and fully tested here, but not yet called from any
+//! production code path.
 
 use super::domains;
 use crate::node_identity::{self, NodeIdentity};
@@ -123,6 +122,14 @@ fn origin_bytes(env: &Envelope) -> Vec<u8> {
 
 /// Sign an envelope's canonical bytes at the origin gateway (design §2:
 /// `domains::ENVELOPE_V1 || canonical_bytes`).
+///
+/// Staged: consumed by federation egress (Task 5, not yet landed) and by
+/// this crate's own test fixtures (`engine::tests_support::
+/// signed_test_envelope`) — not yet called from any production code path,
+/// so `dead_code` stays silenced here specifically (narrowed from Task 1's
+/// module-level `#![allow(dead_code)]` now that `verify_chain` below IS
+/// live, via `engine::fed_ingress`).
+#[allow(dead_code)]
 pub fn sign_origin(env: &Envelope, identity: &NodeIdentity) -> OriginSig {
     OriginSig {
         node_id: identity.node_id(),
@@ -154,6 +161,10 @@ fn attestation_bytes(digest: &[u8; 32], prev_sig: &[u8], ts: DateTime<Utc>) -> V
 /// signature (the last attestation's sig, or the origin's sig if this is
 /// the first attestation), plus `now`. Requires an origin signature to
 /// already be present -- an envelope can't be attested before it's signed.
+///
+/// Staged: consumed by federation egress (Task 5, not yet landed) — see
+/// `sign_origin`'s doc comment for the same posture.
+#[allow(dead_code)]
 pub fn append_attestation(
     env: &mut Envelope,
     identity: &NodeIdentity,

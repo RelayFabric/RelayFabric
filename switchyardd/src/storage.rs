@@ -495,6 +495,39 @@ impl Store {
         rows.collect()
     }
 
+    /// Delivery rows for envelope `message_id` addressed to federation peer
+    /// `peer_key` (design §5 egress: `dest_protocol = "fed"`, `dest_endpoint
+    /// = "<peer_name>/<remote_route>"`) — resolves an inbound `Fed::Ack{id}`
+    /// frame (which only ever carries the envelope id, never a delivery
+    /// row id) back to the delivery row(s) it acknowledges. `peer_key` is
+    /// whatever local identifier the connection that carried the Ack is
+    /// registered under (`fed::conn::FedState.conns`'s key): for a
+    /// connection to a CONFIGURED peer (dialed by us, or accepted from a
+    /// node_id matching a configured peer) this is that peer's config
+    /// `name`, matching the `dest_endpoint` prefix federation egress used
+    /// when it sent the envelope in the first place; a connection from an
+    /// unconfigured node is keyed by its raw `node_id` instead, which can
+    /// never match a `dest_endpoint` prefix (egress destinations always
+    /// name a configured peer, never a raw node_id) — an Ack arriving on
+    /// such a connection therefore always resolves to zero rows, which is
+    /// correct: this daemon could never have sent an envelope out through
+    /// it under a `fed:<peer_name>/...` destination in the first place.
+    /// The `LIKE ?2 || '/%'` match (rather than a bare prefix) deliberately
+    /// requires the `/` separator, so a peer named `"phoen"` cannot match a
+    /// delivery actually addressed to `"phoenix/regional-chat"`.
+    pub fn deliveries_for_fed_ack(
+        &self, message_id: Uuid, peer_key: &str,
+    ) -> rusqlite::Result<Vec<Delivery>> {
+        let sql = format!(
+            "SELECT {} FROM deliveries
+             WHERE message_id = ?1 AND dest_protocol = 'fed' AND dest_endpoint LIKE ?2 || '/%'",
+            Self::DELIVERY_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![message_id.to_string(), peer_key], Self::delivery_from_row)?;
+        rows.collect()
+    }
+
     pub fn deliveries_for_id(&self, id: i64) -> Option<Delivery> {
         let sql = format!("SELECT {} FROM deliveries WHERE id = ?1", Self::DELIVERY_COLS);
         self.conn
@@ -765,6 +798,23 @@ impl Store {
     /// first observed. `updated_at` always advances to `now`, on both the
     /// fresh-insert and the update path.
     pub fn seed_trust(&self, node_id: &str, level: &str, now: DateTime<Utc>) -> rusqlite::Result<()> {
+        // Task 3 review carry-over (Important): guard the level param
+        // against the 5 valid §112.7 levels — a typo'd/programmer-error
+        // level string here would silently corrupt the trust store with a
+        // value `trust_level`'s callers (the accept_from rank comparison,
+        // the handshake blocked check) don't recognize, which is a
+        // security-relevant fail-*open* if the comparison logic treats an
+        // unrecognized string as passing. `debug_assert!` (not a hard
+        // `Err`) because every current call site passes a value already
+        // validated by `config::validate_federation` or a hardcoded
+        // literal ("seen"/"trusted"/"blocked") — this is a debug-build
+        // regression trip-wire for a future caller, not a runtime
+        // condition production code is expected to hit.
+        debug_assert!(
+            matches!(level, "unknown" | "seen" | "verified" | "trusted" | "blocked"),
+            "seed_trust called with invalid trust level {level:?} (expected one of \
+             unknown|seen|verified|trusted|blocked, design §112.7)"
+        );
         self.conn.execute(
             "INSERT INTO node_trust (node_id, level, first_seen, updated_at)
              VALUES (?1, ?2, ?3, ?3)
@@ -1946,5 +1996,100 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         assert_eq!(level, "verified");
         assert_eq!(first_seen, first_seen_at, "first_seen must survive repeated re-seeding");
         assert_eq!(updated_at, boot2);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid trust level")]
+    fn seed_trust_debug_panics_on_an_invalid_level() {
+        // Task 3 review carry-over: seed_trust must guard its level param.
+        // debug_assert! only fires in debug builds, which is how `cargo
+        // test` runs by default (and how CI/verification-before-completion
+        // runs it here) — this is the intended trip-wire, not a release
+        // behavior this test claims anything about.
+        let (_d, s) = store();
+        let _ = s.seed_trust(&node_id(1), "definitely-not-a-real-level", Utc::now());
+    }
+
+    // ---- fed ack -> delivery resolution (design §5 egress) ---------------
+
+    fn fed_dest(peer_and_route: &str) -> Endpoint {
+        Endpoint { protocol: "fed".into(), endpoint: peer_and_route.into() }
+    }
+
+    #[test]
+    fn deliveries_for_fed_ack_finds_the_row_addressed_to_that_peer() {
+        let (_d, s) = store();
+        let e = env();
+        s.insert_message(&e).unwrap();
+        let now = Utc::now();
+        s.insert_delivery(e.id, "general", &fed_dest("phoenix/regional-chat"), now,
+                           e.expires_at, 2).unwrap();
+
+        let rows = s.deliveries_for_fed_ack(e.id, "phoenix").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].destination, fed_dest("phoenix/regional-chat"));
+    }
+
+    #[test]
+    fn deliveries_for_fed_ack_does_not_match_a_different_peer() {
+        let (_d, s) = store();
+        let e = env();
+        s.insert_message(&e).unwrap();
+        let now = Utc::now();
+        s.insert_delivery(e.id, "general", &fed_dest("phoenix/regional-chat"), now,
+                           e.expires_at, 2).unwrap();
+
+        assert!(s.deliveries_for_fed_ack(e.id, "seattle").unwrap().is_empty());
+    }
+
+    #[test]
+    fn deliveries_for_fed_ack_requires_the_slash_separator_not_just_a_prefix() {
+        // A peer named "phoen" must not match a delivery actually addressed
+        // to "phoenix/regional-chat" -- the LIKE pattern requires the '/'
+        // separator, not a bare string-prefix match.
+        let (_d, s) = store();
+        let e = env();
+        s.insert_message(&e).unwrap();
+        let now = Utc::now();
+        s.insert_delivery(e.id, "general", &fed_dest("phoenix/regional-chat"), now,
+                           e.expires_at, 2).unwrap();
+
+        assert!(s.deliveries_for_fed_ack(e.id, "phoen").unwrap().is_empty());
+    }
+
+    #[test]
+    fn deliveries_for_fed_ack_ignores_non_federation_deliveries() {
+        let (_d, s) = store();
+        let e = env();
+        s.insert_message(&e).unwrap();
+        let now = Utc::now();
+        // A normal (non-fed) delivery to a destination whose endpoint just
+        // happens to look like "peer/route" must never be picked up here --
+        // only dest_protocol = 'fed' rows are eligible.
+        s.insert_delivery(e.id, "general",
+                           &Endpoint { protocol: "mocka".into(), endpoint: "phoenix/regional-chat".into() },
+                           now, e.expires_at, 2).unwrap();
+
+        assert!(s.deliveries_for_fed_ack(e.id, "phoenix").unwrap().is_empty());
+    }
+
+    #[test]
+    fn deliveries_for_fed_ack_scopes_by_message_id_too() {
+        let (_d, s) = store();
+        let e1 = env();
+        let mut e2 = env();
+        e2.id = Uuid::now_v7();
+        e2.body = "a different message".into();
+        s.insert_message(&e1).unwrap();
+        s.insert_message(&e2).unwrap();
+        let now = Utc::now();
+        s.insert_delivery(e1.id, "general", &fed_dest("phoenix/regional-chat"), now,
+                           e1.expires_at, 2).unwrap();
+        s.insert_delivery(e2.id, "general", &fed_dest("phoenix/regional-chat"), now,
+                           e2.expires_at, 2).unwrap();
+
+        let rows = s.deliveries_for_fed_ack(e1.id, "phoenix").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_id, e1.id);
     }
 }

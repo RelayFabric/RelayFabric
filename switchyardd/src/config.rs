@@ -343,6 +343,7 @@ pub fn load_from_str(raw: &str) -> Result<Config, String> {
     validate(&cfg)?;
     resolve_secrets(&mut cfg)?;
     warn_if_public_with_no_limits(&cfg);
+    warn_if_federation_node_id_overlap(&cfg);
     Ok(cfg)
 }
 
@@ -432,6 +433,48 @@ fn warn_if_public_with_no_limits(cfg: &Config) {
     if cfg.node.public && per_sender_unset && global_unset {
         eprintln!(
             "warning: node.public is true but limits are unset (unlimited); see SPEC §112.8");
+    }
+}
+
+/// The node_ids that appear in more than one of `federation.peers[]`
+/// (their own `node_id` field), `federation.trusted`, and
+/// `federation.blocked` — a pure helper so the overlap computation itself
+/// is unit-testable without capturing stderr (see
+/// `warn_if_federation_node_id_overlap`, its only caller). Overlap is not
+/// a config error (`seed_federation_trust`'s peers -> trusted -> blocked
+/// application order already resolves it deterministically, blocked
+/// always winning), just a likely operator mistake worth flagging —
+/// `warn_if_public_with_no_limits` precedent.
+fn overlapping_federation_node_ids(fed: &FederationConfig) -> BTreeSet<String> {
+    let peers: BTreeSet<&str> = fed.peers.iter().map(|p| p.node_id.as_str()).collect();
+    let trusted: BTreeSet<&str> = fed.trusted.iter().map(String::as_str).collect();
+    let blocked: BTreeSet<&str> = fed.blocked.iter().map(String::as_str).collect();
+    let mut overlap: BTreeSet<&str> = BTreeSet::new();
+    overlap.extend(peers.intersection(&trusted));
+    overlap.extend(peers.intersection(&blocked));
+    overlap.extend(trusted.intersection(&blocked));
+    overlap.into_iter().map(String::from).collect()
+}
+
+/// Task 3 review carry-over (Important): a node_id listed in more than one
+/// of `federation.peers[]`/`trusted`/`blocked` still loads and seeds
+/// deterministically (`seed_federation_trust` applies peers -> trusted ->
+/// blocked in that fixed order, so `blocked` always wins any overlap), but
+/// it's very likely an operator mistake (e.g. a peer accidentally also
+/// listed in `blocked`, silently disabling it) — flagged the same way
+/// `warn_if_public_with_no_limits` flags its own footgun: a load-time
+/// `eprintln!`, not a `validate()` error, run before `tracing_subscriber`
+/// is initialized (in particular on the `--check-config` path).
+fn warn_if_federation_node_id_overlap(cfg: &Config) {
+    let Some(fed) = &cfg.federation else { return };
+    let overlap = overlapping_federation_node_ids(fed);
+    if !overlap.is_empty() {
+        let ids: Vec<&String> = overlap.iter().collect();
+        eprintln!(
+            "warning: federation node_id(s) appear in more than one of peers/trusted/blocked: {} \
+             (blocked always wins on conflict; see seed_federation_trust)",
+            ids.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        );
     }
 }
 
@@ -1710,6 +1753,76 @@ federation:
         let fed = cfg.federation.unwrap();
         assert_eq!(fed.trusted, vec![node_id_a()]);
         assert_eq!(fed.blocked, vec![node_id_b()]);
+    }
+
+    // ---- federation node_id overlap warning (Task 3 review carry-over) ---
+
+    #[test]
+    fn overlapping_federation_node_ids_is_empty_when_every_list_is_disjoint() {
+        let fed = fed_cfg_for(
+            vec![peer_cfg("phoenix", &node_id_a())], vec![node_id_b()], vec![node_id_c()]);
+        assert!(overlapping_federation_node_ids(&fed).is_empty());
+    }
+
+    #[test]
+    fn overlapping_federation_node_ids_flags_a_peer_also_listed_trusted() {
+        let fed = fed_cfg_for(
+            vec![peer_cfg("phoenix", &node_id_a())], vec![node_id_a()], vec![]);
+        assert_eq!(overlapping_federation_node_ids(&fed), BTreeSet::from([node_id_a()]));
+    }
+
+    #[test]
+    fn overlapping_federation_node_ids_flags_a_peer_also_listed_blocked() {
+        let fed = fed_cfg_for(
+            vec![peer_cfg("phoenix", &node_id_a())], vec![], vec![node_id_a()]);
+        assert_eq!(overlapping_federation_node_ids(&fed), BTreeSet::from([node_id_a()]));
+    }
+
+    #[test]
+    fn overlapping_federation_node_ids_flags_trusted_also_listed_blocked() {
+        let fed = fed_cfg_for(vec![], vec![node_id_a()], vec![node_id_a()]);
+        assert_eq!(overlapping_federation_node_ids(&fed), BTreeSet::from([node_id_a()]));
+    }
+
+    #[test]
+    fn overlapping_federation_node_ids_dedups_when_the_same_id_is_in_all_three() {
+        let fed = fed_cfg_for(
+            vec![peer_cfg("phoenix", &node_id_a())], vec![node_id_a()], vec![node_id_a()]);
+        assert_eq!(overlapping_federation_node_ids(&fed), BTreeSet::from([node_id_a()]));
+    }
+
+    #[test]
+    fn federation_config_with_overlapping_node_ids_still_loads_successfully() {
+        // Overlap is a warning (eprintln!), never a validate() error --
+        // config::load_from_str must still succeed. `blocked` also being in
+        // `peers[]` is the "operator accidentally disabled a peer" case
+        // this warning exists to catch.
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{a}\"\n      \
+             addr: \"10.0.0.2:47000\"\n  blocked: [\"{a}\"]\n",
+            a = node_id_a(),
+        );
+        let cfg = load_from_str(&yaml).unwrap_or_else(|e| {
+            panic!("overlapping node_ids must warn, not fail config load: {e}")
+        });
+        assert_eq!(cfg.federation.unwrap().peers[0].node_id, node_id_a());
+    }
+
+    fn peer_cfg(name: &str, node_id: &str) -> PeerConfig {
+        PeerConfig {
+            name: name.into(), node_id: node_id.into(),
+            addr: "10.0.0.2:47000".into(), trust: "verified".into(),
+        }
+    }
+
+    fn fed_cfg_for(
+        peers: Vec<PeerConfig>, trusted: Vec<String>, blocked: Vec<String>,
+    ) -> FederationConfig {
+        FederationConfig {
+            listen: None, accept_from: "verified".into(), max_hops: 4, max_ttl_secs: 86_400,
+            identity_exposure: "pseudonymous".into(), ingress_routes: vec![],
+            peers, trusted, blocked,
+        }
     }
 
     #[test]

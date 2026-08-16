@@ -14,6 +14,15 @@ pub static RATELIMITED: AtomicU64 = AtomicU64::new(0);
 pub static QUEUE_REJECTED: AtomicU64 = AtomicU64::new(0);
 pub static BUDGET_DEFERRED: AtomicU64 = AtomicU64::new(0);
 pub static LINKS_VERIFIED: AtomicU64 = AtomicU64::new(0);
+// design §6 (cycle F): federation ingress/egress/rejected counters. EGRESS
+// is staged (nothing increments it until Task 5's fed dispatch lands in
+// `engine::process_due`) but is rendered from day one, the same
+// zero-until-wired posture `fed/sign.rs`/`fed/wire.rs` used at the module
+// level — a counter that's always read (in `render`, below) is never
+// flagged dead_code even before anything increments it.
+pub static FED_INGRESS: AtomicU64 = AtomicU64::new(0);
+pub static FED_EGRESS: AtomicU64 = AtomicU64::new(0);
+pub static FED_REJECTED: AtomicU64 = AtomicU64::new(0);
 
 // design §3 (cycle D): received_at -> delivered wall-clock latency, accrued
 // as a micros sum + count pair (rendered in seconds) rather than a
@@ -28,6 +37,23 @@ pub static DELIVERY_LATENCY_COUNT: AtomicU64 = AtomicU64::new(0);
 // needed because Mutex::new(HashMap::new()) is not a const fn.
 pub static ROUTE_MESSAGES: LazyLock<Mutex<HashMap<String, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// design §1/§6 (cycle F): latest up/down state per federation connection,
+/// keyed the same way `fed::conn::FedState.conns` is (configured peer
+/// `name`, or a short `node_id` form for an unconfigured/inbound-only
+/// connection — see `fed::display_peer_key`) — same shape/rationale as
+/// `ROUTE_MESSAGES` above (operator-configured, unbounded in principle, so
+/// a `HashMap` behind a `LazyLock<Mutex<_>>` rather than per-peer
+/// `AtomicU64`s). Set on every connect/disconnect by `fed::conn`, never
+/// cleared otherwise — a peer removed from config keeps its last-known
+/// state rendered until the next daemon restart, matching `ROUTE_MESSAGES`'
+/// own "entries never expire" posture.
+pub static FEDERATION_PEERS_UP: LazyLock<Mutex<HashMap<String, bool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn set_federation_peer_up(peer: &str, up: bool) {
+    FEDERATION_PEERS_UP.lock().unwrap().insert(peer.to_string(), up);
+}
 
 pub fn inc(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
@@ -196,6 +222,9 @@ pub fn render(
         ("relayfabric_queue_rejected_total", &QUEUE_REJECTED),
         ("relayfabric_budget_deferred_total", &BUDGET_DEFERRED),
         ("relayfabric_links_verified_total", &LINKS_VERIFIED),
+        ("relayfabric_federation_ingress_total", &FED_INGRESS),
+        ("relayfabric_federation_egress_total", &FED_EGRESS),
+        ("relayfabric_federation_rejected_total", &FED_REJECTED),
     ];
     for (name, c) in counters {
         out.push_str(&format!("# TYPE {name} counter\n{name} {}\n", c.load(Ordering::Relaxed)));
@@ -208,6 +237,16 @@ pub fn render(
     for (plugin, up) in plugin_up {
         out.push_str(&format!(
             "relayfabric_plugin_up{{plugin=\"{plugin}\"}} {}\n", u8::from(*up)));
+    }
+    out.push_str("# TYPE relayfabric_federation_peer_up gauge\n");
+    {
+        let peers = FEDERATION_PEERS_UP.lock().unwrap();
+        let mut entries: Vec<_> = peers.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (peer, up) in entries {
+            out.push_str(&format!(
+                "relayfabric_federation_peer_up{{peer=\"{peer}\"}} {}\n", u8::from(*up)));
+        }
     }
     out.push_str(&render_latency(
         DELIVERY_LATENCY_MICROS_SUM.load(Ordering::Relaxed),
@@ -246,6 +285,25 @@ mod tests {
         assert!(out.contains("relayfabric_delivery_latency_seconds_count"));
         assert!(out.contains("relayfabric_route_messages_total"));
         assert!(out.contains("relayfabric_plugin_gauge"));
+        assert!(out.contains("relayfabric_federation_ingress_total"));
+        assert!(out.contains("relayfabric_federation_egress_total"));
+        assert!(out.contains("relayfabric_federation_rejected_total"));
+        assert!(out.contains("relayfabric_federation_peer_up"));
+    }
+
+    // ---- federation peer up/down gauge --------------------------------
+
+    #[test]
+    fn set_federation_peer_up_renders_the_latest_state_per_peer() {
+        let key = "test-only-fed-peer-unique-7c2e";
+        set_federation_peer_up(key, true);
+        let out = render(&[], &[], &PluginGauges::new());
+        assert!(out.contains(&format!("relayfabric_federation_peer_up{{peer=\"{key}\"}} 1")));
+
+        set_federation_peer_up(key, false);
+        let out = render(&[], &[], &PluginGauges::new());
+        assert!(out.contains(&format!("relayfabric_federation_peer_up{{peer=\"{key}\"}} 0")),
+            "a fresh set_federation_peer_up call must replace the prior state: {out}");
     }
 
     // ---- delivery latency ------------------------------------------------

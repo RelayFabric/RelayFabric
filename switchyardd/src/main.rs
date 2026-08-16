@@ -71,6 +71,9 @@ fn main() {
             }
         }
         tokio::spawn(engine::pump(daemon.clone()));
+        if let Some(fed_cfg) = daemon.cfg_snapshot(|c| c.federation.clone()) {
+            fed::conn::spawn_federation(daemon.clone(), fed_cfg);
+        }
         let admin_sock = data_dir.join("admin.sock");
         let _ = std::fs::remove_file(&admin_sock);
         let admin_listener =
