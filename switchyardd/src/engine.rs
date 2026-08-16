@@ -1,10 +1,11 @@
+use crate::cas::Cas;
 use crate::config::Config;
 use crate::storage::Store;
 use crate::{alias, dedup, metrics, policy, queue, routes, storage, transform};
 use alias::Aliaser;
 use chrono::{DateTime, Duration as CDuration, Utc};
-use relay_core::{Capabilities, Endpoint, Envelope, Sender};
-use relay_ipc::DaemonToPlugin;
+use relay_core::{AttachmentMeta, Capabilities, Endpoint, Envelope, Sender};
+use relay_ipc::{DaemonToPlugin, IpcAttachment};
 use std::collections::HashMap;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
@@ -25,18 +26,21 @@ pub struct Daemon {
     pub dedup: Mutex<dedup::Dedup>,
     pub aliaser: Aliaser,
     pub plugins: Mutex<HashMap<String, PluginHandle>>,
+    pub cas: Cas,
 }
 
 /// Creates `data_dir` (and any missing parents) with owner-only permissions
-/// (0700). Message bodies, the SQLite DB, and the plugin control socket all
-/// live under this directory; a world- or group-readable dir would let any
-/// local user read message content or connect to plugins.sock regardless of
-/// the individual file modes SQLite/UnixListener happen to create (typically
+/// (0700). Message bodies, the SQLite DB, the plugin control socket, and the
+/// content-addressed attachment store (cas.rs, which reuses this same
+/// helper for its own subdirectory) all live under directories hardened
+/// this way; a world- or group-readable dir would let any local user read
+/// message content or connect to plugins.sock regardless of the individual
+/// file modes SQLite/UnixListener happen to create (typically
 /// umask-derived 0644/0755). `DirBuilder::mode` only governs freshly-created
 /// directories, so the mode is re-asserted with `set_permissions` afterward
 /// to also tighten a pre-existing dir left with looser permissions (e.g.
 /// from an older install or a manual mkdir).
-fn create_data_dir(data_dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_data_dir(data_dir: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(data_dir)?;
     std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))
 }
@@ -52,16 +56,24 @@ impl Daemon {
         }
         let aliaser = Aliaser::load_or_create(&data_dir.join("alias.key"))?;
         let ttl = std::time::Duration::from_secs(cfg.dedup_ttl_secs);
+        let cas = Cas::new(&data_dir.join("attachments"))?;
         Ok(Daemon {
             cfg,
             store: Mutex::new(store),
             dedup: Mutex::new(dedup::Dedup::new(ttl)),
             aliaser,
             plugins: Mutex::new(HashMap::new()),
+            cas,
         })
     }
 }
 
+/// Oversize attachments are dropped and noted in the body; accepted ones are
+/// written to the CAS immediately and get an `AttachmentMeta` on the
+/// envelope. Attachment filenames/content are message content and may
+/// appear in the drop note (part of the body), but must never reach a log
+/// line — logs below only ever carry sizes and shas.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_inbound(
     d: &Daemon,
     plugin: &str,
@@ -70,9 +82,32 @@ pub fn handle_inbound(
     kind: String,
     body: String,
     created_at: Option<DateTime<Utc>>,
+    attachments: Vec<IpcAttachment>,
 ) {
     metrics::inc(&metrics::INGRESS);
-    let key = dedup::key(plugin, &sender, &endpoint, &body, created_at);
+
+    let mut metas: Vec<AttachmentMeta> = Vec::new();
+    let mut shas: Vec<String> = Vec::new();
+    let mut notes = String::new();
+    for att in attachments {
+        let size = att.data.len() as u64;
+        if size > d.cfg.max_attachment_bytes {
+            notes.push_str(&format!(
+                "\n[dropped {}: {size} B over {} B limit]",
+                att.filename, d.cfg.max_attachment_bytes
+            ));
+            continue;
+        }
+        match d.cas.put(&att.data) {
+            Ok(sha) => {
+                shas.push(sha.clone());
+                metas.push(AttachmentMeta { filename: att.filename, mime: att.mime, size, sha256: sha });
+            }
+            Err(e) => warn!(error = %e, size, "failed to store attachment, dropping it"),
+        }
+    }
+
+    let key = dedup::key(plugin, &sender, &endpoint, &body, created_at, &shas);
     if !d.dedup.lock().unwrap().check(&key, Instant::now()) {
         metrics::inc(&metrics::DUPLICATES);
         return;
@@ -88,7 +123,8 @@ pub fn handle_inbound(
         warn!(%source, "dropping unrouted message (deny by default)");
         return;
     }
-    let env = Envelope::new(
+    let body = format!("{body}{notes}");
+    let mut env = Envelope::new(
         source,
         Sender { native_ref: sender },
         kind,
@@ -97,17 +133,22 @@ pub fn handle_inbound(
         now + CDuration::seconds(d.cfg.ttl_default_secs as i64),
         d.cfg.hop_limit,
     );
+    env.attachments = metas;
     let store = d.store.lock().unwrap();
     if let Err(e) = store.insert_message(&env) {
         warn!(error = %e, "failed to persist message");
         return;
+    }
+    if let Err(e) = store.insert_attachment_refs(env.id, &shas) {
+        warn!(error = %e, "failed to persist attachment refs");
     }
     for (route, dest) in &targets {
         if let Err(e) = store.insert_delivery(env.id, route, dest, now, env.expires_at) {
             warn!(error = %e, "failed to enqueue delivery");
         }
     }
-    info!(id = %env.id, source = %env.source, targets = targets.len(), "message accepted");
+    info!(id = %env.id, source = %env.source, targets = targets.len(),
+          attachments = env.attachments.len(), "message accepted");
 }
 
 /// Delivery-state writes are best-effort from the caller's point of view (the
@@ -167,8 +208,16 @@ pub async fn pump(d: Arc<Daemon>) {
             let cutoff = now - CDuration::hours(24);
             let result = d.store.lock().unwrap().purge_terminal(cutoff);
             match result {
-                Ok(n) if n > 0 => info!(purged = n, "retention purge removed old deliveries"),
-                Ok(_) => {}
+                Ok((n, orphans)) => {
+                    if n > 0 {
+                        info!(purged = n, "retention purge removed old deliveries");
+                    }
+                    for sha in &orphans {
+                        if let Err(e) = d.cas.remove(sha) {
+                            warn!(sha = %sha, error = %e, "failed to remove orphaned attachment");
+                        }
+                    }
+                }
                 Err(e) => warn!(error = %e, "retention purge failed"),
             }
         }
@@ -291,6 +340,7 @@ pub mod tests_support {
             ttl_default_secs: 3600,
             dedup_ttl_secs: 3600,
             hop_limit: 8,
+            max_attachment_bytes: 8 * 1024 * 1024,
         };
         Daemon::new(cfg, dir).unwrap()
     }
@@ -306,7 +356,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None);
+                       "hello".into(), None, vec![]);
         // one delivery row, to mockb, none echoed to mocka
         let store = d.store.lock().unwrap();
         let counts = store.queue_counts().unwrap();
@@ -316,12 +366,12 @@ mod tests {
         drop(store);
         // duplicate is dropped
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None);
+                       "hello".into(), None, vec![]);
         assert_eq!(d.store.lock().unwrap().queue_counts().unwrap(),
                    vec![("pending".to_string(), 1)]);
         // unrouted endpoint is dropped (deny by default)
         handle_inbound(&d, "mocka", "elsewhere".into(), "!a".into(), "text".into(),
-                       "hi".into(), None);
+                       "hi".into(), None, vec![]);
         assert_eq!(d.store.lock().unwrap().queue_counts().unwrap(),
                    vec![("pending".to_string(), 1)]);
     }
@@ -398,7 +448,7 @@ mod tests {
         let d = Arc::new(test_daemon(dir.path()));
 
         handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None);
+                       "hello".into(), None, vec![]);
         // sample `now` after handle_inbound (which stamps next_attempt with
         // its own, slightly later, internal Utc::now()) so due_deliveries
         // actually finds the row.
@@ -428,5 +478,47 @@ mod tests {
 
         let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
         assert_eq!(after.state, "pending");
+    }
+
+    #[test]
+    fn inbound_drops_oversize_attachment_stores_accepted_one_and_notes_the_drop() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.cfg.max_attachment_bytes = 16;
+
+        let small = IpcAttachment {
+            filename: "small.txt".into(),
+            mime: "text/plain".into(),
+            data: b"tiny".to_vec(),
+        };
+        let big = IpcAttachment {
+            filename: "big.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: vec![0u8; 64],
+        };
+        let expected_sha = hex::encode(Sha256::digest(&small.data));
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![small, big]);
+
+        let store = d.store.lock().unwrap();
+        let due = store.due_deliveries(chrono::Utc::now(), 10).unwrap();
+        assert_eq!(due.len(), 1);
+        let env = store.get_message(due[0].message_id).unwrap().unwrap();
+
+        assert_eq!(env.attachments.len(), 1, "only the in-cap attachment gets a meta");
+        assert_eq!(env.attachments[0].sha256, expected_sha);
+        assert_eq!(env.attachments[0].filename, "small.txt");
+        assert_eq!(env.attachments[0].size, 4);
+
+        assert!(
+            env.body.contains("[dropped big.bin: 64 B over 16 B limit]"),
+            "body did not carry the drop note: {}", env.body
+        );
+
+        // the accepted attachment's bytes actually landed in the CAS
+        assert_eq!(d.cas.get(&expected_sha).unwrap(), b"tiny");
     }
 }

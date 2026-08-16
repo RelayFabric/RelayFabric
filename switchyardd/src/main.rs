@@ -1,5 +1,6 @@
 mod admin;
 mod alias;
+mod cas;
 mod config;
 mod dedup;
 mod engine;

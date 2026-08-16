@@ -41,6 +41,12 @@ CREATE TABLE IF NOT EXISTS deliveries (
   expires_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_deliveries_due ON deliveries(state, next_attempt);
+CREATE TABLE IF NOT EXISTS message_attachments (
+  message_id TEXT NOT NULL,
+  sha256 TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
+  ON message_attachments(message_id);
 ";
 
 fn ts(t: DateTime<Utc>) -> String {
@@ -65,6 +71,19 @@ impl Store {
             "INSERT OR IGNORE INTO messages (id, envelope, created_at) VALUES (?1, ?2, ?3)",
             params![env.id.to_string(), json, ts(env.created_at)],
         )?;
+        Ok(())
+    }
+
+    /// Records which content-addressed blobs a message references, so that
+    /// `purge_terminal` can later tell which shas are still live (referenced
+    /// by a surviving message) versus orphaned (safe to delete from the CAS).
+    pub fn insert_attachment_refs(&self, message_id: Uuid, shas: &[String]) -> rusqlite::Result<()> {
+        for sha in shas {
+            self.conn.execute(
+                "INSERT INTO message_attachments (message_id, sha256) VALUES (?1, ?2)",
+                params![message_id.to_string(), sha],
+            )?;
+        }
         Ok(())
     }
 
@@ -197,7 +216,17 @@ impl Store {
     /// straight to a terminal state without an attempt (e.g. TTL_EXPIRED,
     /// POLICY_DENIED, DESTINATION_UNKNOWN), which would otherwise never be
     /// purged.
-    pub fn purge_terminal(&self, older_than: DateTime<Utc>) -> rusqlite::Result<usize> {
+    ///
+    /// Also GCs `message_attachments`: any row whose `message_id` no longer
+    /// exists in `messages` (i.e. the message was just purged above, or had
+    /// no deliveries at all) is deleted, and the *distinct* shas it referenced
+    /// are returned so the caller (the pump) can remove the now-unreferenced
+    /// blobs from the CAS. A sha still referenced by any surviving message
+    /// (e.g. a pending delivery) is never returned or deleted here.
+    pub fn purge_terminal(
+        &self,
+        older_than: DateTime<Utc>,
+    ) -> rusqlite::Result<(usize, Vec<String>)> {
         let deleted = self.conn.execute(
             "DELETE FROM deliveries
              WHERE state IN ('delivered','failed','expired','dead_letter')
@@ -208,7 +237,19 @@ impl Store {
             "DELETE FROM messages WHERE id NOT IN (SELECT DISTINCT message_id FROM deliveries)",
             [],
         )?;
-        Ok(deleted)
+        let orphans: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT sha256 FROM message_attachments
+                 WHERE message_id NOT IN (SELECT id FROM messages)",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            rows
+        };
+        self.conn.execute(
+            "DELETE FROM message_attachments WHERE message_id NOT IN (SELECT id FROM messages)",
+            [],
+        )?;
+        Ok((deleted, orphans))
     }
 
     pub fn recover(&self) -> rusqlite::Result<usize> {
@@ -378,8 +419,9 @@ mod tests {
         let pending_id = s.insert_delivery(
             pending_msg.id, "general", &dest(), now, pending_msg.expires_at).unwrap();
 
-        let purged = s.purge_terminal(now + Duration::hours(1)).unwrap();
+        let (purged, orphans) = s.purge_terminal(now + Duration::hours(1)).unwrap();
         assert_eq!(purged, 1);
+        assert!(orphans.is_empty(), "neither message in this test has attachments");
 
         assert!(s.deliveries_for(delivered_msg.id).unwrap().is_empty());
         assert!(s.get_message(delivered_msg.id).unwrap().is_none(),
@@ -391,6 +433,58 @@ mod tests {
         assert_eq!(remaining[0].state, "pending");
         assert!(s.get_message(pending_msg.id).unwrap().is_some(),
             "message with a live pending delivery must survive purge");
+    }
+
+    fn attachment_shas_for(s: &Store, message_id: Uuid) -> Vec<String> {
+        let mut stmt = s.conn
+            .prepare("SELECT sha256 FROM message_attachments WHERE message_id = ?1 ORDER BY sha256")
+            .unwrap();
+        stmt.query_map(params![message_id.to_string()], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn insert_attachment_refs_persists_shas_for_the_message() {
+        let (_d, s) = store();
+        let e = env();
+        s.insert_message(&e).unwrap();
+        s.insert_attachment_refs(e.id, &["sha2".to_string(), "sha1".to_string()]).unwrap();
+        assert_eq!(attachment_shas_for(&s, e.id), vec!["sha1".to_string(), "sha2".to_string()]);
+    }
+
+    #[test]
+    fn purge_terminal_returns_orphan_shas_only_once_referencing_messages_are_gone() {
+        let (_d, s) = store();
+        let now = Utc::now();
+
+        // delivered message with an attachment: once its message is purged,
+        // nothing references the sha anymore, so it must come back as
+        // orphaned (and the ref row itself must be cleaned up).
+        let delivered_msg = env();
+        s.insert_message(&delivered_msg).unwrap();
+        s.insert_attachment_refs(delivered_msg.id, &["orphan-sha".to_string()]).unwrap();
+        let delivered_id = s.insert_delivery(
+            delivered_msg.id, "general", &dest(), now, delivered_msg.expires_at).unwrap();
+        s.mark_attempting(delivered_id).unwrap();
+        s.mark_delivered(delivered_id).unwrap();
+
+        // pending message with an attachment: its message survives, so the
+        // sha must NOT be reported as orphaned nor have its ref row deleted.
+        let pending_msg = env();
+        s.insert_message(&pending_msg).unwrap();
+        s.insert_attachment_refs(pending_msg.id, &["surviving-sha".to_string()]).unwrap();
+        s.insert_delivery(pending_msg.id, "general", &dest(), now, pending_msg.expires_at).unwrap();
+
+        let (deleted, orphans) = s.purge_terminal(now + Duration::hours(1)).unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(orphans, vec!["orphan-sha".to_string()]);
+
+        assert!(attachment_shas_for(&s, delivered_msg.id).is_empty(),
+            "orphaned attachment ref row must be deleted, not just reported");
+        assert_eq!(attachment_shas_for(&s, pending_msg.id), vec!["surviving-sha".to_string()],
+            "a pending message's attachment ref must survive purge");
     }
 
     #[test]

@@ -18,10 +18,13 @@ pub struct Config {
     pub dedup_ttl_secs: u64,
     #[serde(default = "default_hop_limit")]
     pub hop_limit: u8,
+    #[serde(default = "default_max_attachment_bytes")]
+    pub max_attachment_bytes: u64,
 }
 
 fn default_ttl() -> u64 { 86_400 }
 fn default_hop_limit() -> u8 { 8 }
+fn default_max_attachment_bytes() -> u64 { 8 * 1024 * 1024 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeConfig {
@@ -148,6 +151,7 @@ routes:
         assert_eq!(cfg.routes[0].sources[0].protocol, "mocka");
         assert_eq!(cfg.hop_limit, 8);
         assert_eq!(cfg.ttl_default_secs, 86400);
+        assert_eq!(cfg.max_attachment_bytes, 8 * 1024 * 1024);
         assert_eq!(cfg.policies[0].rules.max_payload, Some(200));
         assert!(cfg.plugins["mocka"].command.is_none());
     }

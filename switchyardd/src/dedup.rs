@@ -9,10 +9,17 @@ pub fn key(
     endpoint: &str,
     body: &str,
     created_at: Option<DateTime<Utc>>,
+    attachment_shas: &[String],
 ) -> String {
     let ts = created_at.map(|t| t.timestamp().to_string()).unwrap_or_default();
+    // sorted so the same set of attachments, resent with the shas in a
+    // different order (e.g. a plugin that doesn't preserve ordering),
+    // still dedups against the original.
+    let mut sorted: Vec<&str> = attachment_shas.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let shas = sorted.join(",");
     hex::encode(Sha256::digest(
-        format!("{protocol}|{sender}|{endpoint}|{ts}|{body}").as_bytes(),
+        format!("{protocol}|{sender}|{endpoint}|{ts}|{body}|{shas}").as_bytes(),
     ))
 }
 
@@ -65,11 +72,27 @@ mod tests {
 
     #[test]
     fn key_varies_by_every_component() {
-        let base = key("p", "s", "e", "b", None);
-        assert_ne!(base, key("q", "s", "e", "b", None));
-        assert_ne!(base, key("p", "t", "e", "b", None));
-        assert_ne!(base, key("p", "s", "f", "b", None));
-        assert_ne!(base, key("p", "s", "e", "c", None));
-        assert_eq!(base, key("p", "s", "e", "b", None));
+        let base = key("p", "s", "e", "b", None, &[]);
+        assert_ne!(base, key("q", "s", "e", "b", None, &[]));
+        assert_ne!(base, key("p", "t", "e", "b", None, &[]));
+        assert_ne!(base, key("p", "s", "f", "b", None, &[]));
+        assert_ne!(base, key("p", "s", "e", "c", None, &[]));
+        assert_eq!(base, key("p", "s", "e", "b", None, &[]));
+    }
+
+    #[test]
+    fn key_is_sensitive_to_attachment_shas_but_order_independent() {
+        let none = key("p", "s", "e", "b", None, &[]);
+        let one = key("p", "s", "e", "b", None, &["sha1".to_string()]);
+        let two = key("p", "s", "e", "b", None, &["sha1".to_string(), "sha2".to_string()]);
+        assert_ne!(none, one, "attaching a file must change the key");
+        assert_ne!(one, two, "a different set of attachments must change the key");
+
+        // same set, different order on the wire: must dedup to the same key
+        let forward = key("p", "s", "e", "b", None,
+            &["sha1".to_string(), "sha2".to_string()]);
+        let reversed = key("p", "s", "e", "b", None,
+            &["sha2".to_string(), "sha1".to_string()]);
+        assert_eq!(forward, reversed, "attachment order must not affect the key");
     }
 }
