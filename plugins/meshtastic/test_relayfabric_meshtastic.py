@@ -81,6 +81,15 @@ class ConfigTests(unittest.TestCase):
                 }
             })
 
+    def test_max_text_bytes_not_int(self):
+        with self.assertRaises(TypeError):
+            plug.load_config({
+                "broker": "localhost",
+                "topic_root": "msh",
+                "channels": {"primary": {"index": 0, "topic_channel": "ch-0"}},
+                "max_text_bytes": "200"
+            })
+
     def test_gateway_id_override(self):
         cfg = plug.load_config({
             "broker": "localhost",
@@ -442,6 +451,11 @@ class BridgeTests(unittest.TestCase):
         self.sock = FakeSock()
         self.bridge = plug.Bridge(self.cfg, self.backend, self.sock)
 
+    def test_sent_cache_ttl_is_one_hour(self):
+        # design mandate: 1h, not SentCache's 86400s default (radio echo is
+        # fast; bounds the lost-echo swallow window).
+        self.assertEqual(self.bridge.sent_cache.ttl, 3600)
+
     def test_inbound_mapped_channel_bridges(self):
         self.bridge.handle_event("msh/2/json/ch-0/!12345678", text_event())
         frames = self.sock.frames()
@@ -552,6 +566,12 @@ class MqttJsonBackendTests(unittest.TestCase):
     def test_on_message_invalid_json_skipped(self):
         backend = plug.MqttJsonBackend("mqtt://localhost", "msh")
         msg = type("Msg", (), {"topic": "msh/2/json/ch-0/!1", "payload": b"not json"})()
+        backend._on_message(None, None, msg)
+        self.assertTrue(backend._queue.empty())
+
+    def test_on_message_non_dict_json_skipped(self):
+        backend = plug.MqttJsonBackend("mqtt://localhost", "msh")
+        msg = type("Msg", (), {"topic": "msh/2/json/ch-0/!1", "payload": b"[1]"})()
         backend._on_message(None, None, msg)
         self.assertTrue(backend._queue.empty())
 

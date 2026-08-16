@@ -67,6 +67,10 @@ def load_config(raw):
     cfg["channels"] = channels_copy
     cfg.setdefault("gateway_id", None)
     cfg.setdefault("max_text_bytes", 200)
+    if not isinstance(cfg["max_text_bytes"], int):
+        raise TypeError(
+            f"max_text_bytes must be int, got {type(cfg['max_text_bytes']).__name__}"
+        )
 
     return cfg
 
@@ -202,12 +206,21 @@ class MqttJsonBackend:
         except (ValueError, UnicodeDecodeError) as e:
             log.debug(f"Dropping non-JSON MQTT message on {msg.topic}: {e}")
             return
+        if not isinstance(event, dict):
+            # valid JSON but not an object (e.g. "[1]" or "42") -- any
+            # tenant on a shared broker can publish this. parse_uplink
+            # assumes a dict; drop here instead of queuing something that
+            # would raise AttributeError in the reader loop.
+            log.debug(f"Dropping non-dict MQTT JSON payload on {msg.topic}: {type(event).__name__}")
+            return
         try:
             self._queue.put_nowait((msg.topic, event))
         except queue.Full:
             # never block paho's network thread; a full queue means the
-            # reader thread is falling behind, so drop the oldest-pressure
-            # event rather than wedge inbound MQTT processing entirely.
+            # reader thread is falling behind, so drop this newest event
+            # (put_nowait raises Full without touching the queue's
+            # existing contents) rather than wedge inbound MQTT processing
+            # entirely.
             log.debug(f"Dropping MQTT message on {msg.topic}: event queue full")
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
@@ -260,7 +273,11 @@ class Bridge:
         self.backend = backend
         self.sock_file = sock_file
         self.write_lock = threading.Lock()
-        self.sent_cache = SentCache()
+        # 1h, not SentCache's 86400s default: a Meshtastic radio echo (our
+        # downlink re-uplinked by the node) arrives fast, so this only needs
+        # to bound how long a lost echo can leave a stale entry able to
+        # swallow one genuine identical-text message (see README).
+        self.sent_cache = SentCache(ttl_secs=3600)
         self.by_index = channels_by_index(cfg)
 
     def _send_frame(self, obj):
