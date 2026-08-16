@@ -240,6 +240,7 @@ async fn main() {
                         kind: "text".into(),
                         body,
                         created_at: Some(chrono::Utc::now()),
+                        attachments: vec![],
                     };
                     if write_frame(&mut w, &msg).await.is_err() {
                         warn!("daemon connection lost");

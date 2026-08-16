@@ -243,6 +243,7 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
                 endpoint: del.destination.endpoint.clone(),
                 kind: env.kind.clone(),
                 body,
+                attachments: vec![],
             };
             // try_send, not send().await: this pump task is the single driver
             // of ALL plugins' deliveries plus reclaim_stale. Awaiting a full

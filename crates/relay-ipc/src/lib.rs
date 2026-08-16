@@ -12,6 +12,14 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcAttachment {
+    pub filename: String,
+    pub mime: String,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum PluginToDaemon {
     Hello {
@@ -26,6 +34,8 @@ pub enum PluginToDaemon {
         kind: String,
         body: String,
         created_at: Option<DateTime<Utc>>,
+        #[serde(default)]
+        attachments: Vec<IpcAttachment>,
     },
     DeliveryResult {
         corr: i64,
@@ -38,7 +48,14 @@ pub enum PluginToDaemon {
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum DaemonToPlugin {
     HelloAck { protocol_version: u32, error: Option<String> },
-    Send { corr: i64, endpoint: String, kind: String, body: String },
+    Send {
+        corr: i64,
+        endpoint: String,
+        kind: String,
+        body: String,
+        #[serde(default)]
+        attachments: Vec<IpcAttachment>,
+    },
     Shutdown,
 }
 
@@ -111,6 +128,7 @@ mod tests {
         let (mut a, mut b) = tokio::io::duplex(1024);
         write_frame(&mut a, &DaemonToPlugin::Send {
             corr: 42, endpoint: "chan".into(), kind: "text".into(), body: "hi".into(),
+            attachments: vec![],
         }).await.unwrap();
         let DaemonToPlugin::Send { corr, .. } = read_frame(&mut b).await.unwrap() else {
             panic!("wrong variant");
@@ -137,5 +155,28 @@ mod tests {
         // protocol changed — that is a breaking protocol event, not a test fix.
         let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, "000000a5a561746568656c6c6f66706c7567696e646c786d666776657273696f6e65302e312e307070726f746f636f6c5f76657273696f6e016c6361706162696c6974696573a96474657874f56f6469726563745f6d65737361676573f56667726f757073f56b6174746163686d656e7473f4686c6f636174696f6ef4697265616374696f6e73f4687265636569707473f46870726573656e6365f46b6d61785f7061796c6f6164f6");
+    }
+
+    #[tokio::test]
+    async fn canonical_inbound_attachment_frame_bytes_are_stable() {
+        let mut buf = Vec::new();
+        let msg = PluginToDaemon::Inbound {
+            endpoint: "chan".into(),
+            sender: "s".into(),
+            kind: "text".into(),
+            body: "hi".into(),
+            created_at: None,
+            attachments: vec![IpcAttachment {
+                filename: "a.bin".into(),
+                mime: "application/octet-stream".into(),
+                data: vec![1, 2, 3],
+            }],
+        };
+        write_frame(&mut buf, &msg).await.unwrap();
+        // Wire-format lock: Python plugins reproduce these exact bytes
+        // (test_relay_ipc.py). If this assertion ever fails, the plugin
+        // protocol changed — that is a breaking protocol event, not a test fix.
+        let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "00000085a7617467696e626f756e6468656e64706f696e74646368616e6673656e6465726173646b696e64647465787464626f64796268696a637265617465645f6174f66b6174746163686d656e747381a36866696c656e616d6565612e62696e646d696d6578186170706c69636174696f6e2f6f637465742d73747265616d646461746143010203");
     }
 }

@@ -108,6 +108,7 @@ async fn inbound(
         kind: "text".into(),
         body: body.into(),
         created_at: Some(created_at),
+        attachments: vec![],
     }).await.unwrap();
 }
 

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 relay-core.workspace = true
 serde.workspace = true
+serde_bytes.workspace = true
 chrono.workspace = true
 ciborium.workspace = true
 tokio = { workspace = true }

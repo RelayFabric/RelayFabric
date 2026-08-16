@@ -37,6 +37,14 @@ pub struct Sender {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentMeta {
+    pub filename: String,
+    pub mime: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
     pub version: u8,
     pub id: Uuid,
@@ -51,6 +59,8 @@ pub struct Envelope {
     // ponytail: hop fields carried but only meaningful once federation exists
     pub hop_count: u8,
     pub hop_limit: u8,
+    #[serde(default)]
+    pub attachments: Vec<AttachmentMeta>,
 }
 
 impl Envelope {
@@ -77,6 +87,7 @@ impl Envelope {
             reply_to: None,
             hop_count: 0,
             hop_limit,
+            attachments: Vec::new(),
         }
     }
 
@@ -149,5 +160,40 @@ mod tests {
         assert!(c.text);
         assert!(!c.attachments);
         assert_eq!(c.max_payload, None);
+    }
+
+    #[test]
+    fn envelope_attachments_serde_roundtrip_and_old_json_defaults_empty() {
+        let now = Utc::now();
+        let mut env = Envelope::new(
+            Endpoint { protocol: "mock".into(), endpoint: "chan".into() },
+            Sender { native_ref: "!abcd".into() },
+            "text".into(), "hi".into(), now, now + Duration::hours(24), 8,
+        );
+        assert!(env.attachments.is_empty());
+        env.attachments.push(AttachmentMeta {
+            filename: "a.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 3,
+            sha256: "abc123".into(),
+        });
+
+        let json = serde_json::to_string(&env).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.attachments.len(), 1);
+        assert_eq!(back.attachments[0].filename, "a.bin");
+        assert_eq!(back.attachments[0].mime, "application/octet-stream");
+        assert_eq!(back.attachments[0].size, 3);
+        assert_eq!(back.attachments[0].sha256, "abc123");
+
+        // Old-format JSON, captured before attachments existed, must still
+        // deserialize (forward compatibility with rows already in storage.rs's
+        // sqlite blob column).
+        let mut old: serde_json::Value = serde_json::to_string(&env)
+            .map(|s| serde_json::from_str(&s).unwrap())
+            .unwrap();
+        old.as_object_mut().unwrap().remove("attachments");
+        let old_env: Envelope = serde_json::from_value(old).unwrap();
+        assert!(old_env.attachments.is_empty());
     }
 }
