@@ -2,7 +2,10 @@ use rand::Rng;
 
 /// Generates a 6-digit verification code using OS randomness.
 /// Uses rand::rngs::OsRng for cryptographically secure randomness.
-#[allow(dead_code)] // consumed by admin API (Task 2); remove allow when used
+// engine::initiate_link is its only caller, and that function's own caller
+// (the admin API) doesn't land until Task 4 — unreachable from `main` in a
+// non-test build until then; remove allow when admin.rs wires initiate_link.
+#[allow(dead_code)]
 pub fn generate_code() -> String {
     let mut rng = rand::rngs::OsRng;
     let code: u32 = rng.gen_range(0..=999_999);
@@ -18,7 +21,6 @@ pub fn generate_code() -> String {
 /// - "signal:+14155551234" (18 chars) -> "si****1234"
 /// - "lxmf:aabbccdd" (12 chars) -> "lx****ccdd"
 /// - "short" (5 chars) -> "****"
-#[allow(dead_code)] // consumed by admin API responses (Task 2); remove allow when used
 pub fn mask_ref(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() > 8 {

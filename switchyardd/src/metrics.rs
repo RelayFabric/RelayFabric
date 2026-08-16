@@ -8,6 +8,7 @@ pub static POLICY_DENIALS: AtomicU64 = AtomicU64::new(0);
 pub static RATELIMITED: AtomicU64 = AtomicU64::new(0);
 pub static QUEUE_REJECTED: AtomicU64 = AtomicU64::new(0);
 pub static BUDGET_DEFERRED: AtomicU64 = AtomicU64::new(0);
+pub static LINKS_VERIFIED: AtomicU64 = AtomicU64::new(0);
 
 pub fn inc(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
@@ -24,6 +25,7 @@ pub fn render(queue_counts: &[(String, i64)], plugin_up: &[(String, bool)]) -> S
         ("relayfabric_ratelimited_total", &RATELIMITED),
         ("relayfabric_queue_rejected_total", &QUEUE_REJECTED),
         ("relayfabric_budget_deferred_total", &BUDGET_DEFERRED),
+        ("relayfabric_links_verified_total", &LINKS_VERIFIED),
     ];
     for (name, c) in counters {
         out.push_str(&format!("# TYPE {name} counter\n{name} {}\n", c.load(Ordering::Relaxed)));
@@ -61,5 +63,6 @@ mod tests {
         assert!(out.contains("relayfabric_ratelimited_total"));
         assert!(out.contains("relayfabric_queue_rejected_total"));
         assert!(out.contains("relayfabric_budget_deferred_total"));
+        assert!(out.contains("relayfabric_links_verified_total"));
     }
 }

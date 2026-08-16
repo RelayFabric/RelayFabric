@@ -32,6 +32,13 @@ fn default_ttl() -> u64 { 86_400 }
 fn default_hop_limit() -> u8 { 8 }
 fn default_max_attachment_bytes() -> u64 { 8 * 1024 * 1024 }
 
+/// Reserved route name for identity-link challenge/confirmation deliveries
+/// (design §Lifecycle, §IPC): a user route may never be named this
+/// (`validate()` rejects it below), and `engine::process_due` dispatches
+/// deliveries queued under it via `SendDirect` instead of the normal
+/// `Send`/alias/render path.
+pub const IDENTITY_ROUTE: &str = "@identity";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeConfig {
     pub name: String,
@@ -95,7 +102,16 @@ pub struct RouteConfig {
     pub sources: Vec<Endpoint>,
     #[serde(deserialize_with = "endpoints")]
     pub destinations: Vec<Endpoint>,
+    /// Design §Rendering: "pseudonymous" (default, backward compatible with
+    /// pre-cycle-C configs that have no such key) renders the HMAC alias as
+    /// today; "linked" renders the verified link's `display_name` instead,
+    /// when one exists for the envelope's (source protocol, native_ref) —
+    /// see `engine::process_due`. `validate()` rejects any other value.
+    #[serde(default = "default_identity_mode")]
+    pub identity_mode: String,
 }
+
+fn default_identity_mode() -> String { "pseudonymous".to_string() }
 
 fn endpoints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Endpoint>, D::Error> {
     let raw: Vec<String> = Vec::deserialize(d)?;
@@ -168,8 +184,19 @@ fn warn_if_public_with_no_limits(cfg: &Config) {
 pub fn validate(cfg: &Config) -> Result<(), String> {
     let mut names = BTreeSet::new();
     for r in &cfg.routes {
+        if r.name == IDENTITY_ROUTE {
+            return Err(format!(
+                "route name '{IDENTITY_ROUTE}' is reserved for identity-link delivery and cannot be used as a user route name"
+            ));
+        }
         if !names.insert(&r.name) {
             return Err(format!("duplicate route name '{}'", r.name));
+        }
+        if r.identity_mode != "pseudonymous" && r.identity_mode != "linked" {
+            return Err(format!(
+                "route '{}' has invalid identity_mode '{}' (expected \"pseudonymous\" or \"linked\")",
+                r.name, r.identity_mode
+            ));
         }
         for ep in r.sources.iter().chain(&r.destinations) {
             match cfg.plugins.get(&ep.protocol) {
@@ -629,6 +656,45 @@ limits:
         assert_eq!(cfg.limits.per_route.queue_max, 1000);
         assert_eq!(cfg.limits.global.queue_max, 10000);
         assert_eq!(cfg.limits.global.cas_max_bytes, 1000000000);
+    }
+
+    #[test]
+    fn identity_mode_defaults_to_pseudonymous_when_absent() {
+        // v0.1/pre-cycle-C style config has no identity_mode key at all.
+        let cfg = parse(GOOD).unwrap();
+        assert_eq!(cfg.routes[0].identity_mode, "pseudonymous");
+    }
+
+    #[test]
+    fn identity_mode_linked_is_accepted() {
+        let yaml = GOOD.replace(
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]\n    identity_mode: linked",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.routes[0].identity_mode, "linked");
+    }
+
+    #[test]
+    fn identity_mode_unknown_value_is_rejected() {
+        let yaml = GOOD.replace(
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]\n    identity_mode: anonymous",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("general"), "err should name the route: {err}");
+        assert!(err.contains("anonymous"), "err should quote the bad value: {err}");
+    }
+
+    /// The design's §IPC "@identity" sentinel is where challenge/confirmation
+    /// deliveries live (see `engine::process_due`); a user route claiming
+    /// that name would collide with the dispatch that special-cases it.
+    #[test]
+    fn reserved_identity_route_name_is_rejected() {
+        let yaml = GOOD.replace("name: general", "name: \"@identity\"");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("@identity"), "err was: {err}");
+        assert!(err.contains("reserved"), "err was: {err}");
     }
 
     #[test]

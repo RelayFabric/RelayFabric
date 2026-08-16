@@ -34,6 +34,7 @@ mod tests {
             name: "general".into(),
             sources: vec![ep("mocka:chan"), ep("mockb:chan")],
             destinations: vec![ep("mocka:chan"), ep("mockb:chan")],
+            identity_mode: "pseudonymous".into(),
         }]
     }
 

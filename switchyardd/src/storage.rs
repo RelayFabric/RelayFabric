@@ -23,28 +23,41 @@ pub struct Delivery {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // consumed by message routing and admin API (Tasks 2-3); remove allow when used
 pub struct Challenge {
     pub id: i64,
+    // Deliberately unread outside the SQL match in find_active_challenge:
+    // codes must never be exposed anywhere in engine.rs or an API response
+    // (design §Security invariants) — the field exists for round-tripping,
+    // not for a caller to read back.
+    #[allow(dead_code)]
     pub code: String,
     pub target_protocol: String,
     pub target_ref: String,
     pub requester_protocol: String,
     pub requester_ref: String,
     pub display_name: String,
+    // consumed by admin API's GET /v1/identities/challenges (Task 4); remove
+    // allow when used
+    #[allow(dead_code)]
     pub created_at: DateTime<Utc>,
+    #[allow(dead_code)]
     pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // consumed by rendering and admin API (Tasks 2-3); remove allow when used
 pub struct Link {
     pub id: i64,
+    // consumed by admin API's GET /v1/identities (Task 4); remove allow when used
+    #[allow(dead_code)]
     pub a_protocol: String,
+    #[allow(dead_code)]
     pub a_ref: String,
+    #[allow(dead_code)]
     pub b_protocol: String,
+    #[allow(dead_code)]
     pub b_ref: String,
     pub display_name: String,
+    #[allow(dead_code)]
     pub verified_at: DateTime<Utc>,
 }
 
@@ -429,7 +442,11 @@ impl Store {
 
     /// Creates a new challenge. If a challenge already exists for this target,
     /// it is deleted first (single active challenge per target invariant).
-    #[allow(dead_code)] // consumed by admin API (Task 2); remove allow when used
+    // engine::initiate_link is its only caller, and that function's own
+    // caller (the admin API) doesn't land until Task 4 — so this is
+    // unreachable from `main` (hence dead_code) in a non-test build until
+    // then; remove allow when admin.rs wires initiate_link.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)] // interface per task brief
     pub fn create_challenge(
         &self,
@@ -460,7 +477,6 @@ impl Store {
     /// Finds an active challenge matching the target and code.
     /// Returns None if no matching challenge exists, if it has expired,
     /// or if the code doesn't match.
-    #[allow(dead_code)] // consumed by message routing (Task 2); remove allow when used
     pub fn find_active_challenge(
         &self,
         target_protocol: &str,
@@ -495,7 +511,6 @@ impl Store {
     }
 
     /// Deletes a challenge by id.
-    #[allow(dead_code)] // consumed by message routing (Task 2); remove allow when used
     pub fn delete_challenge(&self, id: i64) -> rusqlite::Result<()> {
         self.conn.execute("DELETE FROM link_challenges WHERE id = ?1", params![id])?;
         Ok(())
@@ -503,7 +518,6 @@ impl Store {
 
     /// Inserts a new identity link. If a link with the same (a_protocol, a_ref, b_protocol, b_ref)
     /// already exists, the verified_at is updated to now. Returns the id of the inserted or updated row.
-    #[allow(dead_code)] // consumed by message routing (Task 2); remove allow when used
     pub fn insert_link(
         &self,
         a_protocol: &str,
@@ -524,7 +538,6 @@ impl Store {
     }
 
     /// Deletes a link by id. Returns true if a row was deleted, false otherwise.
-    #[allow(dead_code)] // consumed by admin API (Task 3); remove allow when used
     pub fn delete_link(&self, id: i64) -> rusqlite::Result<bool> {
         let rows_affected = self.conn.execute("DELETE FROM identity_links WHERE id = ?1", params![id])?;
         Ok(rows_affected > 0)
@@ -532,7 +545,6 @@ impl Store {
 
     /// Finds a link by either side (a_protocol/a_ref OR b_protocol/b_ref).
     /// Returns the most-recently inserted/verified link (ORDER BY id DESC).
-    #[allow(dead_code)] // consumed by rendering (Task 3); remove allow when used
     pub fn link_for_identity(&self, protocol: &str, reference: &str) -> rusqlite::Result<Option<Link>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, a_protocol, a_ref, b_protocol, b_ref, display_name, verified_at
@@ -560,7 +572,7 @@ impl Store {
     }
 
     /// Lists all identity links.
-    #[allow(dead_code)] // consumed by admin API (Task 2); remove allow when used
+    #[allow(dead_code)] // consumed by admin API (Task 4); remove allow when used
     pub fn list_links(&self) -> rusqlite::Result<Vec<Link>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, a_protocol, a_ref, b_protocol, b_ref, display_name, verified_at
@@ -582,7 +594,6 @@ impl Store {
 
     /// Purges expired challenges (those where expires_at < now).
     /// Returns the number of rows deleted.
-    #[allow(dead_code)] // consumed by hourly pump (Task 3); remove allow when used
     pub fn purge_expired_challenges(&self, now: DateTime<Utc>) -> rusqlite::Result<usize> {
         self.conn.execute(
             "DELETE FROM link_challenges WHERE expires_at < ?1",

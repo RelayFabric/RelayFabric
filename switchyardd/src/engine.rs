@@ -1,8 +1,11 @@
 use crate::cas::{self, Cas};
-use crate::config::Config;
+use crate::config::{Config, IDENTITY_ROUTE};
 use crate::limits::{BudgetLimiter, SenderLimiter};
 use crate::storage::Store;
-use crate::{alias, dedup, metrics, node_identity, policy, queue, routes, storage, transform};
+use crate::{
+    alias, dedup, identity_links, metrics, node_identity, policy, queue, routes, storage,
+    transform,
+};
 use alias::Aliaser;
 use node_identity::NodeIdentity;
 use chrono::{DateTime, Duration as CDuration, Utc};
@@ -159,6 +162,33 @@ pub fn handle_inbound(
     // re-evaluating the same unroutable message every retry).
     d.dedup.lock().unwrap().record(&key, Instant::now());
     let now = Utc::now();
+
+    // Identity-link confirm interception (design §Lifecycle step 2): checked
+    // after dedup/rate-limit, strictly before routing — a confirmation reply
+    // is a verification round-trip, not chat content, and must never reach a
+    // route destination. Only a body that is EXACTLY 6 ASCII digits after
+    // trimming is even looked up against the challenge table, so a
+    // non-numeric or wrong-length message never risks a false match (and
+    // never touches find_active_challenge at all) and someone typing an
+    // ordinary 6-digit string with no active challenge bound to THEM falls
+    // straight through to normal routing below.
+    let trimmed_body = body.trim();
+    if trimmed_body.len() == 6 && trimmed_body.chars().all(|c| c.is_ascii_digit()) {
+        let matched = match d.store.lock().unwrap()
+            .find_active_challenge(plugin, &sender, trimmed_body, now)
+        {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "failed to check identity challenge for inbound reply");
+                None
+            }
+        };
+        if let Some(challenge) = matched {
+            confirm_link(d, challenge, now);
+            return;
+        }
+    }
+
     let source = Endpoint { protocol: plugin.to_string(), endpoint };
     let targets: Vec<(String, Endpoint)> = routes::route(&d.cfg.routes, &source)
         .into_iter()
@@ -270,6 +300,174 @@ pub fn handle_inbound(
           attachments = env.attachments.len(), "message accepted");
 }
 
+/// Initiates an identity-link challenge (design §Lifecycle step 1, admin API
+/// or ctl — an operator/user-via-UI action, never implicit): validates that
+/// `target`'s plugin is connected and advertises `capabilities.direct_messages`,
+/// generates a 6-digit code, persists the challenge, and enqueues a
+/// best-effort `SendDirect` carrying it to the target. Returns the challenge
+/// id — NEVER the code itself, which only ever appears in the SendDirect
+/// body (see `identity_links::generate_code`'s callers).
+// Called by the admin API (Task 4), not yet wired in this worktree — hence
+// dead_code in a non-test build (test coverage below exercises it directly).
+// Remove allow when admin.rs's POST /v1/identities/link calls this.
+#[allow(dead_code)]
+pub fn initiate_link(
+    d: &Daemon,
+    requester: Endpoint,
+    target: Endpoint,
+    display_name: &str,
+) -> Result<i64, String> {
+    let direct_capable: Vec<String> = {
+        let plugins = d.plugins.lock().unwrap();
+        plugins.iter()
+            .filter(|(_, h)| h.connected && h.capabilities.direct_messages)
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+    if !direct_capable.iter().any(|p| p == &target.protocol) {
+        return Err(if direct_capable.is_empty() {
+            "target plugin is not connected or does not support direct messages; \
+             no currently-connected plugins support direct messages".to_string()
+        } else {
+            format!(
+                "target plugin '{}' is not connected or does not support direct messages; \
+                 currently direct-capable: {}",
+                target.protocol, direct_capable.join(", ")
+            )
+        });
+    }
+
+    let code = identity_links::generate_code();
+    let now = Utc::now();
+    let expires = now + CDuration::minutes(15);
+    let challenge_id = {
+        let store = d.store.lock().unwrap();
+        store.create_challenge(
+            &code, &target.protocol, &target.endpoint,
+            &requester.protocol, &requester.endpoint,
+            display_name, now, expires,
+        ).map_err(|e| e.to_string())?
+    };
+
+    // Masked per design §Lifecycle step 1's exact body wording: the target
+    // sees who is asking to link, but never the requester's full ref.
+    let masked_requester =
+        identity_links::mask_ref(&format!("{}:{}", requester.protocol, requester.endpoint));
+    let body = format!(
+        "RelayFabric verification code: {code} — reply with this code to link {masked_requester}. Ignore to refuse."
+    );
+    enqueue_identity_send(d, target, body, now, expires);
+
+    Ok(challenge_id)
+}
+
+/// Enqueues a best-effort delivery to `dest` (protocol + plugin-native ref)
+/// via the reserved `IDENTITY_ROUTE` sentinel: synthesizes a "notice"
+/// envelope carrying `body`, persists it, and queues one delivery row that
+/// `process_due`'s identity-dispatch branch (see `process_due_identity`)
+/// sends via `DaemonToPlugin::SendDirect` instead of the normal
+/// `Send`/alias/render path — `dest.endpoint` is stored verbatim in
+/// `dest_endpoint` and reused as the SendDirect `native_ref`. Used for both
+/// challenge delivery (`initiate_link`) and confirmation notices
+/// (`confirm_link`); a persistence failure is logged and swallowed, matching
+/// the "best-effort" posture the design calls for on confirmation notices —
+/// by the time this runs, the challenge has already been consumed/created,
+/// so a failure here must not unwind that.
+fn enqueue_identity_send(
+    d: &Daemon, dest: Endpoint, body: String, now: DateTime<Utc>, expires: DateTime<Utc>,
+) {
+    let env = Envelope::new(
+        Endpoint { protocol: IDENTITY_ROUTE.trim_start_matches('@').to_string(), endpoint: "system".to_string() },
+        Sender { native_ref: IDENTITY_ROUTE.to_string() },
+        "notice".to_string(),
+        body,
+        now,
+        expires,
+        d.cfg.hop_limit,
+    );
+    let store = d.store.lock().unwrap();
+    if let Err(e) = store.insert_message(&env) {
+        warn!(error = %e, "failed to persist identity notice message");
+        return;
+    }
+    if let Err(e) = store.insert_delivery(env.id, IDENTITY_ROUTE, &dest, now, expires,
+        relay_core::priority_rank(&env.priority))
+    {
+        warn!(error = %e, "failed to enqueue identity notice delivery");
+    }
+}
+
+/// Handles an inbound reply whose trimmed body matched an active challenge
+/// (see `handle_inbound`'s confirm interception, design §Lifecycle step 2):
+/// consumes the challenge (a code is never replayable, win or lose),
+/// enforces one-link-per-identity replace semantics (a fresh confirmation
+/// supersedes any existing link touching either party — a re-link
+/// supersedes rather than stacking a second link), inserts the new link, and
+/// enqueues best-effort confirmation notices to both parties via
+/// `IDENTITY_ROUTE`. The confirming message itself is never routed further.
+fn confirm_link(d: &Daemon, challenge: storage::Challenge, now: DateTime<Utc>) {
+    {
+        let store = d.store.lock().unwrap();
+        // Consume first: whatever happens below, this code must not be
+        // usable a second time.
+        if let Err(e) = store.delete_challenge(challenge.id) {
+            warn!(error = %e, "failed to consume identity challenge");
+        }
+
+        // One-link-per-identity: delete any existing link(s) touching
+        // either party before inserting the new one (replace, not stack).
+        for (proto, r) in [
+            (challenge.target_protocol.as_str(), challenge.target_ref.as_str()),
+            (challenge.requester_protocol.as_str(), challenge.requester_ref.as_str()),
+        ] {
+            if let Ok(Some(existing)) = store.link_for_identity(proto, r) {
+                if let Err(e) = store.delete_link(existing.id) {
+                    warn!(error = %e, "failed to delete superseded identity link");
+                }
+            }
+        }
+
+        if let Err(e) = store.insert_link(
+            &challenge.target_protocol, &challenge.target_ref,
+            &challenge.requester_protocol, &challenge.requester_ref,
+            &challenge.display_name, now,
+        ) {
+            warn!(error = %e, "failed to persist identity link");
+            return;
+        }
+    }
+
+    metrics::inc(&metrics::LINKS_VERIFIED);
+    info!(target = %identity_links::mask_ref(&challenge.target_ref),
+          requester = %identity_links::mask_ref(&challenge.requester_ref),
+          "identity link verified");
+
+    let masked_requester = identity_links::mask_ref(
+        &format!("{}:{}", challenge.requester_protocol, challenge.requester_ref));
+    let masked_target = identity_links::mask_ref(
+        &format!("{}:{}", challenge.target_protocol, challenge.target_ref));
+    let expires = now + CDuration::seconds(d.cfg.ttl_default_secs as i64);
+
+    enqueue_identity_send(
+        d,
+        Endpoint { protocol: challenge.target_protocol.clone(), endpoint: challenge.target_ref.clone() },
+        format!(
+            "RelayFabric: identity link confirmed with {masked_requester} as \"{}\".",
+            challenge.display_name
+        ),
+        now, expires,
+    );
+    enqueue_identity_send(
+        d,
+        Endpoint { protocol: challenge.requester_protocol.clone(), endpoint: challenge.requester_ref.clone() },
+        format!(
+            "RelayFabric: {masked_target} confirmed the identity link as \"{}\".",
+            challenge.display_name
+        ),
+        now, expires,
+    );
+}
+
 /// Delivery-state writes are best-effort from the caller's point of view (the
 /// pump will simply reconsider the row on its next pass), but a failure must
 /// never be silent: log it with the delivery id and the state we tried to
@@ -339,6 +537,19 @@ pub async fn pump(d: Arc<Daemon>) {
                 }
                 Err(e) => warn!(error = %e, "retention purge failed"),
             }
+            // Expired challenges (15-min TTL, design §Security invariants):
+            // swept on the same hourly cadence as the retention purge above
+            // rather than a dedicated timer — an unconfirmed challenge is
+            // already unusable past its expiry (find_active_challenge checks
+            // it live), so this is disk hygiene, not a correctness gate.
+            match d.store.lock().unwrap().purge_expired_challenges(now) {
+                Ok(n) => {
+                    if n > 0 {
+                        info!(purged = n, "purged expired identity-link challenges");
+                    }
+                }
+                Err(e) => warn!(error = %e, "expired challenge purge failed"),
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
@@ -368,6 +579,10 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
     if env.is_expired(now) {
         let result = d.store.lock().unwrap().mark_terminal(del.id, "expired", "TTL_EXPIRED");
         warn_if_mark_failed(del.id, "expired", result);
+        return;
+    }
+    if del.route == IDENTITY_ROUTE {
+        process_due_identity(d, del, env, now).await;
         return;
     }
     match policy::evaluate(&d.cfg.policies, &env, &del.destination) {
@@ -435,6 +650,29 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             let alias = d.aliaser.alias(
                 &env.source.protocol, &env.sender.native_ref, &del.route);
 
+            // Rendering (design §Rendering): a route explicitly opted into
+            // "linked" mode AND a verified link connecting this envelope's
+            // (source protocol, native_ref) to some identity swaps the tag
+            // from the HMAC alias to that link's display_name. The link
+            // lookup is live (not cached) on every send, so an unlink
+            // reverts rendering to the pseudonym on the very next delivery
+            // (design §95/§22) — no link, or the route stayed
+            // "pseudonymous" (the default, backward-compatible with configs
+            // that predate this field), and the alias is used exactly as
+            // before.
+            let linked_mode = d.cfg.routes.iter()
+                .find(|r| r.name == del.route)
+                .map(|r| r.identity_mode == "linked")
+                .unwrap_or(false);
+            let tag = if linked_mode {
+                let link = d.store.lock().unwrap()
+                    .link_for_identity(&env.source.protocol, &env.sender.native_ref)
+                    .unwrap_or(None);
+                link.map(|l| l.display_name).unwrap_or_else(|| alias.clone())
+            } else {
+                alias.clone()
+            };
+
             let (attachments, notes) = if env.attachments.is_empty() {
                 (Vec::new(), String::new())
             } else if attachments_allowed && dest_supports_attachments {
@@ -457,7 +695,7 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             // mean a very tight cap can truncate a note away entirely; that
             // is the correct trade-off since the byte cap is the harder
             // constraint the plugin actually enforces on the wire.
-            let body = transform::render(&alias, &format!("{}{notes}", env.body), limit);
+            let body = transform::render(&tag, &format!("{}{notes}", env.body), limit);
             let result = d.store.lock().unwrap().mark_attempting(del.id);
             warn_if_mark_failed(del.id, "attempting", result);
             let send = DaemonToPlugin::Send {
@@ -485,6 +723,74 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
                       reason = closed_or_full, "plugin channel unavailable, requeued");
             }
         }
+    }
+}
+
+/// Delivers an `IDENTITY_ROUTE` envelope (a challenge or confirmation
+/// notice, queued by `enqueue_identity_send`) via
+/// `DaemonToPlugin::SendDirect` instead of the normal `Send`/alias/render
+/// path — `del.destination.endpoint` holds the plugin-native ref to deliver
+/// to, not a route endpoint. Reuses the same connectivity check, transport
+/// budget, `mark_attempting`, and try_send-backpressure-requeue machinery as
+/// the ordinary path in `process_due` above (retry/backoff on failure and
+/// TTL expiry — checked by the caller before this is reached — are
+/// identical), but skips policy evaluation, aliasing, and attachment
+/// handling: these are daemon-generated system notices with no attachments
+/// and no user-content policy to apply. Additionally requires
+/// `capabilities.direct_messages` on the destination plugin (an ordinary
+/// `Send` never checks this) since `SendDirect` is only ever handled by
+/// direct-capable plugins.
+async fn process_due_identity(
+    d: &Arc<Daemon>, del: storage::Delivery, env: Envelope, now: DateTime<Utc>,
+) {
+    let tx = {
+        let plugins = d.plugins.lock().unwrap();
+        plugins.get(&del.destination.protocol)
+            .filter(|h| h.connected && h.capabilities.direct_messages)
+            .map(|h| h.tx.clone())
+    };
+    let Some(tx) = tx else {
+        let result = d.store.lock().unwrap()
+            .mark_retry(del.id, now + CDuration::seconds(5));
+        warn_if_mark_failed(del.id, "pending", result);
+        return;
+    };
+
+    if del.priority > 0 {
+        let per_minute = d.cfg.transport_budgets
+            .get(&del.destination.protocol)
+            .map(|b| b.messages_per_minute)
+            .unwrap_or(0);
+        let allowed = d.budget_limiter.lock().unwrap()
+            .allow(&del.destination.protocol, per_minute, Instant::now());
+        if !allowed {
+            metrics::inc(&metrics::BUDGET_DEFERRED);
+            let result = d.store.lock().unwrap()
+                .mark_retry(del.id, now + CDuration::seconds(10));
+            warn_if_mark_failed(del.id, "pending", result);
+            return;
+        }
+    }
+
+    let result = d.store.lock().unwrap().mark_attempting(del.id);
+    warn_if_mark_failed(del.id, "attempting", result);
+    let send = DaemonToPlugin::SendDirect {
+        corr: del.id,
+        native_ref: del.destination.endpoint.clone(),
+        body: env.body,
+    };
+    // try_send, not send().await — see process_due's identical rationale
+    // above: this pump task must never block on one plugin's channel.
+    if let Err(e) = tx.try_send(send) {
+        let closed_or_full = match e {
+            mpsc::error::TrySendError::Full(_) => "full",
+            mpsc::error::TrySendError::Closed(_) => "closed",
+        };
+        let result = d.store.lock().unwrap()
+            .mark_retry(del.id, now + CDuration::seconds(5));
+        warn_if_mark_failed(del.id, "pending", result);
+        warn!(delivery = del.id, plugin = %del.destination.protocol,
+              reason = closed_or_full, "plugin channel unavailable, requeued");
     }
 }
 
@@ -615,6 +921,7 @@ pub mod tests_support {
                 name: "general".into(),
                 sources: vec!["mocka:chan".parse().unwrap(), "mockb:chan".parse().unwrap()],
                 destinations: vec!["mocka:chan".parse().unwrap(), "mockb:chan".parse().unwrap()],
+                identity_mode: "pseudonymous".into(),
             }],
             policies: vec![],
             ttl_default_secs: 3600,
@@ -941,6 +1248,19 @@ mod tests {
         rx
     }
 
+    /// Registers a connected mock plugin that advertises
+    /// `capabilities.direct_messages` — the identity-link challenge/confirm
+    /// machinery only ever dispatches `SendDirect` to plugins like this one.
+    fn register_direct_plugin(d: &Daemon, name: &str) -> mpsc::Receiver<DaemonToPlugin> {
+        let (tx, rx) = mpsc::channel(8);
+        d.plugins.lock().unwrap().insert(name.to_string(), PluginHandle {
+            tx,
+            capabilities: Capabilities { direct_messages: true, ..Capabilities::default() },
+            connected: true,
+        });
+        rx
+    }
+
     async fn recv_send(rx: &mut mpsc::Receiver<DaemonToPlugin>) -> DaemonToPlugin {
         tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
@@ -1210,8 +1530,13 @@ mod tests {
                        "second".into(), None, vec![], None);
 
         let after = metrics::RATELIMITED.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(after - before, 1,
-            "the second message from the same sender must bump RATELIMITED");
+        // ">" not an exact +1 delta: RATELIMITED is a process-global counter
+        // that other tests in this binary's parallel run (e.g. the identity-
+        // link confirm/rate-limit ordering test) also legitimately bump —
+        // a real increment from this test's own action still guarantees
+        // after > before regardless of what else the counter is doing
+        // concurrently, so this stays a precise, non-flaky assertion.
+        assert!(after > before, "the second message from the same sender must bump RATELIMITED");
 
         let counts = d.store.lock().unwrap().queue_counts().unwrap();
         assert_eq!(counts, vec![("pending".to_string(), 1)],
@@ -1329,5 +1654,438 @@ mod tests {
             panic!("expected Send");
         };
         assert!(body.contains("urgent"), "body was: {body}");
+    }
+
+    // ---- identity linking: initiate_link ----------------------------------
+
+    #[test]
+    fn initiate_link_rejects_target_without_direct_messages_and_names_direct_capable_plugins() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        // "mocka" is connected and direct-capable; "mockb" is connected but
+        // only has the attachments capability, not direct_messages.
+        let _rx_a = register_direct_plugin(&d, "mocka");
+        let _rx_b = register_plugin(&d, "mockb", false);
+
+        let requester: Endpoint = "mockb:!req".parse().unwrap();
+        let target: Endpoint = "mockb:!target-secret".parse().unwrap();
+        let err = initiate_link(&d, requester, target, "Jascha").unwrap_err();
+
+        assert!(err.contains("mocka"), "err must name the direct-capable plugin: {err}");
+        assert!(!err.contains("!target-secret"), "err must never leak the target ref: {err}");
+    }
+
+    #[test]
+    fn initiate_link_rejects_when_no_plugin_is_direct_capable() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let _rx = register_plugin(&d, "mocka", false); // connected, not direct-capable
+
+        let requester: Endpoint = "mocka:!req".parse().unwrap();
+        let target: Endpoint = "mocka:!target".parse().unwrap();
+        let err = initiate_link(&d, requester, target, "Jascha").unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn initiate_link_rejects_when_target_plugin_is_not_connected_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let _rx = register_direct_plugin(&d, "mocka"); // direct-capable, but a different protocol
+
+        let requester: Endpoint = "mocka:!req".parse().unwrap();
+        let target: Endpoint = "ghost:!target".parse().unwrap();
+        let err = initiate_link(&d, requester, target, "Jascha").unwrap_err();
+        assert!(err.contains("mocka"), "err must still name the direct-capable plugins that ARE connected: {err}");
+    }
+
+    #[test]
+    fn initiate_link_error_path_creates_no_challenge_or_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let requester: Endpoint = "mocka:!req".parse().unwrap();
+        let target: Endpoint = "mockb:!target".parse().unwrap();
+        assert!(initiate_link(&d, requester, target, "Jascha").is_err());
+
+        let due = d.store.lock().unwrap().due_deliveries(Utc::now(), 10).unwrap();
+        assert!(due.iter().all(|de| de.route != IDENTITY_ROUTE),
+            "a rejected initiate_link must not enqueue an @identity delivery");
+    }
+
+    #[tokio::test]
+    async fn initiate_link_creates_challenge_and_delivers_masked_code_via_send_direct() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let mut rx = register_direct_plugin(&d, "mockb");
+
+        let requester: Endpoint = "mocka:+15551234567".parse().unwrap();
+        let target: Endpoint = "mockb:+15559876543".parse().unwrap();
+        let challenge_id = initiate_link(&d, requester, target, "Jascha").unwrap();
+        assert!(challenge_id > 0);
+
+        let now = Utc::now();
+        let del = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now, 10).unwrap().into_iter()
+                .find(|de| de.route == IDENTITY_ROUTE)
+                .expect("challenge delivery must be queued on the @identity route")
+        };
+        assert_eq!(del.destination.protocol, "mockb");
+        assert_eq!(del.destination.endpoint, "+15559876543",
+            "the target's native_ref must be stored in dest_endpoint");
+
+        process_due(&d, del, now).await;
+        let DaemonToPlugin::SendDirect { native_ref, body, .. } = recv_send(&mut rx).await else {
+            panic!("expected SendDirect");
+        };
+        assert_eq!(native_ref, "+15559876543");
+        assert!(body.contains("RelayFabric verification code:"), "body was: {body}");
+        assert!(!body.contains("+15551234567"),
+            "the requester's full ref must never appear in the challenge body: {body}");
+
+        let code = body.split("code: ").nth(1).unwrap().split(' ').next().unwrap();
+        assert_eq!(code.len(), 6);
+        assert!(code.chars().all(|c| c.is_ascii_digit()));
+        let found = d.store.lock().unwrap()
+            .find_active_challenge("mockb", "+15559876543", code, now).unwrap();
+        assert!(found.is_some(), "the code in the SendDirect body must match the stored challenge");
+    }
+
+    // ---- identity linking: confirm interception ----------------------------
+
+    fn seed_challenge(
+        d: &Daemon, target: (&str, &str), requester: (&str, &str),
+        code: &str, display_name: &str, now: DateTime<Utc>, ttl_minutes: i64,
+    ) -> i64 {
+        d.store.lock().unwrap().create_challenge(
+            code, target.0, target.1, requester.0, requester.1,
+            display_name, now, now + CDuration::minutes(ttl_minutes),
+        ).unwrap()
+    }
+
+    #[test]
+    fn confirm_right_sender_and_code_creates_link_and_does_not_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let now = Utc::now();
+        seed_challenge(&d, ("mockb", "!target"), ("mocka", "!req"), "424242", "Jascha", now, 15);
+
+        // LINKS_VERIFIED is a process-global counter shared by every test in
+        // this binary's parallel run, so only a monotonic ">" check is safe
+        // here (an exact +1 delta would be racy against any other test
+        // touching the same counter concurrently) — the real, race-free
+        // proof that exactly one confirmation happened is the due_deliveries
+        // count assertion below (confirm_link enqueues a fresh, non-dedup'd
+        // row per call, so a double-fire would show up as 4 rows, not 2).
+        let before = metrics::LINKS_VERIFIED.load(std::sync::atomic::Ordering::Relaxed);
+        handle_inbound(&d, "mockb", "chan".into(), "!target".into(), "text".into(),
+                       "424242".into(), None, vec![], None);
+        let after = metrics::LINKS_VERIFIED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "LINKS_VERIFIED must bump");
+
+        let link = d.store.lock().unwrap().link_for_identity("mockb", "!target").unwrap();
+        assert_eq!(link.unwrap().display_name, "Jascha");
+
+        // Not routed: the "general" route (mockb:chan -> mocka:chan) would
+        // otherwise have produced a delivery for this exact inbound. Only
+        // the two best-effort @identity confirmation notices are queued.
+        let due = d.store.lock().unwrap().due_deliveries(Utc::now(), 10).unwrap();
+        assert!(due.iter().all(|de| de.route == IDENTITY_ROUTE),
+            "the confirming message itself must never be routed: {due:?}");
+        assert_eq!(due.len(), 2, "one confirmation notice per party: {due:?}");
+    }
+
+    #[test]
+    fn confirm_wrong_sender_does_not_confirm() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let now = Utc::now();
+        seed_challenge(&d, ("mockb", "!target"), ("mocka", "!req"), "424242", "Jascha", now, 15);
+
+        // same protocol, same code, but a DIFFERENT native ref replying.
+        handle_inbound(&d, "mockb", "chan".into(), "!someone-else".into(), "text".into(),
+                       "424242".into(), None, vec![], None);
+
+        assert!(d.store.lock().unwrap().link_for_identity("mockb", "!target").unwrap().is_none(),
+            "a third party sending the code must not confirm the link");
+        assert!(d.store.lock().unwrap()
+            .find_active_challenge("mockb", "!target", "424242", Utc::now()).unwrap().is_some(),
+            "the real target's challenge must remain active");
+    }
+
+    #[test]
+    fn confirm_wrong_code_does_not_confirm() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let now = Utc::now();
+        seed_challenge(&d, ("mockb", "!target"), ("mocka", "!req"), "424242", "Jascha", now, 15);
+
+        handle_inbound(&d, "mockb", "chan".into(), "!target".into(), "text".into(),
+                       "999999".into(), None, vec![], None);
+
+        assert!(d.store.lock().unwrap().link_for_identity("mockb", "!target").unwrap().is_none());
+        assert!(d.store.lock().unwrap()
+            .find_active_challenge("mockb", "!target", "424242", Utc::now()).unwrap().is_some(),
+            "the real code must remain valid after a wrong-code attempt");
+    }
+
+    #[test]
+    fn confirm_expired_challenge_does_not_confirm() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let past = Utc::now() - CDuration::minutes(30);
+        // expires_at = past + 15min, still in the past relative to "now" below.
+        seed_challenge(&d, ("mockb", "!target"), ("mocka", "!req"), "424242", "Jascha", past, 15);
+
+        handle_inbound(&d, "mockb", "chan".into(), "!target".into(), "text".into(),
+                       "424242".into(), None, vec![], None);
+
+        assert!(d.store.lock().unwrap().link_for_identity("mockb", "!target").unwrap().is_none(),
+            "an expired challenge must not confirm");
+    }
+
+    #[test]
+    fn confirm_non_matching_six_digit_body_routes_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        // no active challenge at all for this sender.
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "123456".into(), None, vec![], None);
+
+        let due = d.store.lock().unwrap().due_deliveries(Utc::now(), 10).unwrap();
+        assert_eq!(due.len(), 1,
+            "a 6-digit body with no active challenge bound to the sender must route normally, not vanish");
+        assert_eq!(due[0].route, "general");
+        assert_eq!(due[0].destination.protocol, "mockb");
+    }
+
+    #[test]
+    fn confirm_non_numeric_or_wrong_length_bodies_are_never_intercepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let now = Utc::now();
+        seed_challenge(&d, ("mocka", "!a"), ("mockb", "!req"), "424242", "Jascha", now, 15);
+
+        for body in ["42424", "4242422", "42424a", "abcdef", " 424242a"] {
+            handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                           body.into(), None, vec![], None);
+            assert!(
+                d.store.lock().unwrap()
+                    .find_active_challenge("mocka", "!a", "424242", Utc::now()).unwrap().is_some(),
+                "body {body:?} must never consume the active challenge"
+            );
+        }
+        assert!(d.store.lock().unwrap().link_for_identity("mocka", "!a").unwrap().is_none());
+    }
+
+    #[test]
+    fn confirm_interception_is_gated_by_the_sender_rate_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
+            per_sender: crate::config::PerSender { messages_per_minute: 1, bytes_per_hour: 0 },
+            ..Default::default()
+        });
+        let now = Utc::now();
+        seed_challenge(&d, ("mocka", "!a"), ("mockb", "!req"), "424242", "Jascha", now, 15);
+
+        // first message from "!a" consumes the 1/minute budget.
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+
+        // the confirming code, from the SAME sender, right after: must be
+        // rate-limited before it ever reaches the confirm check. RATELIMITED
+        // is a process-global counter also touched by other tests running
+        // concurrently in this binary, so the real, race-free proof here is
+        // the challenge-still-active assertion below: if the confirm check
+        // had run for this second message (i.e. the rate limiter did NOT
+        // gate it first), the challenge would have been consumed.
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "424242".into(), None, vec![], None);
+
+        assert!(d.store.lock().unwrap()
+            .find_active_challenge("mocka", "!a", "424242", Utc::now()).unwrap().is_some(),
+            "a rate-limited confirm attempt must not consume the challenge");
+    }
+
+    #[test]
+    fn confirm_interception_is_gated_by_dedup_a_replayed_confirm_only_confirms_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let now = Utc::now();
+        seed_challenge(&d, ("mocka", "!a"), ("mockb", "!req"), "424242", "Jascha", now, 15);
+
+        for _ in 0..2 {
+            // identical args each call -> identical dedup key.
+            handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                           "424242".into(), None, vec![], None);
+        }
+
+        // confirm_link's insert_delivery calls are NOT dedup'd/idempotent
+        // (unlike insert_link's ON CONFLICT replace) — a second real
+        // confirm_link run would double the confirmation notices to 4. This
+        // is a race-free, per-test-isolated proxy for "confirmed exactly
+        // once" (LINKS_VERIFIED is a process-global counter shared with
+        // other concurrently-running tests, so it isn't a safe signal here).
+        let due = d.store.lock().unwrap().due_deliveries(Utc::now(), 10).unwrap();
+        assert_eq!(due.iter().filter(|de| de.route == IDENTITY_ROUTE).count(), 2,
+            "an exact-duplicate replay of the confirming message must be swallowed by dedup, not re-confirmed");
+    }
+
+    #[test]
+    fn one_link_per_identity_replace_covers_both_the_target_and_requester_sides() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let now = Utc::now();
+
+        // target already linked to some old partner...
+        d.store.lock().unwrap()
+            .insert_link("mocka", "!a", "mockc", "!old-a", "Old A", now).unwrap();
+        // ...and the requester ALSO already linked to some other old partner.
+        d.store.lock().unwrap()
+            .insert_link("mockb", "!req", "mockd", "!old-req", "Old Req", now).unwrap();
+
+        seed_challenge(&d, ("mocka", "!a"), ("mockb", "!req"), "111222", "Fresh", now, 15);
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "111222".into(), None, vec![], None);
+
+        let store = d.store.lock().unwrap();
+        assert!(store.link_for_identity("mockc", "!old-a").unwrap().is_none(),
+            "the target's old partner must be unlinked (replace, not stack)");
+        assert!(store.link_for_identity("mockd", "!old-req").unwrap().is_none(),
+            "the requester's old partner must be unlinked (replace, not stack)");
+        let fresh = store.link_for_identity("mocka", "!a").unwrap().unwrap();
+        assert_eq!(fresh.display_name, "Fresh");
+        assert!(store.link_for_identity("mockb", "!req").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn process_due_identity_requires_direct_messages_capability_not_just_connectivity() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let _rx = register_plugin(&d, "mockb", false); // connected, but NOT direct-capable
+
+        let target: Endpoint = "mockb:!target".parse().unwrap();
+        let now = Utc::now();
+        let env = Envelope::new(
+            "identity:system".parse().unwrap(), Sender { native_ref: "@identity".into() },
+            "notice".into(), "code".into(), now, now + CDuration::minutes(15), 8,
+        );
+        d.store.lock().unwrap().insert_message(&env).unwrap();
+        let del_id = d.store.lock().unwrap()
+            .insert_delivery(env.id, IDENTITY_ROUTE, &target, now, env.expires_at, 2).unwrap();
+        let del = d.store.lock().unwrap().deliveries_for_id(del_id).unwrap();
+
+        process_due(&d, del, now).await;
+
+        let after = d.store.lock().unwrap().deliveries_for_id(del_id).unwrap();
+        assert_eq!(after.state, "pending",
+            "must requeue rather than attempt when the connected plugin lacks direct_messages");
+    }
+
+    // ---- identity linking: rendering ---------------------------------------
+
+    #[tokio::test]
+    async fn process_due_renders_display_name_when_route_is_linked_and_a_verified_link_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.cfg.routes[0].identity_mode = "linked".to_string();
+        let d = Arc::new(d);
+        let mut rx = register_plugin(&d, "mockb", false);
+
+        d.store.lock().unwrap()
+            .insert_link("mocka", "!a", "signal", "+1", "Jascha", Utc::now()).unwrap();
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+        let now = Utc::now();
+        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert!(body.starts_with("[Jascha]\n"), "body was: {body}");
+    }
+
+    #[tokio::test]
+    async fn process_due_never_renders_display_name_on_a_route_that_has_not_opted_into_linked_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path())); // default identity_mode: "pseudonymous"
+        let mut rx = register_plugin(&d, "mockb", false);
+
+        d.store.lock().unwrap()
+            .insert_link("mocka", "!a", "signal", "+1", "Jascha", Utc::now()).unwrap();
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+        let now = Utc::now();
+        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert!(!body.contains("Jascha"),
+            "§107: a route must explicitly opt into linked rendering, even with a verified link present: {body}");
+    }
+
+    #[tokio::test]
+    async fn process_due_renders_alias_in_linked_mode_when_no_link_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.cfg.routes[0].identity_mode = "linked".to_string();
+        let d = Arc::new(d);
+        let mut rx = register_plugin(&d, "mockb", false);
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hello".into(), None, vec![], None);
+        let now = Utc::now();
+        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert!(!body.contains("Jascha"), "with no verified link, linked mode must fall back to the alias: {body}");
+    }
+
+    #[tokio::test]
+    async fn unlink_reverts_rendering_to_pseudonym_on_the_next_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.cfg.routes[0].identity_mode = "linked".to_string();
+        let d = Arc::new(d);
+        let mut rx = register_plugin(&d, "mockb", false);
+
+        let link_id = d.store.lock().unwrap()
+            .insert_link("mocka", "!a", "signal", "+1", "Jascha", Utc::now()).unwrap();
+
+        // first message: linked, renders display_name.
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "first".into(), None, vec![], None);
+        let now = Utc::now();
+        let del1 = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        process_due(&d, del1, now).await;
+        let DaemonToPlugin::Send { body: body1, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert!(body1.starts_with("[Jascha]\n"), "body was: {body1}");
+
+        // unlink is storage-only this task (Task 4 wires the admin/ctl API
+        // around delete_link) — call it directly.
+        assert!(d.store.lock().unwrap().delete_link(link_id).unwrap());
+
+        // second message from the same identity must revert to the
+        // pseudonym immediately: rendering reads links live (§95/§22), never
+        // cached from the first delivery.
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "second".into(), None, vec![], None);
+        let now2 = Utc::now();
+        let del2 = { let store = d.store.lock().unwrap(); store.due_deliveries(now2, 1).unwrap().into_iter().next().unwrap() };
+        process_due(&d, del2, now2).await;
+        let DaemonToPlugin::Send { body: body2, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert!(!body2.contains("Jascha"), "after unlink, rendering must revert to the pseudonym: {body2}");
     }
 }
