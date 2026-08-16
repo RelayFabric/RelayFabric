@@ -1,12 +1,19 @@
 """RelayFabric Meshtastic plugin: bridges Meshtastic MQTT text uplinks over Plugin Protocol v1.
 
-Module top level is stdlib-only (logging) so config/parser/loop-guard helpers stay
-importable without cbor2, paho-mqtt, or meshtastic/protobuf packages (GPL).
-relay_ipc and backend components are imported lazily inside the methods that need them.
+Module top level is stdlib-only (json/logging/os/queue/socket/sys/threading) so
+config/parser/loop-guard helpers stay importable without cbor2, paho-mqtt, or
+meshtastic/protobuf packages (GPL). relay_ipc and paho.mqtt.client are imported
+lazily inside the methods that need them (see MqttJsonBackend.__init__ and main()).
 Text bytes are never logged, only names/types.
 """
 
+import json
 import logging
+import os
+import queue
+import socket
+import sys
+import threading
 
 log = logging.getLogger(__name__)
 
@@ -130,3 +137,232 @@ def parse_uplink(topic, event, by_index, gateway_id):
     ts = event.get("timestamp")
 
     return name, sender, text, ts
+
+
+def parse_broker_url(url):
+    """Parse a Meshtastic plugin broker URL into (host, port).
+
+    Mirrors plugins/mqtt's Rust parse_broker rule: requires an "mqtt://"
+    scheme, and defaults the port to 1883 when omitted.
+    """
+    if not url.startswith("mqtt://"):
+        raise ValueError("broker must be mqtt://host[:port]")
+    rest = url[len("mqtt://"):]
+    if ":" in rest:
+        host, port_str = rest.split(":", 1)
+        try:
+            port = int(port_str)
+        except ValueError as e:
+            raise ValueError(f"bad port in broker url: {port_str!r}") from e
+        return host, port
+    return rest, 1883
+
+
+class MqttJsonBackend:
+    """paho-mqtt transport for the Meshtastic MQTT JSON gateway format.
+
+    The backend seam Bridge depends on (swappable for FakeBackend in tests,
+    per the signal plugin's SignalCliBackend). paho is imported lazily here
+    so the rest of the module stays importable without it (see module
+    docstring).
+    """
+
+    def __init__(self, broker_url, topic_root):
+        import paho.mqtt.client as mqtt
+
+        self.topic_root = topic_root
+        self._host, self._port = parse_broker_url(broker_url)
+        self._sub_topic = f"{topic_root}/2/json/#"
+        self._pub_topic = f"{topic_root}/2/json/mqtt/"
+        self._queue = queue.Queue()
+        self._client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+        self._client.on_connect = self._on_connect
+        self._client.on_message = self._on_message
+        self._client.on_disconnect = self._on_disconnect
+
+    def _on_connect(self, client, userdata, connect_flags, reason_code, properties):
+        # re-subscribe on every (re)connect: paho's auto-reconnect does not
+        # replay subscriptions itself for a fresh session.
+        client.subscribe(self._sub_topic, qos=1)
+        log.info(f"MQTT connected, subscribed to {self._sub_topic!r}")
+
+    def _on_message(self, client, userdata, msg):
+        try:
+            event = json.loads(msg.payload)
+        except (ValueError, UnicodeDecodeError) as e:
+            log.debug(f"Dropping non-JSON MQTT message on {msg.topic}: {e}")
+            return
+        self._queue.put((msg.topic, event))
+
+    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
+        log.warning(f"MQTT disconnected: {reason_code}")
+
+    def start(self):
+        # connect_async() (not connect()) defers the actual TCP attempt to
+        # the network thread loop_start() below spawns: connect() is
+        # blocking and raises synchronously (e.g. ConnectionRefusedError) if
+        # the broker is briefly unreachable at startup, which would crash
+        # the whole plugin process before it ever got a chance to retry.
+        # connect_async() + loop_start() gives paho's built-in auto-reconnect
+        # (reconnect_on_failure, on by default) instead.
+        self._client.connect_async(self._host, self._port)
+        self._client.loop_start()
+
+    def events(self):
+        """Yield (topic, parsed-json) tuples from the queue forever."""
+        while True:
+            yield self._queue.get()
+
+    def publish_downlink(self, obj):
+        payload = json.dumps(obj)
+        info = self._client.publish(self._pub_topic, payload, qos=1)
+        try:
+            info.wait_for_publish(timeout=30)
+        except (ValueError, RuntimeError) as e:
+            raise RuntimeError(f"mqtt publish failed: {e}") from e
+        if not info.is_published():
+            raise RuntimeError(f"mqtt publish to {self._pub_topic!r} timed out")
+
+
+class Bridge:
+    """Bridges parsed Meshtastic MQTT JSON events <-> Plugin Protocol frames.
+
+    Mirrors plugins/signal's Bridge exactly (write lock, _send_frame).
+    handle_event runs on the backend's reader thread; handle_send runs on the
+    main thread; all daemon-socket writes go through _send_frame, serialized
+    by one lock.
+
+    Unlike signal's Bridge, there is no sync/non-sync distinction for the
+    loop guard: the Meshtastic node re-uplinks our own downlinks verbatim, so
+    ANY uplink whose (channel name, text) matches the SentCache is dropped.
+    """
+
+    def __init__(self, cfg, backend, sock_file):
+        from relayfabric_signal import SentCache
+
+        self.cfg = cfg
+        self.backend = backend
+        self.sock_file = sock_file
+        self.write_lock = threading.Lock()
+        self.sent_cache = SentCache()
+        self.by_index = channels_by_index(cfg)
+
+    def _send_frame(self, obj):
+        import relay_ipc
+
+        with self.write_lock:
+            relay_ipc.write_frame(self.sock_file, obj)
+
+    # ----- inbound (Meshtastic -> daemon); called from the backend's reader thread -----
+
+    def handle_event(self, topic, event):
+        parsed = parse_uplink(topic, event, self.by_index, self.cfg["gateway_id"])
+        if parsed is None:
+            return
+        name, sender, text, ts = parsed
+
+        if self.sent_cache.match(name, text):
+            return  # loop guard: node re-uplinked our own downlink verbatim
+
+        import relay_ipc
+
+        self._send_frame(relay_ipc.inbound(name, sender, text, ts))
+        log.info(f"Bridged Meshtastic message from {sender} to '{name}' "
+                 f"({len(text)} chars)")
+
+    # ----- egress (daemon -> Meshtastic); called from the main thread -----
+
+    def handle_send(self, frame):
+        import relay_ipc
+
+        corr = frame["corr"]
+        endpoint = frame["endpoint"]
+        body = frame["body"]
+        channel_spec = self.cfg["channels"].get(endpoint)
+        if channel_spec is None:
+            log.warning(f"Meshtastic send to unknown endpoint {endpoint!r}")
+            self._send_frame(relay_ipc.delivery_result(corr, False, "unknown endpoint"))
+            return
+
+        body_bytes = len(body.encode("utf-8"))
+        max_bytes = self.cfg["max_text_bytes"]
+        if body_bytes > max_bytes:
+            # defensive: the daemon should have already truncated to our
+            # advertised capabilities.max_payload before it ever sends us
+            # this frame.
+            detail = f"body {body_bytes} B exceeds max_text_bytes {max_bytes} B"
+            log.warning(f"Meshtastic send to '{endpoint}' dropped: {detail}")
+            self._send_frame(relay_ipc.delivery_result(corr, False, detail))
+            return
+
+        try:
+            self.backend.publish_downlink({
+                "from": 0,
+                "channel": channel_spec["index"],
+                "type": "sendtext",
+                "payload": body,
+            })
+        except Exception as e:  # noqa: BLE001 - report the failure, don't crash
+            log.warning(f"Meshtastic send to '{endpoint}' failed: {e}")
+            self._send_frame(relay_ipc.delivery_result(corr, False, str(e)))
+            return
+        self.sent_cache.record(endpoint, body)
+        self._send_frame(relay_ipc.delivery_result(corr, True))
+        log.info(f"Sent Meshtastic message to '{endpoint}' ({body_bytes} B)")
+
+
+def main():
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+
+    sock_path = os.environ["RELAYFABRIC_SOCKET"]
+    plugin_name = os.environ.get("RELAYFABRIC_PLUGIN_NAME", "meshtastic")
+    raw_cfg = json.loads(os.environ.get("RELAYFABRIC_PLUGIN_CONFIG", "{}"))
+    try:
+        cfg = load_config(raw_cfg)
+    except (ValueError, TypeError) as e:
+        print(f"relayfabric-meshtastic: invalid config: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    import relay_ipc
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(sock_path)
+    rfile = sock.makefile("rb")
+    wfile = sock.makefile("wb")
+
+    caps = relay_ipc.capabilities(groups=True, max_payload=cfg["max_text_bytes"])
+    relay_ipc.write_frame(wfile, relay_ipc.hello(plugin_name, PLUGIN_VERSION, caps))
+    ack = relay_ipc.read_frame(rfile)
+    if ack.get("t") != "hello_ack" or ack.get("error"):
+        print(f"relayfabric-meshtastic: hello rejected: {ack.get('error')}",
+             file=sys.stderr)
+        sys.exit(1)
+
+    backend = MqttJsonBackend(cfg["broker"], cfg["topic_root"])
+    bridge = Bridge(cfg, backend, wfile)
+    backend.start()
+
+    def reader_loop():
+        for topic, event in backend.events():
+            try:
+                bridge.handle_event(topic, event)
+            except Exception as e:  # noqa: BLE001 - one bad event must not kill the reader
+                log.error(f"Meshtastic event handler error: {e}")
+
+    threading.Thread(target=reader_loop, daemon=True).start()
+
+    while True:
+        try:
+            frame = relay_ipc.read_frame(rfile)
+        except (EOFError, OSError, ValueError) as e:
+            # ValueError: oversize/corrupt frame (relay_ipc.read_frame's own
+            # MAX_FRAME check). The stream is desynced at that point, so exit
+            # rather than continue -- there is no way to resume mid-frame.
+            log.error(f"Daemon connection lost, exiting: {e}")
+            sys.exit(1)
+        kind = frame.get("t")
+        if kind == "send":
+            bridge.handle_send(frame)
+        elif kind == "shutdown":
+            sys.exit(0)
