@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import sys
 import unittest
 
@@ -502,6 +503,19 @@ class BridgeTests(unittest.TestCase):
         self.assertFalse(frames[-1]["delivered"])
         self.assertIn("broker down", frames[-1]["detail"])
 
+    def test_send_failure_does_not_poison_loop_guard(self):
+        # A failed publish must not record into SentCache: it never actually
+        # went out over MQTT, so a later uplink of the same text is a real
+        # (not re-uplinked) message and must still bridge.
+        self.backend.fail_with = RuntimeError("broker down")
+        self.bridge.handle_send({"corr": 5, "endpoint": "primary", "body": "out"})
+        self.backend.fail_with = None
+        self.bridge.handle_event("msh/2/json/ch-0/!12345678", text_event(text="out"))
+        frames = self.sock.frames()
+        self.assertEqual(len(frames), 2)  # failed delivery_result + inbound
+        self.assertEqual(frames[-1]["t"], "inbound")
+        self.assertEqual(frames[-1]["body"], "out")
+
     def test_oversize_body_defensive_drop(self):
         cfg = base_cfg(max_text_bytes=5)
         bridge = plug.Bridge(cfg, self.backend, self.sock)
@@ -547,6 +561,20 @@ class MqttJsonBackendTests(unittest.TestCase):
         gen = backend.events()
         self.assertEqual(next(gen), ("t", {"a": 1}))
 
+    def test_queue_is_bounded(self):
+        backend = plug.MqttJsonBackend("mqtt://localhost", "msh")
+        self.assertEqual(backend._queue.maxsize, 256)
+
+    def test_on_message_drops_without_raising_when_queue_full(self):
+        backend = plug.MqttJsonBackend("mqtt://localhost", "msh")
+        backend._queue = queue.Queue(maxsize=1)
+        backend._queue.put(("first", {"a": 1}))  # fill the queue
+        msg = type("Msg", (), {"topic": "msh/2/json/ch-0/!1", "payload": b'{"type": "text"}'})()
+        backend._on_message(None, None, msg)  # must not raise/block on Full
+        # the pre-existing item is untouched; the new one was dropped, not queued
+        self.assertEqual(backend._queue.qsize(), 1)
+        self.assertEqual(backend._queue.get_nowait(), ("first", {"a": 1}))
+
     def test_publish_downlink_raises_runtime_error_when_disconnected(self):
         backend = plug.MqttJsonBackend("mqtt://localhost", "msh")
         with self.assertRaises(RuntimeError):
@@ -568,6 +596,26 @@ class MqttJsonBackendTests(unittest.TestCase):
                          {"from": 0, "channel": 0, "type": "sendtext", "payload": "hi"})
         self.assertEqual(kwargs.get("qos"), 1)
         info.wait_for_publish.assert_called_once_with(timeout=30)
+
+
+class HelloMaxPayloadTests(unittest.TestCase):
+    """capabilities.max_payload = min(200, cfg["max_text_bytes"]): the
+    advertised cap must stay independent of an operator's max_text_bytes
+    override, so a misconfiguration can't disable both the daemon-side
+    truncation and Bridge.handle_send's local defensive check at once."""
+
+    def test_default_max_text_bytes_yields_200(self):
+        cfg = base_cfg()
+        self.assertEqual(cfg["max_text_bytes"], 200)
+        self.assertEqual(plug.hello_max_payload(cfg), 200)
+
+    def test_higher_max_text_bytes_cannot_loosen_past_200(self):
+        cfg = base_cfg(max_text_bytes=500)
+        self.assertEqual(plug.hello_max_payload(cfg), 200)
+
+    def test_lower_max_text_bytes_tightens_the_cap(self):
+        cfg = base_cfg(max_text_bytes=100)
+        self.assertEqual(plug.hello_max_payload(cfg), 100)
 
 
 if __name__ == "__main__":

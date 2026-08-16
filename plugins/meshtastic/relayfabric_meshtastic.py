@@ -19,6 +19,12 @@ log = logging.getLogger(__name__)
 
 PLUGIN_VERSION = "0.1.0"
 
+# Hard ceiling on advertised Hello capabilities.max_payload, independent of
+# cfg["max_text_bytes"] (see main()'s use of it): a practical cap for
+# Meshtastic text payloads regardless of how an operator configures
+# max_text_bytes.
+MESHTASTIC_MAX_PAYLOAD = 200
+
 
 def load_config(raw):
     """Load and validate Meshtastic plugin configuration.
@@ -174,7 +180,11 @@ class MqttJsonBackend:
         self._host, self._port = parse_broker_url(broker_url)
         self._sub_topic = f"{topic_root}/2/json/#"
         self._pub_topic = f"{topic_root}/2/json/mqtt/"
-        self._queue = queue.Queue()
+        # Bounded, like the Rust mqtt plugin's mpsc::channel(64/256): an
+        # unbounded queue would let a stalled/slow reader thread accumulate
+        # inbound events without limit. put_nowait in _on_message drops (with
+        # a debug log) on Full rather than blocking paho's network thread.
+        self._queue = queue.Queue(maxsize=256)
         self._client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
         self._client.on_connect = self._on_connect
         self._client.on_message = self._on_message
@@ -192,7 +202,13 @@ class MqttJsonBackend:
         except (ValueError, UnicodeDecodeError) as e:
             log.debug(f"Dropping non-JSON MQTT message on {msg.topic}: {e}")
             return
-        self._queue.put((msg.topic, event))
+        try:
+            self._queue.put_nowait((msg.topic, event))
+        except queue.Full:
+            # never block paho's network thread; a full queue means the
+            # reader thread is falling behind, so drop the oldest-pressure
+            # event rather than wedge inbound MQTT processing entirely.
+            log.debug(f"Dropping MQTT message on {msg.topic}: event queue full")
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
         log.warning(f"MQTT disconnected: {reason_code}")
@@ -311,6 +327,20 @@ class Bridge:
         log.info(f"Sent Meshtastic message to '{endpoint}' ({body_bytes} B)")
 
 
+def hello_max_payload(cfg):
+    """Advertised Hello capabilities.max_payload for this config.
+
+    200 is the hard Meshtastic-practical ceiling regardless of config: it
+    keeps the advertised cap (which the daemon min()s against its own
+    policy caps to decide truncation) independent of the local defensive
+    check in Bridge.handle_send (cfg["max_text_bytes"]), so one
+    misconfigured max_text_bytes can't disable both safety layers at once.
+    A lower operator max_text_bytes tightens the advertised cap; a higher
+    one can never loosen it past 200.
+    """
+    return min(MESHTASTIC_MAX_PAYLOAD, cfg["max_text_bytes"])
+
+
 def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -331,7 +361,7 @@ def main():
     rfile = sock.makefile("rb")
     wfile = sock.makefile("wb")
 
-    caps = relay_ipc.capabilities(groups=True, max_payload=cfg["max_text_bytes"])
+    caps = relay_ipc.capabilities(groups=True, max_payload=hello_max_payload(cfg))
     relay_ipc.write_frame(wfile, relay_ipc.hello(plugin_name, PLUGIN_VERSION, caps))
     ack = relay_ipc.read_frame(rfile)
     if ack.get("t") != "hello_ack" or ack.get("error"):
