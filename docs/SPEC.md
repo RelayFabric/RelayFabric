@@ -1068,7 +1068,7 @@ A gateway may drop a message but cannot silently alter signed content without in
 
 ---
 
-## OPAQUE
+## OPAQUE (renamed: SEALED — see §113)
 
 Application-level payload remains encrypted across gateways.
 
@@ -2554,6 +2554,7 @@ Add:
 * gateway federation
 * RelayFabric Discovery Protocol (RFDP, §111)
 * Public Node Profile (§112): node identities, trust levels, public_services, quotas, airtime policy
+* Sealed Routing phase 1 (§113): gateway-to-gateway sealed transit over Noise federation links
 * signed RelayFabric envelopes
 * origin signatures
 
@@ -3144,3 +3145,93 @@ switchyardctl public enable     # wizard: name, services, identity exposure
 ## 112.13 The larger model
 
 Communities contribute whatever connectivity they have — one node brings Reticulum + LoRa, another MeshCore + fiber, another Meshtastic + Nostr, another satellite + Reticulum. RelayFabric doesn't require everyone to deploy the same network; **people contribute capabilities rather than joining one monolithic system.** The Public Node Profile exists so that doing this is safe by default: discovery, federation, pseudonymity, quotas, RF airtime, store-and-forward, and service publishing all ship with safe defaults.
+
+---
+
+# 113. Sealed Routing (zero-knowledge payload routing)
+
+*Added 2026-08-15. Deepens §31's OPAQUE mode (renamed SEALED), §32 (RelayEnvelope), §106–107. Staged: gateway-to-gateway with v0.3 federation; user-to-user with the v0.4 companion client; groups/PQ/metadata hardening v0.5+.*
+
+A cross-network gateway is otherwise a surveillance and compromise point by design. Sealed routing makes RelayFabric infrastructure **mathematically unable to read message payloads** it transports:
+
+```text
+Alice → encrypt for Bob → [ sealed envelope: opaque dest, ciphertext, auth, expiry ]
+      → any transports → switchyardd nodes (ciphertext only) → Bob → decrypt
+```
+
+`switchyardd` answers only *"where does this ciphertext go?"* — never *"what does it say?"*
+
+## 113.1 Naming and modes
+
+§31's three modes are renamed for configuration clarity; semantics unchanged:
+
+| Mode (config) | Was | Privacy | Compatibility |
+|---|---|---|---|
+| `native` | (per-protocol bridge) | low–medium | excellent |
+| `gateway` | TRANSLATE | medium — gateway reads plaintext | excellent |
+| `sealed` | OPAQUE | excellent — infrastructure cannot read content | requires RelayFabric-aware endpoints |
+
+All three are supported; their security characteristics MUST be explicit to operators and users (§4.4).
+
+## 113.2 Downgrade refusal
+
+Routes and nodes MAY pin a floor; a sealed message MUST NOT be silently decrypted into a `gateway` leg:
+
+```yaml
+privacy:
+  minimum_security: sealed
+  allow_gateway_decryption: false
+  allow_protocol_downgrade: false
+```
+
+Policy enforcement: a route whose effective mode falls below the floor is rejected at `--check-config`,
+and a sealed envelope arriving at a route that would require decryption is dead-lettered
+(`SECURITY_DOWNGRADE_REFUSED`), never translated.
+
+## 113.3 The honest limitation: legacy edges
+
+Traffic originating from an unmodified native client (Signal, Sideband, Meshtastic…) is plaintext at
+its ingress gateway — unavoidably. Sealed mode therefore protects, in adoption order:
+
+1. **Gateway-to-gateway (v0.3, with federation):** the origin edge gateway encrypts to the destination
+   edge gateway; every intermediate/public transit node carries ciphertext only. Requires ZERO client
+   adoption and transforms the public-node operator posture: *"the node transports encrypted envelopes
+   it cannot decrypt."* Keys anchor to §112.6 node identities; federation links use Noise (§86) with
+   periodic rekey; envelopes use AEAD (XChaCha20-Poly1305 class) with an algorithm-tagged key-agreement
+   field for future PQ-hybrid agility.
+2. **User-to-user (v0.4, companion client/library):** X3DH/PQXDH-style asynchronous prekeys
+   (store-and-forward-compatible; prekey distribution is a propagation-node-like role) + Double Ratchet
+   for forward secrecy and post-compromise security; sealed sender (intermediaries receive no
+   conventional sender identity); ephemeral rotating routing identifiers derived from a long-term
+   identity.
+3. **Groups (v0.5+):** MLS rather than an invented group ratchet. PQ-hybrid key establishment (ML-KEM)
+   and metadata hardening (padding, batching, delayed forwarding, cover traffic, onion-style
+   forwarding, rendezvous points) also land here.
+
+## 113.4 Sealed routing trades away in-transit transformation
+
+A sealed payload CANNOT be transformed by the fabric: no image downscaling, no truncation to
+`max_payload`, no attachment stripping, no drop-notes (§17; §81's content-inspection impossibility
+applies to ALL content operations). Consequences, stated plainly:
+
+- Capability-aware degradation happens at the ORIGIN edge or not at all — destination capability
+  information must flow end-to-end before send, and oversized sealed payloads for constrained
+  transports are rejected at origin, not shrunk in transit.
+- Content filtering, spam heuristics, and body-dependent policy are unavailable on sealed legs by
+  design; policy operates on envelope metadata only.
+
+## 113.5 Interactions with fabric machinery
+
+- Dedup and replay protection key on the envelope's unique message ID + expiry (not sender) — sealed
+  and ephemeral-sender traffic remain replay-protected.
+- Per-sender quotas key on the presented (possibly ephemeral) routing identity per epoch; rotation
+  bounds correlation, quotas still bind within an epoch.
+- Delivery receipts on sealed routes leak liveness metadata and are opt-in.
+
+## 113.6 Claim discipline
+
+This is **zero-knowledge payload routing / blind E2EE routing** — not traffic anonymity. Nodes still
+observe timing, sizes, interfaces, addresses, and RF activity (§34's traffic-analysis statement
+stands). RelayFabric SHALL NOT describe sealed mode as anonymity.
+
+> **RelayFabric nodes should know only what they need to forward traffic, and no more.**
