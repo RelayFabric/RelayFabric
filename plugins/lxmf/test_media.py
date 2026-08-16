@@ -135,20 +135,5 @@ class TranscodeTests(unittest.TestCase):
         self.assertIsNone(media.codec2_to_wav(0xFE, b"anything"))
 
 
-class AttachmentSigTests(unittest.TestCase):
-    def test_two_tuple(self):
-        self.assertEqual(media.attachment_sig([("a", b"xx")]), "|a:2")
-
-    def test_three_tuple_uses_name_first_data_last(self):
-        self.assertEqual(media.attachment_sig([("a", "ct", b"xx")]), "|a:2")
-
-    def test_empty_list(self):
-        self.assertEqual(media.attachment_sig([]), "")
-
-    def test_multiple_items_are_order_sensitive(self):
-        self.assertEqual(
-            media.attachment_sig([("a", b"x"), ("b", b"yy")]), "|a:1|b:2")
-
-
 if __name__ == "__main__":
     unittest.main()

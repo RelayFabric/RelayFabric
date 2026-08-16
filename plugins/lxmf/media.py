@@ -136,11 +136,3 @@ def codec2_to_wav(mode, data):
         log.debug(
             "codec2 transcode unavailable/failed (%s), forwarding raw", e)
         return None
-
-
-def attachment_sig(items):
-    """Stable digest input for dedup: names and sizes of attachments.
-
-    Accepts (name, ..., data) tuples -- name first, data last.
-    """
-    return "".join(f"|{i[0]}:{len(i[-1])}" for i in items)

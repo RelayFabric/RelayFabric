@@ -67,9 +67,12 @@ policies:
       destination_protocol: [mqtt]
     rules:
       max_payload: 4096
-      drop_kinds: [location]   # location never crosses by default (spec §74)
+      drop_kinds: [location]        # location never crosses by default (spec §74)
+      attachments: reject           # mqtt is payload-constrained; drop attachments outright
+      max_attachment_bytes: 500000  # alternative to `reject`: cap attachment size instead (bytes)
 
 # TTLs and limits (seconds)
 ttl_default_secs: 86400
 dedup_ttl_secs: 86400
 hop_limit: 8
+max_attachment_bytes: 8000000  # daemon-wide inbound attachment budget (bytes); 8 MiB is the default if omitted
