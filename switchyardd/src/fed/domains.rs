@@ -37,8 +37,6 @@ pub const ATTEST_V1: &[u8] = b"relayfabric-attest-v1:";
 /// an envelope's or a Noise static key's signed bytes, but the domain
 /// prefix closes the confusion class outright regardless, the same way
 /// it does for every other signing context here.
-// Only `advert.rs` references this so far, and that whole module is
-// itself dead code until fed exchange (Task 2) and admin (Task 3) wire
-// it in -- see `advert.rs`'s module-level `allow(dead_code)`.
-#[allow(dead_code)]
+// Used by `advert.rs`'s sign/verify pair, in turn wired into live
+// traffic by `fed::conn` (Task 2, cycle G).
 pub const ADVERT_V1: &[u8] = b"relayfabric-advert-v1:";

@@ -84,6 +84,21 @@ pub enum Event {
         up: bool,
         ts: DateTime<Utc>,
     },
+    /// RFDP discovery (design §2/§6, cycle G): a peer advertisement was
+    /// verified and (newer-expires-wins) upserted (`fed::conn::
+    /// receive_advert`). PRIVACY: `name` is the SANITIZED display value
+    /// (`fed::conn::sanitize_advert_name`) -- NEVER the raw, peer-
+    /// controlled string, even though the advert itself is signed (a
+    /// signature proves who sent it, not that it's safe to print). Nothing
+    /// else from the advert (services/protocols/security/expires) is
+    /// carried here -- a subscriber wanting the full document reads Task
+    /// 3's `GET /v1/discovery`, which is public-by-design (the advert was
+    /// built to be shared); this event is just a "something changed" ping.
+    Advert {
+        node_id: String,
+        name: String,
+        ts: DateTime<Utc>,
+    },
 }
 
 impl Event {
@@ -97,6 +112,7 @@ impl Event {
             Event::LinkVerified { .. } => "link_verified",
             Event::ConfigApplied { .. } => "config_applied",
             Event::Federation { .. } => "federation",
+            Event::Advert { .. } => "advert",
         }
     }
 }
@@ -133,6 +149,24 @@ mod tests {
             Event::Federation { peer: "phoenix".into(), up: true, ts: ts() }.event_name(),
             "federation"
         );
+        assert_eq!(
+            Event::Advert { node_id: "rf:ab".into(), name: "phoenix".into(), ts: ts() }.event_name(),
+            "advert"
+        );
+    }
+
+    #[test]
+    fn advert_json_has_no_variant_wrapper_and_carries_node_id_and_sanitized_name() {
+        let json = serde_json::to_value(Event::Advert {
+            node_id: "rf:ab12".into(), name: "clean-name".into(), ts: ts(),
+        }).unwrap();
+        assert_eq!(json["node_id"], "rf:ab12");
+        assert_eq!(json["name"], "clean-name");
+        assert!(json.get("Advert").is_none());
+        let keys: std::collections::BTreeSet<&str> =
+            json.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, std::collections::BTreeSet::from(["node_id", "name", "ts"]),
+            "Advert must carry nothing beyond node_id/name/ts -- no services/protocols/security");
     }
 
     #[test]

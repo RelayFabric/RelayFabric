@@ -23,6 +23,15 @@ pub static LINKS_VERIFIED: AtomicU64 = AtomicU64::new(0);
 pub static FED_INGRESS: AtomicU64 = AtomicU64::new(0);
 pub static FED_EGRESS: AtomicU64 = AtomicU64::new(0);
 pub static FED_REJECTED: AtomicU64 = AtomicU64::new(0);
+// RFDP discovery (design §6, cycle G): advert exchange counters, same
+// zero-until-wired posture as the FED_* trio above -- `fed::conn` is the
+// sole incrementer (ADVERT_TX on every signed advert this daemon sends,
+// ADVERT_RX on every one it verifies+stores, ADVERT_REJECTED on every one
+// it drops pre-storage: oversized, third-party node_id, bad signature,
+// invalid shape, stale/scope-denied).
+pub static ADVERT_RX: AtomicU64 = AtomicU64::new(0);
+pub static ADVERT_TX: AtomicU64 = AtomicU64::new(0);
+pub static ADVERT_REJECTED: AtomicU64 = AtomicU64::new(0);
 
 // design §3 (cycle D): received_at -> delivered wall-clock latency, accrued
 // as a micros sum + count pair (rendered in seconds) rather than a
@@ -225,6 +234,9 @@ pub fn render(
         ("relayfabric_federation_ingress_total", &FED_INGRESS),
         ("relayfabric_federation_egress_total", &FED_EGRESS),
         ("relayfabric_federation_rejected_total", &FED_REJECTED),
+        ("relayfabric_advert_rx_total", &ADVERT_RX),
+        ("relayfabric_advert_tx_total", &ADVERT_TX),
+        ("relayfabric_advert_rejected_total", &ADVERT_REJECTED),
     ];
     for (name, c) in counters {
         out.push_str(&format!("# TYPE {name} counter\n{name} {}\n", c.load(Ordering::Relaxed)));
@@ -289,6 +301,9 @@ mod tests {
         assert!(out.contains("relayfabric_federation_egress_total"));
         assert!(out.contains("relayfabric_federation_rejected_total"));
         assert!(out.contains("relayfabric_federation_peer_up"));
+        assert!(out.contains("relayfabric_advert_rx_total"));
+        assert!(out.contains("relayfabric_advert_tx_total"));
+        assert!(out.contains("relayfabric_advert_rejected_total"));
     }
 
     // ---- federation peer up/down gauge --------------------------------

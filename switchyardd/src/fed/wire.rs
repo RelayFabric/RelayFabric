@@ -24,6 +24,7 @@
 //! `FedChannel::send_frame`/`recv_frame` with CBOR bytes of these variants
 //! on every live connection.
 
+use super::advert::Advert;
 use relay_core::Envelope;
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +55,20 @@ pub enum Fed {
     Ping {},
     /// Keepalive reply.
     Pong {},
+    /// RFDP discovery (design §2, cycle G): the sender's current signed
+    /// Node Advertisement -- sent as a reply to a peer's `AdvertReq`, or
+    /// proactively on the per-connection refresh timer (`fed::conn`,
+    /// `advert_ttl_secs / 2`). Not boxed unlike `Envelope`'s `env`: an
+    /// `Advert` is far smaller (no message body/attachments), well under
+    /// the size where `clippy::large_enum_variant` would flag it.
+    Advert {
+        advert: Advert,
+    },
+    /// RFDP discovery (design §2, cycle G): "send me your current advert,
+    /// if you have one" -- sent once by each side at connection-up
+    /// (subject to the local discovery scope gate, `fed::conn::
+    /// advert_scope_allows`), and carries no fields of its own.
+    AdvertReq {},
     /// Decode-only fallback for a `t` this build doesn't recognize (design
     /// §5 "additive versioning: unknown `t` ignored (fleet precedent)").
     /// Callers ignore it outright -- there is nothing on it to act on.
@@ -124,6 +139,38 @@ mod tests {
     fn pong_frame_roundtrips() {
         let msg = Fed::Pong {};
         assert!(matches!(roundtrip(&msg), Fed::Pong {}));
+    }
+
+    // --- RFDP discovery frames (design §2, cycle G) ------------------------
+
+    fn sample_advert() -> Advert {
+        use crate::fed::advert::SecurityCaps;
+        use std::collections::BTreeMap;
+        Advert {
+            rf_version: 1,
+            node_id: format!("rf:{}", "ab".repeat(32)),
+            name: "test-node".into(),
+            services: BTreeMap::from([("federation".to_string(), true)]),
+            protocols: BTreeMap::new(),
+            security: SecurityCaps { translate: true, signed: true, opaque: false },
+            expires: 1_786_838_400,
+            sig: vec![1, 2, 3, 4],
+        }
+    }
+
+    #[test]
+    fn advert_frame_roundtrips() {
+        let msg = Fed::Advert { advert: sample_advert() };
+        match roundtrip(&msg) {
+            Fed::Advert { advert } => assert_eq!(advert, sample_advert()),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn advert_req_frame_roundtrips() {
+        let msg = Fed::AdvertReq {};
+        assert!(matches!(roundtrip(&msg), Fed::AdvertReq {}));
     }
 
     // --- unknown-tag tolerance --------------------------------------------

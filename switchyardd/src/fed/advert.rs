@@ -14,12 +14,10 @@
 //! by fed exchange (`fed::conn`, Task 2: sign+send on connection-up and
 //! on the refresh timer) and admin `GET /v1/discovery` (Task 3).
 //!
-//! Nothing outside this module's own tests calls any of the below yet --
-//! consumed by fed exchange Task 2 (`build_from_config`/`sign` on
-//! connection-up and the refresh timer, `verify` on the receive path) and
-//! admin Task 3 (`GET /v1/discovery` serving verified stored adverts). A
-//! single module-level `allow` here rather than one per item.
-#![allow(dead_code)]
+//! Consumed by fed exchange (`fed::conn`, Task 2: `build_from_config`/
+//! `sign` on connection-up and the refresh timer, `verify` on the receive
+//! path) and admin Task 3 (`GET /v1/discovery` serving verified stored
+//! adverts).
 
 use super::domains;
 use crate::config::Config;

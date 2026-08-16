@@ -615,8 +615,11 @@ pub enum FedIngressOutcome {
 /// (including `unknown`) so it always fails an `accept_from` comparison
 /// regardless of how low `accept_from` is configured. Shared by
 /// `fed_ingress`'s trust gate (comparing a peer's stored level against
-/// `federation.accept_from`) below.
-fn trust_rank(level: &str) -> u8 {
+/// `federation.accept_from`) below. `pub(crate)` (not private): `fed::conn`
+/// reuses this exact ranking for RFDP discovery's `federation`-scope gate
+/// (design §2 "same gate as fed_ingress", cycle G) rather than duplicating
+/// the ordering.
+pub(crate) fn trust_rank(level: &str) -> u8 {
     match level {
         "blocked" => 0,
         "seen" => 2,
@@ -1280,6 +1283,19 @@ pub async fn pump(d: Arc<Daemon>) {
                     }
                 }
                 Err(e) => warn!(error = %e, "expired challenge purge failed"),
+            }
+            // RFDP peer advertisements (design §3, cycle G): same hourly
+            // cadence as the retention/challenge purges above -- an
+            // expired advert is already excluded from `list_peer_adverts`
+            // (its own `expires > now` filter), so this is disk hygiene,
+            // not a correctness gate.
+            match d.store.lock().unwrap().purge_expired_adverts(now) {
+                Ok(n) => {
+                    if n > 0 {
+                        info!(purged = n, "purged expired peer advertisements");
+                    }
+                }
+                Err(e) => warn!(error = %e, "expired peer advert purge failed"),
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

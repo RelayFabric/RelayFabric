@@ -13,6 +13,11 @@ pub struct Store {
 /// four-tuple spelled out inline (clippy::type_complexity).
 pub type TrustRow = (String, String, DateTime<Utc>, DateTime<Utc>);
 
+/// `(node_id, advert_cbor, received_at)` -- `Store::list_peer_adverts`'s
+/// row shape (design §3, cycle G), named for the same `clippy::
+/// type_complexity` reason `TrustRow` above is.
+pub type PeerAdvertRow = (String, Vec<u8>, DateTime<Utc>);
+
 #[derive(Debug, Clone)]
 pub struct Delivery {
     pub id: i64,
@@ -140,6 +145,13 @@ CREATE TABLE IF NOT EXISTS node_trust (
   level TEXT NOT NULL,
   first_seen TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS peer_adverts (
+  node_id TEXT PRIMARY KEY,
+  advert_cbor BLOB NOT NULL,
+  name TEXT NOT NULL,
+  expires TEXT NOT NULL,
+  received_at TEXT NOT NULL
 );
 ";
 
@@ -899,6 +911,71 @@ impl Store {
             self.seed_trust(node_id, "blocked", now)?;
         }
         Ok(())
+    }
+
+    // ---- RFDP peer advertisements (design §2/§3, cycle G) ----------------
+
+    /// Upserts a verified peer advertisement, NEWER-`expires`-WINS (design
+    /// §3): a row already on hand for `node_id` with an `expires` at or
+    /// past `expires` is left untouched -- a replay, or a peer's own
+    /// retransmit of an advert this store already holds a fresher (or
+    /// equally fresh) copy of. `advert_cbor` is the caller's ORIGINAL,
+    /// still-signature-verifiable wire bytes (`fed::conn::receive_advert`
+    /// stores exactly what it verified, unmutated) -- deliberately NOT
+    /// re-encoded with a sanitized `name`, since mutating any signed field
+    /// post-verification would make the stored signature meaningless to
+    /// re-check later (Task 3's "verify on serve" invariant, design §3).
+    /// `name` is its own column instead, holding the ALREADY-SANITIZED
+    /// display value (`fed::conn::sanitize_advert_name`) -- the safe
+    /// value for any surface that must never echo a peer-controlled string
+    /// verbatim (this cycle's SSE `advert` event). Any caller that later
+    /// decodes `advert_cbor` for its OTHER fields (services/protocols/
+    /// security/expires) MUST NOT trust its embedded `.name` for display --
+    /// re-sanitize it (or read this column instead) before rendering.
+    pub fn upsert_peer_advert(
+        &self, node_id: &str, advert_cbor: &[u8], name: &str,
+        expires: DateTime<Utc>, received_at: DateTime<Utc>,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO peer_adverts (node_id, advert_cbor, name, expires, received_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(node_id) DO UPDATE SET
+               advert_cbor = excluded.advert_cbor,
+               name = excluded.name,
+               expires = excluded.expires,
+               received_at = excluded.received_at
+             WHERE excluded.expires > peer_adverts.expires",
+            params![node_id, advert_cbor, name, ts(expires), ts(received_at)],
+        )?;
+        Ok(())
+    }
+
+    /// Every unexpired (`expires > now`) stored advert, node_id ascending:
+    /// `(node_id, advert_cbor, received_at)` -- backs Task 3's `GET
+    /// /v1/discovery` peers listing and ctl `discovery` command, which
+    /// re-verify `advert_cbor` on serve (defense against direct DB
+    /// tampering, design §3) rather than trusting it just because it's in
+    /// this table.
+    pub fn list_peer_adverts(&self, now: DateTime<Utc>) -> rusqlite::Result<Vec<PeerAdvertRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, advert_cbor, received_at FROM peer_adverts
+             WHERE expires > ?1 ORDER BY node_id",
+        )?;
+        let rows = stmt.query_map(params![ts(now)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                parse_ts(&row.get::<_, String>(2)?),
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Deletes expired adverts (`expires < now`), wired into the existing
+    /// hourly retention sweep (`engine::pump`, alongside
+    /// `purge_expired_challenges`). Returns the number of rows deleted.
+    pub fn purge_expired_adverts(&self, now: DateTime<Utc>) -> rusqlite::Result<usize> {
+        self.conn.execute("DELETE FROM peer_adverts WHERE expires < ?1", params![ts(now)])
     }
 }
 
@@ -2225,5 +2302,69 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let rows = s.deliveries_for_fed_ack(e1.id, "phoenix").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].message_id, e1.id);
+    }
+
+    // ---- RFDP peer advertisements (design §2/§3, cycle G) -----------------
+
+    #[test]
+    fn upsert_peer_advert_newer_expires_wins_older_or_equal_ignored() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        s.upsert_peer_advert("rf:aa", b"first", "Alice", now + Duration::hours(1), now).unwrap();
+
+        // Older expires: ignored entirely -- the first row survives as-is.
+        s.upsert_peer_advert("rf:aa", b"stale", "AliceOld", now + Duration::minutes(30), now)
+            .unwrap();
+        let rows = s.list_peer_adverts(now).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, b"first".to_vec());
+
+        // Equal expires: also ignored (strictly newer required to win).
+        s.upsert_peer_advert("rf:aa", b"equal", "AliceEq", now + Duration::hours(1), now).unwrap();
+        assert_eq!(s.list_peer_adverts(now).unwrap()[0].1, b"first".to_vec());
+
+        // Strictly newer expires: wins, replacing the whole row.
+        s.upsert_peer_advert("rf:aa", b"newer", "AliceNew", now + Duration::hours(2), now).unwrap();
+        assert_eq!(s.list_peer_adverts(now).unwrap()[0].1, b"newer".to_vec());
+    }
+
+    #[test]
+    fn upsert_peer_advert_two_distinct_node_ids_do_not_collide() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        s.upsert_peer_advert("rf:aa", b"a", "Alice", now + Duration::hours(1), now).unwrap();
+        s.upsert_peer_advert("rf:bb", b"b", "Bob", now + Duration::hours(1), now).unwrap();
+        let rows = s.list_peer_adverts(now).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "rf:aa");
+        assert_eq!(rows[1].0, "rf:bb");
+    }
+
+    #[test]
+    fn list_peer_adverts_excludes_expired_rows() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        s.upsert_peer_advert("rf:bb", b"live", "Bob", now + Duration::hours(1), now).unwrap();
+        s.upsert_peer_advert("rf:cc", b"dead", "Carol", now - Duration::hours(1), now).unwrap();
+        let rows = s.list_peer_adverts(now).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "rf:bb");
+    }
+
+    #[test]
+    fn purge_expired_adverts_deletes_only_expired_rows() {
+        let (_d, s) = store();
+        let now = Utc::now();
+        s.upsert_peer_advert("rf:dd", b"live", "Dave", now + Duration::hours(1), now).unwrap();
+        s.upsert_peer_advert("rf:ee", b"dead", "Eve", now - Duration::hours(1), now).unwrap();
+
+        let purged = s.purge_expired_adverts(now).unwrap();
+        assert_eq!(purged, 1);
+
+        let remaining = s.list_peer_adverts(now).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "rf:dd");
+        // A second purge with nothing left to remove is a clean no-op.
+        assert_eq!(s.purge_expired_adverts(now).unwrap(), 0);
     }
 }

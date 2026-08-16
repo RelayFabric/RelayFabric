@@ -30,6 +30,7 @@
 use crate::config::{FederationConfig, PeerConfig};
 use crate::engine::{self, Daemon};
 use crate::events::Event;
+use crate::fed::advert::{self, Advert};
 use crate::fed::noise::{self, FedChannel, StaticKey};
 use crate::fed::wire::Fed;
 use crate::fed::short_node_id;
@@ -125,6 +126,27 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// config knob is deferred to a later cycle; this is a fixed safety
 /// ceiling, not yet an operator-tunable value.
 const MAX_INBOUND_CONNS: usize = 64;
+
+// ---- RFDP discovery tunables (design §2/§3, cycle G) ----------------------
+
+/// Cap on a received `Fed::Advert`'s own serialized size -- NOT `noise::
+/// MAX_FRAME`'s much larger 16MiB transport-level ceiling, a tighter bound
+/// specific to how big a legitimate advert document should ever need to be
+/// (design §2).
+const ADVERT_MAX_BYTES: usize = 16 * 1024;
+/// `advert::Advert::name`'s doc comment: "<=64 chars" (design §1).
+const ADVERT_MAX_NAME_CHARS: usize = 64;
+/// Clock-skew clamp (design §3): an advert claiming to expire further out
+/// than this from `now` is accepted but clamped DOWN to it, never rejected
+/// outright -- a generous TTL claim isn't itself evidence of a bad advert,
+/// just something this receiver refuses to honor past a sane bound.
+const ADVERT_MAX_FUTURE_SECS: i64 = 86_400;
+/// Per-peer throttle for a rejected advert's warn log line -- the same
+/// 1/min-per-peer shape as `engine::warn_pre_trust_rejection`, kept as its
+/// own map (not shared with that one) so the log line reads correctly for
+/// what it actually is ("federation advert rejected...") instead of
+/// borrowing envelope-ingress wording for an unrelated frame type.
+const ADVERT_REJECT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Top-level entry point (called once from `main.rs` when
 /// `cfg.federation.is_some()`): seeds the trust store from `fcfg` (design
@@ -429,17 +451,32 @@ fn register_down(d: &Daemon, peer_key: &str, instance: u64) {
 /// down and re-handshaken every 8h") -- see this module's top doc comment
 /// for why this is one task rather than a split reader/writer pair.
 ///
-/// I/O TIMEOUTS (Task 4 review fix round 1, DoS hardening): EVERY
-/// production channel I/O call is bounded -- `channel.recv_frame()` is
-/// wrapped in `tokio::time::timeout(DEAD_AFTER, ..)` (this IS the dead
-/// timer now, not a separate `last_rx`-elapsed check: a peer that's gone
-/// silent for `DEAD_AFTER` fails this timeout directly), and every
-/// `send_fed` call (ping, an Ack/Pong reply, or a frame handed in via
-/// `rx`) is bounded by `SEND_TIMEOUT` inside `send_fed` itself. Either
-/// timing out is treated exactly like a stream error: the loop breaks,
-/// `admit_and_run` deregisters, and (for an outbound connection)
-/// `spawn_outbound`'s redial loop resumes -- see `SEND_TIMEOUT`'s doc
-/// comment for the wedge this closes.
+/// I/O TIMEOUTS (Task 4 review fix round 1, DoS hardening; Task 2 review
+/// fix round 1, correctness fix on the dead-timer below): every `send_fed`
+/// call (ping, an Ack/Pong reply, or a frame handed in via `rx`) is
+/// bounded by `SEND_TIMEOUT` inside `send_fed` itself -- timing out is
+/// treated exactly like a stream error: the loop breaks, `admit_and_run`
+/// deregisters, and (for an outbound connection) `spawn_outbound`'s redial
+/// loop resumes -- see `SEND_TIMEOUT`'s doc comment for the wedge this
+/// closes. `channel.recv_frame()` is ALSO wrapped in `tokio::time::timeout
+/// (DEAD_AFTER, ..)`, kept as a backstop, but that per-iteration timeout
+/// is NOT the authoritative dead-peer detector (Task 2 review regression
+/// finding): it's an inline `select!` branch expression, freshly
+/// reconstructed every time the loop goes back around regardless of WHICH
+/// branch won -- including the `tick` branch, which fires every `TICK` =
+/// 5s -- so as long as something else keeps the loop iterating (the
+/// housekeeping tick always does), this per-recv timeout's 90s budget
+/// never gets an uninterrupted window long enough to elapse. A peer that
+/// completes the Noise handshake and then sends nothing would otherwise
+/// never be dropped until the 8h `REKEY_INTERVAL`, holding one of
+/// `MAX_INBOUND_CONNS` slots the whole time. The AUTHORITATIVE dead-timer
+/// is `last_activity` (a `tokio::time::Instant`, set at connect and
+/// updated on every successful `recv_frame`) checked against `DEAD_AFTER`
+/// from INSIDE the `tick` branch -- the same "compare a stable `Instant`
+/// against the always-firing 5s tick" shape `REKEY_INTERVAL`/`started`
+/// already used below, which is exactly why `started` never had this bug:
+/// it's set once and never reset, so it correctly accumulates across
+/// ticks no matter how often the loop iterates in between.
 async fn run_conn<S>(
     d: &Arc<Daemon>,
     mut channel: FedChannel<S>,
@@ -451,14 +488,52 @@ async fn run_conn<S>(
 {
     let mut last_ping = Instant::now();
     let started = Instant::now();
+    // Authoritative dead-peer detector (Task 2 review fix round 1) -- see
+    // this function's doc comment for why the per-recv `timeout(DEAD_AFTER,
+    // ..)` below is a backstop only, not sufficient on its own. Set at
+    // connect (a fresh connection that never receives anything must still
+    // be dropped after `DEAD_AFTER`, not given an unlimited grace period),
+    // and refreshed on every successful `recv_frame` regardless of whether
+    // the bytes decode to a recognized `Fed` frame -- this is about
+    // transport-level responsiveness, not frame validity.
+    let mut last_activity = Instant::now();
     let mut tick = tokio::time::interval(TICK);
     tick.tick().await; // interval fires immediately on creation; consume that first tick
+
+    // RFDP discovery, conn-up (design §2, cycle G): ask the peer for its
+    // current advert, gated by the SAME scope check (`advert_scope_allows`)
+    // that governs every other advert send/accept decision with this peer
+    // -- `disabled` discovery never asks (and therefore never answers a
+    // peer's own AdvertReq either, see `handle_frame`), `federation` only
+    // asks a peer that already meets `accept_from`, `public` asks anyone
+    // already on this authenticated connection. Runs for BOTH the
+    // initiator and responder path, since `run_conn` is the one frame loop
+    // shared by both (`admit_and_run`'s only caller of this function). A
+    // send failure here is not specially handled: the loop below's own
+    // recv/send error paths will observe and tear down the same broken
+    // connection within one more iteration.
+    if advert_scope_allows(d, node_id) {
+        let _ = send_fed(&mut channel, &Fed::AdvertReq {}).await;
+    }
+    // Refresh timer (design §2: re-send at `advert_ttl_secs / 2` without
+    // waiting for another `AdvertReq`), piggybacked on the existing `tick`
+    // housekeeping cadence below -- the same "last_X.elapsed() >= INTERVAL"
+    // shape `last_ping`/`PING_INTERVAL` already use, rather than a second
+    // independent `tokio::select!` arm. Read once, at connection start
+    // (matches `discovery`'s "daemon restart required" config posture --
+    // see `Config::discovery`'s doc comment): a config edit landing mid-
+    // connection takes effect on this connection's next 8h rekey, not
+    // instantly.
+    let advert_ttl_secs = d.cfg_snapshot(|c| c.discovery.advert_ttl_secs);
+    let advert_refresh_interval = Duration::from_secs((advert_ttl_secs / 2).max(1));
+    let mut last_advert_refresh = Instant::now();
 
     loop {
         tokio::select! {
             frame = tokio::time::timeout(DEAD_AFTER, channel.recv_frame()) => {
                 match frame {
                     Ok(Ok(bytes)) => {
+                        last_activity = Instant::now();
                         if let Ok(decoded) = ciborium::from_reader::<Fed, _>(bytes.as_slice()) {
                             if let Some(reply) = handle_frame(d, node_id, peer_key, decoded) {
                                 if send_fed(&mut channel, &reply).await.is_err() { break; }
@@ -485,6 +560,10 @@ async fn run_conn<S>(
                 }
             }
             _ = tick.tick() => {
+                if last_activity.elapsed() >= DEAD_AFTER {
+                    warn!(peer = %peer_key, "federation connection silent for {DEAD_AFTER:?}, closing");
+                    break;
+                }
                 if started.elapsed() > REKEY_INTERVAL {
                     info!(peer = %peer_key, "federation connection reached its rekey interval, closing");
                     break;
@@ -492,6 +571,15 @@ async fn run_conn<S>(
                 if last_ping.elapsed() >= PING_INTERVAL {
                     last_ping = Instant::now();
                     if send_fed(&mut channel, &Fed::Ping {}).await.is_err() { break; }
+                }
+                if last_advert_refresh.elapsed() >= advert_refresh_interval {
+                    last_advert_refresh = Instant::now();
+                    if advert_scope_allows(d, node_id) {
+                        if let Some(advert) = build_signed_advert(d) {
+                            metrics::inc(&metrics::ADVERT_TX);
+                            if send_fed(&mut channel, &Fed::Advert { advert }).await.is_err() { break; }
+                        }
+                    }
                 }
             }
         }
@@ -537,7 +625,224 @@ fn handle_frame(d: &Daemon, peer_node_id: &str, peer_key: &str, frame: Fed) -> O
                 engine::FedIngressOutcome::Rejected(_) => None,
             }
         }
+        Fed::AdvertReq {} => {
+            if !advert_scope_allows(d, peer_node_id) {
+                return None;
+            }
+            build_signed_advert(d).map(|advert| {
+                metrics::inc(&metrics::ADVERT_TX);
+                Fed::Advert { advert }
+            })
+        }
+        Fed::Advert { advert } => {
+            receive_advert(d, peer_node_id, advert);
+            None
+        }
         Fed::Unknown => None,
+    }
+}
+
+// ---- RFDP discovery (design §2/§3, cycle G) -------------------------------
+
+/// Whether this daemon's discovery config permits advert exchange with
+/// `peer_node_id` right now -- shared by EVERY advert send/receive
+/// decision (conn-up `AdvertReq`, the `AdvertReq` reply, the refresh
+/// timer, and the receive-path trust gate: design's own "trust gate same
+/// scope rule as sending"). `disabled` -> `false` always (never send,
+/// never accept); `federation` -> the SAME `accept_from` comparison
+/// `engine::fed_ingress` uses (`peer_node_id`'s stored trust level must
+/// rank >= `federation.accept_from`); `public` -> `true` for any peer this
+/// is even called about, since every caller already holds a live, Noise-
+/// authenticated connection to `peer_node_id` -- "public" widens WHO among
+/// already-handshaken peers qualifies, never the transport itself.
+fn advert_scope_allows(d: &Daemon, peer_node_id: &str) -> bool {
+    let mode = d.cfg_snapshot(|c| c.discovery.mode.clone());
+    match mode.as_str() {
+        "disabled" => false,
+        "public" => true,
+        "federation" => {
+            let Some(accept_from) =
+                d.cfg_snapshot(|c| c.federation.as_ref().map(|f| f.accept_from.clone()))
+            else {
+                // Federation config vanished from under a live connection
+                // -- defensive, matches `fed_ingress`'s own posture for the
+                // analogous case (fail closed, never open).
+                return false;
+            };
+            let level = d.store.lock().unwrap().trust_level(peer_node_id).unwrap_or(None);
+            let level_str = level.as_deref().unwrap_or("unknown");
+            engine::trust_rank(level_str) >= engine::trust_rank(&accept_from)
+        }
+        _ => false, // config::validate rejects any other mode; defensive.
+    }
+}
+
+/// Builds and signs this node's current advert from the live config
+/// snapshot (design §2: "built fresh from current cfg snapshot" on every
+/// send, never cached). `None` when discovery is off
+/// (`advert::build_from_config`'s own `mode == "disabled"` check) --
+/// `advert_scope_allows` already keeps disabled-mode callers from ever
+/// reaching this, so the two independently agree rather than one relying
+/// on the other.
+fn build_signed_advert(d: &Daemon) -> Option<Advert> {
+    let unsigned = d.cfg_snapshot(|c| advert::build_from_config(c, &d.node_id, Utc::now()))?;
+    Some(advert::sign(unsigned, &d.identity))
+}
+
+/// Sanity gate on `services`/`protocols` map keys (Task 1 review binding
+/// note): unlike `name` below (cosmetic -- sanitize and store), a garbage
+/// key here is a REJECT of the whole advert, not a strip-and-store -- these
+/// keys are meant to be short, machine-chosen protocol/service-class
+/// identifiers (design §111.2: "chat"/"store_forward"/... , "lxmf", ...),
+/// never the operator/attacker-influenced free text `name` is.
+fn advert_keys_sane(advert: &Advert) -> bool {
+    fn ok(k: &str) -> bool {
+        !k.is_empty()
+            && k.len() <= 32
+            && k.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    }
+    advert.services.keys().all(|k| ok(k.as_str())) && advert.protocols.keys().all(|k| ok(k.as_str()))
+}
+
+/// Unicode display-spoofing codepoints NOT covered by `char::is_control()`
+/// (Task 2 review fix round 1, Important): bidi-control characters can
+/// reorder how the REST of a name renders in a terminal/UI without
+/// altering its bytes (e.g. an RLO before an otherwise-innocuous suffix
+/// can make it display in reverse, disguising it), and default-ignorable
+/// codepoints render invisibly but still occupy "characters" a naive
+/// display/eyeball check would miss entirely. Hardcoded ranges rather than
+/// pulling in a unicode-properties crate for the full `Bidi_Control`/
+/// `Default_Ignorable_Code_Point` categories -- this is the complete,
+/// deliberately narrow set a name field needs blocked, not a general
+/// Unicode classifier: `\u{061C}` ALM, `\u{200E}`/`\u{200F}` LRM/RLM,
+/// `\u{202A}`..=`\u{202E}` LRE/RLE/PDF/LRO/RLO, `\u{2066}`..=`\u{2069}`
+/// LRI/RLI/FSI/PDI (bidi-control); `\u{200B}`..=`\u{200D}` ZWSP/ZWNJ/ZWJ,
+/// `\u{FEFF}` BOM/ZWNBSP, `\u{2060}` word joiner (default-ignorable).
+fn is_display_spoofing(c: char) -> bool {
+    matches!(c,
+        '\u{061C}'
+            | '\u{200E}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200B}'..='\u{200D}'
+            | '\u{FEFF}'
+            | '\u{2060}')
+}
+
+/// Strips every Unicode control character plus the display-spoofing
+/// codepoints above, and truncates to `ADVERT_MAX_NAME_CHARS` (Task 1
+/// review binding ruling: an advert's `name` is UNTRUSTED even though the
+/// advert is signed -- a signature proves WHO sent it, not that its
+/// content is safe to print to a terminal or embed in a UI).
+/// `char::is_control()` covers C0 (U+0000-U+001F, including the ESC byte
+/// 0x1b that starts every ANSI escape sequence -- removing just that byte
+/// reduces a CSI/OSC sequence to inert printable text, e.g.
+/// `"\x1b[31mred"` -> `"[31mred"`, no longer an active escape once ESC is
+/// gone), DEL (U+007F), and C1 (U+0080-U+009F); `is_display_spoofing`
+/// (Task 2 review fix round 1) closes the gap `is_control()` leaves open
+/// for RLO/LRO/isolates/ZWSP/BOM and friends, which are printable-per-
+/// Unicode but exist specifically to misrepresent how the REST of a
+/// string renders. Cosmetic-only (RULING): a name needing this is
+/// stripped-and-stored, NOT grounds to reject the whole advert (unlike
+/// `advert_keys_sane` above).
+///
+/// `pub(crate)` (not private): `advert_cbor` as stored by `upsert_peer_advert`
+/// keeps the ORIGINAL, unsanitized `name` (see that function's doc comment
+/// for why) -- so Task 3's admin/ctl surfaces, which decode `advert_cbor`
+/// fresh on every serve to re-verify it, MUST call this again on whatever
+/// `.name` they get back before ever rendering it. Idempotent: re-running
+/// this over an already-sanitized string is a no-op.
+pub(crate) fn sanitize_advert_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control() && !is_display_spoofing(*c))
+        .take(ADVERT_MAX_NAME_CHARS)
+        .collect()
+}
+
+/// Per-peer throttle map for `reject_advert`'s warn log line (mirrors
+/// `engine::warn_pre_trust_rejection`'s shape, kept separate -- see
+/// `ADVERT_REJECT_WARN_INTERVAL`'s doc comment for why).
+static ADVERT_REJECT_WARN_THROTTLE: std::sync::LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Bumps `ADVERT_REJECTED` and, at most once per peer per minute, warns
+/// with `reason` -- called for every receive-path validation failure
+/// below. NEVER persists anything (design §2: pre-trust posture, matches
+/// `fed_ingress`'s `Persistence::NoPersist` -- an advert is only accepted
+/// from a peer that ALREADY clears `advert_scope_allows`, but every check
+/// before that gate is reachable by any peer that merely completed a bare
+/// Noise handshake).
+fn reject_advert(peer_node_id: &str, reason: &str) {
+    metrics::inc(&metrics::ADVERT_REJECTED);
+    let now = std::time::Instant::now();
+    let mut throttle = ADVERT_REJECT_WARN_THROTTLE.lock().unwrap();
+    let should_warn = match throttle.get(peer_node_id) {
+        Some(last) => now.duration_since(*last) >= ADVERT_REJECT_WARN_INTERVAL,
+        None => true,
+    };
+    if should_warn {
+        throttle.insert(peer_node_id.to_string(), now);
+    }
+    drop(throttle);
+    if should_warn {
+        warn!(peer = %short_node_id(peer_node_id), reason,
+            "federation advert rejected (not persisted; further repeats from this peer are \
+             throttled to 1/min)");
+    }
+}
+
+/// Receive-path validation chain for an inbound `Fed::Advert` (design §2,
+/// mirrors `fed_ingress`'s gate-order posture): size cap -> node_id binds
+/// to the CONNECTION's authenticated peer (an advert relayed for a third
+/// party is rejected -- gossip is future work) -> signature verify ->
+/// services/protocols key sanity -> expires freshness (stale rejected,
+/// far-future clamped) -> the same scope/trust gate sending uses ->
+/// sanitize `name` -> upsert. `advert_cbor` is stored EXACTLY as received
+/// (still signature-verifiable) -- see `Store::upsert_peer_advert`'s doc
+/// comment for why `name` is sanitized into its own column instead of by
+/// mutating the stored document.
+fn receive_advert(d: &Daemon, peer_node_id: &str, advert: Advert) {
+    let mut raw = Vec::new();
+    if ciborium::into_writer(&advert, &mut raw).is_err() || raw.len() > ADVERT_MAX_BYTES {
+        reject_advert(peer_node_id, "OVERSIZED");
+        return;
+    }
+    if advert.node_id != peer_node_id {
+        reject_advert(peer_node_id, "NODE_ID_MISMATCH");
+        return;
+    }
+    if advert::verify(&advert).is_err() {
+        reject_advert(peer_node_id, "BAD_SIGNATURE");
+        return;
+    }
+    if !advert_keys_sane(&advert) {
+        reject_advert(peer_node_id, "INVALID_SHAPE");
+        return;
+    }
+    let now = Utc::now();
+    if advert.expires <= now.timestamp() {
+        reject_advert(peer_node_id, "EXPIRED");
+        return;
+    }
+    if !advert_scope_allows(d, peer_node_id) {
+        reject_advert(peer_node_id, "TRUST_DENIED");
+        return;
+    }
+
+    let clamped_expires = advert.expires.min(now.timestamp() + ADVERT_MAX_FUTURE_SECS);
+    let expires_dt = DateTime::<Utc>::from_timestamp(clamped_expires, 0).unwrap_or(now);
+    let sanitized_name = sanitize_advert_name(&advert.name);
+
+    let result = d.store.lock().unwrap().upsert_peer_advert(
+        &advert.node_id, &raw, &sanitized_name, expires_dt, now);
+    match result {
+        Ok(()) => {
+            metrics::inc(&metrics::ADVERT_RX);
+            d.emit_event(|| Event::Advert {
+                node_id: advert.node_id.clone(), name: sanitized_name.clone(), ts: now,
+            });
+        }
+        Err(e) => warn!(error = %e, "failed to persist peer advert"),
     }
 }
 
@@ -1164,5 +1469,670 @@ mod tests {
         assert!(result.is_ok(), "the connection must be torn down, not wedged forever on a stalled write");
         assert!(d.fed.as_ref().unwrap().conns.lock().unwrap().is_empty(),
             "a send-timed-out connection must deregister, exactly like any other closed connection");
+    }
+
+    // ---- RFDP discovery (design §2/§3, cycle G) ---------------------------
+
+    use chrono::Duration as ChronoDuration;
+    use std::collections::BTreeMap;
+
+    /// Test-only override of `d.cfg.discovery` -- `test_daemon_with_federation`
+    /// always builds a `DiscoveryConfig::default()` (`mode: "disabled"`), so
+    /// every test below that needs `federation`/`public` scope (or a short
+    /// `advert_ttl_secs` for the refresh-timer fake-clock test) mutates it
+    /// directly here rather than adding another `test_daemon_with_*`
+    /// constructor for one field.
+    fn set_discovery(d: &Daemon, mode: &str, advert_ttl_secs: u64) {
+        d.cfg.write().unwrap().discovery =
+            crate::config::DiscoveryConfig { mode: mode.to_string(), advert_ttl_secs };
+    }
+
+    fn test_advert(node_id: &str, name: &str, expires: i64) -> Advert {
+        Advert {
+            rf_version: 1,
+            node_id: node_id.to_string(),
+            name: name.to_string(),
+            services: BTreeMap::from([("federation".to_string(), true)]),
+            protocols: BTreeMap::new(),
+            security: advert::SecurityCaps { translate: true, signed: true, opaque: false },
+            expires,
+            sig: Vec::new(),
+        }
+    }
+
+    /// Full Noise handshake wiring shared by every wire-level advert test
+    /// below: given a PRE-GENERATED `(peer_key, peer_id)` identity (so the
+    /// caller can seed config/trust for that exact node_id BEFORE
+    /// connecting -- `envelope_frame_over_the_wire_is_ingressed_and_acked`'s
+    /// own pattern), spawns `admit_and_run` on the daemon side keyed
+    /// `peer_key_str` and hands back the CLIENT-held channel the test
+    /// drives by hand.
+    async fn connect_for_advert_test(
+        d: &Arc<Daemon>, dir: &std::path::Path, peer_key_str: &str,
+        peer_key: &StaticKey, peer_id: &crate::node_identity::NodeIdentity,
+    ) -> FedChannel<tokio::io::DuplexStream> {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (daemon_static, daemon_identity) = keypair(dir);
+        let responder = tokio::spawn(async move {
+            noise::handshake_responder(b, &daemon_static, &daemon_identity).await
+        });
+        let client_channel = handshake_initiator(a, peer_key, peer_id, None).await.unwrap();
+        let (server_channel, server_node_id) = responder.await.unwrap().unwrap();
+        let d2 = d.clone();
+        let peer_key_owned = peer_key_str.to_string();
+        tokio::spawn(
+            async move { admit_and_run(d2, server_channel, peer_key_owned, server_node_id).await },
+        );
+        client_channel
+    }
+
+    /// A "verified"-trust daemon+config pair shared by most tests below: a
+    /// single configured peer, `federation` discovery, generous TTL.
+    fn advert_test_daemon_and_peer(
+        dir: &std::path::Path,
+    ) -> (Arc<Daemon>, StaticKey, crate::node_identity::NodeIdentity, String) {
+        let (peer_key, peer_id) = keypair(dir);
+        let node_id = peer_id.node_id();
+        let mut cfg = fed_cfg(vec![], vec![]);
+        cfg.peers = vec![PeerConfig {
+            name: "phoenix".into(), node_id: node_id.clone(),
+            addr: "10.0.0.2:47000".into(), trust: "verified".into(), messages_per_minute: 0,
+        }];
+        let d = Arc::new(test_daemon_with_federation(dir, cfg));
+        set_discovery(&d, "federation", 3600);
+        (d, peer_key, peer_id, node_id)
+    }
+
+    // ---- pure functions: name sanitization + key-charset sanity -----------
+
+    #[test]
+    fn sanitize_advert_name_strips_control_chars_and_truncates() {
+        assert_eq!(sanitize_advert_name("hello"), "hello");
+        // ESC bytes removed; the surrounding printable text (now inert,
+        // no longer an active escape sequence) survives untouched.
+        assert_eq!(sanitize_advert_name("\x1b[31mred\x1b[0m"), "[31mred[0m");
+        assert_eq!(sanitize_advert_name("line1\nline2\r\n"), "line1line2");
+        assert_eq!(sanitize_advert_name("null\x00byte"), "nullbyte");
+        assert_eq!(sanitize_advert_name(&"x".repeat(100)).chars().count(), ADVERT_MAX_NAME_CHARS);
+    }
+
+    /// Task 2 review fix round 1 (Important): `char::is_control()` alone
+    /// misses Unicode display-spoofing codepoints -- RLO (right-to-left
+    /// override) can make the REST of a rendered name display reversed/
+    /// disguised without changing its bytes, and ZWSP is invisible but
+    /// still a "character". Neither is a `char::is_control()` control
+    /// character, so both needed `is_display_spoofing`'s dedicated check.
+    #[test]
+    fn sanitize_advert_name_strips_bidi_and_ignorable_spoofing_codepoints() {
+        // U+202E RLO + U+200B ZWSP interleaved with normal text -- only the
+        // normal text must survive.
+        let hostile = "safe\u{202E}\u{200B}name";
+        let sanitized = sanitize_advert_name(hostile);
+        assert_eq!(sanitized, "safename");
+        assert!(!sanitized.contains('\u{202E}'));
+        assert!(!sanitized.contains('\u{200B}'));
+
+        // The rest of the hardcoded set, individually.
+        for spoof in [
+            '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+            '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{200C}', '\u{200D}', '\u{FEFF}',
+            '\u{2060}',
+        ] {
+            let name = format!("a{spoof}b");
+            assert_eq!(sanitize_advert_name(&name), "ab", "spoofing char {spoof:?} was not stripped");
+        }
+    }
+
+    #[test]
+    fn advert_keys_sane_accepts_normal_service_and_protocol_names() {
+        let mut a = test_advert("rf:00", "n", 1);
+        a.services.insert("store_forward".to_string(), true);
+        a.protocols.insert(
+            "lxmf".to_string(),
+            advert::ProtoCaps { rx: true, tx: true, text: true, files: false, max_payload: None },
+        );
+        assert!(advert_keys_sane(&a));
+    }
+
+    #[test]
+    fn advert_keys_sane_rejects_a_key_outside_the_expected_charset() {
+        let mut a = test_advert("rf:00", "n", 1);
+        a.services.insert("bad key!\x1b".to_string(), true);
+        assert!(!advert_keys_sane(&a));
+    }
+
+    #[test]
+    fn advert_keys_sane_rejects_an_empty_key() {
+        let mut a = test_advert("rf:00", "n", 1);
+        a.services.insert(String::new(), true);
+        assert!(!advert_keys_sane(&a));
+    }
+
+    // ---- scope matrix (design §2, disabled/federation/public) -------------
+
+    #[test]
+    fn advert_scope_disabled_never_allows_any_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![]));
+        set_discovery(&d, "disabled", 3600);
+        let node_id = format!("rf:{}", "44".repeat(32));
+        d.store.lock().unwrap().seed_trust(&node_id, "trusted", Utc::now()).unwrap();
+        assert!(!advert_scope_allows(&d, &node_id),
+            "disabled discovery must never allow advert exchange, even with a fully trusted peer");
+    }
+
+    #[test]
+    fn advert_scope_federation_requires_accept_from_rank_a_merely_seen_peer_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![])); // accept_from: verified
+        set_discovery(&d, "federation", 3600);
+        let seen_node = format!("rf:{}", "55".repeat(32));
+        d.store.lock().unwrap().record_seen(&seen_node, Utc::now()).unwrap();
+        assert!(!advert_scope_allows(&d, &seen_node),
+            "a merely-seen peer must not pass federation-mode's accept_from gate");
+    }
+
+    #[test]
+    fn advert_scope_federation_allows_a_peer_meeting_accept_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![]));
+        set_discovery(&d, "federation", 3600);
+        let verified_node = format!("rf:{}", "66".repeat(32));
+        d.store.lock().unwrap().seed_trust(&verified_node, "verified", Utc::now()).unwrap();
+        assert!(advert_scope_allows(&d, &verified_node));
+    }
+
+    #[test]
+    fn advert_scope_public_allows_even_a_merely_seen_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![]));
+        set_discovery(&d, "public", 3600);
+        let seen_node = format!("rf:{}", "77".repeat(32));
+        d.store.lock().unwrap().record_seen(&seen_node, Utc::now()).unwrap();
+        assert!(advert_scope_allows(&d, &seen_node),
+            "public scope must allow any authenticated peer, regardless of trust level");
+    }
+
+    // ---- duplex wire-level exchange ----------------------------------------
+
+    #[tokio::test]
+    async fn advert_exchange_is_duplex_both_sides_send_and_receive() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer_key, peer_id, node_id) = advert_test_daemon_and_peer(dir.path());
+        let mut client_channel =
+            connect_for_advert_test(&d, dir.path(), "phoenix", &peer_key, &peer_id).await;
+
+        // The server must proactively ask the client for its advert at
+        // connect (design §2: each side sends AdvertReq).
+        let first = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
+            .await.expect("timed out waiting for the server's AdvertReq").unwrap();
+        assert!(
+            matches!(ciborium::from_reader::<Fed, _>(first.as_slice()).unwrap(), Fed::AdvertReq {}));
+
+        // Client answers with its OWN signed advert (node_id bound to this
+        // connection's authenticated identity) -- the server must verify,
+        // accept, and store it.
+        let client_advert = advert::sign(
+            test_advert(&node_id, "client-node", (Utc::now() + ChronoDuration::hours(1)).timestamp()),
+            &peer_id,
+        );
+        let mut buf = Vec::new();
+        ciborium::into_writer(&Fed::Advert { advert: client_advert }, &mut buf).unwrap();
+        client_channel.send_frame(&buf).await.unwrap();
+
+        // Client also sends its own AdvertReq -- the server must answer
+        // with its own valid, self-signed advert.
+        let mut req = Vec::new();
+        ciborium::into_writer(&Fed::AdvertReq {}, &mut req).unwrap();
+        client_channel.send_frame(&req).await.unwrap();
+
+        let reply = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
+            .await.expect("timed out waiting for the server's advert reply").unwrap();
+        match ciborium::from_reader::<Fed, _>(reply.as_slice()).unwrap() {
+            Fed::Advert { advert } => {
+                assert_eq!(advert.node_id, d.node_id);
+                assert!(advert::verify(&advert).is_ok());
+            }
+            other => panic!("expected Advert, got {other:?}"),
+        }
+
+        // The server's receive path is async relative to this test; poll
+        // briefly for the client's advert to land.
+        let mut stored = Vec::new();
+        for _ in 0..100 {
+            stored = d.store.lock().unwrap().list_peer_adverts(Utc::now()).unwrap();
+            if !stored.is_empty() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(stored.len(), 1, "the client's advert must be stored on the server side");
+        assert_eq!(stored[0].0, node_id);
+    }
+
+    #[tokio::test]
+    async fn advert_from_a_third_party_node_id_is_rejected_not_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer_key, peer_id, _node_id) = advert_test_daemon_and_peer(dir.path());
+        let mut client_channel =
+            connect_for_advert_test(&d, dir.path(), "phoenix", &peer_key, &peer_id).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
+            .await.unwrap().unwrap(); // the server's own initial AdvertReq
+
+        // A DIFFERENT identity signs a perfectly valid advert for ITSELF,
+        // but it arrives over a connection authenticated as `peer_id` --
+        // an advert relayed for a third party.
+        let (_third_key, third_party) = keypair(dir.path());
+        let third_advert = advert::sign(
+            test_advert(&third_party.node_id(), "impersonator",
+                (Utc::now() + ChronoDuration::hours(1)).timestamp()),
+            &third_party,
+        );
+        let before = metrics::ADVERT_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&Fed::Advert { advert: third_advert }, &mut buf).unwrap();
+        client_channel.send_frame(&buf).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let after = metrics::ADVERT_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "ADVERT_REJECTED must bump for a third-party node_id");
+        let stored = d.store.lock().unwrap().list_peer_adverts(Utc::now()).unwrap();
+        assert!(stored.iter().all(|(nid, _, _)| nid != &third_party.node_id()),
+            "a third-party advert must never be stored: {stored:?}");
+    }
+
+    #[tokio::test]
+    async fn advert_name_with_control_chars_is_sanitized_not_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer_key, peer_id, node_id) = advert_test_daemon_and_peer(dir.path());
+        let mut client_channel =
+            connect_for_advert_test(&d, dir.path(), "phoenix", &peer_key, &peer_id).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
+            .await.unwrap().unwrap();
+
+        let mut events_rx = d.events.subscribe();
+        let malicious_name = "\x1b[31mRED\x1b[0m\nline2\x00null";
+        let advert = advert::sign(
+            test_advert(&node_id, malicious_name, (Utc::now() + ChronoDuration::hours(1)).timestamp()),
+            &peer_id,
+        );
+        let mut buf = Vec::new();
+        ciborium::into_writer(&Fed::Advert { advert }, &mut buf).unwrap();
+        client_channel.send_frame(&buf).await.unwrap();
+
+        // NOT rejected: the SSE event fires (only happens on a successful
+        // upsert) carrying the SANITIZED name -- no ANSI escape, no
+        // newline, no NUL, matching `sanitize_advert_name`'s output
+        // exactly.
+        let ev = tokio::time::timeout(Duration::from_secs(2), events_rx.recv())
+            .await.expect("timed out waiting for the Advert SSE event").unwrap();
+        match ev {
+            Event::Advert { node_id: got_node, name, .. } => {
+                assert_eq!(got_node, node_id);
+                assert_eq!(name, sanitize_advert_name(malicious_name));
+                assert!(!name.contains('\x1b') && !name.contains('\n') && !name.contains('\0'),
+                    "sanitized name must carry no control characters: {name:?}");
+            }
+            other => panic!("expected Advert, got {other:?}"),
+        }
+
+        // The stored advert_cbor is the ORIGINAL, still-verifiable bytes
+        // (Store::upsert_peer_advert's contract) -- proving Task 3's
+        // planned "verify on serve" re-check will succeed against it.
+        let stored = d.store.lock().unwrap().list_peer_adverts(Utc::now()).unwrap();
+        assert_eq!(stored.len(), 1);
+        let decoded: Advert = ciborium::from_reader(stored[0].1.as_slice()).unwrap();
+        assert_eq!(decoded.name, malicious_name, "advert_cbor stores the ORIGINAL bytes verbatim");
+        assert!(advert::verify(&decoded).is_ok(),
+            "stored advert_cbor must remain independently re-verifiable");
+    }
+
+    #[tokio::test]
+    async fn oversized_advert_is_rejected_before_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer_key, peer_id, node_id) = advert_test_daemon_and_peer(dir.path());
+        let mut client_channel =
+            connect_for_advert_test(&d, dir.path(), "phoenix", &peer_key, &peer_id).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
+            .await.unwrap().unwrap();
+
+        let huge_name = "x".repeat(20_000); // well over ADVERT_MAX_BYTES once CBOR-encoded
+        let advert = advert::sign(
+            test_advert(&node_id, &huge_name, (Utc::now() + ChronoDuration::hours(1)).timestamp()),
+            &peer_id,
+        );
+        let before = metrics::ADVERT_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&Fed::Advert { advert }, &mut buf).unwrap();
+        client_channel.send_frame(&buf).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let after = metrics::ADVERT_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "ADVERT_REJECTED must bump for an oversized advert");
+        assert!(d.store.lock().unwrap().list_peer_adverts(Utc::now()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_expires_advert_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer_key, peer_id, node_id) = advert_test_daemon_and_peer(dir.path());
+        let mut client_channel =
+            connect_for_advert_test(&d, dir.path(), "phoenix", &peer_key, &peer_id).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
+            .await.unwrap().unwrap();
+
+        let advert = advert::sign(
+            test_advert(&node_id, "stale", (Utc::now() - ChronoDuration::seconds(10)).timestamp()),
+            &peer_id,
+        );
+        let before = metrics::ADVERT_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&Fed::Advert { advert }, &mut buf).unwrap();
+        client_channel.send_frame(&buf).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let after = metrics::ADVERT_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "ADVERT_REJECTED must bump for an already-expired advert");
+        assert!(d.store.lock().unwrap().list_peer_adverts(Utc::now()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn far_future_expires_is_clamped_not_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, peer_key, peer_id, node_id) = advert_test_daemon_and_peer(dir.path());
+        let mut client_channel =
+            connect_for_advert_test(&d, dir.path(), "phoenix", &peer_key, &peer_id).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
+            .await.unwrap().unwrap();
+
+        let advert = advert::sign(
+            test_advert(&node_id, "far-future", (Utc::now() + ChronoDuration::days(30)).timestamp()),
+            &peer_id,
+        );
+        let mut buf = Vec::new();
+        ciborium::into_writer(&Fed::Advert { advert }, &mut buf).unwrap();
+        client_channel.send_frame(&buf).await.unwrap();
+
+        let mut found = false;
+        for _ in 0..100 {
+            if !d.store.lock().unwrap().list_peer_adverts(Utc::now()).unwrap().is_empty() {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(found, "a far-future-expiring advert must be accepted (clamped), not rejected");
+
+        // Clamped to now + 24h: still present just under that horizon,
+        // gone just past it -- proving the real 30-day claim was NOT
+        // honored verbatim.
+        assert_eq!(
+            d.store.lock().unwrap()
+                .list_peer_adverts(Utc::now() + ChronoDuration::hours(23)).unwrap().len(),
+            1, "must still be unexpired just under the 24h clamp");
+        assert_eq!(
+            d.store.lock().unwrap()
+                .list_peer_adverts(Utc::now() + ChronoDuration::hours(25)).unwrap().len(),
+            0, "must be expired just past the 24h clamp -- the 30-day claim was not honored");
+    }
+
+    // ---- refresh timer, fake-clock (design §2: advert_ttl_secs / 2) -------
+
+    /// Advances the (paused) tokio clock in `TICK`-sized steps rather than
+    /// one big jump. `run_conn`'s housekeeping `tick.tick()` fires (and
+    /// re-arms the `DEAD_AFTER` recv timeout, a fresh future each loop
+    /// iteration) every `TICK`; stepping virtual time at that SAME
+    /// granularity is the faithful way to drive a fake-clock test spanning
+    /// many tick periods, rather than trusting one huge `advance()` jump to
+    /// correctly fast-forward through every intermediate timer firing along
+    /// the way -- a real flake was observed with a single 151s jump under
+    /// full-suite parallel load (525-test run) that never reproduced with
+    /// this stepped approach.
+    async fn advance_in_ticks(total: Duration) {
+        let mut remaining = total;
+        while remaining > Duration::ZERO {
+            let step = remaining.min(TICK);
+            tokio::time::advance(step).await;
+            remaining -= step;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn advert_refresh_timer_resends_after_ttl_over_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let (peer_key, peer_id) = keypair(dir.path());
+        let node_id = peer_id.node_id();
+        let mut cfg = fed_cfg(vec![], vec![]);
+        cfg.peers = vec![PeerConfig {
+            name: "phoenix".into(), node_id: node_id.clone(),
+            addr: "10.0.0.2:47000".into(), trust: "verified".into(), messages_per_minute: 0,
+        }];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), cfg));
+        set_discovery(&d, "federation", 300); // minimum allowed TTL -> 150s refresh interval
+
+        let mut client_channel =
+            connect_for_advert_test(&d, dir.path(), "phoenix", &peer_key, &peer_id).await;
+
+        let first = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
+            .await.unwrap().unwrap();
+        assert!(
+            matches!(ciborium::from_reader::<Fed, _>(first.as_slice()).unwrap(), Fed::AdvertReq {}));
+
+        // Advance in PING_INTERVAL-sized steps (< DEAD_AFTER) toward the
+        // 150s refresh point, replying to each server Ping with a Pong --
+        // this test's own silence would otherwise trip the (correct, Task
+        // 2 review fix round 1) dead-timer at 90s, well before the 150s
+        // refresh ever gets a chance to fire.
+        let mut refreshed = None;
+        for _ in 0..10 {
+            advance_in_ticks(PING_INTERVAL).await;
+            let frame = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
+                .await.expect("timed out waiting for a frame").unwrap();
+            match ciborium::from_reader::<Fed, _>(frame.as_slice()).unwrap() {
+                Fed::Advert { advert } => { refreshed = Some(advert); break; }
+                Fed::Ping {} => {
+                    let mut pong = Vec::new();
+                    ciborium::into_writer(&Fed::Pong {}, &mut pong).unwrap();
+                    client_channel.send_frame(&pong).await.unwrap();
+                }
+                other => panic!("unexpected frame while waiting for the refresh: {other:?}"),
+            }
+        }
+        let advert = refreshed.expect("must have received a refreshed Advert within 10 rounds");
+        assert_eq!(advert.node_id, d.node_id);
+        assert!(advert::verify(&advert).is_ok());
+    }
+
+    // ---- dead timer (Task 2 review fix round 1: DEAD_AFTER regression) ----
+
+    /// A peer that completes the Noise handshake and then sends nothing at
+    /// all must be dropped once `last_activity` (untouched since connect)
+    /// reaches `DEAD_AFTER`, checked from the `tick` branch -- NOT left
+    /// alive indefinitely (the bug: a per-recv `timeout(DEAD_AFTER, ..)`
+    /// alone can never elapse while the 5s housekeeping tick keeps
+    /// recreating it first every iteration). Proves the FULL teardown
+    /// chain: `conns` empties, the SSE `Federation{up:false}` event fires,
+    /// and the client side observes the connection actually close.
+    #[tokio::test(start_paused = true)]
+    async fn silent_peer_is_torn_down_after_dead_after_with_no_recv_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (peer_key, peer_id) = keypair(dir.path());
+        let node_id = peer_id.node_id();
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![])));
+        let mut events = d.events.subscribe();
+
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (daemon_static, daemon_identity) = keypair(dir.path());
+        let responder = tokio::spawn(async move {
+            noise::handshake_responder(b, &daemon_static, &daemon_identity).await
+        });
+        let mut client_channel = handshake_initiator(a, &peer_key, &peer_id, None).await.unwrap();
+        let (server_channel, server_node_id) = responder.await.unwrap().unwrap();
+        assert_eq!(server_node_id, node_id);
+
+        let conn_registration_key = node_id.clone();
+        let d2 = d.clone();
+        let conn_task = tokio::spawn(async move {
+            admit_and_run(d2, server_channel, conn_registration_key, node_id).await;
+        });
+
+        let up = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await.expect("timed out waiting for the up event").unwrap();
+        assert!(matches!(up, Event::Federation { up: true, .. }), "expected Federation up, got {up:?}");
+        for _ in 0..100 {
+            if d.fed.as_ref().unwrap().conns.lock().unwrap().len() == 1 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(d.fed.as_ref().unwrap().conns.lock().unwrap().len(), 1, "must be registered first");
+
+        // The client sends NOTHING from here on -- only the housekeeping
+        // tick (which never itself counts as recv activity) drives virtual
+        // time forward, stepped so as not to rely on one huge `advance()`
+        // jump (see `advance_in_ticks`'s doc comment).
+        advance_in_ticks(DEAD_AFTER + TICK + Duration::from_secs(1)).await;
+
+        let result = tokio::time::timeout(Duration::from_secs(5), conn_task).await;
+        assert!(result.is_ok(), "a silent peer must be torn down, not held forever");
+        assert!(d.fed.as_ref().unwrap().conns.lock().unwrap().is_empty(),
+            "a dead-timed-out connection must deregister");
+
+        let down = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await.expect("timed out waiting for the down event").unwrap();
+        match down {
+            Event::Federation { up, .. } => assert!(!up),
+            other => panic!("expected Federation down event, got {other:?}"),
+        }
+
+        // The server sent a handful of pings before tearing down (none of
+        // which the client read); drain past them to observe the real EOF.
+        let mut observed_close = false;
+        for _ in 0..20 {
+            match tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame()).await {
+                Ok(Err(_)) => { observed_close = true; break; }
+                Ok(Ok(_)) => continue,
+                Err(_) => panic!("timed out waiting to observe the connection close"),
+            }
+        }
+        assert!(observed_close, "the client side must observe the connection close");
+    }
+
+    /// The counterpart to the silent-peer test above: a peer that sends
+    /// SOMETHING within every `DEAD_AFTER` window must NOT be dropped, even
+    /// though the CUMULATIVE elapsed time across several such windows is
+    /// well past `DEAD_AFTER` -- proving `last_activity` genuinely resets
+    /// on each recv rather than the dead-check being a one-shot "time since
+    /// connect" measurement.
+    #[tokio::test(start_paused = true)]
+    async fn active_peer_recv_within_each_window_is_not_dropped_by_dead_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let (peer_key, peer_id) = keypair(dir.path());
+        let node_id = peer_id.node_id();
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![])));
+
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (daemon_static, daemon_identity) = keypair(dir.path());
+        let responder = tokio::spawn(async move {
+            noise::handshake_responder(b, &daemon_static, &daemon_identity).await
+        });
+        let mut client_channel = handshake_initiator(a, &peer_key, &peer_id, None).await.unwrap();
+        let (server_channel, server_node_id) = responder.await.unwrap().unwrap();
+        assert_eq!(server_node_id, node_id);
+
+        let conn_registration_key = node_id.clone();
+        let d2 = d.clone();
+        let conn_task = tokio::spawn(async move {
+            admit_and_run(d2, server_channel, conn_registration_key, node_id).await;
+        });
+        for _ in 0..100 {
+            if d.fed.as_ref().unwrap().conns.lock().unwrap().len() == 1 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let mut ping_buf = Vec::new();
+        ciborium::into_writer(&Fed::Ping {}, &mut ping_buf).unwrap();
+
+        // Three rounds of 40s (< DEAD_AFTER = 90s each), sending activity
+        // every round -- cumulative elapsed time (120s) comfortably
+        // exceeds DEAD_AFTER, but no SINGLE window between two consecutive
+        // sends ever does.
+        for round in 0..3 {
+            advance_in_ticks(Duration::from_secs(40)).await;
+            client_channel.send_frame(&ping_buf).await.unwrap();
+            // Reading anything back proves the server's task actually
+            // polled and processed this round's send -- the real
+            // synchronization point (recv_frame blocks until the server
+            // produces output), not a guess at how many scheduler passes
+            // are enough.
+            let frame = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
+                .await.unwrap_or_else(|_| panic!("timed out waiting for a server reply in round {round}"))
+                .unwrap();
+            ciborium::from_reader::<Fed, _>(frame.as_slice())
+                .unwrap_or_else(|_| panic!("undecodable frame in round {round}"));
+        }
+
+        assert!(!conn_task.is_finished(), "an active peer must not be torn down by the dead timer");
+        assert_eq!(d.fed.as_ref().unwrap().conns.lock().unwrap().len(), 1,
+            "an active peer's connection must remain registered");
+    }
+
+    // ---- 8h rekey, fake-clock (carried from cycle F) -----------------------
+
+    /// Carried from cycle F (design §1 "connections are torn down and
+    /// re-handshaken every 8h"): the `started.elapsed() > REKEY_INTERVAL`
+    /// teardown already exists in `run_conn` -- this proves it actually
+    /// fires, mirroring `stalled_write_is_torn_down_within_send_timeout_
+    /// not_wedged_forever`'s fake-clock methodology. Tearing the connection
+    /// down (deregistering it from `FedState.conns`) is what lets
+    /// `spawn_outbound`'s own redial loop re-handshake on the next attempt
+    /// -- this test proves the teardown half; the redial loop itself is
+    /// exercised elsewhere (`spawn_outbound`'s own tests).
+    #[tokio::test(start_paused = true)]
+    async fn connection_is_torn_down_after_the_8h_rekey_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let (peer_key, peer_id) = keypair(dir.path());
+        let node_id = peer_id.node_id();
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![])));
+
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (daemon_static, daemon_identity) = keypair(dir.path());
+        let responder = tokio::spawn(async move {
+            noise::handshake_responder(b, &daemon_static, &daemon_identity).await
+        });
+        let mut client_channel = handshake_initiator(a, &peer_key, &peer_id, None).await.unwrap();
+        let (server_channel, server_node_id) = responder.await.unwrap().unwrap();
+        assert_eq!(server_node_id, node_id);
+
+        let conn_registration_key = node_id.clone();
+        let d2 = d.clone();
+        let conn_task = tokio::spawn(async move {
+            admit_and_run(d2, server_channel, conn_registration_key, node_id).await;
+        });
+
+        for _ in 0..100 {
+            if d.fed.as_ref().unwrap().conns.lock().unwrap().len() == 1 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(d.fed.as_ref().unwrap().conns.lock().unwrap().len(), 1, "must be registered first");
+
+        // Stay ACTIVE throughout (reply Pong to every server Ping) so the
+        // dead timer (DEAD_AFTER = 90s, Task 2 review fix round 1) never
+        // fires first -- this test exercises REKEY_INTERVAL specifically,
+        // not the (separately fake-clock-tested) dead timer.
+        let mut pong = Vec::new();
+        ciborium::into_writer(&Fed::Pong {}, &mut pong).unwrap();
+        let rounds = REKEY_INTERVAL.as_secs() / PING_INTERVAL.as_secs() + 5;
+        let mut torn_down = false;
+        for _ in 0..rounds {
+            advance_in_ticks(PING_INTERVAL).await;
+            match tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame()).await {
+                Ok(Ok(_)) => { let _ = client_channel.send_frame(&pong).await; }
+                Ok(Err(_)) => { torn_down = true; break; } // EOF: rekey teardown reached
+                Err(_) => panic!("timed out waiting for a frame or the connection to close"),
+            }
+        }
+        assert!(torn_down, "the connection must be torn down at the 8h rekey deadline, not wedged");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), conn_task).await;
+        assert!(result.is_ok(), "the connection task must complete once torn down");
+        assert!(d.fed.as_ref().unwrap().conns.lock().unwrap().is_empty(),
+            "a rekeyed connection must deregister, so spawn_outbound's redial loop can re-handshake");
     }
 }
