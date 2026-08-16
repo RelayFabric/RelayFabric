@@ -5,6 +5,8 @@ import relay_ipc
 
 CANONICAL_HELLO_HEX = "000000a5a561746568656c6c6f66706c7567696e646c786d666776657273696f6e65302e312e307070726f746f636f6c5f76657273696f6e016c6361706162696c6974696573a96474657874f56f6469726563745f6d65737361676573f56667726f757073f56b6174746163686d656e7473f4686c6f636174696f6ef4697265616374696f6e73f4687265636569707473f46870726573656e6365f46b6d61785f7061796c6f6164f6"
 
+CANONICAL_INBOUND_ATTACHMENT_HEX = "00000085a7617467696e626f756e6468656e64706f696e74646368616e6673656e6465726173646b696e64647465787464626f64796268696a637265617465645f6174f66b6174746163686d656e747381a36866696c656e616d6565612e62696e646d696d6578186170706c69636174696f6e2f6f637465742d73747265616d646461746143010203"
+
 
 class CodecTests(unittest.TestCase):
     def test_roundtrip(self):
@@ -49,6 +51,36 @@ class CodecTests(unittest.TestCase):
     def test_inbound_valid_timestamp_sets_created_at(self):
         msg = relay_ipc.inbound("pasadena", "a91d00aa", "hello", 0)
         self.assertEqual(msg["created_at"], "1970-01-01T00:00:00Z")
+
+    def test_attachment_builder(self):
+        att = relay_ipc.attachment("a.bin", "application/octet-stream", b"\x01\x02\x03")
+        self.assertEqual(att["filename"], "a.bin")
+        self.assertEqual(att["mime"], "application/octet-stream")
+        self.assertEqual(att["data"], b"\x01\x02\x03")
+
+    def test_inbound_no_attachments_backward_compat(self):
+        # Existing callers without attachments should emit empty list
+        msg = relay_ipc.inbound("chan", "s", "hi")
+        self.assertEqual(msg["attachments"], [])
+
+    def test_inbound_with_attachments_roundtrip(self):
+        # Roundtrip with attachments
+        buf = io.BytesIO()
+        att = relay_ipc.attachment("a.bin", "application/octet-stream", b"\x01\x02\x03")
+        msg = relay_ipc.inbound("chan", "s", "hi", attachments=[att])
+        relay_ipc.write_frame(buf, msg)
+        buf.seek(0)
+        decoded = relay_ipc.read_frame(buf)
+        self.assertEqual(decoded["attachments"], [att])
+        self.assertEqual(decoded["body"], "hi")
+
+    def test_matches_rust_canonical_inbound_attachment(self):
+        # Golden test: must byte-match Rust canonical encoding
+        buf = io.BytesIO()
+        att = relay_ipc.attachment("a.bin", "application/octet-stream", b"\x01\x02\x03")
+        msg = relay_ipc.inbound("chan", "s", "hi", attachments=[att])
+        relay_ipc.write_frame(buf, msg)
+        self.assertEqual(buf.getvalue().hex(), CANONICAL_INBOUND_ATTACHMENT_HEX)
 
 
 if __name__ == "__main__":

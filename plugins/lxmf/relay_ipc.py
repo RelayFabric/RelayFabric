@@ -52,7 +52,21 @@ def hello(plugin, version, caps):
             "protocol_version": PROTOCOL_VERSION, "capabilities": caps}
 
 
-def inbound(endpoint, sender, body, created_at_epoch=None):
+def attachment(filename, mime, data):
+    """Create an attachment dict for inbound frames.
+
+    Args:
+        filename: attachment filename
+        mime: MIME type string
+        data: bytes payload (encoded as CBOR byte string)
+
+    Returns:
+        dict with filename, mime, data keys
+    """
+    return {"filename": filename, "mime": mime, "data": data}
+
+
+def inbound(endpoint, sender, body, created_at_epoch=None, *, attachments=None):
     created = None
     if created_at_epoch is not None:
         try:
@@ -63,7 +77,8 @@ def inbound(endpoint, sender, body, created_at_epoch=None):
             # the message anyway and let the daemon stamp receive time.
             created = None
     return {"t": "inbound", "endpoint": endpoint, "sender": sender,
-            "kind": "text", "body": body, "created_at": created}
+            "kind": "text", "body": body, "created_at": created,
+            "attachments": attachments or []}
 
 
 def delivery_result(corr, delivered, detail=None):
