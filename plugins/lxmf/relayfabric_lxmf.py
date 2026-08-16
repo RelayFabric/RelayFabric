@@ -1,19 +1,23 @@
 """RelayFabric LXMF plugin: bridges Reticulum/LXMF channels over Plugin Protocol v1.
 
-Module top level is stdlib-only (json/os/socket/sys/threading/time/
-concurrent.futures) so the config/channel/command helpers above stay
+Module top level is stdlib-only (json/mimetypes/os/socket/sys/threading/
+time/concurrent.futures) plus media (itself stdlib-only at import time; see
+media.py) so the config/channel/command/attachment helpers above stay
 importable without rns, lxmf, or even cbor2 installed. relay_ipc and
 RNS/LXMF are imported lazily inside the functions/methods that need
 them (see Bridge and main()).
 """
 
 import json
+import mimetypes
 import os
 import socket
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+
+import media
 
 
 def load_config(raw):
@@ -25,6 +29,10 @@ def load_config(raw):
     cfg.setdefault("announce_interval", 3600)
     cfg.setdefault("stamp_cost", None)
     cfg.setdefault("propagation_node", None)
+    cfg.setdefault("max_attachment_bytes", 1_000_000)
+    cfg.setdefault("image_max_bytes", None)
+    cfg.setdefault("voice_to_codec2", None)
+    cfg.setdefault("lxmf_delivery_limit_kb", 8192)
     cfg["channels"] = [dict(ch) for ch in cfg.get("channels", [])]
     for ch in cfg["channels"]:
         if not ch.get("name"):
@@ -98,6 +106,95 @@ def save_members_atomic(path, dynamic):
     with open(tmp, "w") as f:
         json.dump(dynamic, f, indent=2)
     os.replace(tmp, path)
+
+
+# ---------- attachment helpers (ported from rns-signal-gateway's
+# attachment_fields/lxmf_attachments; use media.py for the FIELD_*/AM_*
+# literals and the shrink_image/audio_to_codec2/codec2_to_wav transforms
+# so these stay importable without lxmf) ----------
+
+def attachment_fields(loaded, max_bytes, voice_codec2_bitrate=None,
+                       image_max_bytes=None):
+    """Build LXMF fields from [(filename, content_type, bytes), ...].
+
+    Returns (fields, notes). The first image becomes FIELD_IMAGE (rendered
+    inline by Sideband), downscaled to image_max_bytes (or max_bytes) when
+    it doesn't already fit. When voice_codec2_bitrate is set, the first
+    audio attachment is transcoded to a codec2 FIELD_AUDIO (tiny, plays in
+    Sideband's voice UI, LoRa-friendly). Everything else becomes
+    FIELD_FILE_ATTACHMENTS; anything still over max_bytes is dropped with
+    a note.
+    """
+    fields = {}
+    files = []
+    notes = []
+    for name, ctype, data in loaded:
+        ext = os.path.splitext(name)[1].lstrip(".").lower()
+        if ctype.startswith("image/") and media.FIELD_IMAGE not in fields:
+            budget = image_max_bytes or max_bytes
+            if len(data) > budget:
+                shrunk = media.shrink_image(data, budget)
+                if shrunk is not None:
+                    data, ext = shrunk, "webp"
+            if len(data) > max_bytes:
+                notes.append(f"[dropped {name}: {len(data)} B over "
+                             f"{max_bytes} B limit]")
+                continue
+            fields[media.FIELD_IMAGE] = [ext or ctype.split("/", 1)[1], data]
+            continue
+        if (ctype.startswith("audio/") and voice_codec2_bitrate
+                and media.FIELD_AUDIO not in fields):
+            c2 = media.audio_to_codec2(data, voice_codec2_bitrate)
+            if c2 is not None:
+                fields[media.FIELD_AUDIO] = [
+                    media.AM_FOR_BITRATE[voice_codec2_bitrate], c2]
+                continue
+        if len(data) > max_bytes:
+            notes.append(f"[dropped {name}: {len(data)} B over "
+                         f"{max_bytes} B limit]")
+            continue
+        files.append([os.path.basename(name), data])
+    if files:
+        fields[media.FIELD_FILE_ATTACHMENTS] = files
+    return fields, notes
+
+
+def lxmf_attachments(message_fields, max_bytes):
+    """Extract [(filename, bytes), ...] plus drop notes from LXMF fields."""
+    out, notes = [], []
+    fields = message_fields or {}
+    image = fields.get(media.FIELD_IMAGE)
+    if isinstance(image, (list, tuple)) and len(image) >= 2 and image[1]:
+        name, data = f"image.{image[0]}", image[1]
+        if len(data) > max_bytes:
+            shrunk = media.shrink_image(data, max_bytes)
+            if shrunk is not None:
+                name, data = "image.webp", shrunk
+        out.append((name, data))
+    audio = fields.get(media.FIELD_AUDIO)
+    if isinstance(audio, (list, tuple)) and len(audio) >= 2 and audio[1]:
+        if audio[0] >= media.AM_OPUS_OGG:
+            # opus modes are ogg containers, played natively downstream
+            out.append(("voice.ogg", audio[1]))
+        else:
+            # codec2: raw low-bitrate radio audio; transcode to WAV if
+            # pycodec2 is installed, else forward raw
+            decoded = media.codec2_to_wav(audio[0], audio[1])
+            if decoded is not None:
+                out.append(("voice.wav", decoded))
+            else:
+                out.append(("voice.c2", audio[1]))
+    for att in fields.get(media.FIELD_FILE_ATTACHMENTS) or []:
+        if isinstance(att, (list, tuple)) and len(att) >= 2 and att[1]:
+            out.append((str(att[0]) or "file", att[1]))
+    kept = []
+    for name, data in out:
+        if len(data) > max_bytes:
+            notes.append(f"[dropped {os.path.basename(name)}: "
+                         f"{len(data)} B over {max_bytes} B limit]")
+        else:
+            kept.append((os.path.basename(name), data))
+    return kept, notes
 
 
 def _harden_storage(storage, identity_path):
@@ -211,7 +308,9 @@ class Bridge:
             self.identity.to_file(identity_path)
         _harden_storage(storage, identity_path)  # to_file writes with umask perms
 
-        self.router = LXMF.LXMRouter(storagepath=os.path.join(storage, "lxmf"))
+        self.router = LXMF.LXMRouter(
+            storagepath=os.path.join(storage, "lxmf"),
+            delivery_limit=cfg["lxmf_delivery_limit_kb"])
         self.stamp_cost = cfg["stamp_cost"]
         self.dest = self.router.register_delivery_identity(
             self.identity,
@@ -310,12 +409,24 @@ class Bridge:
                      RNS.LOG_VERBOSE)
             return
 
+        # attachment bytes are never logged, only counts/sizes via notes
+        kept, notes = lxmf_attachments(message.fields, self.cfg["max_attachment_bytes"])
+        if not text and not kept and not notes:
+            return  # truly empty message (no text, no attachments, nothing dropped)
+        body = "\n".join(p for p in [text, *notes] if p)
+
         import relay_ipc
-        self._send_frame(relay_ipc.inbound(channel["name"], sender, text, message.timestamp))
+        attachments = [
+            relay_ipc.attachment(
+                name, mimetypes.guess_type(name)[0] or "application/octet-stream", data)
+            for name, data in kept
+        ]
+        self._send_frame(relay_ipc.inbound(
+            channel["name"], sender, body, message.timestamp, attachments=attachments))
 
     # ----- egress (daemon -> LXMF) -----
 
-    def handle_send(self, corr, endpoint, body):
+    def handle_send(self, corr, endpoint, body, attachments=None):
         import relay_ipc
 
         channel = channel_by_name(self.cfg, endpoint)
@@ -326,18 +437,27 @@ class Bridge:
         if not members:
             self._send_frame(relay_ipc.delivery_result(corr, False, "no members"))
             return
+
+        # attachment bytes are never logged, only counts/sizes via notes
+        loaded = [(a["filename"], a["mime"], a["data"]) for a in (attachments or [])]
+        fields, notes = attachment_fields(
+            loaded, self.cfg["max_attachment_bytes"],
+            self.cfg["voice_to_codec2"], self.cfg["image_max_bytes"])
+        text = "\n".join(p for p in [body, *notes] if p)
+
         tracker = FanoutTracker(corr, members)
         for member in members:
             self.pool.submit(
-                self.send_lxmf, member, body,
-                lambda success, m=member: self._fanout_done(tracker, m, success))
+                self.send_lxmf, member, text,
+                lambda success, m=member: self._fanout_done(tracker, m, success),
+                fields=fields or None)
 
     def _fanout_done(self, tracker, member, success):
         result = tracker.member_done(member[:8], success)
         if result is not None:
             self._send_frame(result)
 
-    def send_lxmf(self, dest_hex, text, on_result=None, method=None):
+    def send_lxmf(self, dest_hex, text, on_result=None, method=None, fields=None):
         import LXMF
         import RNS
 
@@ -369,13 +489,14 @@ class Bridge:
                 "lxmf", "delivery")
             lxm = LXMF.LXMessage(
                 destination, self.dest, text,
+                fields=fields,
                 desired_method=method,
                 include_ticket=self.stamp_cost is not None)
             lxm.register_delivery_callback(
                 lambda m, d=dest_hex, r=on_result: self._on_delivered(d, r))
             lxm.register_failed_callback(
-                lambda m, d=dest_hex, t=text, meth=method, r=on_result:
-                    self._on_failed(d, t, meth, r))
+                lambda m, d=dest_hex, t=text, meth=method, r=on_result, f=fields:
+                    self._on_failed(d, t, meth, r, f))
             self.router.handle_outbound(lxm)
         except Exception as e:  # noqa: BLE001 - daemon must survive bad sends
             RNS.log(f"LXMF send to {dest_hex} failed: {e}", RNS.LOG_ERROR)
@@ -389,7 +510,7 @@ class Bridge:
         if on_result:
             on_result(True)
 
-    def _on_failed(self, dest_hex, text, method, on_result):
+    def _on_failed(self, dest_hex, text, method, on_result, fields=None):
         import LXMF
         import RNS
 
@@ -402,7 +523,7 @@ class Bridge:
             # delivered=True for this member since store-and-forward
             # custody is the strongest guarantee available here.
             self.pool.submit(self.send_lxmf, dest_hex, text, on_result,
-                              LXMF.LXMessage.PROPAGATED)
+                              LXMF.LXMessage.PROPAGATED, fields)
         else:
             RNS.log(f"LXMF delivery FAILED to {dest_hex}", RNS.LOG_WARNING)
             if on_result:
@@ -437,7 +558,7 @@ def main():
     rfile = sock.makefile("rb")
     wfile = sock.makefile("wb")
 
-    caps = relay_ipc.capabilities(direct_messages=True, groups=True)
+    caps = relay_ipc.capabilities(direct_messages=True, groups=True, attachments=True)
     relay_ipc.write_frame(wfile, relay_ipc.hello(plugin_name, PLUGIN_VERSION, caps))
     ack = relay_ipc.read_frame(rfile)
     if ack.get("t") != "hello_ack" or ack.get("error"):
@@ -457,6 +578,7 @@ def main():
             sys.exit(1)
         kind = frame.get("t")
         if kind == "send":
-            bridge.handle_send(frame["corr"], frame["endpoint"], frame["body"])
+            bridge.handle_send(frame["corr"], frame["endpoint"], frame["body"],
+                               frame.get("attachments"))
         elif kind == "shutdown":
             sys.exit(0)

@@ -1,10 +1,28 @@
+import io
 import os
 import shutil
 import stat
 import tempfile
+import threading
+import types
 import unittest
 
+import media
 import relayfabric_lxmf as plug
+
+try:
+    from PIL import Image
+    HAVE_PIL = True
+except ImportError:
+    HAVE_PIL = False
+
+try:
+    import pycodec2
+    HAVE_PYCODEC2 = True
+except ImportError:
+    HAVE_PYCODEC2 = False
+
+HAVE_FFMPEG = shutil.which("ffmpeg") is not None
 
 CFG = {
     "storage": "/tmp/rf-lxmf-test",
@@ -22,6 +40,22 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(cfg["stamp_cost"])
         self.assertEqual(cfg["channels"][0]["members"], ["a91d00aa"])
         self.assertFalse(cfg["channels"][0]["open"])
+
+    def test_attachment_defaults(self):
+        cfg = plug.load_config(CFG)
+        self.assertEqual(cfg["max_attachment_bytes"], 1_000_000)
+        self.assertIsNone(cfg["image_max_bytes"])
+        self.assertIsNone(cfg["voice_to_codec2"])
+        self.assertEqual(cfg["lxmf_delivery_limit_kb"], 8192)
+
+    def test_attachment_config_overridable(self):
+        cfg = plug.load_config(dict(CFG, max_attachment_bytes=42,
+                                     image_max_bytes=7, voice_to_codec2=1200,
+                                     lxmf_delivery_limit_kb=256))
+        self.assertEqual(cfg["max_attachment_bytes"], 42)
+        self.assertEqual(cfg["image_max_bytes"], 7)
+        self.assertEqual(cfg["voice_to_codec2"], 1200)
+        self.assertEqual(cfg["lxmf_delivery_limit_kb"], 256)
 
     def test_missing_storage_rejected(self):
         with self.assertRaises(ValueError):
@@ -147,6 +181,251 @@ class HardenStorageTests(unittest.TestCase):
             self.assertFalse(os.path.exists(identity_path))
         finally:
             shutil.rmtree(storage)
+
+
+class AttachmentFieldsTests(unittest.TestCase):
+    """attachment_fields: egress (daemon attachments -> LXMF fields)."""
+
+    def test_first_image_inline_rest_as_files_oversize_dropped(self):
+        fields, notes = plug.attachment_fields(
+            [("a.png", "image/png", b"img1"),
+             ("b.jpg", "image/jpeg", b"img2"),
+             ("notes.txt", "text/plain", b"doc"),
+             ("big.bin", "application/x", b"x" * 20)],
+            10)
+        self.assertEqual(fields[media.FIELD_IMAGE], ["png", b"img1"])
+        self.assertEqual(fields[media.FIELD_FILE_ATTACHMENTS],
+                         [["b.jpg", b"img2"], ["notes.txt", b"doc"]])
+        self.assertEqual(notes, ["[dropped big.bin: 20 B over 10 B limit]"])
+
+    def test_empty_loaded_returns_empty(self):
+        self.assertEqual(plug.attachment_fields([], 10), ({}, []))
+
+    def test_undecodable_image_over_cap_drops_with_note(self):
+        _, notes = plug.attachment_fields([("x.png", "image/png", b"z" * 30)], 10)
+        self.assertIn("dropped x.png", notes[0])
+
+    @unittest.skipUnless(HAVE_PIL, "Pillow not installed")
+    def test_large_image_shrinks_to_fit_image_budget(self):
+        buf = io.BytesIO()
+        Image.frombytes(
+            "RGB", (600, 600), os.urandom(600 * 600 * 3)).save(buf, "PNG")
+        big_png = buf.getvalue()
+        self.assertGreater(len(big_png), 10000)
+
+        fields, notes = plug.attachment_fields(
+            [("photo.png", "image/png", big_png)], 1000000,
+            image_max_bytes=10000)
+
+        fmt, data = fields[media.FIELD_IMAGE]
+        self.assertEqual(fmt, "webp")
+        self.assertLessEqual(len(data), 10000)
+        self.assertEqual(notes, [])
+
+    @unittest.skipUnless(HAVE_PYCODEC2 and HAVE_FFMPEG,
+                         "pycodec2 and/or ffmpeg not available")
+    def test_voice_to_codec2_transcodes_audio_attachment(self):
+        frame = bytes(pycodec2.Codec2(1200).bytes_per_frame())
+        wav = media.codec2_to_wav(media.AM_CODEC2_1200, frame)
+        self.assertIsNotNone(wav)
+
+        fields, _ = plug.attachment_fields(
+            [("v.m4a", "audio/mp4", wav)], 100000, voice_codec2_bitrate=2400)
+
+        self.assertEqual(fields[media.FIELD_AUDIO][0], media.AM_CODEC2_2400)
+
+
+class LxmfAttachmentsTests(unittest.TestCase):
+    """lxmf_attachments: inbound (LXMF fields -> daemon attachments)."""
+
+    def test_extraction_and_size_cap(self):
+        kept, notes = plug.lxmf_attachments(
+            {media.FIELD_IMAGE: ["webp", b"12345"],
+             media.FIELD_FILE_ATTACHMENTS: [["big.bin", b"123456789"]]}, 5)
+        self.assertEqual(kept, [("image.webp", b"12345")])
+        self.assertEqual(notes, ["[dropped big.bin: 9 B over 5 B limit]"])
+
+    def test_opus_audio_becomes_playable_ogg(self):
+        kept, _ = plug.lxmf_attachments(
+            {media.FIELD_AUDIO: [media.AM_OPUS_OGG, b"OGGDATA"]}, 100)
+        self.assertEqual(kept, [("voice.ogg", b"OGGDATA")])
+
+    def test_undecodable_codec2_audio_passes_through_raw(self):
+        kept, _ = plug.lxmf_attachments(
+            {media.FIELD_AUDIO: [media.AM_CODEC2_1200, b"C2"]}, 100)
+        self.assertEqual(kept, [("voice.c2", b"C2")])
+
+    def test_none_fields_returns_empty(self):
+        self.assertEqual(plug.lxmf_attachments(None, 5), ([], []))
+
+    def test_path_traversal_name_is_basenamed(self):
+        kept, _ = plug.lxmf_attachments(
+            {media.FIELD_FILE_ATTACHMENTS: [["../evil", b"x"]]}, 5)
+        self.assertEqual(kept, [("evil", b"x")])
+
+    @unittest.skipUnless(HAVE_PIL, "Pillow not installed")
+    def test_oversize_image_shrinks_instead_of_dropping(self):
+        buf = io.BytesIO()
+        Image.frombytes(
+            "RGB", (600, 600), os.urandom(600 * 600 * 3)).save(buf, "PNG")
+        big_png = buf.getvalue()
+
+        kept, notes = plug.lxmf_attachments(
+            {media.FIELD_IMAGE: ["png", big_png]}, 10000)
+
+        self.assertEqual(notes, [])
+        self.assertEqual(kept[0][0], "image.webp")
+        self.assertLessEqual(len(kept[0][1]), 10000)
+
+    @unittest.skipUnless(HAVE_PYCODEC2 and HAVE_FFMPEG,
+                         "pycodec2 and/or ffmpeg not available")
+    def test_codec2_frame_transcodes_to_wav(self):
+        frame = bytes(pycodec2.Codec2(1200).bytes_per_frame())
+        kept, _ = plug.lxmf_attachments(
+            {media.FIELD_AUDIO: [media.AM_CODEC2_1200, frame]}, 100000)
+        self.assertEqual(kept[0][0], "voice.wav")
+
+
+class _ImmediatePool:
+    """Stand-in for ThreadPoolExecutor that runs submissions synchronously."""
+
+    def submit(self, fn, *args, **kwargs):
+        fn(*args, **kwargs)
+
+
+def _bare_bridge(cfg):
+    """A Bridge with __init__ (RNS/LXMF stack setup) skipped, for testing
+    the attachment-wiring logic in _handle_lxmf/handle_send/send_lxmf in
+    isolation. write_lock/pool/dynamic_members are the only pieces those
+    methods touch besides cfg.
+    """
+    bridge = plug.Bridge.__new__(plug.Bridge)
+    bridge.cfg = cfg
+    bridge.dynamic_members = {}
+    bridge.write_lock = threading.Lock()
+    bridge.pool = _ImmediatePool()
+    return bridge
+
+
+class BridgeInboundAttachmentTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = plug.load_config(CFG)
+        self.bridge = _bare_bridge(self.cfg)
+        self.sent = []
+        self.bridge._send_frame = self.sent.append
+
+    def _message(self, content=b"", fields=None, timestamp=1700000000):
+        return types.SimpleNamespace(
+            source_hash=bytes.fromhex("a91d00aa"),
+            content=content,
+            signature_validated=True,
+            timestamp=timestamp,
+            fields=fields or {},
+        )
+
+    def test_attachment_only_message_bridges_with_no_text(self):
+        message = self._message(
+            content=b"", fields={media.FIELD_IMAGE: ["png", b"img-bytes"]})
+
+        self.bridge._handle_lxmf(message)
+
+        self.assertEqual(len(self.sent), 1)
+        frame = self.sent[0]
+        self.assertEqual(frame["body"], "")
+        self.assertEqual(len(frame["attachments"]), 1)
+        att = frame["attachments"][0]
+        self.assertEqual(att["filename"], "image.png")
+        self.assertEqual(att["mime"], "image/png")
+        self.assertEqual(att["data"], b"img-bytes")
+
+    def test_truly_empty_message_does_not_bridge(self):
+        message = self._message(content=b"", fields={})
+
+        self.bridge._handle_lxmf(message)
+
+        self.assertEqual(self.sent, [])
+
+    def test_drop_note_appended_to_body(self):
+        message = self._message(
+            content=b"hello",
+            fields={media.FIELD_FILE_ATTACHMENTS: [["big.bin", b"x" * 20]]})
+        self.bridge.cfg = dict(self.cfg, max_attachment_bytes=10)
+
+        self.bridge._handle_lxmf(message)
+
+        frame = self.sent[0]
+        self.assertIn("hello", frame["body"])
+        self.assertIn("[dropped big.bin: 20 B over 10 B limit]", frame["body"])
+        self.assertEqual(frame["attachments"], [])
+
+    def test_unknown_extension_falls_back_to_octet_stream(self):
+        message = self._message(
+            content=b"file",
+            fields={media.FIELD_FILE_ATTACHMENTS: [["data.rfblob", b"xyz"]]})
+
+        self.bridge._handle_lxmf(message)
+
+        att = self.sent[0]["attachments"][0]
+        self.assertEqual(att["mime"], "application/octet-stream")
+
+    def test_non_member_sender_still_drops_regardless_of_attachments(self):
+        message = types.SimpleNamespace(
+            source_hash=bytes.fromhex("ffff0000"),
+            content=b"",
+            signature_validated=True,
+            timestamp=1700000000,
+            fields={media.FIELD_IMAGE: ["png", b"img"]},
+        )
+
+        self.bridge._handle_lxmf(message)
+
+        self.assertEqual(self.sent, [])
+
+
+class BridgeEgressAttachmentTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = plug.load_config(CFG)
+        self.bridge = _bare_bridge(self.cfg)
+        self.sent = []
+        self.bridge._send_frame = self.sent.append
+        self.send_calls = []
+
+        def fake_send_lxmf(dest_hex, text, on_result=None, method=None, fields=None):
+            self.send_calls.append(
+                {"dest": dest_hex, "text": text, "fields": fields})
+            if on_result:
+                on_result(True)
+
+        self.bridge.send_lxmf = fake_send_lxmf
+
+    def test_attachments_become_fields_kwarg_on_send(self):
+        attachments = [{"filename": "a.png", "mime": "image/png", "data": b"img1"}]
+
+        self.bridge.handle_send(1, "pasadena", "look", attachments)
+
+        self.assertEqual(len(self.send_calls), 1)
+        call = self.send_calls[0]
+        self.assertEqual(call["fields"][media.FIELD_IMAGE], ["png", b"img1"])
+        self.assertEqual(call["text"], "look")
+
+    def test_drop_notes_appended_to_outgoing_text(self):
+        attachments = [{"filename": "big.bin",
+                        "mime": "application/octet-stream", "data": b"x" * 20}]
+        self.bridge.cfg = dict(self.cfg, max_attachment_bytes=10)
+
+        self.bridge.handle_send(1, "pasadena", "look", attachments)
+
+        call = self.send_calls[0]
+        self.assertIn("look", call["text"])
+        self.assertIn("[dropped big.bin: 20 B over 10 B limit]", call["text"])
+        self.assertIsNone(call["fields"])
+
+    def test_no_attachments_passes_none_fields(self):
+        self.bridge.handle_send(1, "pasadena", "hello", None)
+
+        call = self.send_calls[0]
+        self.assertIsNone(call["fields"])
+        self.assertEqual(call["text"], "hello")
 
 
 if __name__ == "__main__":
