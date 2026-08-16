@@ -38,7 +38,7 @@ plugins:
     command: /path/to/RelayFabric/.venv/bin/python /path/to/RelayFabric/plugins/meshtastic/relayfabric-meshtastic
     config:
       broker: mqtt://127.0.0.1:1883
-      topic_root: msh
+      topic_root: msh/US              # your node's full root including region — verify with: mosquitto_sub -t 'msh/#' -v
       gateway_id: null                # null = accept all gateways; set to filter by hex ID
       max_text_bytes: 200             # daemon truncates upstream text
       channels:
@@ -46,11 +46,27 @@ plugins:
         zone2: {index: 1, topic_channel: "tactics"}
 ```
 
+Set `gateway_id` when more than one node on the mesh uplinks to this broker; otherwise each
+message arrives once per gateway node (each with a different `sender`) — bounded duplicates,
+not a loop.
+
 ## Loop guard
 
-The plugin uses SentCache (message deduplication by sender + ID) to break MQTT→Meshtastic→MQTT
-loops. Caveat: distinguishing inbound from outbound uses MQTT topic structure, not a
-sync marker — if uplink JSON reaches the daemon via a bridging route, loops could re-engage.
+The plugin uses a consume-on-match cache keyed on `(channel, text)` to break the
+MQTT→Meshtastic→MQTT loop: a successful downlink send records `(channel, text)` for 1 hour,
+and the next matching uplink is dropped and removes the entry rather than being held for the
+full TTL. Caveat: this key has no sender or message-ID component, so a genuine uplink whose
+text is identical to something we just sent on that channel can also be swallowed — at most
+once per send, and only within that 1 hour window.
+
+## Known field-test risks
+
+- Some firmware validates the downlink `from` field; this plugin always sends `from: 0`.
+  Verify one downlink end-to-end on your firmware — `delivered: true` only means the broker
+  accepted the publish, not that the node accepted or transmitted it.
+- Timestamps (`payload.timestamp`) are assumed to already be epoch seconds.
+- A lost echo (our downlink never re-uplinks, e.g. dropped over the air) leaves the loop-guard
+  entry live until its 1 hour TTL, during which one identical genuine message can be swallowed.
 
 ## Manual e2e smoke test (nodeless)
 
@@ -60,7 +76,7 @@ Without a Meshtastic device, test the config and uplink parsing:
 2. Publish a crafted uplink to the broker (note: the topic segment is the `topic_channel` name; the channel index comes from the JSON `channel` field):
 
 ```
-mosquitto_pub -h 127.0.0.1 -t msh/2/json/general/\!12345678 \
+mosquitto_pub -h 127.0.0.1 -t msh/US/2/json/general/\!12345678 \
   -m '{"type":"text","channel":0,"sender":"!12345678","payload":{"text":"test"},"timestamp":1692000000}'
 ```
 

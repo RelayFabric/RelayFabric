@@ -61,7 +61,7 @@ plugins:
   #   command: /path/to/RelayFabric/.venv/bin/python /path/to/RelayFabric/plugins/meshtastic/relayfabric-meshtastic
   #   config:
   #     broker: mqtt://127.0.0.1:1883
-  #     topic_root: msh
+  #     topic_root: msh/US              # your node's full root including region — verify with: mosquitto_sub -t 'msh/#' -v
   #     gateway_id: null                # null = accept all gateways; set to filter by hex ID
   #     max_text_bytes: 200             # daemon truncates upstream text
   #     channels:
