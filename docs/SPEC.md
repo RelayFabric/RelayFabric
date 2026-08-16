@@ -3092,11 +3092,17 @@ A newly discovered node might be allowed basic chat but not administrative comma
 ## 112.8 Quotas (built into switchyardd, not left to plugins)
 
 ```yaml
-public_limits:
+limits:
   per_sender: { messages_per_minute: 10, bytes_per_hour: 50000 }
   per_route:  { queue_max: 5000 }
-  global:     { disk_queue_max: 2GB }
+  global:     { queue_max: 100000, cas_max_bytes: 2000000000 }
+
+transport_budgets:
+  mqtt: { messages_per_minute: 500 }
+  lxmf: { messages_per_minute: 200 }
 ```
+
+`limits` and `transport_budgets` are siblings at the top of the config, not nested inside each other. Every `limits` field defaults to 0, meaning unlimited — a node MAY ship with no quotas configured at all, but if `node.public` is true and both `per_sender` and `global` are left at 0, `switchyardd` logs a startup warning (unlimited on a public node is allowed, not silently assumed safe). `transport_budgets` keys must name enabled plugins; a configured budget of 0 is rejected at load rather than silently meaning unlimited, so omit the entry instead. These ship in v0.1+ config (`switchyardd`'s `Config::limits` / `Config::transport_budgets`).
 
 Transport classes carry different budgets: Reticulum/IP generous, LoRa constrained, Signal controlled, satellite extremely restricted (extends §45, §46, §79).
 

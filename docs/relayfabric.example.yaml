@@ -91,7 +91,7 @@ policies:
       max_attachment_bytes: 500000  # alternative to `reject`: cap attachment size instead (bytes)
 
 # Public service gating: routes and their ingress/egress protocols.
-# Required when node.public is true; optional when false.
+# Required to cover every route's protocols when node.public is true; optional when false.
 # When node.public is true, every route's source protocols must be covered by
 # the union of all public_services' ingress lists, and every route's destination
 # protocols must be covered by the union of all public_services' egress lists.
