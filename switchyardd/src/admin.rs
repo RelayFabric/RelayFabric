@@ -10,11 +10,11 @@ use axum::extract::{FromRef, Path as AxPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, MethodRouter};
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use relay_core::Endpoint;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
@@ -24,6 +24,7 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 use tracing::warn;
+use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 /// Admin router state (design §3): grows beyond a bare `Arc<Daemon>` because
@@ -52,28 +53,50 @@ impl FromRef<AdminState> for Arc<Daemon> {
     }
 }
 
+/// Single source of truth for every admin route (Task 1, design §1
+/// completeness test): `router()` below is BUILT from this list rather than
+/// a hand-chained sequence of `.route(...)` calls, so the number of paths
+/// the live `Router` actually serves is a structural fact
+/// (`admin_routes().len()`), not a separately hand-maintained count that
+/// could silently drift from reality. `admin::tests::
+/// every_admin_route_is_documented_in_the_openapi_spec` cross-checks this
+/// same list's paths against `ApiDoc::openapi().paths` -- so a route added
+/// here without an accompanying `#[utoipa::path]` (registered in `ApiDoc`'s
+/// `paths(...)`) fails that test, and a route documented in `ApiDoc` that
+/// isn't ALSO in this list simply never gets registered on the live
+/// `Router` (caught by the same test's live-request probe, which sends a
+/// request for every method `ApiDoc` documents and would 404).
+fn admin_routes() -> Vec<(&'static str, MethodRouter<AdminState>)> {
+    vec![
+        ("/v1/status", get(status)),
+        ("/v1/plugins", get(plugins)),
+        ("/v1/routes", get(routes)),
+        ("/v1/config", get(config_yaml).put(config_put)),
+        ("/v1/config/validate", post(config_validate)),
+        ("/v1/config/rollback", post(config_rollback)),
+        ("/v1/queue", get(queue)),
+        ("/v1/messages/{id}", get(trace)),
+        ("/v1/public", get(public)),
+        ("/v1/limits", get(limits)),
+        ("/v1/identities", get(identities)),
+        ("/v1/identities/link", post(create_link)),
+        ("/v1/identities/link/{id}", delete(delete_link)),
+        ("/v1/identities/challenges", get(challenges)),
+        ("/v1/federation", get(federation)),
+        ("/v1/discovery", get(discovery)),
+        ("/v1/events", get(events_stream)),
+        ("/metrics", get(metrics_text)),
+        ("/v1/openapi.json", get(openapi_json)),
+    ]
+}
+
 pub fn router(d: Arc<Daemon>, config_path: PathBuf) -> Router {
     let state = AdminState { daemon: d, config_path, write_lock: Arc::new(Mutex::new(())) };
-    Router::new()
-        .route("/v1/status", get(status))
-        .route("/v1/plugins", get(plugins))
-        .route("/v1/routes", get(routes))
-        .route("/v1/config", get(config_yaml).put(config_put))
-        .route("/v1/config/validate", post(config_validate))
-        .route("/v1/config/rollback", post(config_rollback))
-        .route("/v1/queue", get(queue))
-        .route("/v1/messages/{id}", get(trace))
-        .route("/v1/public", get(public))
-        .route("/v1/limits", get(limits))
-        .route("/v1/identities", get(identities))
-        .route("/v1/identities/link", post(create_link))
-        .route("/v1/identities/link/{id}", delete(delete_link))
-        .route("/v1/identities/challenges", get(challenges))
-        .route("/v1/federation", get(federation))
-        .route("/v1/discovery", get(discovery))
-        .route("/v1/events", get(events_stream))
-        .route("/metrics", get(metrics_text))
-        .with_state(state)
+    let mut r: Router<AdminState> = Router::new();
+    for (path, method_router) in admin_routes() {
+        r = r.route(path, method_router);
+    }
+    r.with_state(state)
 }
 
 /// Takes an already-bound listener (bind failures must fail startup loudly in
@@ -103,32 +126,89 @@ fn plugin_state(d: &Daemon) -> Vec<(String, bool)> {
         .collect()
 }
 
+/// `GET /v1/status` response (Task 1, design §1: promoted from ad-hoc
+/// `json!` -- cheap, and the WebUI wants a typed shape). Field order is
+/// alphabetical to match byte-for-byte what `serde_json::json!`'s
+/// (non-`preserve_order`) `BTreeMap`-backed `Value::Object` already
+/// serialized before this promotion -- see `admin::tests::
+/// status_response_serializes_byte_identical_to_the_pre_promotion_json_shape`.
+#[derive(Serialize, ToSchema)]
+struct StatusResponse {
+    node: String,
+    node_id: String,
+    plugins: BTreeMap<String, bool>,
+    public: bool,
+    queue: BTreeMap<String, i64>,
+}
+
+/// `GET /v1/status` (design §Admin API): node identity, public-mode flag,
+/// per-plugin connected state, and aggregate queue counts by state.
+#[utoipa::path(
+    get,
+    path = "/v1/status",
+    tag = "status",
+    summary = "Node status",
+    description = "Node name/id, public-mode flag, per-plugin connected state, and aggregate queue counts by delivery state.",
+    responses(
+        (status = 200, description = "Current node status", body = StatusResponse),
+    ),
+)]
 async fn status(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let plugins: BTreeMap<_, _> = plugin_state(&d).into_iter().collect();
     let (node_name, public) = d.cfg_snapshot(|c| (c.node.name.clone(), c.node.public));
-    Json(json!({
-        "node": node_name,
-        "node_id": d.node_id,
-        "public": public,
-        "plugins": plugins,
-        "queue": queue_map(&d),
-    }))
+    Json(StatusResponse {
+        node: node_name,
+        node_id: d.node_id.clone(),
+        plugins,
+        public,
+        queue: queue_map(&d),
+    })
 }
 
 /// spec §112.3: which services this node exposes publicly, and their
 /// ingress/egress protocol coverage — the WebUI (and, later, RFDP
 /// discovery) read this rather than parsing the raw config.
+/// One `GET /v1/public` service entry (Task 1: promoted from ad-hoc
+/// `json!`). Field order alphabetical -- see `StatusResponse`'s doc comment
+/// for why.
+#[derive(Serialize, ToSchema)]
+struct PublicServiceItem {
+    egress: Vec<String>,
+    ingress: Vec<String>,
+    name: String,
+    #[serde(rename = "type")]
+    r#type: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct PublicResponse {
+    public: bool,
+    services: Vec<PublicServiceItem>,
+}
+
+/// `GET /v1/public` (design §112.3): which services this node exposes
+/// publicly, and their ingress/egress protocol coverage.
+#[utoipa::path(
+    get,
+    path = "/v1/public",
+    tag = "status",
+    summary = "Publicly exposed services",
+    description = "Whether this node is in public mode, and (if so) the public_services entries it exposes with their ingress/egress protocol coverage.",
+    responses(
+        (status = 200, description = "Public-mode flag and configured public services", body = PublicResponse),
+    ),
+)]
 async fn public(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let (public, services) = d.cfg_snapshot(|c| {
-        let services: Vec<_> = c.public_services.iter().map(|s| json!({
-            "name": s.name,
-            "type": s.r#type,
-            "ingress": s.ingress,
-            "egress": s.egress,
-        })).collect();
+        let services: Vec<_> = c.public_services.iter().map(|s| PublicServiceItem {
+            egress: s.egress.clone(),
+            ingress: s.ingress.clone(),
+            name: s.name.clone(),
+            r#type: s.r#type.clone(),
+        }).collect();
         (c.node.public, services)
     });
-    Json(json!({ "public": public, "services": services }))
+    Json(PublicResponse { public, services })
 }
 
 /// Configured quotas and transport budgets (spec §112.8/§45/§79) — a config
@@ -136,25 +216,68 @@ async fn public(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
 /// getting rate-limited" starts from what's configured, and the in-memory
 /// limiter windows aren't worth exposing (they reset on restart and aren't
 /// meaningful without matching request context anyway).
+/// `GET /v1/limits` response family (Task 1: promoted from ad-hoc `json!`).
+/// Field order alphabetical throughout -- see `StatusResponse`'s doc
+/// comment for why.
+#[derive(Serialize, ToSchema)]
+struct GlobalLimitsItem {
+    cas_max_bytes: u64,
+    queue_max: u32,
+}
+
+#[derive(Serialize, ToSchema)]
+struct PerRouteLimitsItem {
+    queue_max: u32,
+}
+
+#[derive(Serialize, ToSchema)]
+struct PerSenderLimitsItem {
+    bytes_per_hour: u64,
+    messages_per_minute: u32,
+}
+
+#[derive(Serialize, ToSchema)]
+struct TransportBudgetItem {
+    messages_per_minute: u32,
+}
+
+#[derive(Serialize, ToSchema)]
+struct LimitsResponse {
+    global: GlobalLimitsItem,
+    per_route: PerRouteLimitsItem,
+    per_sender: PerSenderLimitsItem,
+    transport_budgets: BTreeMap<String, TransportBudgetItem>,
+}
+
+/// `GET /v1/limits` (design §112.8/§45/§79): configured quotas and
+/// transport budgets -- a config echo, not live counter state.
+#[utoipa::path(
+    get,
+    path = "/v1/limits",
+    tag = "status",
+    summary = "Configured quotas and transport budgets",
+    description = "Configured per-sender/per-route/global limits and per-transport-protocol egress budgets. A config echo, not live limiter counter state (which resets on restart).",
+    responses(
+        (status = 200, description = "Configured limits", body = LimitsResponse),
+    ),
+)]
 async fn limits(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     Json(d.cfg_snapshot(|c| {
         let transport_budgets: BTreeMap<_, _> = c.transport_budgets.iter()
-            .map(|(proto, b)| (proto.clone(), json!({ "messages_per_minute": b.messages_per_minute })))
+            .map(|(proto, b)| (proto.clone(), TransportBudgetItem { messages_per_minute: b.messages_per_minute }))
             .collect();
-        json!({
-            "per_sender": {
-                "messages_per_minute": c.limits.per_sender.messages_per_minute,
-                "bytes_per_hour": c.limits.per_sender.bytes_per_hour,
+        LimitsResponse {
+            global: GlobalLimitsItem {
+                cas_max_bytes: c.limits.global.cas_max_bytes,
+                queue_max: c.limits.global.queue_max,
             },
-            "per_route": {
-                "queue_max": c.limits.per_route.queue_max,
+            per_route: PerRouteLimitsItem { queue_max: c.limits.per_route.queue_max },
+            per_sender: PerSenderLimitsItem {
+                bytes_per_hour: c.limits.per_sender.bytes_per_hour,
+                messages_per_minute: c.limits.per_sender.messages_per_minute,
             },
-            "global": {
-                "queue_max": c.limits.global.queue_max,
-                "cas_max_bytes": c.limits.global.cas_max_bytes,
-            },
-            "transport_budgets": transport_budgets,
-        })
+            transport_budgets,
+        }
     }))
 }
 
@@ -167,6 +290,62 @@ async fn limits(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
 /// `plugins` guard inside this block, which drops the guard before
 /// `d.gauges` (a separate lock) is ever touched -- never hold one Daemon
 /// lock while acquiring another.
+/// `GET /v1/plugins` response shape, DOCUMENTATION ONLY (Task 1: this type
+/// is never constructed or returned by `plugins()` below -- it exists
+/// purely so `ApiDoc` has a concrete schema to reference). `capabilities`
+/// mirrors `relay_core::Capabilities` (defined in a different workspace
+/// crate, `relay-core`, which does not depend on `utoipa` -- adding that
+/// dependency there to derive `ToSchema` directly on `Capabilities` was
+/// judged out of scope for this task's license-gated, switchyardd-only
+/// `utoipa` addition) serialized through `serde_json::to_value`, so it's
+/// documented here as a free-form object rather than a `$ref` to the real
+/// type. `gauges` values are similarly free-form (arbitrary plugin-reported
+/// gauge names). The real handler is unchanged -- still `BTreeMap<String,
+/// serde_json::Value>` built ad-hoc -- because typing `capabilities`
+/// faithfully would mean either duplicating `Capabilities`' fields here
+/// (drifts the moment that struct changes) or reaching into `relay-core`,
+/// both worse than an honest free-form schema.
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct PluginGaugeItemDoc {
+    age_secs: u64,
+    value: f64,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct PluginEntryDoc {
+    /// Mirrors `relay_core::Capabilities` (text/direct_messages/groups/
+    /// attachments/location/reactions/receipts/presence: bool,
+    /// max_payload: Option<u64>); `null` when the plugin has never
+    /// connected.
+    capabilities: Option<serde_json::Value>,
+    connected: bool,
+    /// Keyed by gauge name (plugin-reported, e.g. "queue_depth"); empty
+    /// when the plugin never reported gauges or its snapshot has gone
+    /// stale.
+    gauges: BTreeMap<String, PluginGaugeItemDoc>,
+}
+
+/// `GET /v1/plugins` response, DOCUMENTATION ONLY -- see `PluginEntryDoc`.
+/// Keyed by plugin name.
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct PluginsResponseDoc(BTreeMap<String, PluginEntryDoc>);
+
+/// `GET /v1/plugins` (design §2): per-plugin connected state, capabilities
+/// (as last reported over the plugin socket; `null` if never connected),
+/// and the latest finite gauge values with their age in seconds.
+#[utoipa::path(
+    get,
+    path = "/v1/plugins",
+    tag = "status",
+    summary = "Per-plugin state and capabilities",
+    description = "Enabled plugins keyed by name: connected state, last-reported capabilities (null if never connected), and latest gauge values with age_secs (empty if none reported or stale).",
+    responses(
+        (status = 200, description = "Per-plugin state", body = PluginsResponseDoc),
+    ),
+)]
 async fn plugins(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let enabled_names: Vec<String> = d.cfg_snapshot(|c| {
         c.plugins.iter().filter(|(_, p)| p.enabled).map(|(name, _)| name.clone()).collect()
@@ -234,19 +413,55 @@ fn policies_for_route<'a>(
 /// masking applies here -- masking (RULING 2's compound form) is reserved
 /// for identity refs like `/v1/identities` and `/v1/messages/{id}`
 /// deliveries on the `@identity` route.
+/// `GET /v1/routes` response family (Task 1: promoted from ad-hoc `json!`).
+/// Field order alphabetical -- see `StatusResponse`'s doc comment for why.
+#[derive(Serialize, ToSchema)]
+struct RouteRenderItem {
+    max_chars: u32,
+    tag: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct RouteItem {
+    destinations: Vec<String>,
+    identity_mode: String,
+    name: String,
+    policies: Vec<String>,
+    render: RouteRenderItem,
+    sources: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct RoutesResponse {
+    routes: Vec<RouteItem>,
+}
+
+/// `GET /v1/routes` (design §2): per-route detail beyond name/sources/
+/// destinations -- `identity_mode`, `render` knobs, and the policy names
+/// that apply.
+#[utoipa::path(
+    get,
+    path = "/v1/routes",
+    tag = "status",
+    summary = "Configured routes with policy/render detail",
+    description = "Every configured route: sources/destinations (rendered as protocol:channel strings), identity_mode, render knobs, and the names of policies that apply to it.",
+    responses(
+        (status = 200, description = "Configured routes", body = RoutesResponse),
+    ),
+)]
 async fn routes(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
-    Json(json!({
-        "routes": d.cfg_snapshot(|c| {
-            c.routes.iter().map(|r| json!({
-                "name": r.name,
-                "sources": r.sources.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
-                "destinations": r.destinations.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
-                "identity_mode": r.identity_mode,
-                "render": { "tag": r.render.tag, "max_chars": r.render.max_chars },
-                "policies": policies_for_route(r, &c.policies),
-            })).collect::<Vec<_>>()
+    Json(RoutesResponse {
+        routes: d.cfg_snapshot(|c| {
+            c.routes.iter().map(|r| RouteItem {
+                destinations: r.destinations.iter().map(|e| e.to_string()).collect(),
+                identity_mode: r.identity_mode.clone(),
+                name: r.name.clone(),
+                policies: policies_for_route(r, &c.policies).into_iter().map(String::from).collect(),
+                render: RouteRenderItem { max_chars: r.render.max_chars, tag: r.render.tag.clone() },
+                sources: r.sources.iter().map(|e| e.to_string()).collect(),
+            }).collect()
         })
-    }))
+    })
 }
 
 /// `GET /v1/config` (design §2): the loaded config as YAML text, secrets
@@ -256,6 +471,16 @@ async fn routes(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
 /// `apply_config` storing a newly-applied config's own raw text -- so
 /// byte-fidelity to whatever's actually loaded and zero secret exposure
 /// both fall out of "just don't re-serialize anything".
+#[utoipa::path(
+    get,
+    path = "/v1/config",
+    tag = "config",
+    summary = "Loaded config as YAML",
+    description = "The currently loaded config file, byte-verbatim, with secret references UNRESOLVED (e.g. `${env:...}`) -- never a resolved secret value.",
+    responses(
+        (status = 200, description = "Loaded config YAML", content_type = "text/yaml", body = String),
+    ),
+)]
 async fn config_yaml(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let yaml = d.cfg_snapshot(|c| c.raw_yaml.clone());
     (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/yaml")], yaml)
@@ -388,6 +613,39 @@ fn decode_body_or_422(body: &Bytes) -> Result<&str, (StatusCode, Json<serde_json
 /// resolved fine (see `config_validate_returns_422_with_neither_the_
 /// sentinel_nor_a_resolved_value_when_validation_fails_for_an_unrelated_
 /// reason` below).
+/// `POST /v1/config/validate` / `PUT /v1/config` response shapes,
+/// DOCUMENTATION ONLY (Task 1: not in the brief's named promote-list;
+/// small and asymmetric -- success and failure carry different fields --
+/// so a doc-only pair of schemas is clearer than forcing one struct with
+/// always-optional fields the handlers never actually emit that way).
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct ConfigValidateOk {
+    valid: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct ConfigValidateError {
+    errors: Vec<String>,
+    valid: bool,
+}
+
+/// `POST /v1/config/validate` (design §3): runs the exact same parse +
+/// validate + secret-resolution pipeline `PUT`/startup use against the
+/// POSTed YAML text and returns only whether it would apply successfully.
+#[utoipa::path(
+    post,
+    path = "/v1/config/validate",
+    tag = "config",
+    summary = "Validate a config document without applying it",
+    description = "Runs the same parse/validate/secret-resolution pipeline PUT /v1/config uses against the request body, discards the result, and reports only whether it's valid. Never resolves or echoes any secret value.",
+    request_body(content = String, content_type = "text/yaml", description = "Candidate config YAML"),
+    responses(
+        (status = 200, description = "Config is valid", body = ConfigValidateOk),
+        (status = 422, description = "Config is invalid (parse/validate error, or not valid UTF-8)", body = ConfigValidateError),
+    ),
+)]
 async fn config_validate(body: Bytes) -> impl IntoResponse {
     let text = match decode_body_or_422(&body) {
         Ok(t) => t,
@@ -406,6 +664,40 @@ async fn config_validate(body: Bytes) -> impl IntoResponse {
 /// on-disk config file (`write_config_replacing_current`) and calls
 /// `apply_config` (which itself serializes against ANY other `apply_config`
 /// caller via its own `apply_lock` — see that method's doc comment).
+/// `PUT /v1/config` success response, DOCUMENTATION ONLY (see
+/// `ConfigValidateOk`'s doc comment for why this stays a doc-only mirror
+/// rather than wiring into the handler).
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct ConfigApplyOk {
+    applied: bool,
+    /// Names of enabled plugins whose process must be restarted for this
+    /// config change to take full effect (empty if none).
+    restart_required: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct ConfigWriteError {
+    error: String,
+}
+
+/// `PUT /v1/config` (design §3): validates the POSTed YAML text (422 on
+/// failure, zero filesystem changes), then replaces the on-disk config file
+/// and applies it.
+#[utoipa::path(
+    put,
+    path = "/v1/config",
+    tag = "config",
+    summary = "Replace and apply the config",
+    description = "Validates the request body first (no filesystem changes on failure), then writes it as the new config file (keeping the previous one as a single-revision `.prev` backup) and applies it live.",
+    request_body(content = String, content_type = "text/yaml", description = "New config YAML"),
+    responses(
+        (status = 200, description = "Config written and applied", body = ConfigApplyOk),
+        (status = 422, description = "Config is invalid, or the body is not valid UTF-8; nothing written", body = ConfigValidateError),
+        (status = 500, description = "Config was valid but writing it to disk failed (e.g. ENOSPC, permissions)", body = ConfigWriteError),
+    ),
+)]
 async fn config_put(State(state): State<AdminState>, body: Bytes) -> impl IntoResponse {
     let text = match decode_body_or_422(&body) {
         Ok(t) => t,
@@ -437,6 +729,33 @@ async fn config_put(State(state): State<AdminState>, body: Bytes) -> impl IntoRe
 /// construction — nothing was ever touched — rather than by an undo step.
 /// On success, swaps `path`/`.prev` (`swap_with_prev`: current becomes
 /// `.prev`, matching `PUT`'s one-revision-history rule) and applies.
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct ConfigRollbackNotFound {
+    error: String,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct ConfigRollbackConflict {
+    errors: Vec<String>,
+}
+
+/// `POST /v1/config/rollback` (design §3): re-validates `<path>.prev`
+/// before touching any file, then swaps it back in as the live config.
+#[utoipa::path(
+    post,
+    path = "/v1/config/rollback",
+    tag = "config",
+    summary = "Roll back to the previous config",
+    description = "Re-validates the single-revision `.prev` backup before touching any file; on success, swaps it back in as the live config (current becomes the new `.prev`) and applies it.",
+    responses(
+        (status = 200, description = "Rolled back and applied", body = ConfigApplyOk),
+        (status = 404, description = "No previous config to roll back to", body = ConfigRollbackNotFound),
+        (status = 409, description = "The previous config no longer validates (e.g. an env-resolved secret reference drifted); nothing was touched", body = ConfigRollbackConflict),
+        (status = 500, description = "Reading or swapping the config files failed", body = ConfigWriteError),
+    ),
+)]
 async fn config_rollback(State(state): State<AdminState>) -> impl IntoResponse {
     let prev_path = prev_path_for(&state.config_path);
     let _write_guard = state.write_lock.lock().unwrap();
@@ -487,6 +806,54 @@ struct QueueParams {
 /// route's destination is a route endpoint, not an identity ref, and renders
 /// in full. No message body ever appears here (`list_deliveries`'s `SELECT`
 /// never even touches `messages.envelope`).
+/// One row of `GET /v1/queue?state=...`'s listing shape, DOCUMENTATION ONLY
+/// (Task 1: `queue()` below returns one of TWO distinct shapes depending on
+/// whether `?state=` is present -- an aggregate `{route: count}` map
+/// (default, unchanged since before this task) or this listing -- which
+/// doesn't fit a single promoted return type without either changing the
+/// wire shape or introducing a runtime-unused enum discriminant; documented
+/// via two schemas + prose instead, handler unchanged). `destination` is
+/// pre-masked (same "protocol:masked_ref" rule `trace`'s deliveries use for
+/// `@identity`-route rows).
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct QueueDeliveryItemDoc {
+    attempts: u32,
+    created_at: DateTime<Utc>,
+    destination: String,
+    message_id: Uuid,
+    reason: Option<String>,
+    route: String,
+    state: String,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct QueueListingDoc {
+    deliveries: Vec<QueueDeliveryItemDoc>,
+}
+
+/// `GET /v1/queue` / `GET /v1/queue?state=<state>&limit=<n>` (design §Admin
+/// API, Finding 2 whole-branch review): without `state`, the pre-existing
+/// `{route: count}` aggregate (unchanged, e.g. `switchyardctl`'s own
+/// caller); with `state`, a listing of individual delivery rows in that
+/// state, newest first, capped at `limit` (default 100, clamped to
+/// [1, 1000]).
+#[utoipa::path(
+    get,
+    path = "/v1/queue",
+    tag = "status",
+    summary = "Queue counts, or a delivery listing when ?state= is given",
+    description = "Without `state`: `{route: count}` aggregate counts across every delivery state (the original, still-default shape). With `?state=<state>[&limit=<n>]`: `{\"deliveries\": [...]}`, individual rows in that state, newest first, `limit` clamped to [1, 1000] (default 100).",
+    params(
+        ("state" = Option<String>, Query, description = "Filter to this delivery state (e.g. dead_letter); switches the response to the listing shape"),
+        ("limit" = Option<usize>, Query, description = "Max rows to return when `state` is given; clamped to [1, 1000], default 100"),
+    ),
+    responses(
+        (status = 200, description = "Aggregate counts (default) or a masked delivery listing (with ?state=)", body = QueueListingDoc),
+    ),
+)]
 async fn queue(State(d): State<Arc<Daemon>>, Query(params): Query<QueueParams>) -> impl IntoResponse {
     let Some(state) = params.state else {
         return Json(queue_map(&d)).into_response();
@@ -514,6 +881,60 @@ async fn queue(State(d): State<Arc<Daemon>>, Query(params): Query<QueueParams>) 
     Json(json!({ "deliveries": out })).into_response()
 }
 
+/// `GET /v1/messages/{id}` response shape, DOCUMENTATION ONLY (Task 1: not
+/// in the brief's named promote-list; kept doc-only alongside the other
+/// small ad-hoc admin shapes rather than wired in, to keep this change's
+/// runtime surface limited to the explicitly-called-out handlers).
+/// `destination` is pre-masked per the same rule `queue`'s listing uses.
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct TraceDeliveryItemDoc {
+    attempts: u32,
+    destination: String,
+    expires_at: DateTime<Utc>,
+    next_attempt: DateTime<Utc>,
+    priority: u8,
+    reason: Option<String>,
+    route: String,
+    state: String,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct TraceResponseDoc {
+    body_bytes: usize,
+    created_at: DateTime<Utc>,
+    deliveries: Vec<TraceDeliveryItemDoc>,
+    expires_at: DateTime<Utc>,
+    id: Uuid,
+    kind: String,
+    received_at: DateTime<Utc>,
+    source: String,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct TraceNotFound {
+    error: String,
+}
+
+/// `GET /v1/messages/{id}` (design §90): delivery trace for one message --
+/// per-delivery state/route/priority/attempts, body summarized as a byte
+/// count only, never included.
+#[utoipa::path(
+    get,
+    path = "/v1/messages/{id}",
+    tag = "status",
+    summary = "Delivery trace for one message",
+    description = "Per-delivery state/route/priority/attempts for a message, plus envelope metadata. The message body is never included, only its byte length.",
+    params(
+        ("id" = Uuid, Path, description = "Message id"),
+    ),
+    responses(
+        (status = 200, description = "Message trace", body = TraceResponseDoc),
+        (status = 404, description = "Unknown message id", body = TraceNotFound),
+    ),
+)]
 async fn trace(
     State(d): State<Arc<Daemon>>,
     AxPath(id): AxPath<Uuid>,
@@ -562,6 +983,29 @@ async fn trace(
     })))
 }
 
+/// `GET /metrics` (Prometheus text exposition format, not JSON): counters
+/// `relayfabric_messages_ingress_total`, `relayfabric_messages_egress_total`,
+/// `relayfabric_messages_dropped_total`, `relayfabric_duplicate_messages_total`,
+/// `relayfabric_policy_denials_total`, `relayfabric_ratelimited_total`,
+/// `relayfabric_queue_rejected_total`, `relayfabric_budget_deferred_total`,
+/// `relayfabric_links_verified_total`, `relayfabric_federation_ingress_total`,
+/// `relayfabric_federation_egress_total`, `relayfabric_federation_rejected_total`,
+/// `relayfabric_advert_rx_total`, `relayfabric_advert_tx_total`,
+/// `relayfabric_advert_rejected_total`; gauges `relayfabric_queue_depth{state}`,
+/// `relayfabric_plugin_up{plugin}`, `relayfabric_federation_peer_up{peer}`,
+/// `relayfabric_plugin_gauge{plugin,name}`; summary
+/// `relayfabric_delivery_latency_seconds` (`_sum`/`_count`); and per-route
+/// counter `relayfabric_route_messages_total{route}`.
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    tag = "status",
+    summary = "Prometheus metrics",
+    description = "Prometheus text exposition format (not JSON). Counters: relayfabric_messages_ingress_total, relayfabric_messages_egress_total, relayfabric_messages_dropped_total, relayfabric_duplicate_messages_total, relayfabric_policy_denials_total, relayfabric_ratelimited_total, relayfabric_queue_rejected_total, relayfabric_budget_deferred_total, relayfabric_links_verified_total, relayfabric_federation_ingress_total, relayfabric_federation_egress_total, relayfabric_federation_rejected_total, relayfabric_advert_rx_total, relayfabric_advert_tx_total, relayfabric_advert_rejected_total. Gauges: relayfabric_queue_depth{state}, relayfabric_plugin_up{plugin}, relayfabric_federation_peer_up{peer}, relayfabric_plugin_gauge{plugin,name}. Summary: relayfabric_delivery_latency_seconds (_sum/_count). Per-route counter: relayfabric_route_messages_total{route}.",
+    responses(
+        (status = 200, description = "Prometheus exposition text", content_type = "text/plain", body = String),
+    ),
+)]
 async fn metrics_text(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let q = d.store.lock().unwrap().queue_counts().unwrap_or_default();
     metrics::render(&q, &plugin_state(&d), &d.gauges)
@@ -570,23 +1014,67 @@ async fn metrics_text(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
 /// `GET /v1/identities` (design §Admin API / webui-notes): masked refs in
 /// every response — protocol stays visible, only the ref is masked
 /// (RULING 2's compound convention), full refs never leave this module.
-async fn identities(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
-    let links = d.store.lock().unwrap().list_links().unwrap_or_default();
-    let out: Vec<_> = links.iter().map(|l| json!({
-        "id": l.id,
-        "a": format!("{}:{}", l.a_protocol, identity_links::mask_ref(&l.a_ref)),
-        "b": format!("{}:{}", l.b_protocol, identity_links::mask_ref(&l.b_ref)),
-        "display_name": l.display_name,
-        "verified_at": l.verified_at,
-    })).collect();
-    Json(json!({ "links": out }))
+/// `GET /v1/identities` response family (Task 1: promoted from ad-hoc
+/// `json!`). Field order alphabetical -- see `StatusResponse`'s doc comment
+/// for why. `a`/`b` are the masked "protocol:masked_ref" compound form
+/// (RULING 2), never a raw native ref.
+#[derive(Serialize, ToSchema)]
+struct LinkItem {
+    a: String,
+    b: String,
+    display_name: String,
+    id: i64,
+    verified_at: DateTime<Utc>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, ToSchema)]
+struct IdentitiesResponse {
+    links: Vec<LinkItem>,
+}
+
+/// `GET /v1/identities` (design §Admin API / webui-notes): verified
+/// identity links, refs masked.
+#[utoipa::path(
+    get,
+    path = "/v1/identities",
+    tag = "identities",
+    summary = "Verified identity links",
+    description = "Every verified identity link, with both sides' refs masked (protocol stays visible, only the ref is masked). Full refs never leave this endpoint.",
+    responses(
+        (status = 200, description = "Verified identity links", body = IdentitiesResponse),
+    ),
+)]
+async fn identities(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
+    let links = d.store.lock().unwrap().list_links().unwrap_or_default();
+    let out: Vec<_> = links.iter().map(|l| LinkItem {
+        a: format!("{}:{}", l.a_protocol, identity_links::mask_ref(&l.a_ref)),
+        b: format!("{}:{}", l.b_protocol, identity_links::mask_ref(&l.b_ref)),
+        display_name: l.display_name.clone(),
+        id: l.id,
+        verified_at: l.verified_at,
+    }).collect();
+    Json(IdentitiesResponse { links: out })
+}
+
+#[derive(Deserialize, ToSchema)]
 struct LinkRequest {
+    /// "protocol:ref" of the party requesting the link.
     requester: String,
+    /// "protocol:ref" of the link target.
     target: String,
     display_name: String,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct CreateLinkAccepted {
+    challenge_id: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct CreateLinkError {
+    error: String,
 }
 
 /// `POST /v1/identities/link` (design §Admin API): 202 with a challenge id
@@ -597,6 +1085,22 @@ struct LinkRequest {
 /// than axum's `Json` extractor so every parse failure maps to exactly 400,
 /// not axum's default 415 (bad content-type) / 422 (well-formed JSON, wrong
 /// shape) split.
+/// `POST /v1/identities/link` (design §Admin API): 202 with a challenge id
+/// on success; 400 on a malformed body or an unparsable "proto:ref"; 409 if
+/// the target plugin isn't direct-capable or the global queue is full.
+#[utoipa::path(
+    post,
+    path = "/v1/identities/link",
+    tag = "identities",
+    summary = "Request an identity link",
+    description = "Initiates an identity link between requester and target, sending a verification challenge to the target. 400 on a malformed body or an unparsable \"proto:ref\" endpoint string; 409 if the target plugin isn't direct-message-capable or the global queue is full.",
+    request_body(content = LinkRequest, content_type = "application/json"),
+    responses(
+        (status = 202, description = "Challenge sent", body = CreateLinkAccepted),
+        (status = 400, description = "Malformed body or unparsable endpoint", body = CreateLinkError),
+        (status = 409, description = "Target not direct-capable, or global queue full", body = CreateLinkError),
+    ),
+)]
 async fn create_link(State(d): State<Arc<Daemon>>, body: Bytes) -> impl IntoResponse {
     let req: LinkRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -624,6 +1128,22 @@ async fn create_link(State(d): State<Arc<Daemon>>, body: Bytes) -> impl IntoResp
 /// pseudonyms immediately" regression is exercised at the rendering layer in
 /// engine.rs (rendering reads links live) — this endpoint just removes the
 /// row.
+/// `DELETE /v1/identities/link/{id}` (design §Admin API / §22): 204 on
+/// success, 404 if no such link.
+#[utoipa::path(
+    delete,
+    path = "/v1/identities/link/{id}",
+    tag = "identities",
+    summary = "Remove an identity link",
+    description = "Removes an identity link by id. Aliases on the affected route revert to pseudonyms immediately.",
+    params(
+        ("id" = i64, Path, description = "Link id"),
+    ),
+    responses(
+        (status = 204, description = "Link removed"),
+        (status = 404, description = "No such link"),
+    ),
+)]
 async fn delete_link(State(d): State<Arc<Daemon>>, AxPath(id): AxPath<i64>) -> impl IntoResponse {
     let deleted = match d.store.lock().unwrap().delete_link(id) {
         Ok(b) => b,
@@ -639,15 +1159,43 @@ async fn delete_link(State(d): State<Arc<Daemon>>, AxPath(id): AxPath<i64>) -> i
 /// masked targets and expiry — codes never leave `storage::Challenge`
 /// (design §Security invariants); this handler never reads the `code`
 /// field.
+/// `GET /v1/identities/challenges` response family (Task 1: promoted from
+/// ad-hoc `json!`). Field order alphabetical -- see `StatusResponse`'s doc
+/// comment for why. `code` never appears -- see `storage::Challenge`.
+#[derive(Serialize, ToSchema)]
+struct ChallengeItem {
+    expires_at: DateTime<Utc>,
+    id: i64,
+    target: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ChallengesResponse {
+    challenges: Vec<ChallengeItem>,
+    pending_count: usize,
+}
+
+/// `GET /v1/identities/challenges` (design §Admin API): pending identity
+/// link challenges -- masked target and expiry only, codes never exposed.
+#[utoipa::path(
+    get,
+    path = "/v1/identities/challenges",
+    tag = "identities",
+    summary = "Pending identity link challenges",
+    description = "Pending (unexpired) identity link challenges: masked target ref and expiry. The verification code itself is never exposed by any API response.",
+    responses(
+        (status = 200, description = "Pending challenges", body = ChallengesResponse),
+    ),
+)]
 async fn challenges(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let now = Utc::now();
     let list = d.store.lock().unwrap().list_challenges(now).unwrap_or_default();
-    let out: Vec<_> = list.iter().map(|c| json!({
-        "id": c.id,
-        "target": format!("{}:{}", c.target_protocol, identity_links::mask_ref(&c.target_ref)),
-        "expires_at": c.expires_at,
-    })).collect();
-    Json(json!({ "pending_count": out.len(), "challenges": out }))
+    let out: Vec<_> = list.iter().map(|c| ChallengeItem {
+        expires_at: c.expires_at,
+        id: c.id,
+        target: format!("{}:{}", c.target_protocol, identity_links::mask_ref(&c.target_ref)),
+    }).collect();
+    Json(ChallengesResponse { pending_count: out.len(), challenges: out })
 }
 
 /// `GET /v1/federation` (design §6, Task 5): every configured
@@ -661,9 +1209,42 @@ async fn challenges(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
 /// `federation:` config block) reports an empty list rather than 404 --
 /// consistent with `public()`'s "disabled reports zero services" precedent
 /// below, not an error condition.
+/// `GET /v1/federation` response family (Task 1: promoted from ad-hoc
+/// `json!`). Field order alphabetical -- see `StatusResponse`'s doc comment
+/// for why.
+#[derive(Serialize, ToSchema)]
+struct FederationPeerItem {
+    connected: bool,
+    last_seen: Option<DateTime<Utc>>,
+    /// The configured peer name, or `null` for an "inbound-only seen" node
+    /// (a completed Noise handshake with no `peers[]` entry).
+    name: Option<String>,
+    node_id: String,
+    trust: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct FederationResponse {
+    peers: Vec<FederationPeerItem>,
+}
+
+/// `GET /v1/federation` (design §6, Task 5): every configured
+/// `federation.peers[]` entry plus any trust-store node not covered by one,
+/// each with its live connected state and last-seen timestamp. Federation
+/// entirely off reports an empty list, not 404.
+#[utoipa::path(
+    get,
+    path = "/v1/federation",
+    tag = "federation",
+    summary = "Federation peers",
+    description = "Every configured federation peer, plus any trust-store node with no peers[] entry (\"inbound-only seen\"), with live connected state and last_seen. Deliberately omits dial addresses. Reports an empty list (not 404) when federation is off.",
+    responses(
+        (status = 200, description = "Federation peers", body = FederationResponse),
+    ),
+)]
 async fn federation(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let Some(fed) = &d.fed else {
-        return Json(json!({ "peers": Vec::<serde_json::Value>::new() }));
+        return Json(FederationResponse { peers: Vec::new() });
     };
     let configured: Vec<crate::config::PeerConfig> =
         d.cfg_snapshot(|c| c.federation.as_ref().map(|f| f.peers.clone()).unwrap_or_default());
@@ -678,10 +1259,10 @@ async fn federation(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let live: BTreeMap<&str, &PeerConn> = conns.values().map(|c| (c.node_id.as_str(), c)).collect();
 
     let mut named: BTreeSet<&str> = BTreeSet::new();
-    let mut peers_out: Vec<serde_json::Value> = Vec::new();
+    let mut peers_out: Vec<FederationPeerItem> = Vec::new();
     for p in &configured {
         named.insert(p.node_id.as_str());
-        peers_out.push(federation_peer_json(
+        peers_out.push(federation_peer_item(
             Some(p.name.as_str()), &p.node_id, &trust_rows, live.get(p.node_id.as_str()).copied(),
         ));
     }
@@ -690,10 +1271,10 @@ async fn federation(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
         if named.contains(node_id) {
             continue; // already listed above, under its configured name
         }
-        peers_out.push(federation_peer_json(None, node_id, &trust_rows, live.get(node_id).copied()));
+        peers_out.push(federation_peer_item(None, node_id, &trust_rows, live.get(node_id).copied()));
     }
     drop(conns);
-    Json(json!({ "peers": peers_out }))
+    Json(FederationResponse { peers: peers_out })
 }
 
 /// One `GET /v1/federation` peer entry. `last_seen` (Task 5 choice,
@@ -705,19 +1286,19 @@ async fn federation(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
 /// `trust` similarly falls back to `"unknown"` for the (should-not-happen
 /// in practice, since boot-time seeding covers every configured peer)
 /// case of a configured peer absent from the trust store entirely.
-fn federation_peer_json(
+fn federation_peer_item(
     name: Option<&str>, node_id: &str, trust_rows: &[crate::storage::TrustRow], conn: Option<&PeerConn>,
-) -> serde_json::Value {
+) -> FederationPeerItem {
     let row = trust_rows.iter().find(|row| row.0 == node_id);
     let trust = row.map(|r| r.1.as_str()).unwrap_or("unknown");
     let last_seen = conn.map(|c| c.connected_at).or_else(|| row.map(|r| r.3));
-    json!({
-        "name": name,
-        "node_id": node_id,
-        "trust": trust,
-        "connected": conn.is_some(),
-        "last_seen": last_seen,
-    })
+    FederationPeerItem {
+        connected: conn.is_some(),
+        last_seen,
+        name: name.map(String::from),
+        node_id: node_id.to_string(),
+        trust: trust.to_string(),
+    }
 }
 
 /// `GET /v1/discovery` (design §6, Task 3): this node's own advert -- built
@@ -767,6 +1348,67 @@ fn federation_peer_json(
 /// characters and all; re-sanitizing before it ever reaches this response
 /// is the entire reason that function is `pub(crate)` rather than
 /// private.
+/// `GET /v1/discovery` response shape, DOCUMENTATION ONLY (Task 1: not
+/// wired into `discovery()` below -- `our_advert` reuses the full
+/// `fed::advert::Advert` shape while `peers[]` entries are a bespoke
+/// reshaping of it (adds `received_at`, omits `sig`/`rf_version`), so no
+/// single promoted type covers both without either duplicating fields or
+/// misdescribing one of the two; doc-only mirrors instead, handler
+/// unchanged). `protocols`/`security` mirror `fed::advert::{ProtoCaps,
+/// SecurityCaps}` -- free-form here rather than `$ref`ing those types,
+/// since doing so would require deriving `ToSchema` on `fed::advert` types
+/// this task doesn't otherwise touch.
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct DiscoveryAdvertDoc {
+    expires: i64,
+    name: String,
+    node_id: String,
+    protocols: serde_json::Value,
+    rf_version: u32,
+    security: serde_json::Value,
+    services: BTreeMap<String, bool>,
+    sig: Vec<u8>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct DiscoveryPeerItemDoc {
+    expires: i64,
+    name: String,
+    node_id: String,
+    protocols: serde_json::Value,
+    received_at: DateTime<Utc>,
+    security: serde_json::Value,
+    services: BTreeMap<String, bool>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+struct DiscoveryResponseDoc {
+    mode: String,
+    /// This node's own advert, freshly built and signed; `null` when
+    /// discovery is off.
+    our_advert: Option<DiscoveryAdvertDoc>,
+    /// Every stored, unexpired peer advert, re-verified against its own
+    /// signature (and against the row it's keyed under) on every request.
+    peers: Vec<DiscoveryPeerItemDoc>,
+}
+
+/// `GET /v1/discovery` (design §6, Task 3): this node's own RFDP advert
+/// (freshly built/signed from the live config, `null` when discovery is
+/// off) plus every stored, unexpired peer advert, each re-verified on
+/// serve.
+#[utoipa::path(
+    get,
+    path = "/v1/discovery",
+    tag = "federation",
+    summary = "RFDP discovery: this node's advert and known peer adverts",
+    description = "This node's own advert (built fresh from the live config on every request, null when discovery is off) plus every stored, unexpired peer advert. Each peer advert is re-verified against its own signature AND against the row key it's stored under before being served -- a row that fails either check is silently dropped, never served half-trusted.",
+    responses(
+        (status = 200, description = "This node's advert and known peer adverts", body = DiscoveryResponseDoc),
+    ),
+)]
 async fn discovery(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let mode = d.cfg_snapshot(|c| c.discovery.mode.clone());
     let our_advert = crate::fed::conn::build_signed_advert(&d);
@@ -850,11 +1492,114 @@ fn events_stream_from(rx: broadcast::Receiver<Event>) -> impl Stream<Item = Resu
 /// intermediary. SSE here is advisory -- the REST surface underneath
 /// remains the source of truth (design §4) -- so a lagged/slow subscriber
 /// simply misses events rather than the daemon buffering for it.
+/// `GET /v1/events` (design §4): a live Server-Sent Events feed, NOT a
+/// request/response JSON endpoint -- documented as `text/event-stream`
+/// with the seven event types' payload shapes described here rather than a
+/// fabricated JSON response body. Each SSE frame's `event:` field is one of
+/// `ingress | delivery | plugin | link_verified | config_applied | \
+/// federation | advert`; `data:` is that event's JSON payload (untagged,
+/// flat -- no variant-name wrapper). Advisory only: the REST surface above
+/// remains the source of truth, and a lagged/slow subscriber simply misses
+/// events rather than the daemon buffering for it.
+///
+/// - `ingress {id, protocol, sender_masked, routes[], ts}` -- a message was
+///   accepted and fanned out.
+/// - `delivery {id, route, state, ts}` -- a delivery attempt reached a
+///   terminal state or was scheduled for retry; `state` is one of
+///   `delivered | failed | dead_letter | retry | expired`.
+/// - `plugin {name, up, ts}` -- a plugin connected or disconnected.
+/// - `link_verified {link_id, ts}` -- an identity-link challenge was
+///   confirmed; carries only the opaque link id, nothing else.
+/// - `config_applied {restart_required[], ts}` -- a config change was
+///   applied (via `PUT /v1/config` or `POST /v1/config/rollback`).
+/// - `federation {peer, up, ts}` -- a federation connection came up or
+///   went down; `peer` is the configured name or a shortened node_id.
+/// - `advert {node_id, name, ts}` -- a peer advertisement was verified and
+///   upserted; `name` is sanitized for display.
+///
+/// PRIVACY: no message bodies, no full native refs, no identity-link
+/// challenge codes, no resolved secrets in any payload, ever.
+#[utoipa::path(
+    get,
+    path = "/v1/events",
+    tag = "status",
+    summary = "Live event feed (Server-Sent Events)",
+    description = "A live SSE feed of daemon events. `event:` is one of ingress|delivery|plugin|link_verified|config_applied|federation|advert; `data:` is that event's flat JSON payload. Advisory only -- the REST surface remains the source of truth. See the handler doc comment in admin.rs for each event type's exact fields.",
+    responses(
+        (status = 200, description = "SSE stream of the seven event types (see description)", content_type = "text/event-stream", body = String),
+    ),
+)]
 async fn events_stream(
     State(d): State<Arc<Daemon>>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     Sse::new(events_stream_from(d.events.subscribe())).keep_alive(KeepAlive::default())
 }
+
+/// `GET /v1/openapi.json` (Task 1, design §1): the generated OpenAPI 3.1
+/// document for this admin API, produced fresh from `ApiDoc::openapi()` on
+/// every request (so it can never drift from the annotated handlers below
+/// it -- there is no separate hand-maintained copy to go stale).
+#[utoipa::path(
+    get,
+    path = "/v1/openapi.json",
+    tag = "status",
+    summary = "OpenAPI document for this admin API",
+    description = "This admin API's own OpenAPI 3.1 document, generated from the handler annotations in this module.",
+    responses(
+        (status = 200, description = "OpenAPI 3.1 document", content_type = "application/json"),
+    ),
+)]
+async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
+    Json(ApiDoc::openapi())
+}
+
+/// The generated OpenAPI document for the switchyardd admin API (Task 1,
+/// design §1). `info.description` states the actual trust boundary: this
+/// API is served over a Unix domain socket, gated by filesystem
+/// permissions/same-UID access, not an HTTP auth scheme -- deliberately no
+/// `securityScheme` is declared, since inventing one the daemon doesn't
+/// implement would mislead client generators (design's "No auth scheme is
+/// invented" ruling).
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "RelayFabric switchyardd Admin API",
+        version = env!("CARGO_PKG_VERSION"),
+        description = "Admin/control API for a RelayFabric switchyardd node. \
+            Trust boundary: served exclusively over a Unix domain socket \
+            (default `admin.sock`), access controlled by filesystem \
+            permissions -- any process running as the same UID (or in an \
+            authorized group) as the daemon can reach it. There is no HTTP \
+            authentication/authorization scheme at this layer (no bearer \
+            token, no OAuth, no API key): callers are expected to reach \
+            this socket only via a trusted local path (switchyardctl, a \
+            reverse proxy fronting the socket, or an operator's own \
+            tunnel). Do not expose this API over a network listener \
+            without adding an auth layer in front of it.",
+    ),
+    paths(
+        status, plugins, routes, config_yaml, config_put, config_validate, config_rollback,
+        queue, trace, public, limits, identities, create_link, delete_link, challenges,
+        federation, discovery, events_stream, metrics_text, openapi_json,
+    ),
+    components(schemas(
+        StatusResponse,
+        PublicResponse, PublicServiceItem,
+        LimitsResponse, GlobalLimitsItem, PerRouteLimitsItem, PerSenderLimitsItem, TransportBudgetItem,
+        PluginsResponseDoc, PluginEntryDoc, PluginGaugeItemDoc,
+        RoutesResponse, RouteItem, RouteRenderItem,
+        ConfigValidateOk, ConfigValidateError, ConfigApplyOk, ConfigWriteError,
+        ConfigRollbackNotFound, ConfigRollbackConflict,
+        QueueListingDoc, QueueDeliveryItemDoc,
+        TraceResponseDoc, TraceDeliveryItemDoc, TraceNotFound,
+        IdentitiesResponse, LinkItem,
+        LinkRequest, CreateLinkAccepted, CreateLinkError,
+        ChallengesResponse, ChallengeItem,
+        FederationResponse, FederationPeerItem,
+        DiscoveryResponseDoc, DiscoveryAdvertDoc, DiscoveryPeerItemDoc,
+    )),
+)]
+struct ApiDoc;
 
 #[cfg(test)]
 mod tests {
@@ -2560,5 +3305,181 @@ routes:
             .expect("stream must not end just because the receiver lagged");
         let _event: SseEvent =
             item.expect("must yield a real event once the lagged gap is skipped, not an error");
+    }
+
+    // ---- Task 1 (design §1): OpenAPI generation ---------------------------
+
+    /// The load-bearing completeness test (design §1): every route the live
+    /// `Router` serves must appear in `ApiDoc::openapi().paths`, and vice
+    /// versa. Both sides of the comparison are structural, not hand-typed:
+    /// `admin_routes()` is the SAME list `router()` is built from (not a
+    /// separately hand-maintained mirror of it), and `doc.paths.paths` is
+    /// whatever the `#[utoipa::path]` annotations actually produced. A
+    /// route added to the router without a matching `#[utoipa::path]`
+    /// entry in `ApiDoc`'s `paths(...)` list -- or vice versa -- fails
+    /// this test.
+    ///
+    /// The path-set/length checks alone can't see a narrower mistake:
+    /// a path documented under the wrong HTTP verb (e.g. `ApiDoc` claims
+    /// `PUT /v1/config` but the router only wired `GET`) -- `MethodRouter`
+    /// doesn't expose which methods it was built with, so a live probe
+    /// closes that gap: for every (method, path) `ApiDoc` documents, send
+    /// exactly that method through the real router and assert the
+    /// response is never `405 Method Not Allowed`. Business-logic status
+    /// codes (several handlers legitimately return their OWN 404s, e.g.
+    /// `config_rollback`/`delete_link`) are irrelevant to this check --
+    /// only 405 uniquely means "the path matched but this method isn't
+    /// wired," so nothing else needs to be interpreted.
+    #[tokio::test]
+    async fn every_admin_route_is_documented_in_the_openapi_spec() {
+        let router_paths: BTreeSet<&str> = admin_routes().iter().map(|(path, _)| *path).collect();
+        let doc = ApiDoc::openapi();
+        let doc_paths: BTreeSet<&str> = doc.paths.paths.keys().map(|s| s.as_str()).collect();
+
+        assert_eq!(
+            router_paths, doc_paths,
+            "router paths and ApiDoc paths must match exactly -- a route was added to one without the other"
+        );
+        assert_eq!(
+            admin_routes().len(), doc.paths.paths.len(),
+            "admin_routes().len() (what router() is literally built from) must equal ApiDoc's documented path count"
+        );
+
+        let live = router(daemon());
+        for (path, item) in &doc.paths.paths {
+            let methods: [(&str, bool); 8] = [
+                ("GET", item.get.is_some()),
+                ("PUT", item.put.is_some()),
+                ("POST", item.post.is_some()),
+                ("DELETE", item.delete.is_some()),
+                ("OPTIONS", item.options.is_some()),
+                ("HEAD", item.head.is_some()),
+                ("PATCH", item.patch.is_some()),
+                ("TRACE", item.trace.is_some()),
+            ];
+            // The router matches on path SHAPE, not a path param's own
+            // validity (Uuid vs i64 vs anything else) -- any non-empty
+            // segment proves the pattern is registered.
+            let concrete_path = path.replace("{id}", "1");
+            for (method, documented) in methods {
+                if !documented {
+                    continue;
+                }
+                let resp = live.clone()
+                    .oneshot(Request::builder().method(method).uri(&concrete_path)
+                        .body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_ne!(
+                    resp.status(), StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {path} is documented in ApiDoc but the router has no handler for that method"
+                );
+            }
+        }
+    }
+
+    /// Sentinel test (design §1 / Security invariants): the served OpenAPI
+    /// document is produced only from static handler annotations + Rust
+    /// types -- `ApiDoc::openapi()` takes no config/daemon argument at all,
+    /// so it structurally cannot echo a loaded secret. Asserted directly
+    /// anyway per the brief: load a config whose ONLY appearance of a
+    /// sentinel value is a resolved `${env:...}` secret reference, then
+    /// confirm the generated OpenAPI document's serialized JSON never
+    /// contains it.
+    #[test]
+    fn openapi_document_never_contains_a_loaded_secret_value() {
+        const VAR: &str = "RF_ADMIN_TEST_OPENAPI_SENTINEL";
+        const SENTINEL: &str = "sentinel-runtime-value-must-not-appear-in-openapi-doc";
+        std::env::set_var(VAR, SENTINEL);
+        let yaml = format!(
+            r#"
+node:
+  name: test-node
+  data_dir: /tmp/relayfabric-admin-openapi-sentinel-test
+plugins:
+  mocka:
+    enabled: true
+    config:
+      token: "${{env:{VAR}}}"
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["mocka:chan", "mockb:chan"]
+    destinations: ["mocka:chan", "mockb:chan"]
+"#
+        );
+        let cfg = crate::config::load_from_str(&yaml).unwrap();
+        // Prove the secret genuinely resolved (not just an unused env var
+        // sitting in the process environment) before checking the doc.
+        assert_eq!(cfg.plugins["mocka"].config.get("token").unwrap().as_str().unwrap(), SENTINEL);
+
+        let doc_json = serde_json::to_string(&ApiDoc::openapi()).unwrap();
+        assert!(!doc_json.contains(SENTINEL), "OpenAPI doc leaked a loaded secret value: {doc_json}");
+        std::env::remove_var(VAR);
+    }
+
+    /// A promoted struct must serialize to the identical bytes the
+    /// pre-promotion ad-hoc `json!` construction produced (design §1: "do
+    /// not change the actual JSON shape on the wire"). `serde_json`'s
+    /// default (non-`preserve_order`) `Value::Object` is `BTreeMap`-backed,
+    /// so `json!{...}` always serializes object keys in ALPHABETICAL
+    /// order regardless of the literal's field order -- each promoted
+    /// struct's fields are declared in that same alphabetical order (see
+    /// each struct's own doc comment) specifically so a plain
+    /// `#[derive(Serialize)]` (which serializes in DECLARATION order)
+    /// reproduces it byte-for-byte. Covers the two most structurally
+    /// nested promotions (`LimitsResponse`, `FederationResponse`); the
+    /// existing handler tests above (unchanged, still passing with
+    /// `body.contains(...)` assertions) cover the rest at the HTTP-response
+    /// level.
+    #[test]
+    fn limits_response_serializes_byte_identical_to_the_pre_promotion_json_shape() {
+        let mut transport_budgets = BTreeMap::new();
+        transport_budgets.insert("mockb".to_string(), TransportBudgetItem { messages_per_minute: 30 });
+        let resp = LimitsResponse {
+            global: GlobalLimitsItem { cas_max_bytes: 1_000_000_000, queue_max: 50_000 },
+            per_route: PerRouteLimitsItem { queue_max: 5_000 },
+            per_sender: PerSenderLimitsItem { bytes_per_hour: 50_000, messages_per_minute: 10 },
+            transport_budgets,
+        };
+        let old = json!({
+            "per_sender": { "messages_per_minute": 10u32, "bytes_per_hour": 50_000u64 },
+            "per_route": { "queue_max": 5_000u32 },
+            "global": { "queue_max": 50_000u32, "cas_max_bytes": 1_000_000_000u64 },
+            "transport_budgets": { "mockb": { "messages_per_minute": 30u32 } },
+        });
+        assert_eq!(serde_json::to_string(&resp).unwrap(), serde_json::to_string(&old).unwrap());
+    }
+
+    #[test]
+    fn federation_response_serializes_byte_identical_to_the_pre_promotion_json_shape() {
+        let ts = chrono::Utc::now();
+        let resp = FederationResponse {
+            peers: vec![
+                FederationPeerItem {
+                    connected: true, last_seen: Some(ts),
+                    name: Some("phoenix".to_string()), node_id: "rf:abc".to_string(),
+                    trust: "trusted".to_string(),
+                },
+                FederationPeerItem {
+                    connected: false, last_seen: None,
+                    name: None, node_id: "rf:def".to_string(), trust: "unknown".to_string(),
+                },
+            ],
+        };
+        let old = json!({
+            "peers": [
+                json!({
+                    "name": "phoenix", "node_id": "rf:abc", "trust": "trusted",
+                    "connected": true, "last_seen": ts,
+                }),
+                json!({
+                    "name": serde_json::Value::Null, "node_id": "rf:def", "trust": "unknown",
+                    "connected": false, "last_seen": serde_json::Value::Null,
+                }),
+            ]
+        });
+        assert_eq!(serde_json::to_string(&resp).unwrap(), serde_json::to_string(&old).unwrap());
     }
 }
