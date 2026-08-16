@@ -28,7 +28,7 @@ pub struct Daemon {
     pub dedup: Mutex<dedup::Dedup>,
     pub aliaser: Aliaser,
     #[allow(dead_code)]
-    // consumed by RFDP envelope signing/verification (v0.2); remove allow when used
+    // consumed when RFDP/federation lands; remove allow when used
     pub identity: NodeIdentity,
     pub node_id: String,
     pub plugins: Mutex<HashMap<String, PluginHandle>>,

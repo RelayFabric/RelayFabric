@@ -5,7 +5,7 @@ use std::path::Path;
 
 pub struct NodeIdentity {
     #[allow(dead_code)]
-    // consumed by RFDP envelope signing (v0.2); remove allow when used
+    // consumed when RFDP/federation lands; remove allow when used
     signing_key: SigningKey,
     verifying_key: VerifyingKey,
 }
@@ -59,14 +59,14 @@ impl NodeIdentity {
     }
 
     #[allow(dead_code)]
-    // consumed by RFDP envelope signing (v0.2); remove allow when used
+    // consumed when RFDP/federation lands; remove allow when used
     pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
         self.signing_key.sign(msg).to_bytes().to_vec()
     }
 }
 
 #[allow(dead_code)]
-// consumed by RFDP envelope verification (v0.2); remove allow when used
+// consumed when RFDP/federation lands; remove allow when used
 pub fn verify(node_id: &str, msg: &[u8], sig: &[u8]) -> bool {
     // Parse node_id of form "rf:..." where ... is 64 hex chars (32 bytes)
     let Some(hex_part) = node_id.strip_prefix("rf:") else {
