@@ -723,10 +723,15 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             };
             // Design §4: `render.tag == "none"` means the route opted out
             // of tags altogether, suppressing whichever of the alias/
-            // display_name `tag` above resolved to; `render.max_chars`
-            // (0 = disabled) is a route-level char-count truncation applied
-            // before `limit` (the transport byte cap) below — see
-            // `transform::render`'s doc comment for the two-stage ordering.
+            // display_name `tag` above resolved to. `render.max_chars`
+            // (0 = disabled) is a route-level, BODY-ONLY char-count
+            // truncation (fix round 1) — applied to `env.body` below,
+            // BEFORE the tag is assembled and BEFORE attachment notes are
+            // appended, so neither the tag (which has no length cap
+            // anywhere — a linked `display_name` could be arbitrarily long)
+            // nor the notes are ever eaten by it; see `transform::
+            // truncate_body`'s doc comment for why an earlier ruling that
+            // truncated the assembled `"[tag]\nbody"` string was reverted.
             let render_tag = match route_cfg.map(|r| r.render.tag.as_str()) {
                 Some("none") => None,
                 _ => Some(tag.as_str()),
@@ -748,16 +753,28 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
                     env.attachments.iter().map(|a| (a.filename.clone(), a.size)).collect();
                 (Vec::new(), transform::attachment_notes(&dropped, "omitted"))
             };
-            // Decision: notes (capability/policy strip, byte-cap drops, CAS
-            // misses) are folded into the body BEFORE max_payload
-            // truncation runs, not appended after — so that a note-inflated
-            // body still respects the destination's byte cap instead of the
-            // notes sneaking past it by arriving post-truncation. That does
-            // mean a very tight cap can truncate a note away entirely; that
-            // is the correct trade-off since the byte cap is the harder
-            // constraint the plugin actually enforces on the wire.
+            // Decision: `env.body` is route-level `max_chars`-truncated
+            // FIRST (fix round 1: body-only, never touches the tag), THEN
+            // notes (capability/policy strip, byte-cap drops, CAS misses)
+            // are appended — so notes are NEVER counted toward the
+            // max_chars budget (a dropped-attachment note must reliably
+            // reach the recipient even when the body itself had to shrink
+            // to fit). The resulting body+notes is folded together BEFORE
+            // max_payload truncation runs, not appended after — so a
+            // note-inflated body still respects the destination's byte cap
+            // instead of the notes sneaking past it by arriving
+            // post-truncation. That does mean a very tight transport cap
+            // can truncate a note away entirely, and — unlike max_chars —
+            // CAN truncate into the tag too; that is the correct trade-off
+            // since the byte cap is the harder constraint the plugin
+            // actually enforces on the wire (pre-existing v0.1 behavior,
+            // unrelated to the route-level max_chars knob).
+            let truncated_body = match render_max_chars {
+                Some(mc) => transform::truncate_body(&env.body, mc),
+                None => env.body.clone(),
+            };
             let body = transform::render(
-                render_tag, &format!("{}{notes}", env.body), render_max_chars, limit);
+                render_tag, &format!("{truncated_body}{notes}"), limit);
             let result = d.store.lock().unwrap().mark_attempting(del.id);
             warn_if_mark_failed(del.id, "attempting", result);
             let send = DaemonToPlugin::Send {
@@ -2452,8 +2469,11 @@ mod tests {
             "tag: none must suppress the linked display_name too, not just the pseudonym: {body}");
     }
 
+    /// Fix round 1: `max_chars` truncates the BODY only, so the `[alias]\n`
+    /// tag prefix must always come through untouched -- only the text
+    /// after the newline is capped at `max_chars`.
     #[tokio::test]
-    async fn render_max_chars_truncates_before_the_transport_max_payload_cap() {
+    async fn render_max_chars_truncates_the_body_only_leaving_the_tag_intact() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = test_daemon(dir.path());
         d.cfg.routes[0].render.max_chars = 20;
@@ -2469,7 +2489,78 @@ mod tests {
         let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
             panic!("expected Send");
         };
-        assert_eq!(body.chars().count(), 20, "route-level max_chars must truncate to exactly 20 chars: {body}");
-        assert!(body.ends_with('…'), "body was: {body}");
+        assert!(body.starts_with('['), "tag prefix must still be present: {body}");
+        let after_tag = body.split_once('\n').expect("tag prefix followed by a newline").1;
+        assert_eq!(after_tag.chars().count(), 20,
+            "route-level max_chars must truncate only the body (post-tag) to exactly 20 chars: {body}");
+        assert!(after_tag.ends_with('…'), "body was: {body}");
+    }
+
+    /// The exact regression fix round 1 targets: a route in `linked` mode
+    /// with a verified link whose `display_name` is much longer than
+    /// `max_chars` (no length cap exists on `display_name` anywhere) must
+    /// still render the display_name fully intact -- only the body may be
+    /// truncated, never the tag, no matter how long the tag is relative to
+    /// the configured floor.
+    #[tokio::test]
+    async fn render_max_chars_at_the_16_floor_never_truncates_a_long_linked_display_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.cfg.routes[0].identity_mode = "linked".to_string();
+        d.cfg.routes[0].render.max_chars = 16;
+        let d = Arc::new(d);
+        let mut rx = register_plugin(&d, "mockb", false);
+
+        d.store.lock().unwrap()
+            .insert_link("mocka", "!a", "signal", "+1", "AVeryLongDisplayNameIndeed", Utc::now()).unwrap();
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "this body is much longer than sixteen characters".into(), None, vec![], None);
+        let now = Utc::now();
+        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert!(body.starts_with("[AVeryLongDisplayNameIndeed]\n"),
+            "a long linked display_name must never be truncated by render.max_chars: {body}");
+        assert!(body.contains('…'), "the body must still be truncated: {body}");
+    }
+
+    /// design decision (fix round 1, point 4): attachment-strip notes are
+    /// appended AFTER `max_chars` truncates the body, so notes are NOT
+    /// counted toward the `max_chars` budget -- a note explaining a dropped
+    /// attachment must reliably reach the recipient even when the body
+    /// itself is truncated to make room.
+    #[tokio::test]
+    async fn render_max_chars_truncates_body_before_notes_are_appended_notes_not_counted_toward_max_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.cfg.routes[0].render.max_chars = 16;
+        let d = Arc::new(d);
+        let mut rx = register_plugin(&d, "mockb", false); // no attachments capability
+
+        let att = IpcAttachment {
+            filename: "photo.jpg".into(), mime: "image/jpeg".into(), data: b"bytes".to_vec(),
+        };
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "this body is much longer than sixteen characters".into(), None, vec![att], None);
+        let now = Utc::now();
+        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert!(body.contains("[attachment omitted]"),
+            "the note must survive even though the body was truncated to make room: {body}");
+        // The truncated-body portion (everything after the tag, up through
+        // the truncation ellipsis) is exactly 16 chars -- the note text
+        // itself is not counted toward that budget.
+        let note_start = body.find("\n[attachment omitted]").expect("note present");
+        let body_only = &body[body.find('\n').unwrap() + 1..note_start];
+        assert_eq!(body_only.chars().count(), 16,
+            "max_chars must bound the body alone, not the body+note total: {body}");
     }
 }

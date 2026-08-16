@@ -115,9 +115,11 @@ routes:
     # per-route pseudonym (or, in identity_mode: linked with a verified
     # link, that link's display_name); "none" suppresses the [tag] prefix
     # entirely, including the linked display_name. max_chars (0 = disabled,
-    # else >= 16) truncates the rendered message to that many Unicode
-    # characters BEFORE the transport's own byte cap, which still applies
-    # afterward as the hard floor.
+    # else >= 16) truncates the message BODY to that many Unicode
+    # characters -- the sender tag is not counted, so it's never shortened
+    # by this even if it's a long linked display_name. The transport's own
+    # byte cap still applies afterward to the whole message as the hard
+    # floor, and unlike max_chars it MAY still truncate into the tag.
     # render:
     #   tag: alias
     #   max_chars: 900

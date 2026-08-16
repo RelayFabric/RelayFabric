@@ -142,12 +142,20 @@ pub struct RenderConfig {
     /// `engine::process_due`'s render-tag selection).
     #[serde(default = "default_render_tag")]
     pub tag: String,
-    /// 0 (default): no route-level truncation. >=16: truncate the rendered
-    /// message to this many Unicode *characters* (not bytes) before the
-    /// transport's `max_payload` byte cap, which still applies afterward as
-    /// the hard floor (`transform::render`). Values 1..16 are rejected by
-    /// `validate()` -- large enough to be a meaningful message, not a
-    /// footgun that truncates everything to near-nothing.
+    /// 0 (default): no route-level truncation. >=16: truncates the
+    /// MESSAGE BODY ONLY (fix round 1) to this many Unicode *characters*
+    /// (not bytes) -- the sender tag is NEVER counted or shortened by this,
+    /// no matter how long it is (a linked `display_name` has no length cap
+    /// anywhere; an earlier ruling that truncated the assembled
+    /// `"[tag]\nbody"` string let a long tag eat the whole budget and
+    /// silently drop the body entirely -- see `transform::truncate_body`).
+    /// The transport's `max_payload` byte cap still applies afterward, to
+    /// the fully assembled message, as the hard floor (`transform::
+    /// render`) -- unlike `max_chars`, it MAY still truncate into the tag
+    /// if it's tight enough; that's pre-existing v0.1 behavior, unrelated
+    /// to this route-level knob. Values 1..16 are rejected by `validate()`
+    /// -- large enough for the truncated body to still carry meaningful
+    /// content, not a footgun that reduces it to near-nothing.
     #[serde(default)]
     pub max_chars: u32,
 }
