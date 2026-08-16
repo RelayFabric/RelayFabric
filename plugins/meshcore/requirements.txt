@@ -1,0 +1,2 @@
+# meshcore 2.3.8: MIT license
+meshcore==2.3.8
