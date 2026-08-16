@@ -1131,6 +1131,40 @@ fn total_queue_count(body: &str) -> i64 {
     v.as_object().unwrap().values().map(|n| n.as_i64().unwrap()).sum()
 }
 
+/// Polls `total_queue_count` on `sock` every ~200ms until it reads the SAME
+/// value `REQUIRED_STREAK` (5) consecutive times in a row -- any change
+/// resets the streak -- bounded at `max_wait` overall. The crate's own
+/// "poll rather than sleep-and-hope" convention (see
+/// `poll_until_contains`/`poll_stream_until_count` above), specialized for
+/// "prove a value has genuinely stopped changing" (a real storm would never
+/// stabilize) rather than "wait for a value to first appear". Panics if it
+/// never stabilizes within `max_wait`; returns the stable total.
+async fn poll_until_queue_count_stable(sock: &Path, max_wait: Duration) -> i64 {
+    const REQUIRED_STREAK: usize = 5;
+    const INTERVAL: Duration = Duration::from_millis(200);
+    let deadline = tokio::time::Instant::now() + max_wait;
+    let mut last: Option<i64> = None;
+    let mut streak = 0usize;
+    loop {
+        let value = total_queue_count(&admin_get(sock, "/v1/queue").await);
+        if Some(value) == last {
+            streak += 1;
+        } else {
+            last = Some(value);
+            streak = 1;
+        }
+        if streak >= REQUIRED_STREAK {
+            return value;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "queue count on {} never stabilized within {max_wait:?} (currently {value}, streak {streak})",
+            sock.display()
+        );
+        tokio::time::sleep(INTERVAL).await;
+    }
+}
+
 /// Design §Testing's two-real-daemon federation e2e. Noise identity binding
 /// itself is T1/T4's job (`fed::noise`/`fed::conn`'s own unit + in-memory
 /// duplex tests) -- this test starts from an already-authenticated pair and
@@ -1340,17 +1374,143 @@ federation:
         "the loop's echo was delivered to the terminal mock plugin a second time"
     );
 
-    // bounded total: let any in-flight echo/ack traffic settle, then confirm
-    // the total delivery row count on EACH daemon is both small and STABLE
-    // across two samples -- a genuine storm would keep growing.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let a_queue_1 = total_queue_count(&admin_get(&d_a.admin_sock(), "/v1/queue").await);
-    let b_queue_1 = total_queue_count(&admin_get(&d_b.admin_sock(), "/v1/queue").await);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    let a_queue_2 = total_queue_count(&admin_get(&d_a.admin_sock(), "/v1/queue").await);
-    let b_queue_2 = total_queue_count(&admin_get(&d_b.admin_sock(), "/v1/queue").await);
-    assert_eq!(a_queue_1, a_queue_2, "daemon A's total delivery row count kept growing -- storm");
-    assert_eq!(b_queue_1, b_queue_2, "daemon B's total delivery row count kept growing -- storm");
-    assert!(a_queue_1 <= 12, "daemon A's total delivery rows unexpectedly large: {a_queue_1}");
-    assert!(b_queue_1 <= 12, "daemon B's total delivery rows unexpectedly large: {b_queue_1}");
+    // bounded total: poll each daemon's total delivery row count until it
+    // stabilizes (5 consecutive identical reads, 200ms apart, capped at
+    // 15s) -- a genuine storm would never stop changing, so stabilizing at
+    // all is itself part of the assertion, not just the value it settles
+    // to.
+    let a_total = poll_until_queue_count_stable(&d_a.admin_sock(), Duration::from_secs(15)).await;
+    let b_total = poll_until_queue_count_stable(&d_b.admin_sock(), Duration::from_secs(15)).await;
+    assert!(a_total <= 12, "daemon A's total delivery rows unexpectedly large: {a_total}");
+    assert!(b_total <= 12, "daemon B's total delivery rows unexpectedly large: {b_total}");
+}
+
+/// Design §Testing's "peer-down retry-then-recover" leg -- a SIBLING to
+/// `federation_two_daemons_bidirectional_with_trust_and_loop_guards` above
+/// rather than a fourth phase bolted onto it: that test is already long,
+/// and killing+respawning a daemon subprocess mid-test is a genuinely
+/// different shape from its steady-state flow. Reuses
+/// `precreate_node_identity`/`free_tcp_port` exactly as the main test does,
+/// so A's node_id, B's node_id, and A's `federation.listen` port are all
+/// known before either config is written.
+///
+/// TIMING (why there's no backoff to "beat" here): B is killed and
+/// respawned as a BRAND NEW OS process on the SAME `data_dir` (same
+/// identity file, same node_id, same config text/port). Unlike
+/// `fed::conn::spawn_outbound`'s own redial loop -- which backs off
+/// 1s..60s across REPEATED ATTEMPTS BY THE SAME LONG-LIVED TASK when a
+/// live process keeps failing to connect -- a freshly-spawned process's
+/// `spawn_outbound` starts a brand new `backoff` local variable and makes
+/// its FIRST connection attempt immediately, with no sleep before it (see
+/// `spawn_outbound`'s loop shape: connect first, `sleep(backoff)` only
+/// AFTER each attempt). So it does not matter how long this test waits
+/// between killing B and respawning it -- the respawned process always
+/// dials A on its very first tick, at `backoff`'s initial 1s-but-unused
+/// value. The one real timing constraint is A's OWN fixed 5s `mark_retry`
+/// interval on the stuck delivery row (`engine::process_due_fed`'s "no
+/// live connection" branch, design §5) -- `expect_send`'s existing 10s
+/// bound already covers that with margin.
+#[tokio::test]
+async fn federation_peer_down_then_recovers() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let data_a = dir_a.path().join("data");
+    let data_b = dir_b.path().join("data");
+    let node_id_a = precreate_node_identity(&data_a);
+    let node_id_b = precreate_node_identity(&data_b);
+
+    let a_port = free_tcp_port();
+    let a_addr = format!("127.0.0.1:{a_port}");
+
+    // ---- daemon A: listener. This test only needs the A -> B egress -------
+    // direction (the one that actually gets stuck while B is down), so A
+    // has exactly one route with a `fed:` destination and no ingress route
+    // of its own.
+    let config_a = format!(
+        r#"
+node:
+  name: e2e-fed-recover-a
+  data_dir: DATA_DIR
+plugins:
+  mocka:
+    enabled: true
+routes:
+  - name: a-out
+    sources: ["mocka:outchan"]
+    destinations: ["fed:b/b-in"]
+federation:
+  listen: "{a_addr}"
+  peers:
+    - name: b
+      node_id: "{node_id_b}"
+      addr: "127.0.0.1:1"
+"#
+    );
+    let d_a = start_daemon_with_config(dir_a, &config_a);
+    wait_for(&d_a.plugin_sock()).await;
+    wait_for(&d_a.admin_sock()).await;
+    let (_ra, mut wa) = connect_plugin(&d_a.plugin_sock(), "mocka").await;
+
+    let config_b = format!(
+        r#"
+node:
+  name: e2e-fed-recover-b
+  data_dir: DATA_DIR
+plugins:
+  mockb:
+    enabled: true
+routes:
+  - name: b-in
+    sources: []
+    destinations: ["mockb:inchan"]
+federation:
+  ingress_routes: [b-in]
+  peers:
+    - name: a
+      node_id: "{node_id_a}"
+      addr: "{a_addr}"
+"#
+    );
+    let mut d_b = start_daemon_with_config(dir_b, &config_b);
+    wait_for(&d_b.plugin_sock()).await;
+
+    // ---- 1. healthy: confirm the connection is up before killing anything -
+    poll_until_contains(&d_a.admin_sock(), "/v1/federation", "\"connected\":true").await;
+
+    // ---- 2. kill B (the honest version of "peer down" -- an actual dead ---
+    // process, not just a dropped connection). A must notice within its
+    // own 90s dead-timer bound, but in practice a killed process's TCP
+    // socket closes immediately, so A's read errors out right away.
+    d_b.child.kill().unwrap();
+    d_b.child.wait().unwrap();
+    poll_until_contains(&d_a.admin_sock(), "/v1/federation", "\"connected\":false").await;
+
+    // ---- 3. drive a message toward the now-dead peer: the delivery must ---
+    // go (and stay) pending -- retried every 5s by process_due_fed's "no
+    // live connection" branch -- never dead_lettered, never lost.
+    inbound(&mut wa, "outchan", "!recover-secret", "message sent while b is down",
+        chrono::Utc::now()).await;
+    poll_until_contains(&d_a.admin_sock(), "/v1/queue?state=pending", "\"route\":\"a-out\"").await;
+
+    // ---- 4. respawn B on the SAME data_dir (same identity/config/port) ----
+    // -- see this test's doc comment for why there's no backoff to time
+    // around here.
+    let _ = std::fs::remove_file(d_b.plugin_sock());
+    let cfg_path_b = d_b.dir.path().join("relayfabric.yaml");
+    d_b.child = spawn_daemon(&cfg_path_b);
+    wait_for(&d_b.plugin_sock()).await;
+    let (mut rb, mut wb) = connect_plugin(&d_b.plugin_sock(), "mockb").await;
+
+    // ---- 5. bounded settle: the parked message reaches B's mock plugin ----
+    // (rendered, pseudonymous) and A's own delivery row is marked delivered
+    // by B's Fed::Ack once the connection comes back and the pump retries.
+    let (corr, endpoint, body, _) = expect_send(&mut rb).await;
+    assert_eq!(endpoint, "inchan");
+    assert!(body.contains("message sent while b is down"), "body was: {body}");
+    assert!(!body.contains("!recover-secret"), "native ref leaked across federation: {body}");
+    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
+        corr, delivered: true, detail: None,
+    }).await.unwrap();
+
+    poll_until_contains(&d_a.admin_sock(), "/v1/queue?state=delivered", "\"route\":\"a-out\"").await;
 }
