@@ -64,5 +64,4 @@ can also be swallowed — at most once per send, within 1 hour.
   serial/tcp/ble.
 - Alias prefix collision with Meshtastic: both protocols alias as MESH-XXXX
   (first 4 protocol-name chars); cosmetic, aliases remain distinct per sender.
-- Some firmware validates downlink `from`; plugin always sends `from: 0`.
 - Timestamp (`ts`) units assumed to be epoch seconds.
