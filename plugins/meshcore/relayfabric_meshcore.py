@@ -265,7 +265,13 @@ class MeshCoreBackend:
                 self._loop.run_forever()
 
         threading.Thread(target=_run, daemon=True).start()
-        ready.wait(timeout=30)
+        if not ready.wait(timeout=30):
+            # BLE scans (create_ble with no address) can legitimately take a
+            # while; a silent timeout here would leave self._mc None forever
+            # -- a distinct "dead plugin" failure mode from a raised connect
+            # error (same end state, but previously invisible), so surface
+            # it the same way instead of returning as if start() succeeded.
+            raise RuntimeError("meshcore connect timed out after 30s")
         if self._start_error is not None:
             raise RuntimeError(f"meshcore connect failed: {self._start_error}") from self._start_error
 
@@ -283,6 +289,22 @@ class MeshCoreBackend:
         if mc is None:
             raise RuntimeError("meshcore: no response from node")
         mc.subscribe(meshcore_mod.EventType.CHANNEL_MSG_RECV, self._on_channel_msg)
+        # auto_reconnect defaults False (and we never opt in), so a dropped
+        # radio connection is permanent -- without this subscription the
+        # plugin would sit silently doing nothing forever, with the daemon
+        # never finding out. See _on_disconnected for why the reaction is
+        # os._exit(1) rather than a normal exit.
+        mc.subscribe(meshcore_mod.EventType.DISCONNECTED, self._on_disconnected)
+        # The Companion Radio Protocol is PULL-based: the radio only ever
+        # pushes MESSAGES_WAITING notifications on its own; CHANNEL_MSG_RECV
+        # (and CONTACT_MSG_RECV) frames are replies to CMD_SYNC_NEXT_MESSAGE,
+        # which MeshCore.connect() does NOT issue. start_auto_message_fetching()
+        # (meshcore/meshcore.py) is what subscribes MESSAGES_WAITING and drives
+        # the get_msg() drain loop that actually produces CHANNEL_MSG_RECV
+        # events -- without calling it, the subscription above never fires
+        # against real hardware (it only ever fired in this module's own
+        # fakes/stubs, which invoke the callback directly).
+        await mc.start_auto_message_fetching()
         self._mc = mc
 
     def _on_channel_msg(self, event):
@@ -291,6 +313,21 @@ class MeshCoreBackend:
             self._queue.put_nowait(ev)
         except queue.Full:
             log.debug("Dropping meshcore channel event: event queue full")
+
+    def _on_disconnected(self, event):
+        # This callback runs on the backend's private asyncio loop thread,
+        # not the main thread -- main() is blocked in relay_ipc.read_frame()
+        # on the daemon socket, so a plain sys.exit()/raise here would only
+        # kill the loop thread and leave the process running with a
+        # permanently dead radio link (auto_reconnect is off, see above).
+        # os._exit(1) terminates the whole process immediately from any
+        # thread, which the daemon's plugin supervisor is expected to detect
+        # and restart, matching the rest of the fleet's supervisor-restart
+        # lifecycle for unrecoverable backend failures.
+        payload = getattr(event, "payload", None) or {}
+        reason = payload.get("reason")
+        log.error(f"meshcore: radio disconnected ({reason}), exiting for supervisor restart")
+        os._exit(1)
 
     def events(self):
         """Yield normalized event dicts from the queue forever."""
@@ -355,6 +392,9 @@ class Bridge:
 
         import relay_ipc
 
+        # ts (from sender_timestamp) is remote-sender-controlled, same trust
+        # posture as meshtastic's uplink timestamp; the daemon is responsible
+        # for guarding against bogus/out-of-range values.
         self._send_frame(relay_ipc.inbound(name, sender, text, ts))
         log.info(f"Bridged MeshCore message from {sender} to '{name}' "
                  f"({len(text)} chars)")

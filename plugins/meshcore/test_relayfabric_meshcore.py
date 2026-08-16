@@ -1,13 +1,28 @@
 import os
 import queue
 import sys
+import time
 import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lxmf"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "signal"))
 
 import relayfabric_meshcore as plug
+
+
+def _stop_and_close_loop(loop):
+    """Test-only cleanup for a MeshCoreBackend's private event loop: stop()
+    is scheduled onto the loop thread asynchronously, so poll briefly for it
+    to actually take effect before close() -- closing a still-running loop
+    raises, and never closing it emits a ResourceWarning at GC time."""
+    loop.call_soon_threadsafe(loop.stop)
+    deadline = time.time() + 2
+    while loop.is_running() and time.time() < deadline:
+        time.sleep(0.01)
+    if not loop.is_running():
+        loop.close()
 
 
 class ConfigTests(unittest.TestCase):
@@ -450,6 +465,75 @@ class MeshCoreBackendTests(unittest.TestCase):
     def test_queue_is_bounded(self):
         backend = plug.MeshCoreBackend("serial:///dev/ttyUSB0")
         self.assertEqual(backend._queue.maxsize, 256)
+
+    def test_on_disconnected_exits_process(self):
+        # auto_reconnect is off, so a dropped radio connection is permanent;
+        # os._exit(1), not sys.exit, because this callback runs on the
+        # backend's loop thread while main() blocks in read_frame() on the
+        # main thread (see _on_disconnected's comment). Patch os._exit so
+        # the test process doesn't actually die.
+        backend = plug.MeshCoreBackend("serial:///dev/ttyUSB0")
+        fake_event = types.SimpleNamespace(payload={"reason": "unknown"})
+        with mock.patch.object(plug.os, "_exit") as fake_exit:
+            backend._on_disconnected(fake_event)
+        fake_exit.assert_called_once_with(1)
+
+    def test_start_timeout_raises_runtime_error(self):
+        # ready.wait(timeout=30)'s return value must be checked: a timeout
+        # (e.g. a slow BLE scan) previously returned silently, leaving
+        # self._mc None forever -- a distinct, invisible dead-plugin mode.
+        backend = plug.MeshCoreBackend("serial:///dev/ttyUSB0")
+        fake_ready = mock.Mock()
+        fake_ready.wait.return_value = False
+        with mock.patch.object(plug.threading, "Event", return_value=fake_ready), \
+             mock.patch.object(plug.threading, "Thread") as fake_thread_cls:
+            fake_thread_cls.return_value = mock.Mock()
+            with self.assertRaises(RuntimeError):
+                backend.start()
+        self.addCleanup(backend._loop.close)
+
+    def test_start_calls_start_auto_message_fetching_and_subscribes_disconnected(self):
+        # The Companion protocol is pull-based: CHANNEL_MSG_RECV frames are
+        # replies to CMD_SYNC_NEXT_MESSAGE, driven by
+        # start_auto_message_fetching()'s MESSAGES_WAITING drain loop --
+        # connect() alone never triggers it, so this call is required for
+        # inbound to work at all against real hardware. Injects a stub
+        # "meshcore" module via sys.modules (never a real import), so this
+        # runs without the meshcore package installed, per the module's
+        # no-meshcore-import-in-tests constraint.
+        calls = []
+
+        class FakeCommands:
+            async def send_chan_msg(self, chan, msg, timestamp=None):
+                raise NotImplementedError
+
+        class FakeMC:
+            def __init__(self):
+                self.commands = FakeCommands()
+                self.subs = []
+
+            def subscribe(self, event_type, callback):
+                self.subs.append(event_type)
+
+            async def start_auto_message_fetching(self):
+                calls.append("start_auto_message_fetching")
+
+        async def fake_create_serial(port, baudrate=115200, **kw):
+            return FakeMC()
+
+        fake_module = types.ModuleType("meshcore")
+        fake_module.MeshCore = types.SimpleNamespace(create_serial=fake_create_serial)
+        fake_module.EventType = types.SimpleNamespace(
+            CHANNEL_MSG_RECV="channel_message", DISCONNECTED="disconnected")
+
+        with mock.patch.dict(sys.modules, {"meshcore": fake_module}):
+            backend = plug.MeshCoreBackend("serial:///dev/ttyUSB0")
+            backend.start()
+
+        self.addCleanup(_stop_and_close_loop, backend._loop)
+        self.assertEqual(calls, ["start_auto_message_fetching"])
+        self.assertIn(fake_module.EventType.CHANNEL_MSG_RECV, backend._mc.subs)
+        self.assertIn(fake_module.EventType.DISCONNECTED, backend._mc.subs)
 
 
 def base_cfg(**overrides):

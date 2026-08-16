@@ -55,8 +55,13 @@ can also be swallowed — at most once per send, within 1 hour.
 
 ## Known field-test risks
 
-- Library API exercised only against fakes — verify one end-to-end send on
-  hardware.
+- Library API exercised only against fakes — verify end-to-end on hardware:
+  one INBOUND channel message reaching the daemon (exercises the pull-based
+  auto-fetch path: MESSAGES_WAITING -> CMD_SYNC_NEXT_MESSAGE ->
+  CHANNEL_MSG_RECV), and one max-length send (alias tag + body = 160 bytes
+  rendered).
+- These checks apply per connection kind — re-verify when switching between
+  serial/tcp/ble.
 - Alias prefix collision with Meshtastic: both protocols alias as MESH-XXXX
   (first 4 protocol-name chars); cosmetic, aliases remain distinct per sender.
 - Some firmware validates downlink `from`; plugin always sends `from: 0`.
