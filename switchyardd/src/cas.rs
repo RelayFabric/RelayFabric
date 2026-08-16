@@ -44,6 +44,13 @@ pub fn is_budget_exceeded(e: &io::Error) -> bool {
 /// `Cas::new`, to recover `total_bytes` after a restart; a directory entry
 /// that vanishes mid-walk (e.g. a concurrent GC pass) or whose metadata
 /// can't be read is skipped rather than failing the whole walk.
+///
+/// Known ceiling, not fixed here: this counts every regular file, including
+/// a `.<sha>.<pid>.tmp` staging file orphaned by a crash between `put`'s
+/// `write` and its atomic `rename` (nothing currently cleans those up). An
+/// orphaned tmp file therefore inflates the recovered `total_bytes` above
+/// what's actually reachable as a real blob, shrinking effective budget
+/// until the file is removed by hand.
 fn existing_bytes(dir: &Path) -> io::Result<u64> {
     let mut total = 0u64;
     for entry in std::fs::read_dir(dir)? {
@@ -127,13 +134,25 @@ impl Cas {
     /// budget (see `total_bytes`) — stat-then-remove rather than
     /// remove-then-trust-the-old-size, so a size read that fails (already
     /// gone) simply skips the decrement instead of risking an underflow.
+    ///
+    /// The decrement itself is a saturating subtract (via `fetch_update`,
+    /// not a plain `fetch_sub`): if `total_bytes` were ever undercounted —
+    /// e.g. `existing_bytes`'s startup dir-walk missed a blob, or two
+    /// `remove`s raced on the same size — a bare `fetch_sub` could wrap a
+    /// `u64` counter around to a huge value, and every `put` would then
+    /// refuse until the next restart. Saturating at zero instead just
+    /// under-accounts (the budget looks emptier than it is), which is the
+    /// safe direction to be wrong in.
     pub fn remove(&self, sha: &str) -> io::Result<()> {
         let path = self.path_for(sha)?;
         let size = std::fs::metadata(&path).ok().map(|m| m.len());
         match std::fs::remove_file(path) {
             Ok(()) => {
                 if let Some(size) = size {
-                    self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+                    let _ = self.total_bytes.fetch_update(
+                        Ordering::Relaxed, Ordering::Relaxed,
+                        |cur| Some(cur.saturating_sub(size)),
+                    );
                 }
                 Ok(())
             }

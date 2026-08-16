@@ -1,11 +1,11 @@
 //! Quota enforcement primitives (spec §45 backpressure): sliding-window
 //! counters that gate ingress before it ever reaches storage.
 //!
-//! Both limiters here are in-memory only. // ponytail: a restart just gives
-//! every key a fresh window -- that's an acceptable reset for a rate limiter
-//! (nobody is owed a persisted quota across a daemon bounce), so there's no
-//! sqlite table backing this, unlike `dedup`'s TTL cache which shares the
-//! same "in-memory, prune on access" shape for the same reason.
+//! Both limiters here are in-memory only: a restart just gives every key a
+//! fresh window -- that's an acceptable reset for a rate limiter (nobody is
+//! owed a persisted quota across a daemon bounce), so there's no sqlite
+//! table backing this, unlike `dedup`'s TTL cache which shares the same
+//! "in-memory, prune on access" shape for the same reason.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -38,27 +38,43 @@ impl SenderLimiter {
         if self.messages_per_minute == 0 && self.bytes_per_hour == 0 {
             return true;
         }
-        let entry = self.windows.entry(key.to_string()).or_default();
-        // Prune to the longer of the two windows up front (prune-on-access,
-        // no background sweep); the per-minute message count below then
-        // filters this same pruned history down further for its own,
-        // shorter window.
-        entry.retain(|(t, _)| now.duration_since(*t) < HOUR);
+        // Global prune-on-access over the *whole* map on every call, not
+        // just the key being touched right now — same "in-memory, prune on
+        // access" shape `dedup.rs`'s TTL cache uses (see the module doc
+        // comment). Per-key pruning alone only trims a key's own history
+        // when that same key is looked up again; a key that's never
+        // revisited would otherwise keep its now-stale VecDeque, and the
+        // map entry itself, alive forever. That's exactly the abuse case
+        // this limiter exists to stop: a hostile sender on a public node
+        // minting a fresh native_ref per message would grow `self.windows`
+        // without bound. O(keys) global prune per call; fine at gateway
+        // volumes — move to a scheduled sweep if key counts ever grow large.
+        self.windows.retain(|_, entries| {
+            entries.retain(|(t, _)| now.duration_since(*t) < HOUR);
+            !entries.is_empty()
+        });
 
+        // Read-only lookup first (not `entry().or_default()`): a call that
+        // ends up denying below must not leave a freshly-inserted empty
+        // entry for `key` sitting in the map — that would defeat the sweep
+        // above for a key that's denied on every call it's ever seen on.
+        let existing = self.windows.get(key);
         if self.messages_per_minute > 0 {
-            let count_in_minute =
-                entry.iter().filter(|(t, _)| now.duration_since(*t) < MINUTE).count();
+            let count_in_minute = existing
+                .map(|e| e.iter().filter(|(t, _)| now.duration_since(*t) < MINUTE).count())
+                .unwrap_or(0);
             if count_in_minute as u32 >= self.messages_per_minute {
                 return false;
             }
         }
         if self.bytes_per_hour > 0 {
-            let bytes_in_hour: u64 = entry.iter().map(|(_, b)| b).sum();
+            let bytes_in_hour: u64 =
+                existing.map(|e| e.iter().map(|(_, b)| b).sum()).unwrap_or(0);
             if bytes_in_hour + bytes > self.bytes_per_hour {
                 return false;
             }
         }
-        entry.push_back((now, bytes));
+        self.windows.entry(key.to_string()).or_default().push_back((now, bytes));
         true
     }
 }
@@ -167,6 +183,43 @@ mod tests {
         assert!(lim.allow("a", 1, now));
         assert!(lim.allow("b", 1, now), "a different sender key must have its own budget");
         assert!(!lim.allow("a", 1, now));
+    }
+
+    /// Regression guard for unbounded memory growth: a key that's allowed
+    /// once and never revisited must not keep its map entry alive forever.
+    /// This is the abuse case the global prune-on-access sweep exists for —
+    /// a hostile sender on a public node minting a fresh native_ref (key)
+    /// per message.
+    #[test]
+    fn stale_keys_are_pruned_from_the_map_not_just_their_own_windows() {
+        let mut lim = SenderLimiter::new(0, 100);
+        let t0 = Instant::now();
+        for i in 0..50 {
+            assert!(lim.allow(&format!("churn-{i}"), 1, t0));
+        }
+        assert_eq!(lim.windows.len(), 50);
+
+        // one more call, from a brand-new key, over an hour later: every
+        // churned key's window has expired, and this fresh key is the only
+        // one touched at t1, so the whole map must collapse to just it.
+        let t1 = t0 + Duration::from_secs(3_601);
+        assert!(lim.allow("fresh", 1, t1));
+        assert_eq!(lim.windows.len(), 1, "stale keys must be pruned, not just their windows");
+        assert!(lim.windows.contains_key("fresh"));
+    }
+
+    /// A key denied on its very first call (nothing to prune yet, because
+    /// nothing was ever recorded for it) must not leave a freshly-inserted,
+    /// permanently-empty entry sitting in the map — that would defeat the
+    /// point of the prune sweep for a key that never once gets through.
+    #[test]
+    fn a_denied_call_does_not_insert_an_empty_entry_for_a_brand_new_key() {
+        let mut lim = SenderLimiter::new(0, 10); // bytes-only, tiny budget
+        let now = Instant::now();
+        assert!(!lim.allow("too-big", 20, now),
+            "20 bytes exceeds the 10-byte budget on the very first call");
+        assert!(lim.windows.is_empty(),
+            "a key denied on its first-ever call must never appear in the map");
     }
 
     #[test]
