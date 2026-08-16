@@ -38,7 +38,7 @@ plugins:
     command: /path/to/RelayFabric/.venv/bin/python /path/to/RelayFabric/plugins/meshtastic/relayfabric-meshtastic
     config:
       broker: mqtt://127.0.0.1:1883
-      topic_root: msh/2/json
+      topic_root: msh
       gateway_id: null                # null = accept all gateways; set to filter by hex ID
       max_text_bytes: 200             # daemon truncates upstream text
       channels:
@@ -57,10 +57,10 @@ sync marker — if uplink JSON reaches the daemon via a bridging route, loops co
 Without a Meshtastic device, test the config and uplink parsing:
 
 1. Start the daemon with Meshtastic config.
-2. Publish a crafted uplink to the broker:
+2. Publish a crafted uplink to the broker (note: the topic segment is the `topic_channel` name; the channel index comes from the JSON `channel` field):
 
 ```
-mosquitto_pub -h 127.0.0.1 -t msh/2/json/zone1/\!12345678 \
+mosquitto_pub -h 127.0.0.1 -t msh/2/json/general/\!12345678 \
   -m '{"type":"text","channel":0,"sender":"!12345678","payload":{"text":"test"},"timestamp":1692000000}'
 ```
 
