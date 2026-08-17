@@ -79,3 +79,7 @@ stay separate from route management (correlation data is more sensitive).
 - `GET /v1/plugins` — per-plugin connection state, capabilities, gauges
 - `GET /v1/federation` — peers: name, node_id, trust, connected, last_seen (no addr)
 - `GET /v1/discovery` — mode, our_advert, peers: node_id/name/services/protocols/security/expires/received_at
+- `GET /v1/openapi.json` — generated OpenAPI 3.1 document for this whole API
+- `GET /docs` — self-contained Swagger UI (no CDN), browsable via `socat`/SSH
+  tunnel over the admin socket; see `docs/api-reference.md`
+- `switchyardctl openapi` — dumps `/v1/openapi.json` to stdout for headless use

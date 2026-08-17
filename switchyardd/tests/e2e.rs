@@ -269,6 +269,23 @@ async fn admin_request(sock: &Path, method: &str, path: &str, body: Option<&str>
     (status, body.to_string())
 }
 
+/// Like `admin_request`, but also returns the raw response head (status
+/// line + headers, lowercased) — none of the existing callers have ever
+/// needed a header (only status + body), so this is kept separate rather
+/// than changing `admin_request`'s widely-used signature. Task 3 (design
+/// §3) needs this once, to assert `/docs` is actually served as
+/// `text/html`.
+async fn admin_get_with_head(sock: &Path, path: &str) -> (u16, String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = UnixStream::connect(sock).await.unwrap();
+    s.write_all(format!("GET {path} HTTP/1.0\r\nhost: x\r\n\r\n").as_bytes()).await.unwrap();
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).await.unwrap();
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+    let status: u16 = head.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+    (status, head.to_lowercase(), body.to_string())
+}
+
 /// Polls an admin endpoint every 100ms (up to ~5s) until the response body
 /// contains `needle`. Used in place of a fixed settle-sleep: the pump loop
 /// and delivery-state writes are async, so a positive assertion must poll
@@ -1764,4 +1781,108 @@ federation:
 
     // ...and the deferral shows up on the metric, not just as an absence.
     poll_until_contains(&d_a.admin_sock(), "/metrics", "relayfabric_budget_deferred_total 1").await;
+}
+
+/// Task 3 (design §3): the human-facing/machine-facing docs surfaces
+/// (Tasks 1-2), exercised end to end over a real subprocess + admin
+/// socket rather than the in-process `tower::oneshot` calls `admin.rs`'s
+/// own unit tests use. Covers:
+/// - `GET /v1/openapi.json` parses as JSON, is OpenAPI 3.1.x, and its
+///   `paths` map contains a sampling of the real routes.
+/// - `GET /docs` is a direct 200 `text/html` containing a UI marker, with
+///   no external host anywhere in ITS OWN bytes (the literal index.html,
+///   not the vendored JS bundles it loads — see `admin.rs`'s
+///   `docs_html_has_no_external_href_or_src` for why those are excluded).
+/// - `/docs/swagger-initializer.js` — the file that actually wires the UI
+///   to this daemon — references `/v1/openapi.json` (the "GET /docs ...
+///   references /v1/openapi.json" requirement; the literal index.html
+///   only pulls in swagger-initializer.js by `<script src>`, it doesn't
+///   inline the URL itself) and carries `"validatorUrl": "none"`, the
+///   config that neutralizes Swagger UI's default phone-home to
+///   validator.swagger.io. This is the CARRIED-OVER regression guard from
+///   the Task 2 review: that proof previously lived only in the review
+///   transcript, not in a test.
+/// - `/docs/swagger-ui-bundle.js` contains the vendored Swagger UI dist's
+///   own embedded version string, PINNED to the exact version currently
+///   vendored (`utoipa-swagger-ui-vendored` 0.1.2 bakes in Swagger UI
+///   5.17.14 — confirmed directly against that crate's `res/*.zip`). If a
+///   future `utoipa-swagger-ui`/`-vendored` bump changes this, this
+///   assertion fails LOUDLY rather than silently shipping a different
+///   dist (with possibly different default phone-home behavior) unnoticed.
+/// - "ctl `openapi` over the socket dumps parseable JSON with the same
+///   path count": switchyardctl is a separate binary crate this
+///   `switchyardd`-crate integration test cannot spawn (`CARGO_BIN_EXE_`
+///   is only injected for binaries of the package under test, confirmed
+///   empirically — `switchyardctl` isn't one), the same constraint
+///   `admin_request`/`open_events_stream` already document above. Per
+///   `switchyardctl/src/main.rs`, `openapi` does nothing beyond `fetch()`
+///   (identical wire request to `admin_get`) followed by an UNMODIFIED
+///   `print!("{body}")` — no reformatting, unlike every other subcommand —
+///   so a second `admin_get` of the same path is byte-for-byte what ctl
+///   would print, and comparing its parsed path count against the first
+///   fetch's is exactly "ctl's output has the same path count as the
+///   direct GET". `switchyardctl`'s own `request_for`/raw-print logic is
+///   unit-tested in that crate.
+#[tokio::test]
+async fn openapi_doc_and_swagger_ui_are_served() {
+    let d = start_daemon(tempfile::tempdir().unwrap());
+    wait_for(&d.admin_sock()).await;
+
+    // GET /v1/openapi.json -- parses, OpenAPI 3.1.x, has the real paths.
+    let spec_body = admin_get(&d.admin_sock(), "/v1/openapi.json").await;
+    let spec: serde_json::Value =
+        serde_json::from_str(&spec_body).expect("/v1/openapi.json must parse as JSON");
+    let version = spec["openapi"].as_str().expect("openapi field must be a string");
+    assert!(version.starts_with("3.1"), "expected OpenAPI 3.1.x, got {version:?}");
+    let paths = spec["paths"].as_object().expect("paths must be an object");
+    for want in [
+        "/v1/status", "/v1/config", "/v1/identities/link", "/v1/federation", "/v1/discovery",
+    ] {
+        assert!(paths.contains_key(want), "openapi.json paths missing {want}: {:?}", paths.keys().collect::<Vec<_>>());
+    }
+    let direct_path_count = paths.len();
+
+    // GET /docs -- direct 200 text/html, a UI marker, no external host in
+    // the literal index.html bytes.
+    let (status, head, docs_body) = admin_get_with_head(&d.admin_sock(), "/docs").await;
+    assert_eq!(status, 200, "GET /docs must be a direct 200, not a redirect");
+    assert!(head.contains("text/html"), "GET /docs content-type head was: {head}");
+    assert!(
+        docs_body.contains("swagger-ui") || docs_body.contains("Swagger UI"),
+        "GET /docs body has no Swagger UI marker: {docs_body}"
+    );
+    assert!(
+        !docs_body.contains("http://") && !docs_body.contains("https://"),
+        "GET /docs body references an external host: {docs_body}"
+    );
+
+    // swagger-initializer.js -- the piece that actually points the UI at
+    // this daemon's /v1/openapi.json, with the phone-home guard.
+    let init_js = admin_get(&d.admin_sock(), "/docs/swagger-initializer.js").await;
+    assert!(init_js.contains("/v1/openapi.json"), "swagger-initializer.js: {init_js}");
+    assert!(
+        init_js.contains("\"validatorUrl\": \"none\""),
+        "swagger-initializer.js is missing validatorUrl:\"none\" -- Swagger UI's default \
+         validator.swagger.io phone-home may be live again: {init_js}"
+    );
+
+    // swagger-ui-bundle.js -- pinned vendored dist version regression guard.
+    let bundle_js = admin_get(&d.admin_sock(), "/docs/swagger-ui-bundle.js").await;
+    assert!(
+        bundle_js.contains("PACKAGE_VERSION:\"5.17.14\""),
+        "vendored Swagger UI dist version drifted from the pinned 5.17.14 -- re-verify \
+         validatorUrl:none (and no new phone-home) still holds in the new version before \
+         updating this assertion"
+    );
+
+    // ctl `openapi` over the socket -- see the doc comment above for why
+    // this reproduces the fetch rather than spawning the ctl binary.
+    let ctl_body = admin_get(&d.admin_sock(), "/v1/openapi.json").await;
+    let ctl_spec: serde_json::Value =
+        serde_json::from_str(&ctl_body).expect("ctl openapi output must parse as JSON");
+    let ctl_paths = ctl_spec["paths"].as_object().expect("paths must be an object");
+    assert_eq!(
+        ctl_paths.len(), direct_path_count,
+        "ctl openapi's path count must match the direct GET /v1/openapi.json"
+    );
 }
