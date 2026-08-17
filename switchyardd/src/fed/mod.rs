@@ -19,13 +19,15 @@
 //! Sealed routing (design doc, cycle H, SPEC §113): `sealkey` defines the
 //! per-node stable X25519 keypair a sealed-routing origin encrypts to
 //! (SPEC §113.3 "keys anchor to §112.6 node identities"), published via
-//! `advert::SecurityCaps::sealed_key`. The AEAD envelope format itself
-//! (`seal`/`unseal`) is a later cycle-H task.
+//! `advert::SecurityCaps::sealed_key`. `seal` defines the AEAD envelope
+//! format itself (`SealedEnvelope`, `seal`/`unseal`, design §2) -- wiring
+//! it into federation egress/ingress is a later cycle-H task.
 
 pub mod advert;
 pub mod conn;
 pub mod domains;
 pub mod noise;
+pub mod seal;
 pub mod sealkey;
 pub mod sign;
 pub mod wire;
