@@ -691,7 +691,10 @@ fn advert_scope_allows(d: &Daemon, peer_node_id: &str) -> bool {
 /// must never show a DIFFERENT advert than what this daemon actually
 /// sends peers over the wire.
 pub(crate) fn build_signed_advert(d: &Daemon) -> Option<Advert> {
-    let unsigned = d.cfg_snapshot(|c| advert::build_from_config(c, &d.node_id, Utc::now()))?;
+    let sealed_key_hex = hex::encode(d.sealed_key.public());
+    let unsigned = d.cfg_snapshot(|c| {
+        advert::build_from_config(c, &d.node_id, &sealed_key_hex, Utc::now())
+    })?;
     Some(advert::sign(unsigned, &d.identity))
 }
 
@@ -1250,7 +1253,7 @@ mod tests {
         cfg.peers = vec![PeerConfig {
             name: "phoenix".into(), node_id: node_id.clone(),
             addr: "10.0.0.2:47000".into(), trust: "verified".into(),
-            messages_per_minute: 0,
+            messages_per_minute: 0, sealed_key: None,
         }];
         let d = Arc::new(test_daemon_with_federation(dir.path(), cfg));
 
@@ -1502,7 +1505,9 @@ mod tests {
             name: name.to_string(),
             services: BTreeMap::from([("federation".to_string(), true)]),
             protocols: BTreeMap::new(),
-            security: advert::SecurityCaps { translate: true, signed: true, opaque: false },
+            security: advert::SecurityCaps {
+                translate: true, signed: true, sealed: true, sealed_key: Some("22".repeat(32)),
+            },
             expires,
             sig: Vec::new(),
         }
@@ -1545,6 +1550,7 @@ mod tests {
         cfg.peers = vec![PeerConfig {
             name: "phoenix".into(), node_id: node_id.clone(),
             addr: "10.0.0.2:47000".into(), trust: "verified".into(), messages_per_minute: 0,
+            sealed_key: None,
         }];
         let d = Arc::new(test_daemon_with_federation(dir, cfg));
         set_discovery(&d, "federation", 3600);
@@ -1700,6 +1706,13 @@ mod tests {
             Fed::Advert { advert } => {
                 assert_eq!(advert.node_id, d.node_id);
                 assert!(advert::verify(&advert).is_ok());
+                // Cycle H (design §1): the server's own live advert, over
+                // the real wire path (build_signed_advert -> Fed::Advert),
+                // must carry ITS OWN daemon's real sealed key -- not a
+                // fixture, the actual `d.sealed_key.public()` this daemon
+                // loaded/created at construction.
+                assert!(advert.security.sealed);
+                assert_eq!(advert.security.sealed_key, Some(hex::encode(d.sealed_key.public())));
             }
             other => panic!("expected Advert, got {other:?}"),
         }
@@ -1916,6 +1929,7 @@ mod tests {
         cfg.peers = vec![PeerConfig {
             name: "phoenix".into(), node_id: node_id.clone(),
             addr: "10.0.0.2:47000".into(), trust: "verified".into(), messages_per_minute: 0,
+            sealed_key: None,
         }];
         let d = Arc::new(test_daemon_with_federation(dir.path(), cfg));
         set_discovery(&d, "federation", 300); // minimum allowed TTL -> 150s refresh interval

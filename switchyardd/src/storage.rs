@@ -1915,6 +1915,7 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
             addr: "10.0.0.1:47000".into(),
             trust: trust.into(),
             messages_per_minute: 0,
+            sealed_key: None,
         }
     }
 

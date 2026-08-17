@@ -290,6 +290,17 @@ pub struct PeerConfig {
     /// `BudgetLimiter`) is a later cycle-G task.
     #[serde(default)]
     pub messages_per_minute: u32,
+    /// Sealed-routing key pin (design §1/SPEC §113.3, cycle H): 64 lowercase
+    /// hex chars, this peer's `fed::sealkey::SealedKey` public half -- an
+    /// explicit operator-configured value, independent of whatever this
+    /// peer's own advert later claims. `None` (default, every pre-cycle-H
+    /// config) means this peer's sealed key is whatever its advert says, if
+    /// anything. Egress key-RESOLUTION (config pin vs. advert-learned, and
+    /// what happens when both are present and disagree -- config wins +
+    /// warn) is a later cycle-H task; this field is validated here (shape
+    /// only) and otherwise inert this task.
+    #[serde(default)]
+    pub sealed_key: Option<String>,
 }
 
 fn default_peer_trust() -> String {
@@ -837,6 +848,14 @@ fn validate_federation(cfg: &Config) -> Result<(), String> {
                 p.name, p.trust
             ));
         }
+        if let Some(sealed_key) = &p.sealed_key {
+            if !is_valid_hex64(sealed_key) {
+                return Err(format!(
+                    "federation peer '{}' has invalid sealed_key '{}' (expected 64 hex chars)",
+                    p.name, sealed_key
+                ));
+            }
+        }
     }
 
     for node_id in fed.trusted.iter().chain(&fed.blocked) {
@@ -932,6 +951,14 @@ fn is_valid_rf_node_id(s: &str) -> bool {
         Some(hex_part) => hex_part.len() == 64 && hex_part.chars().all(|c| c.is_ascii_hexdigit()),
         None => false,
     }
+}
+
+/// Bare 64-hex-char format check, no `"rf:"` prefix (design §1, cycle H):
+/// the shape `fed::advert::SecurityCaps::sealed_key` and `PeerConfig::
+/// sealed_key` both use -- a raw X25519 public key, not a node identity, so
+/// it deliberately does NOT reuse `is_valid_rf_node_id`'s prefix.
+fn is_valid_hex64(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -2002,6 +2029,61 @@ federation:
         assert!(err.contains("superfan"), "err was: {err}");
     }
 
+    // --- peer sealed_key (design §1, cycle H) ------------------------------
+
+    #[test]
+    fn federation_peer_sealed_key_defaults_to_none_when_absent() {
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{a}\"\n      addr: \"10.0.0.2:47000\"\n",
+            a = node_id_a(),
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.federation.unwrap().peers[0].sealed_key, None);
+    }
+
+    #[test]
+    fn federation_accepts_a_valid_peer_sealed_key() {
+        let sealed_key = "11".repeat(32);
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{a}\"\n      addr: \"10.0.0.2:47000\"\n      sealed_key: \"{sk}\"\n",
+            a = node_id_a(), sk = sealed_key,
+        );
+        let cfg = parse(&yaml).unwrap_or_else(|e| panic!("valid sealed_key should be accepted: {e}"));
+        assert_eq!(cfg.federation.unwrap().peers[0].sealed_key, Some(sealed_key));
+    }
+
+    #[test]
+    fn federation_rejects_peer_sealed_key_with_wrong_hex_length() {
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{a}\"\n      addr: \"10.0.0.2:47000\"\n      sealed_key: \"abcd\"\n",
+            a = node_id_a(),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("sealed_key"), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_rejects_peer_sealed_key_with_non_hex_characters() {
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{a}\"\n      addr: \"10.0.0.2:47000\"\n      sealed_key: \"{}\"\n",
+            "zz".repeat(32), a = node_id_a(),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("sealed_key"), "err was: {err}");
+    }
+
+    #[test]
+    fn federation_rejects_peer_sealed_key_with_rf_prefix() {
+        // sealed_key is a bare X25519 public key, NOT a node identity --
+        // the "rf:" node_id prefix must not be accepted here.
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{a}\"\n      addr: \"10.0.0.2:47000\"\n      sealed_key: \"rf:{}\"\n",
+            "11".repeat(32), a = node_id_a(),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("sealed_key"), "err was: {err}");
+    }
+
     #[test]
     fn federation_rejects_malformed_trusted_entry() {
         let yaml = format!("{FED_BASE}\nfederation:\n  trusted: [\"not-rf\"]\n");
@@ -2085,7 +2167,7 @@ federation:
         PeerConfig {
             name: name.into(), node_id: node_id.into(),
             addr: "10.0.0.2:47000".into(), trust: "verified".into(),
-            messages_per_minute: 0,
+            messages_per_minute: 0, sealed_key: None,
         }
     }
 

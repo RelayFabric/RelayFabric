@@ -57,6 +57,13 @@ pub struct Daemon {
     pub aliaser: Aliaser,
     pub identity: NodeIdentity,
     pub node_id: String,
+    /// Sealed-routing X25519 static keypair (design §1, SPEC §113.3, cycle
+    /// H): loaded/created unconditionally in `Daemon::new`, same posture as
+    /// `identity`/`aliaser` -- every node has one, whether or not
+    /// federation/discovery are configured, so `fed::advert::
+    /// build_from_config`'s `security.sealed`/`sealed_key` are always
+    /// populated (see `fed::conn::build_signed_advert`).
+    pub sealed_key: fed::sealkey::SealedKey,
     pub plugins: Mutex<HashMap<String, PluginHandle>>,
     pub cas: Cas,
     pub sender_limiter: Mutex<SenderLimiter>,
@@ -127,6 +134,7 @@ impl Daemon {
         let aliaser = Aliaser::load_or_create(&data_dir.join("alias.key"))?;
         let identity = NodeIdentity::load_or_create(&data_dir.join("identity"))?;
         let node_id = identity.node_id();
+        let sealed_key = fed::sealkey::SealedKey::load_or_create(&data_dir.join("sealed.key"))?;
         let ttl = std::time::Duration::from_secs(cfg.dedup_ttl_secs);
         let cas = Cas::new(&data_dir.join("attachments"), cfg.limits.global.cas_max_bytes)?;
         let sender_limiter = SenderLimiter::new(
@@ -148,6 +156,7 @@ impl Daemon {
             aliaser,
             identity,
             node_id,
+            sealed_key,
             plugins: Mutex::new(HashMap::new()),
             cas,
             sender_limiter: Mutex::new(sender_limiter),
@@ -4315,7 +4324,7 @@ routes:
         crate::config::PeerConfig {
             name: name.into(), node_id: node_id.into(),
             addr: "10.0.0.2:47000".into(), trust: trust.into(),
-            messages_per_minute: 0,
+            messages_per_minute: 0, sealed_key: None,
         }
     }
 

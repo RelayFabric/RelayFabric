@@ -1,8 +1,9 @@
-//! Node Advertisements (design doc §1, SPEC §111.1, cycle G): a signed,
-//! expiring capability document describing what a gateway can actually
-//! do -- services (chat/store_forward/telemetry/federation...), the
-//! protocols reaching each, and the security posture (translate/signed/
-//! opaque). Mirrors `fed/sign.rs`'s structure: an explicit canonical-bytes
+//! Node Advertisements (design doc §1, SPEC §111.1, cycle G; sealed fields
+//! design doc §1, SPEC §113.3, cycle H): a signed, expiring capability
+//! document describing what a gateway can actually do -- services (chat/
+//! store_forward/telemetry/federation...), the protocols reaching each, and
+//! the security posture (translate/signed/sealed + the node's sealed_key).
+//! Mirrors `fed/sign.rs`'s structure: an explicit canonical-bytes
 //! tuple (never the struct's own `Serialize`, so a future field addition
 //! to `Advert` can never silently perturb what gets signed), a
 //! domain-separated sign/verify pair (`fed/domains.rs::ADVERT_V1`), and a
@@ -76,11 +77,22 @@ pub struct ProtoCaps {
     pub max_payload: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Design §1/SPEC §113.3, cycle H: `sealed`/`sealed_key` replace the cycle-G
+/// `opaque: false` placeholder. `sealed` is true once the node has a
+/// sealed-routing keypair (`fed::sealkey::SealedKey`, this cycle: always,
+/// once cycle H lands -- see `build_from_config`); `sealed_key` is that
+/// key's public half, 64 lowercase hex chars (`hex::encode` of the raw
+/// 32-byte X25519 public key, no `"rf:"`-style prefix -- it is NOT a node
+/// identity, just a recipient key). Trustworthy because the WHOLE advert
+/// (this field included) is Ed25519-signed by the node identity named in
+/// `Advert::node_id` -- a peer cannot publish a `sealed_key` under another
+/// node's identity without forging that node's signature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecurityCaps {
     pub translate: bool,
     pub signed: bool,
-    pub opaque: bool,
+    pub sealed: bool,
+    pub sealed_key: Option<String>,
 }
 
 /// Advert verification failures (mirrors `fed::sign::SigError`'s posture:
@@ -111,17 +123,28 @@ impl fmt::Display for AdvertError {
 impl std::error::Error for AdvertError {}
 
 /// Deterministic CBOR tuple of the fields an advert signature covers
-/// (design §1): `(rf_version, node_id, name, services, protocols,
-/// (translate, signed, opaque), expires)`. `sig` is NOT included --
-/// self-referential otherwise. Built as an explicit tuple, not by
-/// serializing `Advert` itself, for the same reason `fed::sign::
-/// canonical_bytes` is: a future field added to `Advert` must never
-/// silently join or reorder what gets signed. `services`/`protocols`
-/// being `BTreeMap`s gives deterministic (sorted) key order for free;
-/// `security` is flattened to a raw bool tuple rather than letting
-/// `SecurityCaps`'s own derived `Serialize` decide the encoding, so this
-/// function -- not that struct's field order -- is the single source of
-/// truth for the signed byte layout.
+/// (design §1; extended cycle H design §1/SPEC §113.3): `(rf_version,
+/// node_id, name, services, protocols, (translate, signed, sealed,
+/// sealed_key), expires)`. `sig` is NOT included -- self-referential
+/// otherwise. Built as an explicit tuple, not by serializing `Advert`
+/// itself, for the same reason `fed::sign::canonical_bytes` is: a future
+/// field added to `Advert` must never silently join or reorder what gets
+/// signed. `services`/`protocols` being `BTreeMap`s gives deterministic
+/// (sorted) key order for free; `security` is flattened to a raw tuple
+/// rather than letting `SecurityCaps`'s own derived `Serialize` decide the
+/// encoding, so this function -- not that struct's field order -- is the
+/// single source of truth for the signed byte layout. `sealed_key`'s
+/// `Option<String>` encodes deterministically via ciborium (`None` -> CBOR
+/// null, `Some(s)` -> a CBOR text string), so it composes into the tuple
+/// exactly like every other field here.
+///
+/// CYCLE H RE-VERSIONING (Task 1, expected -- see report): this changes the
+/// signed byte layout from cycle G's `(..., (translate, signed, opaque),
+/// ...)`. Every advert issued by a pre-cycle-H node fails `verify` against
+/// a cycle-H peer and vice versa (a peer's `SecurityCaps` shape must match
+/// bytes-for-bytes what the signer signed) -- this is a breaking wire-
+/// format event for advert signing, matching every prior `canonical_bytes`
+/// golden-vector-lock posture in this codebase.
 pub fn canonical_bytes(advert: &Advert) -> Vec<u8> {
     let tuple = (
         advert.rf_version,
@@ -129,7 +152,12 @@ pub fn canonical_bytes(advert: &Advert) -> Vec<u8> {
         advert.name.as_str(),
         &advert.services,
         &advert.protocols,
-        (advert.security.translate, advert.security.signed, advert.security.opaque),
+        (
+            advert.security.translate,
+            advert.security.signed,
+            advert.security.sealed,
+            &advert.security.sealed_key,
+        ),
         advert.expires,
     );
     let mut buf = Vec::new();
@@ -195,17 +223,31 @@ pub fn verify(advert: &Advert) -> Result<(), AdvertError> {
 /// `files: false`, `max_payload: None` for all of them this cycle (see
 /// `ProtoCaps`'s doc comment -- live-capability enrichment is future
 /// work, so this function reads only `cfg.public_services`, never
-/// `cfg.plugins`, to build the protocols map). `security` is the fixed
-/// `{translate: true, signed: true, opaque: false}` this cycle ships
-/// (`opaque` becomes real in cycle H). `expires` is `now +
+/// `cfg.plugins`, to build the protocols map). `security` is
+/// `{translate: true, signed: true, sealed: true, sealed_key:
+/// Some(sealed_key_hex)}` (cycle H, design §1: `sealed`/`sealed_key`
+/// replace the cycle-G `opaque: false` placeholder) -- `sealed_key_hex` is
+/// the CALLER's job to source (this function stays a pure `Config` ->
+/// `Advert` mapper, same as `node_id`/`now` are already caller-supplied
+/// rather than read from `cfg`; the real caller is `fed::conn::
+/// build_signed_advert`, which hex-encodes `Daemon::sealed_key.public()`).
+/// `sealed` is unconditionally `true` here because every node that reaches
+/// this function has ALREADY loaded (or created) a `fed::sealkey::
+/// SealedKey` at daemon construction, same as it always has a
+/// `node_identity::NodeIdentity` -- there is no "no sealed key yet" state
+/// to represent once cycle H has landed. `expires` is `now +
 /// cfg.discovery.advert_ttl_secs`.
 ///
 /// Trusts `cfg` is already `config::validate`d, same posture every other
 /// `Config`-consuming function in this codebase takes -- in particular it
 /// does NOT itself check `mode: "public"` requires `node.public`; that's
 /// `validate`'s job, enforced before a `Config` this function ever sees
-/// can exist.
-pub fn build_from_config(cfg: &Config, node_id: &str, now: DateTime<Utc>) -> Option<Advert> {
+/// can exist. Does NOT validate `sealed_key_hex`'s shape either -- it
+/// trusts the caller passed `SealedKey::public()`'s own hex encoding,
+/// which is 64 lowercase hex chars by construction.
+pub fn build_from_config(
+    cfg: &Config, node_id: &str, sealed_key_hex: &str, now: DateTime<Utc>,
+) -> Option<Advert> {
     if cfg.discovery.mode == "disabled" {
         return None;
     }
@@ -246,7 +288,12 @@ pub fn build_from_config(cfg: &Config, node_id: &str, now: DateTime<Utc>) -> Opt
         name: cfg.node.name.clone(),
         services,
         protocols,
-        security: SecurityCaps { translate: true, signed: true, opaque: false },
+        security: SecurityCaps {
+            translate: true,
+            signed: true,
+            sealed: true,
+            sealed_key: Some(sealed_key_hex.to_string()),
+        },
         expires,
         sig: Vec::new(),
     })
@@ -260,6 +307,12 @@ mod tests {
     fn identity(dir: &std::path::Path, name: &str) -> NodeIdentity {
         NodeIdentity::load_or_create(&dir.join(name)).unwrap()
     }
+
+    /// Fixed 64-hex sealed_key stand-in for `build_from_config`'s tests
+    /// below -- these tests exercise the SOURCING logic (which cfg fields
+    /// land where), not `fed::sealkey::SealedKey` itself (covered by
+    /// `fed::sealkey`'s own test module), so a fixed hex string is enough.
+    const TEST_SEALED_KEY_HEX: &str = "11223344556677889900aabbccddeeff11223344556677889900aabbccddee";
 
     fn fixed_advert() -> Advert {
         let mut services = BTreeMap::new();
@@ -278,7 +331,12 @@ mod tests {
             name: "DX.PE Pasadena".to_string(),
             services,
             protocols,
-            security: SecurityCaps { translate: true, signed: true, opaque: false },
+            security: SecurityCaps {
+                translate: true,
+                signed: true,
+                sealed: true,
+                sealed_key: Some("cd".repeat(32)),
+            },
             expires: 1_786_838_400,
             sig: Vec::new(),
         }
@@ -291,10 +349,13 @@ mod tests {
         let advert = fixed_advert();
         let hex: String =
             canonical_bytes(&advert).iter().map(|b| format!("{b:02x}")).collect();
-        // Cross-version stability lock (design §1): if this ever changes,
-        // that's a breaking wire-format event for advert signing, not a
-        // test to casually update.
-        let expected = "8701784372663a616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626e44582e5045205061736164656e61a26463686174f56a66656465726174696f6ef5a1646c786d66a5627278f5627478f56474657874f56566696c6573f46b6d61785f7061796c6f6164f683f5f5f41a6a80fd80";
+        // Cross-version stability lock (design §1). RE-VERSIONED cycle H
+        // (design §1/SPEC §113.3, EXPECTED -- see Task 1 report): `opaque`
+        // dropped, `sealed`/`sealed_key` added to the signed security
+        // tuple, so this hex differs from cycle G's. If it ever changes
+        // AGAIN, that's a breaking wire-format event for advert signing,
+        // not a test to casually update.
+        let expected = "8701784372663a616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626e44582e5045205061736164656e61a26463686174f56a66656465726174696f6ef5a1646c786d66a5627278f5627478f56474657874f56566696c6573f46b6d61785f7061796c6f6164f684f5f5f57840636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463641a6a80fd80";
         assert_eq!(hex, expected);
     }
 
@@ -372,7 +433,26 @@ mod tests {
         let mut signed = sign(advert, &id);
         assert_eq!(verify(&signed), Ok(()));
 
-        signed.security.opaque = true;
+        signed.security.sealed = false;
+        assert_eq!(verify(&signed), Err(AdvertError::BadSignature));
+    }
+
+    /// A peer must not be able to swap in a DIFFERENT sealed_key after
+    /// signing (design §1: "a peer can't spoof another's sealed_key") --
+    /// this is the field-level version of the struct-level check above,
+    /// since `sealed_key` is the one new field this cycle actually adds
+    /// attacker-relevant content to (unlike the plain `bool` fields, a
+    /// tampered `sealed_key` would redirect where an origin encrypts to).
+    #[test]
+    fn tamper_sealed_key_after_signing_fails_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = identity(dir.path(), "origin");
+        let mut advert = fixed_advert();
+        advert.node_id = id.node_id();
+        let mut signed = sign(advert, &id);
+        assert_eq!(verify(&signed), Ok(()));
+
+        signed.security.sealed_key = Some("ef".repeat(32));
         assert_eq!(verify(&signed), Err(AdvertError::BadSignature));
     }
 
@@ -458,21 +538,21 @@ routes:
     fn build_from_config_is_none_when_discovery_block_absent() {
         let cfg = config::load_from_str(base_yaml()).unwrap();
         assert!(cfg.discovery.mode == "disabled");
-        assert!(build_from_config(&cfg, "rf:whatever", now()).is_none());
+        assert!(build_from_config(&cfg, "rf:whatever", TEST_SEALED_KEY_HEX, now()).is_none());
     }
 
     #[test]
     fn build_from_config_is_none_when_discovery_mode_explicitly_disabled() {
         let yaml = format!("{}\ndiscovery:\n  mode: disabled\n", base_yaml());
         let cfg = config::load_from_str(&yaml).unwrap();
-        assert!(build_from_config(&cfg, "rf:whatever", now()).is_none());
+        assert!(build_from_config(&cfg, "rf:whatever", TEST_SEALED_KEY_HEX, now()).is_none());
     }
 
     #[test]
     fn build_from_config_with_empty_public_services_advertises_federation_only() {
         let yaml = format!("{}\ndiscovery:\n  mode: federation\n", base_yaml());
         let cfg = config::load_from_str(&yaml).unwrap();
-        let advert = build_from_config(&cfg, "rf:whatever", now()).unwrap();
+        let advert = build_from_config(&cfg, "rf:whatever", TEST_SEALED_KEY_HEX, now()).unwrap();
         assert_eq!(advert.services, BTreeMap::from([("federation".to_string(), true)]));
         assert!(advert.protocols.is_empty());
     }
@@ -486,7 +566,7 @@ routes:
             base_yaml()
         );
         let cfg = config::load_from_str(&yaml).unwrap();
-        let advert = build_from_config(&cfg, "rf:whatever", now()).unwrap();
+        let advert = build_from_config(&cfg, "rf:whatever", TEST_SEALED_KEY_HEX, now()).unwrap();
 
         assert_eq!(
             advert.services,
@@ -536,20 +616,37 @@ discovery:
   mode: public
 "#;
         let cfg = config::load_from_str(yaml).unwrap();
-        let advert = build_from_config(&cfg, "rf:distinct-node-id", now()).unwrap();
+        let advert = build_from_config(&cfg, "rf:distinct-node-id", TEST_SEALED_KEY_HEX, now()).unwrap();
         assert_eq!(advert.name, "test-node");
         assert_eq!(advert.node_id, "rf:distinct-node-id");
     }
 
     #[test]
-    fn build_from_config_security_is_the_fixed_cycle_g_posture() {
+    fn build_from_config_security_is_the_fixed_cycle_h_posture() {
         let yaml = format!("{}\ndiscovery:\n  mode: federation\n", base_yaml());
         let cfg = config::load_from_str(&yaml).unwrap();
-        let advert = build_from_config(&cfg, "rf:whatever", now()).unwrap();
+        let advert = build_from_config(&cfg, "rf:whatever", TEST_SEALED_KEY_HEX, now()).unwrap();
         assert_eq!(
             advert.security,
-            SecurityCaps { translate: true, signed: true, opaque: false }
+            SecurityCaps {
+                translate: true,
+                signed: true,
+                sealed: true,
+                sealed_key: Some(TEST_SEALED_KEY_HEX.to_string()),
+            }
         );
+    }
+
+    #[test]
+    fn build_from_config_sealed_key_is_the_caller_supplied_hex_not_recomputed() {
+        // build_from_config stays a pure Config -> Advert mapper (design §1
+        // doc comment): it must carry whatever hex the caller passed
+        // through VERBATIM, never derive or validate it itself.
+        let yaml = format!("{}\ndiscovery:\n  mode: federation\n", base_yaml());
+        let cfg = config::load_from_str(&yaml).unwrap();
+        let distinct_hex = "99".repeat(32);
+        let advert = build_from_config(&cfg, "rf:whatever", &distinct_hex, now()).unwrap();
+        assert_eq!(advert.security.sealed_key, Some(distinct_hex));
     }
 
     #[test]
@@ -559,7 +656,7 @@ discovery:
             base_yaml()
         );
         let cfg = config::load_from_str(&yaml).unwrap();
-        let advert = build_from_config(&cfg, "rf:whatever", now()).unwrap();
+        let advert = build_from_config(&cfg, "rf:whatever", TEST_SEALED_KEY_HEX, now()).unwrap();
         assert_eq!(advert.expires, now().timestamp() + 900);
     }
 
@@ -567,7 +664,7 @@ discovery:
     fn build_from_config_default_ttl_is_3600() {
         let yaml = format!("{}\ndiscovery:\n  mode: federation\n", base_yaml());
         let cfg = config::load_from_str(&yaml).unwrap();
-        let advert = build_from_config(&cfg, "rf:whatever", now()).unwrap();
+        let advert = build_from_config(&cfg, "rf:whatever", TEST_SEALED_KEY_HEX, now()).unwrap();
         assert_eq!(advert.expires, now().timestamp() + 3600);
     }
 
@@ -621,7 +718,7 @@ routes:
         let cfg = config::load_from_str(&yaml).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let id = identity(dir.path(), "sentinel");
-        let advert = build_from_config(&cfg, &id.node_id(), now()).unwrap();
+        let advert = build_from_config(&cfg, &id.node_id(), TEST_SEALED_KEY_HEX, now()).unwrap();
         let signed = sign(advert, &id);
 
         let mut serialized = Vec::new();

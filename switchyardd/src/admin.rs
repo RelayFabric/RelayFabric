@@ -2282,7 +2282,7 @@ policies:
         crate::config::PeerConfig {
             name: name.into(), node_id: node_id.into(),
             addr: "10.0.0.2:47000".into(), trust: "verified".into(),
-            messages_per_minute: 0,
+            messages_per_minute: 0, sealed_key: None,
         }
     }
 
@@ -2446,7 +2446,9 @@ policies:
             name: advert_name.to_string(),
             services,
             protocols: BTreeMap::new(),
-            security: crate::fed::advert::SecurityCaps { translate: true, signed: true, opaque: false },
+            security: crate::fed::advert::SecurityCaps {
+                translate: true, signed: true, sealed: true, sealed_key: Some("11".repeat(32)),
+            },
             expires: expires.timestamp(),
             sig: Vec::new(),
         };

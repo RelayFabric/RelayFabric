@@ -152,7 +152,9 @@ mod tests {
             name: "test-node".into(),
             services: BTreeMap::from([("federation".to_string(), true)]),
             protocols: BTreeMap::new(),
-            security: SecurityCaps { translate: true, signed: true, opaque: false },
+            security: SecurityCaps {
+                translate: true, signed: true, sealed: true, sealed_key: Some("33".repeat(32)),
+            },
             expires: 1_786_838_400,
             sig: vec![1, 2, 3, 4],
         }

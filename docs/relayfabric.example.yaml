@@ -195,6 +195,7 @@ policies:
 #       addr: "10.0.0.2:47000"
 #       trust: trusted               # optional; default verified
 #       messages_per_minute: 100     # optional; default 0 (unlimited) — aggregate egress cap for this peer's fed link
+#       sealed_key: "<64hex>"        # optional; pins this peer's sealed-routing X25519 key (else advert-learned) — cycle H, §113.3
 #   trusted: []                      # extra node_ids
 #   blocked: []
 

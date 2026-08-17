@@ -41,6 +41,18 @@ curve25519-dalek.workspace = true
 # after `cargo fetch`, which a build-time network fetch would not survive.
 utoipa = { version = "5.5.0", features = ["axum_extras", "chrono", "uuid"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"] }
+# Task 1 (design §1, cycle H sealed routing) license gate, PASSED: the only
+# two NET-NEW crates this pulls in -- `crypto_box` itself and its
+# `crypto_secretbox` dependency -- are both `Apache-2.0 OR MIT` (recorded
+# verbatim in the Task 1 report; `cargo metadata` confirmed). Every other
+# dependency `crypto_box` needs for `ChaChaBox` (chacha20, chacha20poly1305,
+# curve25519-dalek, ...) was ALREADY locked via cycle F's `snow`, so this
+# adds zero additional transitive crates beyond those two. `default-features
+# = false` drops the unused `salsa20`/`SalsaBox`/`seal` machinery (this
+# codebase only ever constructs `ChaChaBox`, X25519 + XChaCha20-Poly1305 per
+# design §2) -- `chacha20`/`std`/`alloc`/`getrandom`/`rand_core` are the
+# minimum feature set that compiles `ChaChaBox::new`/`.encrypt`/`.decrypt`.
+crypto_box = { version = "0.9.1", default-features = false, features = ["chacha20", "std", "alloc", "getrandom", "rand_core"] }
 
 [dev-dependencies]
 tempfile.workspace = true
