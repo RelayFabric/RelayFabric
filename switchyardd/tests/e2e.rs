@@ -1128,6 +1128,31 @@ fn precreate_node_identity(data_dir: &Path) -> String {
     format!("rf:{}", hex::encode(signing_key.verifying_key().to_bytes()))
 }
 
+/// Pre-generates a sealed-routing X25519 keypair (cycle H, Task 6, design
+/// §1/§4) and writes the secret directly to `<data_dir>/sealed.key` in the
+/// exact on-disk format `fed::sealkey::SealedKey::load_or_create` expects
+/// (raw 32-byte hex, 0600, create_new) -- the same
+/// "known-to-the-test-before-the-owning-daemon-boots" shape as
+/// `precreate_node_identity` above, and for the identical reason: a
+/// sealed-mode route's peer config must carry a CONFIG-PINNED `sealed_key`
+/// (design §1/§113.2 -- `--check-config` cannot see advert-learned keys at
+/// load time), so the origin's config has to be written with the
+/// destination's PUBLIC sealed key already known, before the destination
+/// daemon has ever run to generate/publish one itself. Returns the 64-hex-
+/// char public key exactly as `federation.peers[].sealed_key` expects it.
+fn precreate_sealed_key(data_dir: &Path) -> String {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::create_dir_all(data_dir).unwrap();
+    let secret_bytes: [u8; 32] = rand::random();
+    let mut f = std::fs::OpenOptions::new()
+        .write(true).create_new(true).mode(0o600)
+        .open(data_dir.join("sealed.key")).unwrap();
+    f.write_all(hex::encode(secret_bytes).as_bytes()).unwrap();
+    let public = crypto_box::SecretKey::from_bytes(secret_bytes).public_key().to_bytes();
+    hex::encode(public)
+}
+
 /// Binds an ephemeral TCP port, reads back the OS-assigned port, then
 /// immediately drops the listener -- the federation config text needs a
 /// concrete, currently-free port to template into `federation.listen`
@@ -1180,6 +1205,28 @@ async fn poll_until_queue_count_stable(sock: &Path, max_wait: Duration) -> i64 {
         );
         tokio::time::sleep(INTERVAL).await;
     }
+}
+
+/// Polls `GET /v1/federation` (JSON-parsed, not a raw substring match --
+/// `FederationPeerItem`'s `connected`/`name` fields aren't adjacent in the
+/// serialized object, and this needs to distinguish a SPECIFIC named peer's
+/// connected state from any other peer entry the same response might carry,
+/// unlike every other `poll_until_contains` caller in this file which only
+/// ever has one peer to wait on) until `name`'s entry reports
+/// `connected: true`. Cycle H, Task 6: the sealed-routing e2e below has TWO
+/// peers (b, c) connecting to the same listener, so a plain substring poll
+/// for `"connected":true` would pass as soon as EITHER one came up.
+async fn wait_for_fed_peer_connected(sock: &Path, name: &str) {
+    for _ in 0..50 {
+        let body = admin_get(sock, "/v1/federation").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if v["peers"].as_array().unwrap().iter()
+            .any(|p| p["name"] == name && p["connected"] == true) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("peer {name:?} on {} never showed connected:true", sock.display());
 }
 
 /// Design §Testing's two-real-daemon federation e2e. Noise identity binding
@@ -1781,6 +1828,208 @@ federation:
 
     // ...and the deferral shows up on the metric, not just as an absence.
     poll_until_contains(&d_a.admin_sock(), "/metrics", "relayfabric_budget_deferred_total 1").await;
+}
+
+/// Design §Testing's two-gateway sealed-routing e2e (cycle H, Task 6, SPEC
+/// §113): a THIRD real multi-daemon scenario in this file's federation
+/// family, but for `security_mode: sealed` routes specifically. Reuses this
+/// file's whole federation pattern -- `precreate_node_identity` (every
+/// node_id known before any mutually-referencing config is written),
+/// `free_tcp_port`/one listener (A) dialed by every other daemon (B, C) --
+/// plus this task's own `precreate_sealed_key`/`wait_for_fed_peer_connected`
+/// above.
+///
+/// A seals for B on a `security_mode: sealed` route, using B's PRE-
+/// GENERATED, config-pinned `sealed_key`; B decrypts and delivers to its
+/// mock plugin -- proving delivery+decrypt end to end over a REAL two-
+/// process round trip. The sealed `Fed::Sealed` frame itself rides inside
+/// the Noise transport layer, so it can't be sniffed in the clear at the
+/// TCP level from this test (there is no plaintext TCP hop to observe); the
+/// "ciphertext, not plaintext, crosses the fed layer" half of this claim is
+/// instead proven at the unit level by `engine::tests::
+/// process_due_fed_sealed_mode_produces_fed_sealed_frame_that_unseals_and_verifies`
+/// (already landed, Task 4), which asserts the exact serialized `Fed::
+/// Sealed` CBOR frame bytes never contain the sentinel body/native-ref --
+/// this test is the delivery-side pair that unit test's own doc comment
+/// anticipates.
+///
+/// A third daemon C -- otherwise an identical sealed destination, with its
+/// OWN pre-generated, config-pinned `sealed_key` -- sets
+/// `allow_gateway_decryption: false` on its ingress route. A's sealed send
+/// to C completes the FULL decrypt+verify+trust pipeline at C (proving the
+/// refusal is the last, deliberate policy gate, not an earlier one firing
+/// first) and then refuses. Per Task 5's `sealed_reject` (`engine.rs`),
+/// EVERY `fed_sealed_ingress` rejection reason -- including
+/// `SECURITY_DOWNGRADE_REFUSED` -- is `Persistence::NoPersist`: nothing is
+/// ever written to C's own `dead_letter` table, precisely so a refused
+/// decryption never itself becomes a plaintext-bearing DLQ row. So this is
+/// asserted via the `SEALED_REJECTED` counter on C's `GET /metrics`
+/// (`relayfabric_sealed_rejected_total`) plus a bounded negative (C's mock
+/// plugin never receives anything) -- never via
+/// `/v1/queue?state=dead_letter`, which Task 5's own posture rules out here.
+///
+/// SEALED_OVERSIZE (design §4/§113.4: "rejected at origin, never shrunk")
+/// is deliberately NOT reproduced here via a real subprocess payload: the
+/// ceiling it dead-letters against (`engine::SEALED_MAX_BYTES` -- `fed::
+/// noise::MAX_FRAME` minus a 512-byte margin) and the plugin IPC protocol's
+/// OWN frame ceiling (`relay_ipc::MAX_FRAME`) are the SAME 16 MiB constant,
+/// leaving under a kilobyte of daylight between "big enough to dead-letter
+/// SEALED_OVERSIZE at A" and "too big for the Inbound frame to even reach A
+/// over the mock plugin socket" -- reproducing that here would be exactly
+/// the fragile, unbounded test this cycle's own "keep it bounded"
+/// instruction rules out. It's already proven, byte-boundary-exact, at the
+/// engine integration level (design §Testing's own "Integration: duplex
+/// sealed egress→ingress through the real handlers" tier) by
+/// `engine::tests::
+/// process_due_fed_sealed_mode_oversized_envelope_dead_letters_sealed_oversize_not_shrunk`
+/// (already landed, Task 4): constructs the oversized envelope directly,
+/// in-process, driven through the real `process_due` handler against a
+/// live registered fed connection -- no IPC frame ceiling in the way there.
+#[tokio::test]
+async fn sealed_routing_two_gateways_end_to_end() {
+    const DELIVER_SENTINEL: &str = "SENTINEL-SEALED-DELIVERY-BODY-xyz789";
+    const DOWNGRADE_SENTINEL: &str = "SENTINEL-SEALED-DOWNGRADE-REFUSED-BODY-abc123";
+
+    // ---- 0. identities, sealed keys, and the one real TCP port needed -----
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let dir_c = tempfile::tempdir().unwrap();
+    let data_a = dir_a.path().join("data");
+    let data_b = dir_b.path().join("data");
+    let data_c = dir_c.path().join("data");
+    let node_id_a = precreate_node_identity(&data_a);
+    let node_id_b = precreate_node_identity(&data_b);
+    let node_id_c = precreate_node_identity(&data_c);
+    let sealed_key_b = precreate_sealed_key(&data_b);
+    let sealed_key_c = precreate_sealed_key(&data_c);
+
+    let a_port = free_tcp_port();
+    let a_addr = format!("127.0.0.1:{a_port}");
+
+    // ---- 1. daemon A: listener, sealed routes to both b and c -------------
+    let config_a = format!(
+        r#"
+node:
+  name: e2e-sealed-a
+  data_dir: DATA_DIR
+plugins:
+  mocka:
+    enabled: true
+routes:
+  - name: a-out-b
+    sources: ["mocka:outchan-b"]
+    destinations: ["fed:b/b-in"]
+    security_mode: sealed
+  - name: a-out-c
+    sources: ["mocka:outchan-c"]
+    destinations: ["fed:c/c-in"]
+    security_mode: sealed
+federation:
+  listen: "{a_addr}"
+  peers:
+    - name: b
+      node_id: "{node_id_b}"
+      addr: "127.0.0.1:1"
+      sealed_key: "{sealed_key_b}"
+    - name: c
+      node_id: "{node_id_c}"
+      addr: "127.0.0.1:1"
+      sealed_key: "{sealed_key_c}"
+"#
+    );
+    let d_a = start_daemon_with_config(dir_a, &config_a);
+    wait_for(&d_a.plugin_sock()).await;
+    wait_for(&d_a.admin_sock()).await;
+    let (_ra, mut wa) = connect_plugin(&d_a.plugin_sock(), "mocka").await;
+
+    // ---- 2. daemon B: dials A, ingress route with the DEFAULT (true) ------
+    // allow_gateway_decryption -- the normal sealed-termination case.
+    let config_b = format!(
+        r#"
+node:
+  name: e2e-sealed-b
+  data_dir: DATA_DIR
+plugins:
+  mockb:
+    enabled: true
+routes:
+  - name: b-in
+    sources: []
+    destinations: ["mockb:inchan"]
+federation:
+  ingress_routes: [b-in]
+  peers:
+    - name: a
+      node_id: "{node_id_a}"
+      addr: "{a_addr}"
+"#
+    );
+    let d_b = start_daemon_with_config(dir_b, &config_b);
+    wait_for(&d_b.plugin_sock()).await;
+    wait_for(&d_b.admin_sock()).await;
+    let (mut rb, mut wb) = connect_plugin(&d_b.plugin_sock(), "mockb").await;
+
+    // ---- 3. daemon C: dials A, ingress route REFUSES gateway decryption ---
+    let config_c = format!(
+        r#"
+node:
+  name: e2e-sealed-c
+  data_dir: DATA_DIR
+plugins:
+  mockc:
+    enabled: true
+routes:
+  - name: c-in
+    sources: []
+    destinations: ["mockc:inchan"]
+    allow_gateway_decryption: false
+federation:
+  ingress_routes: [c-in]
+  peers:
+    - name: a
+      node_id: "{node_id_a}"
+      addr: "{a_addr}"
+"#
+    );
+    let d_c = start_daemon_with_config(dir_c, &config_c);
+    wait_for(&d_c.plugin_sock()).await;
+    wait_for(&d_c.admin_sock()).await;
+    let (mut rc, _wc) = connect_plugin(&d_c.plugin_sock(), "mockc").await;
+
+    // both B and C dial out to A; wait for both live connections (named
+    // specifically -- see `wait_for_fed_peer_connected`'s doc comment) so
+    // neither send below races a still-handshaking peer.
+    wait_for_fed_peer_connected(&d_a.admin_sock(), "b").await;
+    wait_for_fed_peer_connected(&d_a.admin_sock(), "c").await;
+
+    // ---- 4. A -> B, sealed: delivered and DECRYPTED at B ------------------
+    inbound(&mut wa, "outchan-b", "!a-secret-b", DELIVER_SENTINEL, chrono::Utc::now()).await;
+    let (corr_b, endpoint_b, body_b, _) = expect_send(&mut rb).await;
+    assert_eq!(endpoint_b, "inchan");
+    assert!(body_b.contains(DELIVER_SENTINEL), "body was: {body_b}");
+    assert!(!body_b.contains("!a-secret-b"), "native ref leaked across sealed federation: {body_b}");
+    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
+        corr: corr_b, delivered: true, detail: None,
+    }).await.unwrap();
+
+    poll_until_contains(&d_a.admin_sock(), "/metrics", "relayfabric_sealed_egress_total 1").await;
+    poll_until_contains(&d_b.admin_sock(), "/metrics", "relayfabric_sealed_ingress_total 1").await;
+
+    // ---- 5. A -> C, sealed: decrypts fine, then DOWNGRADE REFUSAL ---------
+    // at C's policy gate -- never delivered, never persisted (NoPersist).
+    inbound(&mut wa, "outchan-c", "!a-secret-c", DOWNGRADE_SENTINEL, chrono::Utc::now()).await;
+
+    poll_until_contains(&d_c.admin_sock(), "/metrics", "relayfabric_sealed_rejected_total 1").await;
+    assert!(
+        timeout(Duration::from_secs(2), read_frame::<_, DaemonToPlugin>(&mut rc)).await.is_err(),
+        "a security-downgrade-refused sealed message was delivered to C's mock plugin anyway"
+    );
+
+    // bounded negative, over the SAME window: the refused content never
+    // shows up in C's dead-letter queue either (Task 5's NoPersist posture
+    // for every fed_sealed_ingress rejection -- a persisted row here would
+    // make the refusal cosmetic, not real).
+    assert_stays_absent(&d_c.admin_sock(), "/v1/queue?state=dead_letter", "SECURITY_DOWNGRADE_REFUSED").await;
 }
 
 /// Task 3 (design §3): the human-facing/machine-facing docs surfaces

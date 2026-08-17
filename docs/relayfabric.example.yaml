@@ -225,8 +225,12 @@ policies:
 # privacy:
 #   minimum_security: gateway        # gateway (default) | sealed
 #   allow_gateway_decryption: true   # default true; false = this node refuses to be a
-#                                     # sealed→plaintext termination point (ingress, §113.3)
-#   allow_protocol_downgrade: true   # default true
+#                                     # sealed→plaintext termination point (ingress, §113.3) —
+#                                     # this is the phase-1 downgrade-refusal enforcement point.
+#   allow_protocol_downgrade: true   # default true; parsed/stored this cycle but NOT YET
+#                                     # separately enforced — phase-1's actual downgrade-refusal
+#                                     # gate is allow_gateway_decryption above (documented, not
+#                                     # hidden: see docs/api-reference.md's security modes note)
 
 # TTLs and limits (seconds)
 ttl_default_secs: 86400

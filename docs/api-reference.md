@@ -133,6 +133,44 @@ deliberately declares no `securityScheme` — inventing a bearer/OAuth scheme
 the daemon doesn't implement would mislead client generators into thinking
 one exists.
 
+## Security modes (sealed routing, SPEC §113)
+
+A route's `security_mode` is `gateway` (default — this daemon reads and may
+transform plaintext, SPEC §113.1's renamed `TRANSLATE`) or `sealed`
+(SPEC §113.1's renamed `OPAQUE`: the origin edge gateway AEAD-seals the
+payload — X25519 + XChaCha20-Poly1305, algorithm-tagged for future PQ
+agility — for the destination edge gateway's `sealed_key`; every
+intermediate/transit node carries ciphertext only). `sealed` requires every
+destination to be a `fed:<peer>` peer with a config-pinned `sealed_key`
+(`federation.peers[].sealed_key`); `--check-config` rejects a `sealed` route
+otherwise. Node-level `privacy.minimum_security` (`gateway` default,
+`sealed`) is a floor: `--check-config` rejects any route whose effective mode
+falls below it, rather than silently allowing a downgrade.
+
+**Downgrade refusal (§113.2):** a sealed inbound message is never silently
+decrypted onto a route that refuses to terminate it. That refusal is gated
+by `privacy.allow_gateway_decryption` (node-level, default `true`) or its
+per-route override — `false` means this route will not be a
+sealed→plaintext termination point, and a sealed inbound message aimed at
+it dead-letters `SECURITY_DOWNGRADE_REFUSED`, never translated.
+`allow_protocol_downgrade` is parsed and stored (config-only, this phase)
+but is NOT a separate enforcement point yet — phase-1's actual
+downgrade-refusal gate is `allow_gateway_decryption` above; this is
+documented rather than left to look enforced when it isn't. Rejected sealed
+inbound (any reason — unsupported algorithm, tampered ciphertext, wrong
+recipient, downgrade refusal, etc.) is never persisted to
+`/v1/queue?state=dead_letter`: writing a just-decrypted refusal into a
+queryable table would make the refusal cosmetic, not real. Watch the
+`relayfabric_sealed_egress_total` / `relayfabric_sealed_ingress_total` /
+`relayfabric_sealed_rejected_total` counters on `GET /metrics` instead.
+
+**Claim discipline (§113.6):** sealed routing is **zero-knowledge / blind
+payload routing — NOT anonymity.** Nodes still observe timing, sizes,
+interfaces, and addresses. Nothing in this API, in `switchyardctl`, or in
+any future WebUI may describe sealed mode as anonymous, hidden, or
+untraceable — only as payload confidentiality between the origin and
+destination edge gateways.
+
 ## Privacy
 
 - Identity references are masked in every response that isn't the raw

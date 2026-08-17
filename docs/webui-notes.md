@@ -36,10 +36,24 @@ into `switchyardd`. One source of truth: UI → authenticated API → daemon.
 
 ## Security boundary visibility
 
-The UI must make trust boundaries visually obvious — show that TRANSLATE mode
-means gateway plaintext access, and show OPAQUE mode as ciphertext-only
-transit. This prevents operators from misunderstanding what the bridge
-guarantees.
+The UI must make trust boundaries visually obvious — show that a route's
+`security_mode: gateway` (SPEC §113.1's renamed `TRANSLATE`, the default)
+means the gateway reads plaintext, and `security_mode: sealed` (renamed
+`OPAQUE`) means ciphertext-only transit: the origin edge AEAD-seals the
+payload for the destination edge's key, and every intermediate node —
+including this one, for traffic it merely relays — carries opaque ciphertext
+it cannot read. This prevents operators from misunderstanding what the
+bridge guarantees.
+
+**Claim discipline (SPEC §113.6 — MUST be honored in every UI string):**
+sealed mode is **zero-knowledge / blind payload routing, NOT anonymity** —
+nodes still observe timing, sizes, interfaces, and addresses. The UI must
+never describe sealed mode as anonymous, hidden, or untraceable; label it
+as payload confidentiality only. `allow_protocol_downgrade` is parsed and
+stored (design cycle H) but phase-1's actual downgrade-refusal enforcement
+runs through `allow_gateway_decryption` — a route/node that sets it `false`
+refuses to terminate a sealed inbound message into a plaintext leg
+(`SECURITY_DOWNGRADE_REFUSED`), rather than silently downgrading it.
 
 ## Privacy defaults
 
