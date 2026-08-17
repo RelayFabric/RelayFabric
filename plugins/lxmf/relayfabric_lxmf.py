@@ -265,6 +265,33 @@ class FanoutTracker:
             return relay_ipc.delivery_result(self.corr, self._delivered > 0, detail)
 
 
+def failure_disposition(is_direct, has_propagation_node, has_path):
+    """Decide what to do when LXMF reports an outbound send failed.
+
+    Returns "propagate" | "delivered" | "failed".
+
+    LXMF marks a DIRECT message DELIVERED only when the recipient's return
+    delivery proof arrives. Over long/multi-hop paths that return proof is
+    routinely lost even though the message itself transferred, so a bare
+    failed_callback is NOT proof of non-delivery:
+    - DIRECT + a propagation node -> hand to store-and-forward (custody is
+      the strongest guarantee available).
+    - DIRECT + a known path -> proof-timeout fallback: the recipient was
+      reachable and LXMF transferred the message over a link; treat as
+      delivered rather than letting the daemon retry and re-deliver a
+      duplicate. This is optimistic if the path is known but the
+      recipient app is offline -- the packet still reached its node; a
+      per-message link-establishment/transfer signal is the upgrade path.
+    - otherwise (no path, or a non-DIRECT method that already failed) ->
+      genuine failure.
+    """
+    if is_direct and has_propagation_node:
+        return "propagate"
+    if is_direct and has_path:
+        return "delivered"
+    return "failed"
+
+
 class _PropagationNodePicker:
     """Announce handler that selects the closest active propagation node.
 
@@ -357,6 +384,14 @@ class Bridge:
             self.has_propagation_node = True
 
         self.pool = ThreadPoolExecutor(max_workers=8)
+        # Idempotency: at most one in-flight LXMessage per daemon `corr`
+        # (the stable delivery id). The daemon reclaims a delivery stuck
+        # "attempting" past its window and re-dispatches it; without this
+        # guard each re-dispatch would build a fresh LXMessage and the
+        # recipient would get duplicates. Cleared when the send reaches a
+        # terminal result.
+        self.inflight_corrs = set()
+        self.inflight_lock = threading.Lock()
         self.router.register_delivery_callback(self._on_lxmf)
 
         RNS.log(f"Gateway LXMF address: {RNS.prettyhexrep(self.dest.hash)}",
@@ -441,6 +476,19 @@ class Bridge:
 
     # ----- egress (daemon -> LXMF) -----
 
+    def _claim_corr(self, corr):
+        """Reserve `corr` for an in-flight send. Returns False if a send for
+        it is already in flight (a duplicate dispatch to be ignored)."""
+        with self.inflight_lock:
+            if corr in self.inflight_corrs:
+                return False
+            self.inflight_corrs.add(corr)
+            return True
+
+    def _release_corr(self, corr):
+        with self.inflight_lock:
+            self.inflight_corrs.discard(corr)
+
     def handle_send(self, corr, endpoint, body, attachments=None):
         from relayfabric_sdk import ipc as relay_ipc
 
@@ -451,6 +499,12 @@ class Bridge:
         members = channel_members(channel, self.dynamic_members)
         if not members:
             self._send_frame(relay_ipc.delivery_result(corr, False, "no members"))
+            return
+
+        if not self._claim_corr(corr):
+            # A send for this delivery is already in flight (the daemon
+            # reclaimed a slow "attempting" delivery and re-dispatched it).
+            # Ignore the duplicate; the in-flight send reports the result.
             return
 
         # attachment bytes are never logged, only counts/sizes via notes
@@ -470,6 +524,7 @@ class Bridge:
     def _fanout_done(self, tracker, member, success):
         result = tracker.member_done(member[:8], success)
         if result is not None:
+            self._release_corr(tracker.corr)
             self._send_frame(result)
 
     def handle_send_direct(self, corr, native_ref, body):
@@ -483,6 +538,8 @@ class Bridge:
         if not looks_like_hex_ref(native_ref):
             self._send_frame(relay_ipc.delivery_result(corr, False, "invalid destination ref"))
             return
+        if not self._claim_corr(corr):
+            return  # duplicate re-dispatch; the in-flight send reports the result
         self.pool.submit(
             self.send_lxmf, native_ref, body,
             lambda success: self._direct_done(corr, success))
@@ -490,6 +547,7 @@ class Bridge:
     def _direct_done(self, corr, success):
         from relayfabric_sdk import ipc as relay_ipc
 
+        self._release_corr(corr)
         detail = None if success else "delivery failed"
         self._send_frame(relay_ipc.delivery_result(corr, success, detail))
 
@@ -550,18 +608,28 @@ class Bridge:
         import LXMF
         import RNS
 
-        if method == LXMF.LXMessage.DIRECT and self.has_propagation_node:
+        is_direct = method == LXMF.LXMessage.DIRECT
+        has_path = RNS.Transport.has_path(bytes.fromhex(dest_hex))
+        disp = failure_disposition(is_direct, self.has_propagation_node, has_path)
+
+        if disp == "propagate":
             RNS.log(f"Direct delivery to {dest_hex} failed, handing to "
                      f"propagation node", RNS.LOG_INFO)
-            # a resubmitted PROPAGATED message's own delivery
-            # callback fires once the propagation node accepts custody, not
-            # once the recipient fetches it. We treat that handoff as
-            # delivered=True for this member since store-and-forward
-            # custody is the strongest guarantee available here.
+            # a resubmitted PROPAGATED message's own delivery callback fires
+            # once the propagation node accepts custody, not once the
+            # recipient fetches it. We treat that handoff as delivered=True
+            # since store-and-forward custody is the strongest guarantee here.
             self.pool.submit(self.send_lxmf, dest_hex, text, on_result,
                               LXMF.LXMessage.PROPAGATED, fields)
+        elif disp == "delivered":
+            RNS.log(f"Delivery proof not received for {dest_hex} but path is "
+                     f"established; treating as delivered (proof-timeout "
+                     f"fallback)", RNS.LOG_NOTICE)
+            if on_result:
+                on_result(True)
         else:
-            RNS.log(f"LXMF delivery FAILED to {dest_hex}", RNS.LOG_WARNING)
+            RNS.log(f"LXMF delivery FAILED to {dest_hex} (unreachable)",
+                     RNS.LOG_WARNING)
             if on_result:
                 on_result(False)
 

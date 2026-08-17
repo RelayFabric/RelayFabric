@@ -157,6 +157,98 @@ class FanoutTests(unittest.TestCase):
         self.assertIsNone(t.member_done("a", False))
 
 
+class FailureDispositionTests(unittest.TestCase):
+    def test_direct_with_propagation_node_propagates(self):
+        self.assertEqual(plug.failure_disposition(True, True, False), "propagate")
+        self.assertEqual(plug.failure_disposition(True, True, True), "propagate")
+
+    def test_direct_with_path_falls_back_to_delivered(self):
+        # proof-timeout fallback: recipient reachable, message transferred,
+        # only the return proof was lost -> delivered, not a duplicate retry
+        self.assertEqual(plug.failure_disposition(True, False, True), "delivered")
+
+    def test_direct_without_path_or_propagation_fails(self):
+        self.assertEqual(plug.failure_disposition(True, False, False), "failed")
+
+    def test_non_direct_failure_is_genuine(self):
+        # a PROPAGATED send that failed = propagation node refused custody;
+        # a known path must NOT turn that into an optimistic delivered
+        self.assertEqual(plug.failure_disposition(False, True, True), "failed")
+        self.assertEqual(plug.failure_disposition(False, False, True), "failed")
+
+
+class OnFailedWiringTests(unittest.TestCase):
+    """_on_failed maps the disposition to the right on_result / resubmit."""
+
+    def _run(self, has_path, has_prop, is_direct=True):
+        fake_rns = types.SimpleNamespace(
+            Transport=types.SimpleNamespace(has_path=lambda h: has_path),
+            log=lambda *a, **k: None,
+            LOG_INFO=0, LOG_NOTICE=0, LOG_WARNING=0)
+        fake_lxmf = types.SimpleNamespace(
+            LXMessage=types.SimpleNamespace(DIRECT=1, PROPAGATED=2))
+        method = fake_lxmf.LXMessage.DIRECT if is_direct else fake_lxmf.LXMessage.PROPAGATED
+        bridge = _bare_bridge(plug.load_config(CFG))
+        bridge.has_propagation_node = has_prop
+        results = []
+        old = {k: sys.modules.get(k) for k in ("RNS", "LXMF")}
+        sys.modules["RNS"], sys.modules["LXMF"] = fake_rns, fake_lxmf
+        try:
+            bridge._on_failed("a91d00aa", "hi", method, results.append)
+        finally:
+            for k, v in old.items():
+                if v is not None:
+                    sys.modules[k] = v
+                else:
+                    sys.modules.pop(k, None)
+        return results
+
+    def test_proof_timeout_with_path_reports_delivered(self):
+        self.assertEqual(self._run(has_path=True, has_prop=False), [True])
+
+    def test_unreachable_reports_failure(self):
+        self.assertEqual(self._run(has_path=False, has_prop=False), [False])
+
+
+class EgressIdempotencyTests(unittest.TestCase):
+    """One in-flight LXMessage per daemon corr: a reclaim-driven re-dispatch
+    of a still-attempting delivery must not build a duplicate send."""
+
+    def setUp(self):
+        self.cfg = plug.load_config(CFG)
+        self.bridge = _bare_bridge(self.cfg)
+        self.sent = []
+        self.bridge._send_frame = self.sent.append
+        self.calls = []
+
+        def fake_send(dest_hex, text, on_result=None, method=None, fields=None):
+            self.calls.append(on_result)  # capture, but don't resolve yet
+
+        self.bridge.send_lxmf = fake_send
+
+    def test_duplicate_dispatch_does_not_resend(self):
+        self.bridge.handle_send(1, "pasadena", "hi")
+        self.assertEqual(len(self.calls), 1)
+        # daemon reclaimed the slow "attempting" delivery and re-dispatched
+        self.bridge.handle_send(1, "pasadena", "hi")
+        self.assertEqual(len(self.calls), 1)  # no duplicate LXMessage
+        self.assertEqual(self.sent, [])       # nothing reported yet
+
+    def test_corr_released_after_terminal_result(self):
+        self.bridge.handle_send(1, "pasadena", "hi")
+        self.calls[0](True)  # the in-flight send delivers -> tracker fires
+        self.assertEqual(len(self.sent), 1)
+        self.assertTrue(self.sent[0]["delivered"])
+        # a fresh dispatch of the same corr (now resolved) sends again
+        self.bridge.handle_send(1, "pasadena", "hi")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_distinct_corrs_each_send(self):
+        self.bridge.handle_send(1, "pasadena", "hi")
+        self.bridge.handle_send(2, "pasadena", "hi")
+        self.assertEqual(len(self.calls), 2)
+
+
 class HardenStorageTests(unittest.TestCase):
     def test_tightens_dir_and_identity_perms(self):
         storage = tempfile.mkdtemp()
@@ -309,6 +401,8 @@ def _bare_bridge(cfg):
     bridge.dynamic_members = {}
     bridge.write_lock = threading.Lock()
     bridge.pool = _ImmediatePool()
+    bridge.inflight_corrs = set()
+    bridge.inflight_lock = threading.Lock()
     return bridge
 
 
@@ -322,6 +416,8 @@ def _bare_bridge_with_sock(cfg):
     bridge.dynamic_members = {}
     bridge.write_lock = threading.Lock()
     bridge.pool = _ImmediatePool()
+    bridge.inflight_corrs = set()
+    bridge.inflight_lock = threading.Lock()
     sock = FakeSock()
     bridge.wfile = sock
     return bridge, sock
