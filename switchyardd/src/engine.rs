@@ -1687,6 +1687,31 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
                 return;
             };
 
+            // Transport-class policy (design §3, spec §17/§113.4): the
+            // destination plugin's TRANSPORT -- not just its protocol
+            // `Capabilities` -- can impose a further payload ceiling and/or
+            // forbid media (Meshtastic/LoRa, satellite, etc). Resolved live
+            // per delivery, the same as `route_cfg`/render below, so a
+            // `--check-config`-validated `transports:` edit takes effect on
+            // the very next send, no restart. `del.destination.protocol` is
+            // the plugin name, exactly what `Config::transport_policy` keys
+            // on.
+            //
+            // SEALED EXEMPTION (§113.4, CRITICAL): this line -- and every
+            // use of `tp` below it, in this function and in
+            // `load_attachments` -- is reached ONLY for a non-fed,
+            // non-identity LOCAL PLUGIN destination. `process_due`'s own
+            // dispatch, above, already sent a `FED_PROTOCOL` delivery to
+            // `process_due_fed`, which for a `sealed` route hands off to
+            // `process_due_fed_sealed` (whose own doc comment: "NO TRANSFORM
+            // -- out_env is sealed EXACTLY as the caller left it") before
+            // this function is ever called. So the exemption holds
+            // STRUCTURALLY, by dispatch order, not by an in-line guard here
+            // -- there is no shared code path between sealed egress and the
+            // transport-policy resolution/application below to guard in the
+            // first place.
+            let tp = d.cfg_snapshot(|c| c.transport_policy(&del.destination.protocol));
+
             // Transport egress budget (spec §4/§45): a per-protocol cap on
             // sends-per-minute, independent of the sender-side and queue
             // quotas above (those gate what gets *accepted*; this gates what
@@ -1716,6 +1741,22 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
                 }
             }
 
+            // Effective payload cap (design §3): min(plugin
+            // Capabilities.max_payload, transport_policy.max_payload_bytes)
+            // -- the transport cap COMPOSES with, never replaces, the
+            // plugin's own protocol cap. Folding the combined value into
+            // `cap_limit` itself (rather than adding a second truncation
+            // stage) means the pre-existing `max_payload`/`cap_limit`
+            // min-merge just below, and the single `transform::render` call
+            // it feeds, already produce the right answer -- no truncation
+            // stacked. For the TerrestrialInternet default this is a no-op
+            // in practice: its transport cap is >= `MAX_FRAME` (16 MiB), at
+            // least as large as anything a plugin has ever been able to
+            // advertise (`TERRESTRIAL_MAX_PAYLOAD_BYTES`'s doc comment in
+            // `relay_core::transport`) -- the backward-compat anchor.
+            let cap_limit = Some(
+                cap_limit.map(|v| v as u64).unwrap_or(u64::MAX).min(tp.max_payload_bytes) as usize
+            );
             let limit = match (max_payload, cap_limit) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -1771,7 +1812,7 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
                 (Vec::new(), String::new())
             } else if attachments_allowed && dest_supports_attachments {
                 let frame_budget = u64::from(MAX_FRAME) - FRAME_HEADROOM_BYTES;
-                load_attachments(d, &env.attachments, max_attachment_bytes, frame_budget)
+                load_attachments(d, &env.attachments, max_attachment_bytes, frame_budget, tp)
             } else {
                 // destination lacks the capability, or policy rejects
                 // attachments outright: strip every attachment and note it
@@ -2334,11 +2375,21 @@ const FRAME_HEADROOM_BYTES: u64 = 64 * 1024;
 /// Rehydrates the accepted attachments of an outgoing message from the CAS,
 /// applying (in cheapest-first order, to avoid disk I/O for anything that
 /// will be dropped anyway):
+/// 0. the destination transport's media policy (design §3, spec §113.4):
+///    `!tp.allow_images`/`!tp.allow_video` demotes an `image/*`/`video/*`
+///    attachment to a note, REUSING this same "strip from `attachments`,
+///    note it instead" shape the two byte-cap checks below already use --
+///    just a different reason wording, so the recipient can tell a
+///    transport-policy demotion apart from an oversize drop. Checked first
+///    since it's a cheap string-prefix test, no different in spirit from
+///    checking `meta.size` before touching the CAS. Non-media attachments,
+///    and media the transport allows, fall through to the existing checks
+///    unchanged.
 /// 1. the per-attachment policy byte cap (`max_attachment_bytes`), then
 /// 2. the cumulative `frame_budget` guard, so the whole Send frame stays
 ///    under `MAX_FRAME` even when several in-cap attachments are combined.
 ///
-/// Anything that fails either check, plus anything whose blob has gone
+/// Anything that fails any of these, plus anything whose blob has gone
 /// missing from the CAS, is dropped from the attachment list and noted in
 /// the returned string instead — never logged, since attachment
 /// filenames/content are message content (see `handle_inbound`'s
@@ -2348,11 +2399,24 @@ fn load_attachments(
     metas: &[AttachmentMeta],
     max_attachment_bytes: Option<u64>,
     frame_budget: u64,
+    tp: relay_core::TransportPolicy,
 ) -> (Vec<IpcAttachment>, String) {
     let mut attachments = Vec::new();
     let mut notes = String::new();
     let mut cumulative: u64 = 0;
     for meta in metas {
+        let demote = if meta.mime.starts_with("image/") && !tp.allow_images {
+            Some("image")
+        } else if meta.mime.starts_with("video/") && !tp.allow_video {
+            Some("video")
+        } else {
+            None
+        };
+        if let Some(kind) = demote {
+            notes.push_str(&format!("\n[{kind} omitted — constrained transport]"));
+            metrics::inc(&metrics::TRANSPORT_DEMOTED);
+            continue;
+        }
         if let Some(cap) = max_attachment_bytes {
             if meta.size > cap {
                 notes.push_str(&transform::attachment_notes(
@@ -3033,6 +3097,262 @@ mod tests {
         assert!(body.contains("[attachment gone.bin unavailable]"), "body was: {body}");
     }
 
+    // ---- transport-class policy (design §3, spec §17/§113.4): egress -----
+
+    /// Constrained-transport route (Meshtastic/LoRa class, `max_payload_bytes:
+    /// 237`, `allow_images: false`): an image attachment is demoted to a
+    /// note -- reusing the same "strip from attachments, note it" shape as
+    /// the capability/oversize drop paths -- and `TRANSPORT_DEMOTED` bumps.
+    #[tokio::test]
+    async fn process_due_constrained_transport_demotes_image_to_a_note_and_bumps_the_metric() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().transports.insert("mockb".to_string(), crate::config::TransportEntry {
+            class: relay_core::TransportClass::Meshtastic,
+            max_payload_bytes: None,
+            allow_images: None,
+            allow_video: None,
+            compress: None,
+            batch_telemetry: None,
+        });
+        let d = Arc::new(d);
+        let mut rx = register_plugin(&d, "mockb", true);
+        let before = metrics::TRANSPORT_DEMOTED.load(std::sync::atomic::Ordering::Relaxed);
+
+        let att = IpcAttachment {
+            filename: "photo.jpg".into(), mime: "image/jpeg".into(), data: vec![7u8; 32],
+        };
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hi".into(), None, vec![att], None);
+        let now = Utc::now();
+        let del = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+        };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert!(attachments.is_empty(),
+            "an image must never reach a transport that forbids images");
+        assert!(body.contains("[image omitted — constrained transport]"), "body was: {body}");
+        let after = metrics::TRANSPORT_DEMOTED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "TRANSPORT_DEMOTED must increment on a media demotion");
+    }
+
+    /// `allow_images`/`allow_video` are independent knobs (design §1): a
+    /// route that only forbids video must demote JUST the video attachment
+    /// and pass a co-attached, non-media file through untouched -- proving
+    /// the demotion is selective, not a blanket strip.
+    #[tokio::test]
+    async fn process_due_transport_policy_demotes_video_but_keeps_a_non_media_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().transports.insert("mockb".to_string(), crate::config::TransportEntry {
+            class: relay_core::TransportClass::TerrestrialInternet,
+            max_payload_bytes: None,
+            allow_images: None,       // stays true (internet default)
+            allow_video: Some(false), // explicitly forbidden for this route
+            compress: None,
+            batch_telemetry: None,
+        });
+        let d = Arc::new(d);
+        let mut rx = register_plugin(&d, "mockb", true);
+        let before = metrics::TRANSPORT_DEMOTED.load(std::sync::atomic::Ordering::Relaxed);
+
+        let clip = IpcAttachment {
+            filename: "clip.mp4".into(), mime: "video/mp4".into(), data: vec![1u8; 32],
+        };
+        let doc = IpcAttachment {
+            filename: "notes.pdf".into(), mime: "application/pdf".into(), data: vec![2u8; 32],
+        };
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "hi".into(), None, vec![clip, doc], None);
+        let now = Utc::now();
+        let del = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+        };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert_eq!(attachments.len(), 1, "only the video should be demoted, the PDF must pass through");
+        assert_eq!(attachments[0].filename, "notes.pdf");
+        assert!(body.contains("[video omitted — constrained transport]"), "body was: {body}");
+        let after = metrics::TRANSPORT_DEMOTED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before);
+    }
+
+    /// Effective payload cap = min(plugin cap, transport cap) (design §3):
+    /// here the TRANSPORT cap (Meshtastic, 237 B) is the tighter of the two,
+    /// so it must win over a much looser plugin-advertised cap.
+    #[tokio::test]
+    async fn process_due_constrained_transport_caps_payload_to_the_tighter_transport_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        d.cfg.write().unwrap().transports.insert("mockb".to_string(), crate::config::TransportEntry {
+            class: relay_core::TransportClass::Meshtastic, // 237 B cap
+            max_payload_bytes: None,
+            allow_images: None,
+            allow_video: None,
+            compress: None,
+            batch_telemetry: None,
+        });
+        let d = Arc::new(d);
+        let (tx, mut rx) = mpsc::channel(8);
+        d.plugins.lock().unwrap().insert("mockb".to_string(), PluginHandle {
+            tx,
+            capabilities: Capabilities { max_payload: Some(5000), ..Capabilities::default() },
+            connected: true,
+        });
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "x".repeat(1000), None, vec![], None);
+        let now = Utc::now();
+        let del = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+        };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert!(body.len() <= 237,
+            "body must be capped to the tighter TRANSPORT limit, not the looser plugin one: {} bytes", body.len());
+    }
+
+    /// Same min() composition, opposite direction: the destination's
+    /// TerrestrialInternet default is non-constraining (>= MAX_FRAME), so a
+    /// tighter PLUGIN cap must still be the one that wins -- introducing
+    /// transport policy must never loosen what a plugin's own Capabilities
+    /// already enforced.
+    #[tokio::test]
+    async fn process_due_internet_transport_still_honors_a_tighter_plugin_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path())); // no transports: block configured
+        let (tx, mut rx) = mpsc::channel(8);
+        d.plugins.lock().unwrap().insert("mockb".to_string(), PluginHandle {
+            tx,
+            capabilities: Capabilities { max_payload: Some(20), ..Capabilities::default() },
+            connected: true,
+        });
+
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "this body is much longer than twenty bytes".into(), None, vec![], None);
+        let now = Utc::now();
+        let del = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+        };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert!(body.len() <= 20,
+            "the non-constraining internet transport cap must never override a tighter plugin cap: {} bytes", body.len());
+    }
+
+    /// Backward-compat regression guard (design §3, "Security/compat
+    /// invariants"): a destination with NO `transports:` entry resolves to
+    /// the TerrestrialInternet default (>= MAX_FRAME, media allowed), which
+    /// must never newly constrain an existing route -- an image and an
+    /// ordinary body must arrive exactly as they did before this feature.
+    #[tokio::test]
+    async fn process_due_internet_route_regression_image_and_body_pass_through_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let mut rx = register_plugin(&d, "mockb", true);
+
+        let att = IpcAttachment {
+            filename: "photo.jpg".into(), mime: "image/jpeg".into(), data: vec![9u8; 64],
+        };
+        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
+                       "ordinary message".into(), None, vec![att], None);
+        let now = Utc::now();
+        let del = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+        };
+        process_due(&d, del, now).await;
+
+        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+            panic!("expected Send");
+        };
+        assert_eq!(attachments.len(), 1,
+            "the internet-default transport must never demote media: backward compat");
+        assert_eq!(attachments[0].filename, "photo.jpg");
+        assert!(body.ends_with("ordinary message"), "body must be delivered untruncated: {body}");
+        assert!(!body.contains("omitted"), "no demotion note may appear on the non-constraining default: {body}");
+    }
+
+    /// SEALED EXEMPTION (design §3, SPEC §113.4, CRITICAL): sealed egress
+    /// (`process_due_fed_sealed`) never resolves `transport_policy` at all
+    /// -- `process_due` dispatches `FED_PROTOCOL` deliveries to
+    /// `process_due_fed`/`process_due_fed_sealed` BEFORE reaching the
+    /// transport-policy code in the `Allow` arm, so the exemption holds
+    /// structurally, not via an in-line guard. Proven here even under an
+    /// ADVERSARIAL config -- a `transports:` entry deliberately keyed on
+    /// `FED_PROTOCOL` ("fed") with a tiny cap and both media flags off --
+    /// to show that entry is simply never consulted on a sealed route: the
+    /// unsealed body/attachments at the far end are the ORIGINAL, untouched
+    /// ones. (`TRANSPORT_DEMOTED` is a process-global shared with every
+    /// other test in this binary's parallel run, so it is NOT asserted
+    /// here — an exact before/after equality on it would be a false
+    /// negative any time a concurrent demotion test in this same run
+    /// legitimately bumps it; the body/attachments equality checks below
+    /// are the load-bearing proof of the exemption.)
+    #[tokio::test]
+    async fn process_due_fed_sealed_egress_ignores_transport_policy_even_when_misconfigured_for_fed() {
+        let dir = tempfile::tempdir().unwrap();
+        let recipient_secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_pub = recipient_secret.public_key();
+        let node_id = format!("rf:{}", "48".repeat(32));
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        let mut peer = fed_peer_cfg("phoenix", &node_id, "verified");
+        peer.sealed_key = Some(hex::encode(recipient_pub.to_bytes()));
+        fed_cfg.peers = vec![peer];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+        {
+            let mut cfg = d.cfg.read().unwrap().clone();
+            let route = cfg.routes.iter_mut().find(|r| r.name == "general").unwrap();
+            route.security_mode = "sealed".to_string();
+            cfg.transports.insert(FED_PROTOCOL.to_string(), crate::config::TransportEntry {
+                class: relay_core::TransportClass::Meshtastic,
+                max_payload_bytes: Some(64),
+                allow_images: Some(false),
+                allow_video: Some(false),
+                compress: None,
+                batch_telemetry: None,
+            });
+            d.apply_config(cfg);
+        }
+        let mut rx = register_fed_conn(&d, "phoenix", &node_id);
+
+        let long_body = "this body is deliberately much longer than the 64-byte transport cap \
+                          configured above and must survive sealing completely whole";
+        assert!(long_body.len() > 64, "fixture sanity check");
+        let mut env = local_env("!ref", long_body);
+        env.attachments = vec![AttachmentMeta {
+            filename: "photo.jpg".into(), mime: "image/jpeg".into(),
+            size: 32, sha256: "deadbeef".repeat(8),
+        }];
+        let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        process_due(&d, del, Utc::now()).await;
+
+        let (sealed, _) = unwrap_sealed_frame(rx.try_recv().unwrap());
+        let opened = fed::seal::unseal(&sealed, &recipient_secret).unwrap();
+        let decoded: Envelope = ciborium::from_reader(opened.as_slice()).unwrap();
+        assert_eq!(decoded.body, long_body, "sealed egress must never truncate to a transport cap");
+        assert_eq!(decoded.attachments.len(), 1, "sealed egress must never demote media to a note");
+        assert_eq!(decoded.attachments[0].filename, "photo.jpg");
+    }
+
     #[test]
     fn load_attachments_drops_whatever_would_exceed_the_cumulative_frame_budget() {
         let dir = tempfile::tempdir().unwrap();
@@ -3052,7 +3372,8 @@ mod tests {
         ];
 
         // budget only has room for the first attachment's 10 bytes.
-        let (attachments, notes) = load_attachments(&d, &metas, None, 15);
+        let tp = relay_core::TransportPolicy::for_class(relay_core::TransportClass::TerrestrialInternet);
+        let (attachments, notes) = load_attachments(&d, &metas, None, 15, tp);
 
         assert_eq!(attachments.len(), 1, "only the first fits under the frame budget");
         assert_eq!(attachments[0].filename, "a.bin");

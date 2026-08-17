@@ -54,6 +54,18 @@ pub static SEALED_EGRESS: AtomicU64 = AtomicU64::new(0);
 pub static SEALED_INGRESS: AtomicU64 = AtomicU64::new(0);
 pub static SEALED_REJECTED: AtomicU64 = AtomicU64::new(0);
 
+// Transport-class policy (design §3, transport-class cycle task 3, spec
+// §17/§113.4): `engine::load_attachments` is the sole incrementer, bumped
+// once per attachment demoted to a note because the destination's resolved
+// `TransportPolicy` forbids its media type (`!allow_images`/`!allow_video`)
+// -- never for an ordinary capability/oversize/CAS-miss drop, which already
+// have their own note wording and don't touch this counter. Deliberately
+// label-free (the design doc's own optional `{plugin,reason}` labels are
+// NOT wired this cycle -- a bare count is enough signal for v0.1 and keeps
+// the "no content in metrics" invariant trivially true: no filename,
+// plugin name, or mime type is ever attached to this counter).
+pub static TRANSPORT_DEMOTED: AtomicU64 = AtomicU64::new(0);
+
 // design §3 (cycle D): received_at -> delivered wall-clock latency, accrued
 // as a micros sum + count pair (rendered in seconds) rather than a
 // histogram — the SHOULD-list ask is a Prometheus summary's _sum/_count,
@@ -261,6 +273,7 @@ pub fn render(
         ("relayfabric_sealed_egress_total", &SEALED_EGRESS),
         ("relayfabric_sealed_ingress_total", &SEALED_INGRESS),
         ("relayfabric_sealed_rejected_total", &SEALED_REJECTED),
+        ("relayfabric_transport_demoted_total", &TRANSPORT_DEMOTED),
     ];
     for (name, c) in counters {
         out.push_str(&format!("# TYPE {name} counter\n{name} {}\n", c.load(Ordering::Relaxed)));
@@ -331,6 +344,7 @@ mod tests {
         assert!(out.contains("relayfabric_sealed_egress_total"));
         assert!(out.contains("relayfabric_sealed_ingress_total"));
         assert!(out.contains("relayfabric_sealed_rejected_total"));
+        assert!(out.contains("relayfabric_transport_demoted_total"));
     }
 
     // ---- federation peer up/down gauge --------------------------------
