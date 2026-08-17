@@ -101,7 +101,15 @@ plainly rather than implying a protection that doesn't exist:
   route above, including config replace/rollback and identity linking —
   and `root` always does, regardless of UID.** There is no per-route, no
   per-user, and no read-only tier: reaching the socket at all is
-  equivalent to full admin.
+  equivalent to full admin. As a second belt on top of the `0700`
+  directory, both `admin.sock` and `plugins.sock` are themselves
+  explicitly locked to mode `0600` right after `bind()` (`bind()` alone
+  leaves a socket file's mode umask-derived, not tightened) — so even if
+  the parent directory's permissions were ever loosened by mistake, the
+  socket files stay owner-only. This is still filesystem-only,
+  defense-in-depth on the *same* same-UID boundary described above, not a
+  new one: it adds no authentication and no per-route/per-user
+  distinction.
 - `switchyardd` binds no network listener by default. Nothing here is
   reachable over a network unless an operator deliberately exposes it (an
   SSH tunnel, a `socat` forward, a reverse proxy) — and doing so without

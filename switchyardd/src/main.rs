@@ -18,7 +18,26 @@ mod secrets;
 mod storage;
 mod transform;
 
+use std::path::Path;
 use std::sync::Arc;
+
+/// Locks a just-bound unix-socket file down to owner-only (0600). The
+/// parent `data_dir` is already created (and, if pre-existing with looser
+/// permissions, tightened) to `0700` by `engine::create_data_dir`, and that
+/// directory is the primary access gate -- but `UnixListener::bind` leaves
+/// the socket file's own mode umask-derived (typically 0644/0755, not
+/// tightened), so a future slip in the directory's permissions (a
+/// misconfigured parent, a bind-mount, a restore from an older install)
+/// would otherwise leave the socket file itself connectable beyond the
+/// owning UID. This is a second belt, not a new gate: it does not add
+/// authentication and does not change the same-UID access model (see
+/// docs/api-reference.md's "Access control & security model"). A failure
+/// here fails startup loudly rather than silently continuing with a
+/// world-accessible socket.
+fn harden_socket(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -60,6 +79,7 @@ fn main() {
         let plugin_sock = data_dir.join("plugins.sock");
         let _ = std::fs::remove_file(&plugin_sock);
         let listener = tokio::net::UnixListener::bind(&plugin_sock).expect("bind plugin socket");
+        harden_socket(&plugin_sock).expect("harden plugin socket permissions");
         tokio::spawn(plugins::listen(daemon.clone(), listener));
         let plugin_configs = daemon.cfg_snapshot(|c| c.plugins.clone());
         for (name, pc) in &plugin_configs {
@@ -78,10 +98,34 @@ fn main() {
         let _ = std::fs::remove_file(&admin_sock);
         let admin_listener =
             tokio::net::UnixListener::bind(&admin_sock).expect("bind admin socket");
+        harden_socket(&admin_sock).expect("harden admin socket permissions");
         tokio::spawn(admin::serve(
             daemon.clone(), std::path::PathBuf::from(config_path), admin_listener));
         tracing::info!(node = daemon.cfg_snapshot(|c| c.node.name.clone()), "switchyardd running");
         tokio::signal::ctrl_c().await.expect("ctrl_c");
         tracing::info!("shutting down");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn harden_socket_locks_a_bound_socket_file_to_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("test.sock");
+        // Bind leaves the file's mode umask-derived (typically 0644/0755,
+        // never as tight as 0600 under a normal umask) -- this is the
+        // pre-condition harden_socket exists to fix.
+        let _listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        let before = std::fs::metadata(&sock_path).unwrap().permissions().mode() & 0o777;
+        assert_ne!(before, 0o600, "test assumption: a fresh bind isn't already 0600");
+
+        harden_socket(&sock_path).unwrap();
+
+        let after = std::fs::metadata(&sock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(after, 0o600, "harden_socket must lock the socket file to owner-only 0600");
+    }
 }
