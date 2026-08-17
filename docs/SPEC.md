@@ -51,25 +51,20 @@ switchyardd
 
 Conceptually:
 
-```text
-                         RelayFabric
+```mermaid
+flowchart TD
+    SY["switchyardd<br/>routing / policy / identity /<br/>queueing / security / audit"]
+    SY --> LXMF
+    SY --> Signal1[Signal]
+    SY --> MeshCore1[MeshCore]
+    SY --> Meshtastic1[Meshtastic]
+    SY --> Bitchat1[Bitchat]
 
-                     ┌─────────────────┐
-                     │   switchyardd   │
-                     │                 │
-                     │ routing         │
-                     │ policy          │
-                     │ identity        │
-                     │ queueing        │
-                     │ security        │
-                     │ audit           │
-                     └────────┬────────┘
-                              │
-          ┌───────────┬───────┼───────┬───────────┐
-          │           │       │       │           │
-        LXMF       Signal  MeshCore Meshtastic Bitchat
-          │           │       │       │           │
-     Reticulum     Signal    LoRa    LoRa       BLE/Nostr
+    LXMF --> Reticulum1[Reticulum]
+    Signal1 --> Signal2[Signal]
+    MeshCore1 --> LoRa1[LoRa]
+    Meshtastic1 --> LoRa2[LoRa]
+    Bitchat1 --> BLE1["BLE/Nostr"]
 ```
 
 ---
@@ -214,36 +209,22 @@ Plugins SHOULD therefore run out-of-process by default.
 
 # 5. High-Level Architecture
 
-```text
- ┌─────────────────────────────────────────────────────────┐
- │                      RelayFabric                        │
- │                                                         │
- │                    switchyardd                          │
- │                                                         │
- │  ┌───────────┐   ┌────────────┐   ┌─────────────────┐ │
- │  │ Ingress   │──►│ Normalizer │──►│ Policy / Router │ │
- │  └───────────┘   └────────────┘   └────────┬────────┘ │
- │                                            │           │
- │                                      ┌─────▼─────┐     │
- │                                      │ Queue     │     │
- │                                      │ Manager   │     │
- │                                      └─────┬─────┘     │
- │                                            │           │
- │                                      ┌─────▼─────┐     │
- │                                      │ Transform │     │
- │                                      └─────┬─────┘     │
- │                                            │           │
- │                                      ┌─────▼─────┐     │
- │                                      │ Egress    │     │
- │                                      └───────────┘     │
- │                                                         │
- └─────────────────────────┬───────────────────────────────┘
-                           │ Plugin IPC
-        ┌──────────────────┼─────────────────────────┐
-        │                  │                         │
-  relay-lxmf         relay-signal            relay-meshtastic
-        │                  │                         │
-      LXMF             signal-cli                  radio
+```mermaid
+flowchart TD
+    subgraph RF["RelayFabric — switchyardd"]
+        Ingress --> Normalizer --> Policy["Policy / Router"]
+        Policy --> Queue["Queue Manager"]
+        Queue --> Transform
+        Transform --> Egress
+    end
+
+    RF -- "Plugin IPC" --> relaylxmf["relay-lxmf"]
+    RF -- "Plugin IPC" --> relaysignal["relay-signal"]
+    RF -- "Plugin IPC" --> relaymeshtastic["relay-meshtastic"]
+
+    relaylxmf --> LXMF
+    relaysignal --> signalcli["signal-cli"]
+    relaymeshtastic --> radio
 ```
 
 ---
@@ -318,14 +299,13 @@ switchyardctl message trace
 
 RelayFabric SHALL support multiple backend styles.
 
-```text
-Plugin
-  │
-  ├── native library
-  ├── native protocol
-  ├── daemon API
-  ├── local socket
-  └── external service
+```mermaid
+flowchart TD
+    Plugin --> NativeLibrary["native library"]
+    Plugin --> NativeProtocol["native protocol"]
+    Plugin --> DaemonAPI["daemon API"]
+    Plugin --> LocalSocket["local socket"]
+    Plugin --> ExternalService["external service"]
 ```
 
 Preference order:
@@ -372,16 +352,12 @@ signal-cli JSON-RPC
 
 Architecture:
 
-```text
-relayfabric-signal
-       │
- SignalBackend API
-       │
- SignalCliBackend
-       │
-   signal-cli
-       │
- Signal service
+```mermaid
+flowchart TD
+    A["relayfabric-signal"] --> B["SignalBackend API"]
+    B --> C["SignalCliBackend"]
+    C --> D["signal-cli"]
+    D --> E["Signal service"]
 ```
 
 The Signal plugin SHALL abstract its backend so that a different implementation can replace `signal-cli` later.
@@ -653,20 +629,12 @@ struct Capabilities {
 
 Before egress:
 
-```text
-canonical message
-       │
-       ▼
-destination capabilities
-       │
-       ▼
-policy
-       │
-       ▼
-transform
-       │
-       ▼
-protocol adapter
+```mermaid
+flowchart TD
+    A["canonical message"] --> B["destination capabilities"]
+    B --> C["policy"]
+    C --> D["transform"]
+    D --> E["protocol adapter"]
 ```
 
 Example:
@@ -887,20 +855,19 @@ LXMF user → Signal user
 
 ### One-to-many
 
-```text
-LXMF room
-   ├→ Signal group
-   └→ MeshCore channel
+```mermaid
+flowchart LR
+    A["LXMF room"] --> B["Signal group"]
+    A --> C["MeshCore channel"]
 ```
 
 ### Many-to-one
 
-```text
-MeshCore
-Meshtastic
-LXMF
-   ↓
-Signal emergency room
+```mermaid
+flowchart TD
+    A[MeshCore] --> D["Signal emergency room"]
+    B[Meshtastic] --> D
+    C[LXMF] --> D
 ```
 
 ### Many-to-many
@@ -1000,17 +967,11 @@ Multiple RelayFabric gateways MAY interconnect.
 
 Example:
 
-```text
-Pasadena RelayFabric
-       │
-       ▼
-DX.PE backbone
-       │
-       ▼
-Desert RelayFabric
-       │
-       ▼
-MeshCore
+```mermaid
+flowchart TD
+    A["Pasadena RelayFabric"] --> B["DX.PE backbone"]
+    B --> C["Desert RelayFabric"]
+    C --> D[MeshCore]
 ```
 
 Federated routing SHOULD preserve gateway provenance.
@@ -1023,13 +984,10 @@ RelayFabric SHALL define three content-security modes.
 
 ## TRANSLATE
 
-```text
-Network A encryption
-       ↓
-     gateway
-    plaintext
-       ↓
-Network B encryption
+```mermaid
+flowchart TD
+    A["Network A encryption"] --> B["gateway plaintext"]
+    B --> C["Network B encryption"]
 ```
 
 Provides maximum compatibility.
@@ -1052,14 +1010,11 @@ This MUST be documented as a trusted gateway mode.
 
 Content is visible to the gateway but carries an origin signature.
 
-```text
-sender
-  ↓ sign
-message
-  ↓
-gateway
-  ↓
-destination verifies
+```mermaid
+flowchart TD
+    A[sender] -- sign --> B[message]
+    B --> C[gateway]
+    C --> D["destination verifies"]
 ```
 
 This protects integrity and provenance when destination software understands RelayFabric signatures.
@@ -1072,21 +1027,14 @@ A gateway may drop a message but cannot silently alter signed content without in
 
 Application-level payload remains encrypted across gateways.
 
-```text
-sender
-  │ encrypt
-  ▼
-ciphertext
-  │
-Network A
-  │
-Gateway
-  │
-Network B
-  │
-recipient
-  ▼
-decrypt
+```mermaid
+flowchart TD
+    A[sender] -- encrypt --> B[ciphertext]
+    B --> C["Network A"]
+    C --> D[Gateway]
+    D --> E["Network B"]
+    E --> F[recipient]
+    F -- decrypt --> G[plaintext]
 ```
 
 The gateway sees only required routing metadata.
@@ -1099,19 +1047,19 @@ This mode requires RelayFabric-aware endpoints or companion applications.
 
 Future SIGNED/OPAQUE operation SHOULD support:
 
-```text
-RelayEnvelope
-├── version
-├── message_id
-├── origin
-├── destination
-├── timestamp
-├── expiration
-├── payload
-├── payload_type
-├── origin_signature
-├── encryption_metadata
-└── gateway_attestations[]
+```mermaid
+flowchart TD
+    RelayEnvelope --> version
+    RelayEnvelope --> message_id
+    RelayEnvelope --> origin
+    RelayEnvelope --> destination
+    RelayEnvelope --> timestamp
+    RelayEnvelope --> expiration
+    RelayEnvelope --> payload
+    RelayEnvelope --> payload_type
+    RelayEnvelope --> origin_signature
+    RelayEnvelope --> encryption_metadata
+    RelayEnvelope --> gateway_attestations["gateway_attestations[]"]
 ```
 
 ---
@@ -1122,14 +1070,11 @@ Each participating gateway MAY append an attestation.
 
 Example:
 
-```text
-Origin signature
-       ↓
-Gateway A attestation
-       ↓
-Gateway B attestation
-       ↓
-Destination
+```mermaid
+flowchart TD
+    A["Origin signature"] --> B["Gateway A attestation"]
+    B --> C["Gateway B attestation"]
+    C --> D[Destination]
 ```
 
 This creates a verifiable transit history without requiring every gateway to be trusted for authorship.
@@ -1320,13 +1265,21 @@ state
 
 # 41. Queue States
 
-```text
-pending
-attempting
-delivered
-failed
-expired
-dead-letter
+```mermaid
+stateDiagram-v2
+    state "dead-letter" as dead_letter
+
+    [*] --> pending
+    pending --> attempting
+    pending --> expired
+    attempting --> delivered
+    attempting --> failed
+    attempting --> expired
+    failed --> attempting: retry
+    failed --> dead_letter
+    delivered --> [*]
+    expired --> [*]
+    dead_letter --> [*]
 ```
 
 ---
@@ -1816,73 +1769,66 @@ Plugins requiring hardware access can receive only required devices.
 
 ## Edge gateway
 
-```text
-Raspberry Pi
-│
-├── switchyardd
-├── RNode
-├── Meshtastic radio
-├── MeshCore radio
-└── IP backhaul
+```mermaid
+flowchart TD
+    RPi["Raspberry Pi"] --> switchyardd
+    RPi --> RNode
+    RPi --> MeshtasticRadio["Meshtastic radio"]
+    RPi --> MeshCoreRadio["MeshCore radio"]
+    RPi --> IPBackhaul["IP backhaul"]
 ```
 
 ---
 
 ## Backbone gateway
 
-```text
-Server / VM
-│
-├── switchyardd
-├── Signal plugin
-├── LXMF plugin
-├── Nostr plugin
-├── MQTT plugin
-└── federation
+```mermaid
+flowchart TD
+    Server["Server / VM"] --> switchyardd
+    Server --> SignalPlugin["Signal plugin"]
+    Server --> LXMFPlugin["LXMF plugin"]
+    Server --> NostrPlugin["Nostr plugin"]
+    Server --> MQTTPlugin["MQTT plugin"]
+    Server --> federation
 ```
 
 ---
 
 ## Hybrid site
 
-```text
-                    Raspberry Pi
+```mermaid
+flowchart TD
+    RPi["Raspberry Pi"] --> switchyardd
+    switchyardd --> RNode
+    switchyardd --> Meshtastic
+    switchyardd --> MeshCore
 
-                    switchyardd
-                         │
-          ┌──────────────┼──────────────┐
-          │              │              │
-       RNode       Meshtastic      MeshCore
-          │              │              │
-      Reticulum         LoRa            LoRa
-                         │
-                     Internet
-                         │
-                       Signal
+    RNode --> Reticulum
+    Meshtastic --> LoRa1[LoRa]
+    MeshCore --> LoRa2[LoRa]
+
+    LoRa1 --> Internet
+    Internet --> Signal
 ```
 
 ---
 
 # 65. Recommended DX.PE Topology
 
-```text
-                       DX.PE Backbone
-                              │
-                   RelayFabric Backbone
-                              │
-                ┌─────────────┼─────────────┐
-                │             │             │
-              Signal        Nostr         MQTT
-                │
-          BackboneInterface
-                │
-          Pasadena Gateway
-                │
-           switchyardd
-          ┌─────┼─────┐
-          │     │     │
-        RNode  Mesh  Meshtastic
-               Core
+```mermaid
+flowchart TD
+    DXPE["DX.PE Backbone"] --> RFBackbone["RelayFabric Backbone"]
+    RFBackbone --> Signal
+    RFBackbone --> Nostr
+    RFBackbone --> MQTT
+
+    Signal --> BackboneInterface
+    BackboneInterface --> PasadenaGateway["Pasadena Gateway"]
+    PasadenaGateway --> switchyardd
+
+    switchyardd --> RNode
+    switchyardd --> MeshCore
+    switchyardd --> Meshtastic
 ```
 
 Other RelayFabric sites can connect to the same backbone.
@@ -2221,12 +2167,9 @@ Backward compatibility SHOULD be maintained within a major version.
 
 A future RelayFabric-to-RelayFabric protocol SHOULD transmit canonical envelopes directly.
 
-```text
-switchyardd A
-      │
- encrypted authenticated connection
-      │
-switchyardd B
+```mermaid
+flowchart TD
+    A["switchyardd A"] -- "encrypted authenticated connection" --> B["switchyardd B"]
 ```
 
 This avoids unnecessary translation through another messaging protocol.
@@ -2268,14 +2211,10 @@ A remote RelayFabric node SHOULD continue serving local protocols when backbone 
 
 Example:
 
-```text
-Internet X
-
-Meshtastic
-    │
-RelayFabric
-    │
-Reticulum LoRa
+```mermaid
+flowchart TD
+    Internet["Internet (unavailable)"]
+    Meshtastic --> RelayFabric --> ReticulumLoRa["Reticulum LoRa"]
 ```
 
 Local cross-protocol communication may continue even without Internet connectivity.
@@ -2339,35 +2278,34 @@ Security:
 
 Recommended:
 
-```text
-relayfabric/
-│
-├── Cargo.toml
-├── crates/
-│   ├── relay-core/
-│   ├── relay-protocol/
-│   ├── relay-policy/
-│   ├── relay-storage/
-│   ├── relay-ipc/
-│   └── relay-sdk/
-│
-├── switchyardd/
-├── switchyardctl/
-│
-├── plugins/
-│   ├── lxmf/
-│   ├── signal/
-│   ├── meshtastic/
-│   ├── meshcore/
-│   ├── bitchat/
-│   ├── nostr/
-│   └── mqtt/
-│
-├── schemas/
-├── examples/
-├── packaging/
-├── docs/
-└── tests/
+```mermaid
+flowchart TD
+    root["relayfabric/"] --> CargoToml["Cargo.toml"]
+    root --> crates["crates/"]
+    crates --> relaycore["relay-core/"]
+    crates --> relayprotocol["relay-protocol/"]
+    crates --> relaypolicy["relay-policy/"]
+    crates --> relaystorage["relay-storage/"]
+    crates --> relayipc["relay-ipc/"]
+    crates --> relaysdk["relay-sdk/"]
+
+    root --> switchyardd["switchyardd/"]
+    root --> switchyardctl["switchyardctl/"]
+
+    root --> plugins["plugins/"]
+    plugins --> lxmf["lxmf/"]
+    plugins --> signal["signal/"]
+    plugins --> meshtastic["meshtastic/"]
+    plugins --> meshcore["meshcore/"]
+    plugins --> bitchat["bitchat/"]
+    plugins --> nostr["nostr/"]
+    plugins --> mqtt["mqtt/"]
+
+    root --> schemas["schemas/"]
+    root --> examples["examples/"]
+    root --> packaging["packaging/"]
+    root --> docs["docs/"]
+    root --> tests["tests/"]
 ```
 
 ---
@@ -2692,12 +2630,10 @@ RelayFabric must never imply that protocol translation preserves native end-to-e
 
 For normal translated traffic:
 
-```text
-Network A E2EE
-       ↓
- RelayFabric
-       ↓
-Network B E2EE
+```mermaid
+flowchart TD
+    A["Network A E2EE"] --> B[RelayFabric]
+    B --> C["Network B E2EE"]
 ```
 
 RelayFabric is a trusted content endpoint.
@@ -2750,30 +2686,24 @@ The same core routing model should apply to both.
 
 # 109. Example Pasadena Deployment
 
-```text
-                       DX.PE Backbone
-                              │
-                    ┌─────────┴─────────┐
-                    │                   │
-              RelayFabric Core      Internet
-                 switchyardd             │
-                    │                  Signal
-                    │
-              BackboneInterface
-                    │
-             Pasadena RF Site
-                    │
-              Raspberry Pi 5
-                    │
-               switchyardd
-          ┌─────────┼─────────┐
-          │         │         │
-        RNode    MeshCore  Meshtastic
-          │         │         │
-       915 MHz   915 MHz    915 MHz
-          │         │         │
-       RNS users MeshCore  Meshtastic
-                   users      users
+```mermaid
+flowchart TD
+    DXPE["DX.PE Backbone"] --> Core["RelayFabric Core switchyardd"]
+    DXPE --> Internet
+
+    Internet --> Signal
+    Core --> BackboneInterface
+    BackboneInterface --> PasadenaSite["Pasadena RF Site"]
+    PasadenaSite --> RPi5["Raspberry Pi 5"]
+    RPi5 --> SY[switchyardd]
+
+    SY --> RNode
+    SY --> MeshCore
+    SY --> Meshtastic
+
+    RNode --> RNodeFreq["915 MHz"] --> RNSUsers["RNS users"]
+    MeshCore --> MeshCoreFreq["915 MHz"] --> MeshCoreUsers["MeshCore users"]
+    Meshtastic --> MeshtasticFreq["915 MHz"] --> MeshtasticUsers["Meshtastic users"]
 ```
 
 Traffic can be selectively routed:
@@ -2794,43 +2724,27 @@ without requiring any protocol to become the RelayFabric internal transport.
 
 RelayFabric consists of five principal layers:
 
-```text
-┌──────────────────────────────────────────────┐
-│ 5. Native Networks                          │
-│ Signal / LXMF / MeshCore / Meshtastic / ... │
-├──────────────────────────────────────────────┤
-│ 4. Protocol Plugins                         │
-├──────────────────────────────────────────────┤
-│ 3. Canonical Message + Identity Model       │
-├──────────────────────────────────────────────┤
-│ 2. Routing / Policy / Security / Queueing   │
-├──────────────────────────────────────────────┤
-│ 1. switchyardd                              │
-└──────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    L5["5. Native Networks<br/>Signal / LXMF / MeshCore / Meshtastic / ..."]
+    L4["4. Protocol Plugins"]
+    L3["3. Canonical Message + Identity Model"]
+    L2["2. Routing / Policy / Security / Queueing"]
+    L1["1. switchyardd"]
+
+    L5 --> L4 --> L3 --> L2 --> L1
 ```
 
 The fundamental model is:
 
-```text
-       Native Network A
-              │
-              ▼
-            Plugin
-              │
-              ▼
-      Canonical Envelope
-              │
-              ▼
-     Policy + Switchyard
-              │
-              ▼
-     Queue + Transformation
-              │
-              ▼
-            Plugin
-              │
-              ▼
-       Native Network B
+```mermaid
+flowchart TD
+    A["Native Network A"] --> B1[Plugin]
+    B1 --> C["Canonical Envelope"]
+    C --> D["Policy + Switchyard"]
+    D --> E["Queue + Transformation"]
+    E --> B2[Plugin]
+    B2 --> F["Native Network B"]
 ```
 
 RelayFabric therefore becomes a general-purpose communications interoperability layer capable of spanning:
@@ -2898,20 +2812,20 @@ Advertisements SHALL be signed (Ed25519) by the RelayFabric node identity so pee
 
 Nodes advertise **services** (chat, emergency-messaging, store-and-forward, telemetry, git, …); protocols describe *how those services are reachable*:
 
-```text
-DX.PE Pasadena
-│
-├── chat
-│    ├── LXMF
-│    ├── Meshtastic
-│    └── Signal
-│
-├── telemetry
-│    ├── Meshtastic
-│    └── MQTT
-│
-└── git
-     └── rngit / Reticulum
+```mermaid
+flowchart TD
+    Node["DX.PE Pasadena"] --> Chat[chat]
+    Node --> Telemetry[telemetry]
+    Node --> Git[git]
+
+    Chat --> ChatLXMF[LXMF]
+    Chat --> ChatMeshtastic[Meshtastic]
+    Chat --> ChatSignal[Signal]
+
+    Telemetry --> TelemetryMeshtastic[Meshtastic]
+    Telemetry --> TelemetryMQTT[MQTT]
+
+    Git --> GitBackend["rngit / Reticulum"]
 ```
 
 Another node can then ask "can you deliver chat toward Signal?" without caring how the gateway is implemented.
@@ -2969,14 +2883,12 @@ Advertisements MAY later carry broad, coarse cost classes (`bandwidth_class`, `l
 
 ## 111.7 Architecture
 
-```text
-              RelayFabric Node Advertisement
-                         │
-              signed capability document
-                         │
-           ┌─────────────┼─────────────┐
-           │             │             │
-       Protocols      Services      Security
+```mermaid
+flowchart TD
+    A["RelayFabric Node Advertisement"] --> B["signed capability document"]
+    B --> Protocols
+    B --> Services
+    B --> Security
 ```
 
 Signed advertisements flowing between `switchyardd` peers give the decentralized intermesh **service discovery without a central directory**.
@@ -3083,8 +2995,16 @@ federation:
 
 ## 112.7 Trust levels
 
-```text
-UNKNOWN → SEEN → VERIFIED → TRUSTED    (and BLOCKED)
+```mermaid
+stateDiagram-v2
+    [*] --> UNKNOWN
+    UNKNOWN --> SEEN
+    SEEN --> VERIFIED
+    VERIFIED --> TRUSTED
+    UNKNOWN --> BLOCKED
+    SEEN --> BLOCKED
+    VERIFIED --> BLOCKED
+    TRUSTED --> BLOCKED
 ```
 
 A newly discovered node might be allowed basic chat but not administrative commands, identity linking, large files, or expensive gateways until trusted. **Discovery must never automatically become trust.**
