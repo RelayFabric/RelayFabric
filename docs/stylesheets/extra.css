@@ -1,0 +1,22 @@
+/* Mermaid diagrams: full-width, centered, scroll on overflow */
+.mermaid svg {
+  max-width: 100% !important;
+}
+
+.mermaid {
+  overflow-x: auto;
+  text-align: center;
+}
+
+/* Wide tables scroll inside their own container instead of the page body */
+.md-typeset__table {
+  overflow-x: auto;
+}
+
+/* Slightly richer purple for the primary brand on both schemes */
+:root {
+  --md-primary-fg-color: #5e35b1;        /* deep-purple 600 */
+  --md-primary-fg-color--light: #7e57c2; /* deep-purple 400 */
+  --md-primary-fg-color--dark: #4527a0;  /* deep-purple 800 */
+  --md-accent-fg-color: #7c4dff;         /* purple A200 */
+}

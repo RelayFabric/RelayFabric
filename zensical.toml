@@ -1,0 +1,54 @@
+[project]
+site_name = "RelayFabric Documentation"
+copyright = "Copyright &copy; 2026 RelayFabric contributors"
+site_url = "https://jaschadub.github.io/RelayFabric/"
+site_description = "A protocol-independent, plugin-based communications routing fabric — bridge Reticulum/LXMF, Signal, Meshtastic, MeshCore, Nostr, Bitchat, and MQTT through one routing, policy, identity, and security layer."
+repo_url = "https://github.com/jaschadub/RelayFabric"
+repo_name = "jaschadub/RelayFabric"
+nav = [
+  {"Home" = "index.md"},
+  {"Getting Started" = "getting-started.md"},
+  {"Architecture" = "architecture.md"},
+  {"Configuration" = "configuration.md"},
+  {"Plugins" = "plugins.md"},
+  {"Routing & Policy" = "routing.md"},
+  {"Identity & Privacy" = "identity.md"},
+  {"Transport Classes" = "transport-classes.md"},
+  {"Security & Sealed Routing" = "security.md"},
+  {"Federation & Discovery" = "federation.md"},
+  {"Operations" = "operations.md"},
+  {"Live & Field Testing" = "live-testing.md"},
+  {"Plugin Authoring" = "plugin-authors.md"},
+  {"API Reference" = "api-reference.md"},
+  {"Specification" = "SPEC.md"},
+]
+
+extra_css = ["stylesheets/extra.css"]
+
+[project.theme]
+language = "en"
+
+# Dark mode default (slate), with a toggle to light. Purple brand.
+[[project.theme.palette]]
+scheme = "slate"
+primary = "deep-purple"
+accent = "purple"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+scheme = "default"
+primary = "deep-purple"
+accent = "purple"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to dark mode"
+
+[project.theme.features]
+navigation = ["navigation.tabs", "navigation.sections", "navigation.top", "navigation.footer", "navigation.tracking"]
+search = ["search.suggest", "search.highlight"]
+content = ["content.code.copy", "content.code.annotate"]
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/jaschadub/RelayFabric"
+name = "RelayFabric on GitHub"

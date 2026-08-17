@@ -7,3 +7,7 @@ __pycache__/
 /.claude/
 /.superpowers/
 /docs/superpowers/
+
+# zensical documentation build output
+/site/
+/.cache/
