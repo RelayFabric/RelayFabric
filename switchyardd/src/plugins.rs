@@ -107,6 +107,13 @@ pub async fn supervise(d: Arc<Daemon>, name: String, command: String, socket: Pa
             .env("RELAYFABRIC_SOCKET", &socket)
             .env("RELAYFABRIC_PLUGIN_NAME", &name)
             .env("RELAYFABRIC_PLUGIN_CONFIG", &cfg_json)
+            // Python block-buffers stdout when it's a pipe (not a tty), so a
+            // long-running plugin's diagnostic logs (e.g. the LXMF plugin's
+            // RNS.log lines) never reach the inherited daemon log until the
+            // process exits -- they simply vanish in production. Force
+            // unbuffered so plugin logs surface live. Harmless for the Rust
+            // plugins, which don't read it.
+            .env("PYTHONUNBUFFERED", "1")
             .spawn();
         let started = Instant::now();
         match child {
