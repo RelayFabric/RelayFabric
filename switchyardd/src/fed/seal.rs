@@ -14,10 +14,9 @@
 //! `unseal`'s doc comment.
 //!
 //! `seal` is wired into federation egress (`engine::process_due_fed`'s
-//! `security_mode: sealed` branch, Task 4, design §4). `unseal` is not yet
-//! wired into federation ingress (`engine::fed_ingress`'s `Fed::Sealed`
-//! arm, Task 5, design §5) -- that remains this module's one open
-//! consumer.
+//! `security_mode: sealed` branch, Task 4, design §4). `unseal` is wired
+//! into federation ingress (`engine::fed_sealed_ingress`, Task 5, design
+//! §5), reached via `fed::conn::handle_frame`'s `Fed::Sealed` arm.
 
 use crypto_box::aead::{Aead, AeadCore};
 use crypto_box::{ChaChaBox, PublicKey, SecretKey};
@@ -274,13 +273,9 @@ fn seal_fixed(
 /// 5. Assert `inner_id == sealed.id && inner_expires_at ==
 ///    sealed.expires_at` -- the header/inner binding (design §2) -- else
 ///    `SealError::BadBinding`.
-/// 6. Return `canonical_env_cbor`. The CALLER (`engine::fed_ingress`, a
-///    later task) is responsible for everything downstream: CBOR-decoding
-///    it as an `Envelope`, `fed::sign::verify_chain`, trust, dedup.
-///
-/// `#[allow(dead_code)]`: not yet wired into federation ingress (consumed
-/// by `engine::fed_ingress`'s `Fed::Sealed` arm, Task 5, design §5).
-#[allow(dead_code)]
+/// 6. Return `canonical_env_cbor`. The CALLER (`engine::fed_sealed_ingress`,
+///    Task 5) is responsible for everything downstream: CBOR-decoding it
+///    as an `Envelope`, `fed::sign::verify_chain`, trust, dedup.
 pub fn unseal(sealed: &SealedEnvelope, own_secret: &SecretKey) -> Result<Vec<u8>, SealError> {
     if sealed.alg != SEAL_ALG_V1 {
         return Err(SealError::UnsupportedAlg);

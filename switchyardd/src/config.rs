@@ -210,8 +210,10 @@ pub struct RouteConfig {
     /// termination point (SECURITY_DOWNGRADE_REFUSED). Not validated at
     /// --check-config (only `security_mode` + `privacy.minimum_security` +
     /// a sealed peer's `sealed_key` are, per design §3's three-item
-    /// rejection list); resolving/consuming this override is Task 5's job
-    /// (ingress downgrade refusal) -- inert this task beyond shape parsing.
+    /// rejection list). Resolved (this field vs. the node's
+    /// `privacy.allow_gateway_decryption` floor) by
+    /// `effective_allow_gateway_decryption`, below -- consumed by Task 5's
+    /// `engine::fed_sealed_ingress` downgrade-refusal gate.
     #[serde(default)]
     pub allow_gateway_decryption: Option<bool>,
 }
@@ -413,7 +415,9 @@ pub struct PrivacyConfig {
     /// gateway decryption point). Default `true` (today's only possible
     /// behavior -- every pre-cycle-H node IS such a termination point).
     /// `RouteConfig::allow_gateway_decryption` overrides this per route when
-    /// set. Read at ingress (Task 5), not validated at --check-config.
+    /// set -- see `effective_allow_gateway_decryption`, below, for the
+    /// resolution. Read at ingress (Task 5's `engine::fed_sealed_ingress`),
+    /// not validated at --check-config.
     #[serde(default = "default_allow_gateway_decryption")]
     pub allow_gateway_decryption: bool,
     /// Whether a `sealed`-floor node may still accept/emit a lower-security
@@ -870,17 +874,35 @@ fn validate_privacy(cfg: &Config) -> Result<(), String> {
 }
 
 /// Rank for `RouteConfig::security_mode`/`PrivacyConfig::minimum_security`
-/// ordering comparisons (design §113.2: "sealed > gateway"). Callers only
-/// ever pass an already-validated value (`validate()` runs the {gateway,
-/// sealed} value check on both fields before any ranking comparison); any
-/// other string ranks as `gateway`'s floor (0) defensively rather than
-/// panicking, since a rank comparison must never be the thing that panics
-/// on operator input.
+/// ordering comparisons (design §113.2: "sealed > gateway"). `validate()`'s
+/// routes loop DOES check `r.security_mode` is one of {gateway, sealed}
+/// immediately before ranking it here -- but `cfg.privacy.minimum_security`,
+/// the OTHER value ranked at that same call site, isn't checked until
+/// `validate_privacy` runs, later, AFTER the routes loop (harmless: an
+/// invalid `minimum_security` string just ranks at `gateway`'s floor (0)
+/// below, so the comparison still fails closed either way -- but the order
+/// is looser than "both fields validated before any ranking" might imply).
+/// Any unrecognized string ranks as `gateway`'s floor (0) defensively
+/// rather than panicking, since a rank comparison must never be the thing
+/// that panics on operator input.
 fn security_rank(mode: &str) -> u8 {
     match mode {
         "sealed" => 1,
         _ => 0,
     }
+}
+
+/// Resolves whether `route` may terminate a sealed inbound envelope by
+/// decrypting it for delivery to a plaintext leg (design §5, SPEC §113.2,
+/// Task 5): `route.allow_gateway_decryption`'s `Some(_)` wins when set,
+/// else the node-level `cfg.privacy.allow_gateway_decryption` floor
+/// applies. The ACTUAL shared resolution point Task 3's config-parsing
+/// doc comments only ever described in prose (`RouteConfig::
+/// allow_gateway_decryption`'s own doc comment, above) -- `false` here is
+/// what `engine::fed_sealed_ingress`'s downgrade-refusal gate dead-letters
+/// `SECURITY_DOWNGRADE_REFUSED` on.
+pub(crate) fn effective_allow_gateway_decryption(cfg: &Config, route: &RouteConfig) -> bool {
+    route.allow_gateway_decryption.unwrap_or(cfg.privacy.allow_gateway_decryption)
 }
 
 /// Design §3/§113.2 validation specific to a `security_mode: sealed` route,
@@ -2714,6 +2736,36 @@ federation:
     #[test]
     fn security_rank_orders_sealed_above_gateway() {
         assert!(security_rank("sealed") > security_rank("gateway"));
+    }
+
+    // ---- effective_allow_gateway_decryption (Task 5, design §5/§113.2) ----
+
+    #[test]
+    fn effective_allow_gateway_decryption_defers_to_node_privacy_when_route_unset() {
+        let mut cfg = parse(GOOD).unwrap();
+        assert_eq!(cfg.routes[0].allow_gateway_decryption, None, "fixture sanity check");
+        cfg.privacy.allow_gateway_decryption = true;
+        assert!(effective_allow_gateway_decryption(&cfg, &cfg.routes[0]));
+        cfg.privacy.allow_gateway_decryption = false;
+        assert!(!effective_allow_gateway_decryption(&cfg, &cfg.routes[0]));
+    }
+
+    #[test]
+    fn effective_allow_gateway_decryption_route_override_true_wins_over_node_false() {
+        let mut cfg = parse(GOOD).unwrap();
+        cfg.privacy.allow_gateway_decryption = false;
+        cfg.routes[0].allow_gateway_decryption = Some(true);
+        assert!(effective_allow_gateway_decryption(&cfg, &cfg.routes[0]),
+            "an explicit route-level true must win over the node's false floor");
+    }
+
+    #[test]
+    fn effective_allow_gateway_decryption_route_override_false_wins_over_node_true() {
+        let mut cfg = parse(GOOD).unwrap();
+        cfg.privacy.allow_gateway_decryption = true;
+        cfg.routes[0].allow_gateway_decryption = Some(false);
+        assert!(!effective_allow_gateway_decryption(&cfg, &cfg.routes[0]),
+            "an explicit route-level false must win even when the node default is true");
     }
 
     // ---- privacy floor (node-level, design §3, SPEC §113.2, cycle H) ------

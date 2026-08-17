@@ -1,5 +1,7 @@
 use crate::cas::{self, Cas};
-use crate::config::{Config, RouteConfig, FED_PROTOCOL, IDENTITY_ROUTE};
+use crate::config::{
+    effective_allow_gateway_decryption, Config, RouteConfig, FED_PROTOCOL, IDENTITY_ROUTE,
+};
 use crate::events::Event;
 use crate::limits::{BudgetLimiter, SenderLimiter};
 use crate::storage::Store;
@@ -923,6 +925,305 @@ pub fn fed_ingress(
     }
 
     metrics::inc(&metrics::FED_INGRESS);
+    FedIngressOutcome::Accepted(env.id)
+}
+
+/// Per-peer throttle for `fed_sealed_ingress`'s rejection warn lines --
+/// same shape/rationale as `PRE_TRUST_REJECT_WARN_THROTTLE`/
+/// `warn_pre_trust_rejection` above (Task 4 review fix round 1), kept in
+/// its OWN map rather than sharing that one: EVERY `fed_sealed_ingress`
+/// rejection reason (alg/expiry/bad-seal/bad-binding/bad-sig/trust/route/
+/// downgrade-refused) is `Persistence::NoPersist` here, not just the
+/// pre-trust subset cycle-F's own split names -- see `sealed_reject`'s doc
+/// comment for why.
+static SEALED_REJECT_WARN_THROTTLE: std::sync::LazyLock<Mutex<HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Rejects a `fed_sealed_ingress` gate failure (design §5): bumps
+/// `SEALED_REJECTED` unconditionally, logs a per-peer-throttled warn (1/min,
+/// reusing `PRE_TRUST_REJECT_WARN_INTERVAL`), and returns the `Rejected`
+/// outcome -- NEVER touches storage, for every named reason this returns.
+///
+/// This is a stricter posture than `fed_ingress`'s own `Persistence` split:
+/// there, `HOP_LIMIT`/`ROUTE_NOT_FEDERATED` persist a dead_letter row
+/// because they're only reachable once a peer has already cleared the
+/// trust gate. `fed_sealed_ingress` never persists ANY rejection, even
+/// post-trust ones (`ROUTE_NOT_FEDERATED`/`SECURITY_DOWNGRADE_REFUSED`),
+/// for two independent reasons: (1) the pre-decode gates (alg/header-
+/// expiry/bad-seal/bad-binding/malformed-decode) run BEFORE signature
+/// verification, so -- unlike cycle-F's HOP_LIMIT/ROUTE_NOT_FEDERATED --
+/// they're reachable by ANY peer that merely completed a Noise handshake,
+/// the identical DoS concern that motivates `Persistence::NoPersist` in
+/// the first place; (2) `SECURITY_DOWNGRADE_REFUSED` specifically means
+/// "this route will not be a sealed->plaintext termination point" (design
+/// §113.2) -- writing the just-decrypted envelope into this daemon's own
+/// `dead_letter` table (queryable via the admin DLQ surface) on that exact
+/// path would make the refusal cosmetic, not real. Keeping the posture
+/// uniform across every reason (rather than splitting pre-/post-trust
+/// like `fed_ingress` does) means "sealed ingress never persists a
+/// rejection, full stop" is a single, easily-audited invariant.
+fn sealed_reject(peer_node_id: &str, reason: &'static str) -> FedIngressOutcome {
+    metrics::inc(&metrics::SEALED_REJECTED);
+    let now = Instant::now();
+    let mut throttle = SEALED_REJECT_WARN_THROTTLE.lock().unwrap();
+    let should_warn = match throttle.get(peer_node_id) {
+        Some(last) => now.duration_since(*last) >= PRE_TRUST_REJECT_WARN_INTERVAL,
+        None => true,
+    };
+    if should_warn {
+        throttle.insert(peer_node_id.to_string(), now);
+    }
+    drop(throttle);
+    if should_warn {
+        warn!(peer = %fed::short_node_id(peer_node_id), reason,
+              "sealed federation ingress rejected (not persisted; further repeats from this \
+               peer are throttled to 1/min)");
+    }
+    FedIngressOutcome::Rejected(reason)
+}
+
+/// Sealed federation ingress (design §5, SPEC §113.2/§113.5, cycle H, Task
+/// 5): the receive side of `Fed::Sealed` (egress: `process_due_fed_sealed`,
+/// Task 4). Unlike `fed_ingress`'s single verified `Envelope`, this starts
+/// from OPAQUE ciphertext plus a small cleartext header (`SealedEnvelope`'s
+/// `alg`/`id`/`expires_at`) and must earn its way to a decrypted `Envelope`
+/// before any of `fed_ingress`'s own gates even apply. Full gate order,
+/// FAIL CLOSED at every step (`sealed_reject` -- see its doc comment for
+/// why NOTHING here ever persists a rejection, unlike `fed_ingress`):
+///
+/// 1. `sealed.alg` supported -> else `UNSUPPORTED_SEAL_ALG`.
+/// 2. `sealed.expires_at` (cleartext header) > now -> else `EXPIRED`
+///    (mirrors cycle-F's own header-level expiry check, but this is the
+///    SEALED header, unsigned and sender-set -- the SIGNED inner
+///    `created_at` gets its own independent bound at step 10, below).
+/// 3. Dedup PEEK on `id+expiry` (design §113.5: "dedup keys on id+expiry,
+///    NOT sender -- sealed sender is opaque"). Duplicate -> silent drop
+///    (`DUPLICATE`, mirrors `fed_ingress`'s own dedup category: no
+///    `sealed_reject`, no persistence, just the shared `DUPLICATES`
+///    metric). Peek-only: anything rejected below must not be recorded as
+///    seen yet.
+/// 4. `fed::seal::unseal` with THIS node's OWN `sealed_key` -> `SealError`
+///    maps to `UNSUPPORTED_SEAL_ALG`/`BAD_SEAL`/`BAD_BINDING` (the header/
+///    inner id+expiry binding check is inside `unseal` itself).
+/// 5. CBOR-decode the unsealed plaintext as an `Envelope` -> malformed
+///    (decrypted-but-not-a-valid-Envelope) -> `BAD_SEAL`, via
+///    `ciborium::from_reader`'s own `Result`, never a panic on
+///    attacker-shaped-but-successfully-decrypted bytes.
+/// 6. Priority strip (cycle-F's CONTROLLER RULING, design §5: applies
+///    identically here -- `priority` is deliberately unsigned, so a sealed
+///    envelope must not carry an emergency-budget bypass any more than a
+///    cleartext federated one can). Applied before `verify_chain` (safe:
+///    `fed::sign::canonical_bytes` never includes `priority`) and before
+///    every gate below, so nothing downstream ever sees the remote-claimed
+///    value.
+/// 7. `fed::sign::verify_chain` (origin sig over the DECODED envelope) ->
+///    else `BAD_SIGNATURE`.
+/// 8. `federation` config present -> else `FED_CONFIG_MISSING`.
+/// 9. Trust gate (`peer_node_id`'s stored level >= `accept_from`) -> else
+///    `TRUST_DENIED`.
+/// 10. Replay-window bound (final-review I-1's cycle-F fix, reused
+///     verbatim here on the now-decrypted, SIGNED `created_at`): stale
+///     (older than `max_ttl_secs`) or far-future (clock-skew abuse) ->
+///     `EXPIRED`. This is INDEPENDENT of step 2's header-level check --
+///     step 2 only bounds the unsigned sealed header, which the connected
+///     peer fully controls; this step bounds the SIGNED inner timestamp,
+///     closing the same post-restart/post-dedup-eviction replay gap I-1
+///     closed for cycle-F.
+/// 11. TTL clamp: `env.expires_at` (also unsigned, also attacker-settable)
+///     clamped DOWN to `max_ttl_secs` from now, never extended, never a
+///     rejection -- same posture as `fed_ingress`'s own clamp.
+/// 12. `target_route` ∈ `federation.ingress_routes` -> else
+///     `ROUTE_NOT_FEDERATED`.
+/// 13. `target_route` resolves to a real `RouteConfig` -> else
+///     `FED_CONFIG_MISSING` (defensive, same as `fed_ingress`).
+/// 14. **DOWNGRADE REFUSAL (design §113.2, the reason this task exists):**
+///     `config::effective_allow_gateway_decryption` resolves the target
+///     route's floor (route override wins over the node's
+///     `privacy.allow_gateway_decryption` default) -> `false` ->
+///     `SECURITY_DOWNGRADE_REFUSED`, and the decrypted content is NEVER
+///     persisted or fanned out -- phase 1 has no sealed relay-onward, so a
+///     route that refuses to be a sealed->plaintext termination point
+///     simply, honestly refuses (design §113.3's "delivering to a local
+///     plaintext plugin IS a gateway decryption at the destination edge").
+/// 15. Per-sender quota (design §113.5): sealed has no cleartext sender,
+///     so this keys the SAME `SenderLimiter` plugin/`fed_ingress` ingress
+///     uses on `("fed-sealed", peer_node_id)` instead of a native_ref --
+///     documented: sealed traffic is rate-limited per-PEER, not
+///     per-origin-user, since the origin is opaque by design. Exceeded ->
+///     silent drop (`RATE_LIMITED`, shared `RATELIMITED` metric, mirrors
+///     `fed_ingress`'s own category -- no `sealed_reject`).
+/// 16. Dedup RECORD, persist the decrypted envelope + attachment refs,
+///     `fan_out_deliveries` into `target_route`'s destinations (the EXACT
+///     same helper `fed_ingress` uses -- the delivered envelope is the
+///     decrypted one, indistinguishable downstream from any other
+///     federated arrival), `SEALED_INGRESS` metric, `Accepted(env.id)` ->
+///     the caller (`fed::conn::handle_frame`) replies `Fed::Ack{id}`,
+///     exactly mirroring `fed_ingress`'s own Accepted handling.
+pub fn fed_sealed_ingress(
+    d: &Daemon,
+    peer_node_id: &str,
+    sealed: fed::seal::SealedEnvelope,
+    target_route: String,
+) -> FedIngressOutcome {
+    if sealed.alg != fed::seal::SEAL_ALG_V1 {
+        return sealed_reject(peer_node_id, "UNSUPPORTED_SEAL_ALG");
+    }
+
+    if sealed.expires_at <= Utc::now().timestamp() {
+        return sealed_reject(peer_node_id, "EXPIRED");
+    }
+
+    // Dedup peek (design §113.5: "dedup keys on id+expiry, NOT sender --
+    // sealed sender is opaque"). Both fields are the CLEARTEXT sealed
+    // header (readable pre-decrypt), matching `fed_ingress`'s own
+    // peek-before-persist split: anything rejected below must not be
+    // recorded as seen yet.
+    let dedup_key = format!("sealed:{}:{}", sealed.id, sealed.expires_at);
+    if d.dedup.lock().unwrap().is_duplicate(&dedup_key, Instant::now()) {
+        metrics::inc(&metrics::DUPLICATES);
+        return FedIngressOutcome::Rejected("DUPLICATE");
+    }
+
+    let canonical_env_cbor = match fed::seal::unseal(&sealed, d.sealed_key.secret()) {
+        Ok(bytes) => bytes,
+        // Defensive/unreachable in practice: step 1 above already checked
+        // `sealed.alg`, so `unseal`'s own identical first check can never
+        // actually fire here -- kept as an explicit arm (not folded into
+        // `BAD_SEAL`) so the mapping stays exhaustive and self-documenting
+        // if `unseal`'s gate order ever changes.
+        Err(fed::seal::SealError::UnsupportedAlg) => {
+            return sealed_reject(peer_node_id, "UNSUPPORTED_SEAL_ALG");
+        }
+        Err(fed::seal::SealError::BadSeal) => return sealed_reject(peer_node_id, "BAD_SEAL"),
+        Err(fed::seal::SealError::BadBinding) => return sealed_reject(peer_node_id, "BAD_BINDING"),
+    };
+
+    // Malformed-but-successfully-decrypted plaintext (the "tampered
+    // ciphertext that happens to decrypt to non-Envelope CBOR" case is
+    // cryptographically implausible under AEAD, but a HONEST sender could
+    // still seal garbage) must fail closed via `Result`, never panic.
+    let mut env: Envelope = match ciborium::from_reader(canonical_env_cbor.as_slice()) {
+        Ok(env) => env,
+        Err(_) => return sealed_reject(peer_node_id, "BAD_SEAL"),
+    };
+
+    // CONTROLLER RULING (cycle-F, Task 2 review; applies identically to
+    // sealed ingress, design §5): strip the decrypted envelope's priority
+    // to the default BEFORE anything else runs -- `priority` is
+    // deliberately unsigned (`fed::sign::canonical_bytes` never includes
+    // it), so this is safe to do before `verify_chain` below, and doing it
+    // this early means no downstream gate/log/persisted copy ever sees
+    // the remote-claimed value.
+    env.priority = "normal".to_string();
+
+    if fed::sign::verify_chain(&env).is_err() {
+        return sealed_reject(peer_node_id, "BAD_SIGNATURE");
+    }
+
+    let fed_cfg = d.cfg_snapshot(|c| c.federation.clone());
+    let Some(fed_cfg) = fed_cfg else {
+        // Federation config vanished from under a live connection -- a
+        // config-invariant violation this daemon's own operator caused,
+        // never an untrusted peer (same defensive posture as
+        // `fed_ingress`'s identical check).
+        return sealed_reject(peer_node_id, "FED_CONFIG_MISSING");
+    };
+
+    let level = d.store.lock().unwrap().trust_level(peer_node_id).unwrap_or(None);
+    let level_str = level.as_deref().unwrap_or("unknown");
+    if trust_rank(level_str) < trust_rank(&fed_cfg.accept_from) {
+        return sealed_reject(peer_node_id, "TRUST_DENIED");
+    }
+
+    // Replay-window bound (final-review I-1, reused verbatim from
+    // `fed_ingress` -- see this function's doc comment, step 10, for why
+    // this is independent of the header-level expiry check above): the
+    // SIGNED `created_at` is the only trustworthy time claim; the sealed
+    // header's `expires_at` and the envelope's own `expires_at` are both
+    // unsigned and peer-controlled.
+    const MAX_CREATED_AT_SKEW_SECS: i64 = 300;
+    let ingress_now = Utc::now();
+    let stale = env.created_at + CDuration::seconds(fed_cfg.max_ttl_secs as i64) < ingress_now;
+    let far_future = env.created_at > ingress_now + CDuration::seconds(MAX_CREATED_AT_SKEW_SECS);
+    if stale || far_future {
+        return sealed_reject(peer_node_id, "EXPIRED");
+    }
+
+    // TTL clamp (mirrors `fed_ingress`'s own, design §4): never a
+    // rejection, just bounds what gets persisted -- the envelope's own
+    // `expires_at` is unsigned and peer-controlled, same as the sealed
+    // header's.
+    let capped = Utc::now() + CDuration::seconds(fed_cfg.max_ttl_secs as i64);
+    if env.expires_at > capped {
+        env.expires_at = capped;
+    }
+
+    if !fed_cfg.ingress_routes.contains(&target_route) {
+        return sealed_reject(peer_node_id, "ROUTE_NOT_FEDERATED");
+    }
+    let Some(route_cfg) = d.route_cfg(&target_route) else {
+        // Defensive: same rationale as `fed_ingress`'s identical check --
+        // config validation guarantees every `ingress_routes` name
+        // resolves to a real route, so this should be unreachable.
+        return sealed_reject(peer_node_id, "FED_CONFIG_MISSING");
+    };
+
+    // DOWNGRADE REFUSAL (design §5/§113.2, the reason this task exists):
+    // a route/node that refuses to be a sealed->plaintext termination
+    // point dead-letters (NEVER delivers) rather than silently
+    // downgrading -- phase 1 has no sealed relay-onward, so there is no
+    // other honest option than refusal.
+    let allow_decrypt =
+        d.cfg_snapshot(|c| effective_allow_gateway_decryption(c, &route_cfg));
+    if !allow_decrypt {
+        return sealed_reject(peer_node_id, "SECURITY_DOWNGRADE_REFUSED");
+    }
+
+    // Per-sender quota (design §113.5): sealed has no cleartext sender, so
+    // this keys the SAME `SenderLimiter` on `("fed-sealed", peer_node_id)`
+    // instead of `fed_ingress`'s `"fed|<node_short>:<native_ref>"` --
+    // documented: sealed traffic is rate-limited per-PEER, not
+    // per-origin-user, since the origin is opaque by design.
+    let node_short = fed::short_node_id(peer_node_id);
+    let sender_key = format!("fed-sealed|{node_short}");
+    let sender_bytes =
+        env.body.len() as u64 + env.attachments.iter().map(|a| a.size).sum::<u64>();
+    if !d.sender_limiter.lock().unwrap().allow(&sender_key, sender_bytes, Instant::now()) {
+        metrics::inc(&metrics::RATELIMITED);
+        return FedIngressOutcome::Rejected("RATE_LIMITED");
+    }
+    // Accepted by both dedup and the rate limiter: record now, mirroring
+    // `fed_ingress`'s own ordering.
+    d.dedup.lock().unwrap().record(&dedup_key, Instant::now());
+
+    let now = Utc::now();
+    let priority_rank = relay_core::priority_rank(&env.priority);
+    let targets: Vec<(String, Endpoint)> = route_cfg
+        .destinations
+        .iter()
+        .map(|dest| (target_route.clone(), dest.clone()))
+        .collect();
+    let (route_max, global_max) =
+        d.cfg_snapshot(|c| (c.limits.per_route.queue_max, c.limits.global.queue_max));
+
+    let store = d.store.lock().unwrap();
+    if let Err(e) = store.insert_message(&env) {
+        warn!(error = %e, "failed to persist sealed federated message");
+        drop(store);
+        return FedIngressOutcome::Rejected("STORAGE_ERROR");
+    }
+    let shas: Vec<String> = env.attachments.iter().map(|a| a.sha256.clone()).collect();
+    if let Err(e) = store.insert_attachment_refs(env.id, &shas) {
+        warn!(error = %e, "failed to persist sealed federated attachment refs");
+    }
+    let queue_full_routes = fan_out_deliveries(
+        &store, env.id, env.expires_at, priority_rank, &targets, route_max, global_max, now);
+    drop(store);
+    for route in &queue_full_routes {
+        emit_delivery(d, env.id, route.clone(), "dead_letter");
+    }
+
+    metrics::inc(&metrics::SEALED_INGRESS);
     FedIngressOutcome::Accepted(env.id)
 }
 
@@ -5092,6 +5393,381 @@ routes:
         // Only the first message's two deliveries -- the rate-limited
         // second message gets no dead_letter row at all (silent drop,
         // mirroring handle_inbound's own rate-limit gate).
+        assert_eq!(store.queue_counts().unwrap(), vec![("pending".to_string(), 2)]);
+    }
+
+    // ==== fed_sealed_ingress (design §5, SPEC §113.2/§113.5, cycle H,
+    // Task 5) ================================================================
+
+    /// Seals `env` for `recipient_pub`, header `expires_at` set to `env`'s
+    /// own `expires_at` -- the common case every test below uses except the
+    /// header-expiry test, which needs an independently-chosen header
+    /// value (see `seal_env_for_with_expiry`).
+    fn seal_env_for(env: &Envelope, recipient_pub: &crypto_box::PublicKey) -> fed::seal::SealedEnvelope {
+        seal_env_for_with_expiry(env, recipient_pub, env.expires_at.timestamp())
+    }
+
+    /// `seal_env_for`, but with an independently-chosen sealed-header
+    /// `expires_at` -- lets a test set the CLEARTEXT header's expiry
+    /// without touching the envelope's own (separately-checked, post-
+    /// decrypt) `created_at`/`expires_at`.
+    fn seal_env_for_with_expiry(
+        env: &Envelope, recipient_pub: &crypto_box::PublicKey, header_expires_at: i64,
+    ) -> fed::seal::SealedEnvelope {
+        let mut cbor = Vec::new();
+        ciborium::into_writer(env, &mut cbor).unwrap();
+        fed::seal::seal(&cbor, &env.id.to_string(), header_expires_at, recipient_pub)
+    }
+
+    /// Sets `route_name`'s `allow_gateway_decryption` override via
+    /// `apply_config` (live, no restart) -- the downgrade-refusal test
+    /// fixture setup, mirroring `set_route_security_mode`'s own pattern.
+    fn set_route_allow_gateway_decryption(d: &Daemon, route_name: &str, value: Option<bool>) {
+        let mut cfg = d.cfg.read().unwrap().clone();
+        let route = cfg.routes.iter_mut().find(|r| r.name == route_name)
+            .unwrap_or_else(|| panic!("route '{route_name}' not found in test fixture config"));
+        route.allow_gateway_decryption = value;
+        d.apply_config(cfg);
+    }
+
+    #[tokio::test]
+    async fn fed_sealed_ingress_happy_path_decrypts_delivers_to_mock_plugin_and_increments_sealed_ingress() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), cfg));
+        let mut rx_a = register_plugin(&d, "mocka", true);
+        let mut rx_b = register_plugin(&d, "mockb", true);
+
+        let recipient_pub = crypto_box::PublicKey::from(d.sealed_key.public());
+        let body = "hello sealed ingress";
+        let env = signed_test_envelope(&identity, body, 0);
+        let env_id = env.id;
+        let sealed = seal_env_for(&env, &recipient_pub);
+
+        let before = metrics::SEALED_INGRESS.load(std::sync::atomic::Ordering::Relaxed);
+        let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Accepted(env_id));
+        assert!(metrics::SEALED_INGRESS.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "SEALED_INGRESS must increment on accept");
+
+        let now = Utc::now();
+        let dels = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 10).unwrap() };
+        assert_eq!(dels.len(), 2, "both of general's destinations must get a delivery row");
+        for del in dels {
+            process_due(&d, del, now).await;
+        }
+
+        let DaemonToPlugin::Send { body: got_a, .. } = recv_send(&mut rx_a).await else {
+            panic!("expected Send to mocka");
+        };
+        let DaemonToPlugin::Send { body: got_b, .. } = recv_send(&mut rx_b).await else {
+            panic!("expected Send to mockb");
+        };
+        assert!(got_a.contains(body), "decrypted body must reach mocka verbatim: {got_a}");
+        assert!(got_b.contains(body), "decrypted body must reach mockb verbatim: {got_b}");
+    }
+
+    #[test]
+    fn fed_sealed_ingress_unsupported_alg_is_rejected_before_any_crypto() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+        let recipient_pub = crypto_box::PublicKey::from(d.sealed_key.public());
+
+        let env = signed_test_envelope(&identity, "hello", 0);
+        let mut sealed = seal_env_for(&env, &recipient_pub);
+        sealed.alg = "some-future-pq-hybrid-v2".to_string();
+
+        let before = metrics::SEALED_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+        let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("UNSUPPORTED_SEAL_ALG"));
+        assert!(metrics::SEALED_REJECTED.load(std::sync::atomic::Ordering::Relaxed) > before);
+        assert!(d.store.lock().unwrap().queue_counts().unwrap().is_empty(),
+            "no sealed rejection ever persists a delivery row");
+    }
+
+    #[test]
+    fn fed_sealed_ingress_expired_header_is_rejected_before_unseal() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+        let recipient_pub = crypto_box::PublicKey::from(d.sealed_key.public());
+
+        let env = signed_test_envelope(&identity, "hello", 0);
+        let past = (Utc::now() - CDuration::hours(1)).timestamp();
+        let sealed = seal_env_for_with_expiry(&env, &recipient_pub, past);
+
+        let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("EXPIRED"));
+        assert!(d.store.lock().unwrap().queue_counts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fed_sealed_ingress_tampered_ciphertext_fails_bad_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+        let recipient_pub = crypto_box::PublicKey::from(d.sealed_key.public());
+
+        let env = signed_test_envelope(&identity, "hello", 0);
+        let mut sealed = seal_env_for(&env, &recipient_pub);
+        sealed.ct[0] ^= 0xFF;
+
+        let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("BAD_SEAL"));
+        assert!(d.store.lock().unwrap().queue_counts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fed_sealed_ingress_tampered_header_id_fails_bad_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+        let recipient_pub = crypto_box::PublicKey::from(d.sealed_key.public());
+
+        let env = signed_test_envelope(&identity, "hello", 0);
+        let mut sealed = seal_env_for(&env, &recipient_pub);
+        // AEAD still opens fine (id isn't part of ct's AAD -- there is
+        // none); only the post-decrypt binding check catches this.
+        sealed.id = "a-completely-different-id".to_string();
+
+        let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("BAD_BINDING"));
+        assert!(d.store.lock().unwrap().queue_counts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fed_sealed_ingress_malformed_inner_cbor_fails_bad_seal_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+        let recipient_pub = crypto_box::PublicKey::from(d.sealed_key.public());
+
+        // Seal bytes that are NOT a valid Envelope CBOR at all -- `unseal`
+        // itself only assumes a `(bytes, string, i64)` tuple shape, so
+        // decrypt+binding both succeed; the failure must surface at
+        // `fed_sealed_ingress`'s own decode step, via `Result`, never a
+        // panic.
+        let garbage = b"not a valid envelope cbor, just some sentinel bytes".to_vec();
+        let expires = (Utc::now() + CDuration::hours(1)).timestamp();
+        let sealed = fed::seal::seal(&garbage, "msg-malformed-inner", expires, &recipient_pub);
+
+        let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("BAD_SEAL"));
+        assert!(d.store.lock().unwrap().queue_counts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fed_sealed_ingress_bad_signature_unsigned_envelope_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+        let recipient_pub = crypto_box::PublicKey::from(d.sealed_key.public());
+
+        // No origin signature at all -- decrypts and decodes fine, but
+        // verify_chain must reject before trust/downgrade/delivery.
+        let now = Utc::now();
+        let env = Envelope::new(
+            Endpoint { protocol: "mock".into(), endpoint: "origin-chan".into() },
+            Sender { native_ref: "!origin-sender".into() },
+            "text".into(), "unsigned".into(), now, now + CDuration::hours(1), 8,
+        );
+        let sealed = seal_env_for(&env, &recipient_pub);
+
+        let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("BAD_SIGNATURE"));
+        assert!(d.store.lock().unwrap().queue_counts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fed_sealed_ingress_trust_denied_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        // Peer is configured at "verified", but accept_from requires
+        // "trusted" -- mirrors `fed_ingress`'s own trust-denial fixture.
+        let mut cfg = fed_config("trusted", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+        let recipient_pub = crypto_box::PublicKey::from(d.sealed_key.public());
+
+        let env = signed_test_envelope(&identity, "hello", 0);
+        let sealed = seal_env_for(&env, &recipient_pub);
+
+        let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("TRUST_DENIED"));
+        assert!(d.store.lock().unwrap().queue_counts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fed_sealed_ingress_route_not_federated_when_target_not_in_ingress_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.ingress_routes = vec![]; // "general" deliberately not federated
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+        let recipient_pub = crypto_box::PublicKey::from(d.sealed_key.public());
+
+        let env = signed_test_envelope(&identity, "hello", 0);
+        let sealed = seal_env_for(&env, &recipient_pub);
+
+        let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("ROUTE_NOT_FEDERATED"));
+        // Unlike `fed_ingress`'s own ROUTE_NOT_FEDERATED (Persist, since it
+        // only fires post-trust), `fed_sealed_ingress` never persists ANY
+        // rejection -- see `sealed_reject`'s doc comment for why.
+        assert!(d.store.lock().unwrap().queue_counts().unwrap().is_empty());
+    }
+
+    /// The reason this whole task exists (design §113.2): a route that has
+    /// declared it will not be a sealed->plaintext termination point must
+    /// dead-letter, and -- critically -- the decrypted content must reach
+    /// NEITHER a plugin NOR local storage.
+    #[test]
+    fn fed_sealed_ingress_downgrade_refused_route_never_delivers_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+        set_route_allow_gateway_decryption(&d, "general", Some(false));
+        let mut rx_a = register_plugin(&d, "mocka", true);
+        let mut rx_b = register_plugin(&d, "mockb", true);
+        let recipient_pub = crypto_box::PublicKey::from(d.sealed_key.public());
+
+        let sentinel = "SENTINEL-DOWNGRADE-REFUSED-BODY-MUST-NEVER-BE-DELIVERED";
+        let env = signed_test_envelope(&identity, sentinel, 0);
+        let env_id = env.id;
+        let sealed = seal_env_for(&env, &recipient_pub);
+
+        let before = metrics::SEALED_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
+        let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("SECURITY_DOWNGRADE_REFUSED"));
+        assert!(metrics::SEALED_REJECTED.load(std::sync::atomic::Ordering::Relaxed) > before);
+
+        let store = d.store.lock().unwrap();
+        assert!(store.queue_counts().unwrap().is_empty(),
+            "downgrade refusal must never create a delivery row -- content stays undelivered");
+        assert!(store.get_message(env_id).unwrap().is_none(),
+            "downgrade refusal must never persist the decrypted envelope either");
+        drop(store);
+
+        assert!(rx_a.try_recv().is_err(), "mocka plugin must receive nothing on downgrade refusal");
+        assert!(rx_b.try_recv().is_err(), "mockb plugin must receive nothing on downgrade refusal");
+    }
+
+    #[test]
+    fn fed_sealed_ingress_dedup_replay_is_inert_no_new_delivery_rows_or_sealed_ingress_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+        let recipient_pub = crypto_box::PublicKey::from(d.sealed_key.public());
+
+        let env = signed_test_envelope(&identity, "replay me", 0);
+        let sealed = seal_env_for(&env, &recipient_pub);
+        let sealed_replay = sealed.clone();
+
+        let first = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
+        assert!(matches!(first, FedIngressOutcome::Accepted(_)));
+
+        let before_dup = metrics::DUPLICATES.load(std::sync::atomic::Ordering::Relaxed);
+        let second = fed_sealed_ingress(&d, &node_id, sealed_replay, "general".to_string());
+        assert_eq!(second, FedIngressOutcome::Rejected("DUPLICATE"));
+        assert!(metrics::DUPLICATES.load(std::sync::atomic::Ordering::Relaxed) > before_dup);
+
+        let store = d.store.lock().unwrap();
+        assert_eq!(store.queue_counts().unwrap(), vec![("pending".to_string(), 2)],
+            "the replay must not create any additional delivery rows");
+    }
+
+    #[test]
+    fn fed_sealed_ingress_strips_remote_priority_to_default_rank_even_when_emergency_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+        let recipient_pub = crypto_box::PublicKey::from(d.sealed_key.public());
+
+        // priority is unsigned by design -- tampering it after signing must
+        // not break verify_chain (same fixture shape as fed_ingress's own
+        // priority-strip test).
+        let mut env = signed_test_envelope(&identity, "urgent!!", 0);
+        env.priority = "emergency".to_string();
+        assert_eq!(fed::sign::verify_chain(&env), Ok(()));
+        let sealed = seal_env_for(&env, &recipient_pub);
+
+        let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
+        assert!(matches!(outcome, FedIngressOutcome::Accepted(_)));
+
+        let store = d.store.lock().unwrap();
+        let due = store.due_deliveries(Utc::now(), 10).unwrap();
+        assert_eq!(due.len(), 2);
+        assert!(due.iter().all(|d| d.priority == relay_core::priority_rank("normal")),
+            "every delivery row must be at the DEFAULT rank, never emergency's rank 0: {due:?}");
+        let stored = store.get_message(due[0].message_id).unwrap().unwrap();
+        assert_eq!(stored.priority, "normal",
+            "the stored envelope's priority class itself must be re-stamped to \"normal\"");
+    }
+
+    #[test]
+    fn fed_sealed_ingress_per_peer_quota_denies_second_message_without_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let limits = crate::config::Limits {
+            per_sender: crate::config::PerSender { messages_per_minute: 1, bytes_per_hour: 0 },
+            ..Default::default()
+        };
+        let d = test_daemon_with_federation_and_limits(dir.path(), cfg, limits);
+        let recipient_pub = crypto_box::PublicKey::from(d.sealed_key.public());
+
+        let first_env = signed_test_envelope(&identity, "first", 0);
+        let first_sealed = seal_env_for(&first_env, &recipient_pub);
+        assert!(matches!(fed_sealed_ingress(&d, &node_id, first_sealed, "general".to_string()),
+            FedIngressOutcome::Accepted(_)));
+
+        let before = metrics::RATELIMITED.load(std::sync::atomic::Ordering::Relaxed);
+        let second_env = signed_test_envelope(&identity, "second, distinct body", 0);
+        let second_sealed = seal_env_for(&second_env, &recipient_pub);
+        let outcome = fed_sealed_ingress(&d, &node_id, second_sealed, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("RATE_LIMITED"));
+        assert!(metrics::RATELIMITED.load(std::sync::atomic::Ordering::Relaxed) > before);
+
+        let store = d.store.lock().unwrap();
+        // Only the first message's two deliveries -- the rate-limited
+        // second message (per-peer quota, sealed sender is opaque) gets no
+        // dead_letter row at all, mirroring fed_ingress's own category.
         assert_eq!(store.queue_counts().unwrap(), vec![("pending".to_string(), 2)]);
     }
 

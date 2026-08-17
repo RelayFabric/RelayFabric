@@ -608,15 +608,13 @@ async fn send_fed<S: AsyncRead + AsyncWrite + Unpin>(
 /// `engine::fed_ingress`, replying `Ack{id}` only on `Accepted` (design
 /// §5: rejections are never acked, so a misbehaving/rejected sender's
 /// retry machinery eventually gives up via its own TTL rather than being
-/// told "yes" for something that was actually dropped); `Sealed{..}` ->
-/// ignored for now (design §4/§5, cycle H, Task 4): egress sends this
-/// variant (`engine::process_due_fed`'s sealed branch), but the real
-/// unseal -> verify_chain -> trust -> downgrade-refusal -> dedup -> deliver
-/// ingress pipeline is Task 5's job -- until then a received `Sealed`
-/// frame gets the same "not yet handled" treatment `Unknown` does (never a
-/// decode error, never acked); `Unknown` -> nothing (design §5 additive
-/// versioning: an unrecognized frame type from a newer peer is silently
-/// ignored, not an error).
+/// told "yes" for something that was actually dropped); `Sealed{sealed,
+/// target_route}` -> `engine::fed_sealed_ingress` (design §5/§113.2, cycle
+/// H, Task 5): unseal -> verify_chain -> trust -> downgrade-refusal ->
+/// dedup -> deliver, replying `Ack{id}` only on `Accepted` -- the exact
+/// same "never ack a rejection" posture `Envelope` gets, above; `Unknown`
+/// -> nothing (design §5 additive versioning: an unrecognized frame type
+/// from a newer peer is silently ignored, not an error).
 fn handle_frame(d: &Daemon, peer_node_id: &str, peer_key: &str, frame: Fed) -> Option<Fed> {
     match frame {
         Fed::Ping {} => Some(Fed::Pong {}),
@@ -644,7 +642,12 @@ fn handle_frame(d: &Daemon, peer_node_id: &str, peer_key: &str, frame: Fed) -> O
             receive_advert(d, peer_node_id, advert);
             None
         }
-        Fed::Sealed { .. } => None,
+        Fed::Sealed { sealed, target_route } => {
+            match engine::fed_sealed_ingress(d, peer_node_id, sealed, target_route) {
+                engine::FedIngressOutcome::Accepted(id) => Some(Fed::Ack { id: id.to_string() }),
+                engine::FedIngressOutcome::Rejected(_) => None,
+            }
+        }
         Fed::Unknown => None,
     }
 }

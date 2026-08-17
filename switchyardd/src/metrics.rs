@@ -37,10 +37,22 @@ pub static ADVERT_REJECTED: AtomicU64 = AtomicU64::new(0);
 // `engine::process_due_fed`'s `security_mode: sealed` branch is the sole
 // incrementer, on every `Fed::Sealed` frame actually handed to a live
 // connection's channel (mirrors `FED_EGRESS`'s own bump point exactly, one
-// security_mode over). SEALED_INGRESS/SEALED_REJECTED (design §6) are a
-// later cycle-H task (Task 5), once ingress handling for `Fed::Sealed`
-// exists to increment them from.
+// security_mode over). SEALED_INGRESS/SEALED_REJECTED (design §6) are
+// defined below, near DELIVERY_LATENCY_*, since Task 5 landed the ingress
+// side that increments them.
 pub static SEALED_EGRESS: AtomicU64 = AtomicU64::new(0);
+
+// Sealed routing ingress (design §5/§6, SPEC §113.2/§113.5, cycle H, Task
+// 5): `engine::fed_sealed_ingress` is the sole incrementer. SEALED_INGRESS
+// bumps once per accepted `Fed::Sealed` frame (mirrors `FED_INGRESS`'s own
+// bump point, one security_mode over). SEALED_REJECTED bumps on every gate
+// failure that returns a named reason (alg/expiry/bad-seal/bad-binding/
+// bad-sig/trust/route/downgrade-refused, via `engine::sealed_reject`) --
+// NOT on the two silent-drop categories (`DUPLICATE`/`RATE_LIMITED`), which
+// reuse the existing shared `DUPLICATES`/`RATELIMITED` counters instead,
+// exactly mirroring `fed_ingress`'s own drop-vs-reject split.
+pub static SEALED_INGRESS: AtomicU64 = AtomicU64::new(0);
+pub static SEALED_REJECTED: AtomicU64 = AtomicU64::new(0);
 
 // design §3 (cycle D): received_at -> delivered wall-clock latency, accrued
 // as a micros sum + count pair (rendered in seconds) rather than a
@@ -247,6 +259,8 @@ pub fn render(
         ("relayfabric_advert_tx_total", &ADVERT_TX),
         ("relayfabric_advert_rejected_total", &ADVERT_REJECTED),
         ("relayfabric_sealed_egress_total", &SEALED_EGRESS),
+        ("relayfabric_sealed_ingress_total", &SEALED_INGRESS),
+        ("relayfabric_sealed_rejected_total", &SEALED_REJECTED),
     ];
     for (name, c) in counters {
         out.push_str(&format!("# TYPE {name} counter\n{name} {}\n", c.load(Ordering::Relaxed)));
@@ -315,6 +329,8 @@ mod tests {
         assert!(out.contains("relayfabric_advert_tx_total"));
         assert!(out.contains("relayfabric_advert_rejected_total"));
         assert!(out.contains("relayfabric_sealed_egress_total"));
+        assert!(out.contains("relayfabric_sealed_ingress_total"));
+        assert!(out.contains("relayfabric_sealed_rejected_total"));
     }
 
     // ---- federation peer up/down gauge --------------------------------

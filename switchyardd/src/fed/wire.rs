@@ -22,12 +22,11 @@
 //!
 //! Consumed by `fed::conn`, which drives `FedChannel::send_frame`/
 //! `recv_frame` with CBOR bytes of these variants on every live connection.
-//! `Sealed` (design §4, SPEC §113.4, cycle H) is this cycle's additive
-//! variant: `engine::process_due_fed`'s `security_mode: sealed` branch
-//! sends it (Task 4); `fed::conn::handle_frame` decodes and ignores it for
-//! now (real ingress is Task 5) -- exactly the tolerance every OTHER
-//! variant here already extends to a tag it doesn't recognize at all,
-//! just for one it does.
+//! `Sealed` (design §4/§5, SPEC §113.4/§113.2, cycle H) is this cycle's
+//! additive variant: `engine::process_due_fed`'s `security_mode: sealed`
+//! branch sends it (Task 4); `fed::conn::handle_frame` dispatches it to
+//! `engine::fed_sealed_ingress` (Task 5) exactly like `Envelope` dispatches
+//! to `engine::fed_ingress`.
 
 use super::advert::Advert;
 use super::seal::SealedEnvelope;
@@ -87,9 +86,9 @@ pub enum Fed {
     /// uses, cleartext for the identical reason (routing metadata, not
     /// payload). Ingress handling (`fed::seal::unseal` -> CBOR-decode as
     /// `Envelope` -> `fed::sign::verify_chain` -> trust -> downgrade
-    /// refusal -> dedup -> deliver, design §5) is Task 5 -- this cycle's
-    /// `fed::conn::handle_frame` only decodes and ignores it (matching
-    /// `Unknown`'s "not yet handled" posture, not a real receive path yet).
+    /// refusal -> dedup -> deliver, design §5) is `engine::
+    /// fed_sealed_ingress` (Task 5), dispatched from `fed::conn::
+    /// handle_frame` exactly like `Envelope` dispatches to `fed_ingress`.
     Sealed {
         sealed: SealedEnvelope,
         target_route: String,
