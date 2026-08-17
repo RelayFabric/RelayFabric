@@ -1,0 +1,18 @@
+# License gate (2026-08-16), Task 1: schnorr/secp256k1 + relay transport deps.
+# coincurve 21.0.0: License-Expression "MIT OR Apache-2.0" (verified via
+#   `pip show -f coincurve` -> dist-info METADATA: Classifier "License :: OSI
+#   Approved :: MIT License" + "License :: OSI Approved :: Apache Software
+#   License"). No new transitive deps: cffi/pycparser were already present
+#   (required by `cryptography`), themselves permissive (cffi MIT, pycparser
+#   BSD-3-Clause). Chosen over a fallback because it exposes BIP-340 schnorr
+#   directly and needs no wrapping: PrivateKey.sign_schnorr(msg32) and
+#   PublicKeyXOnly.verify(sig64, msg32).
+# websockets 17.0.1: License-Expression "BSD-3-Clause". No transitive deps.
+#   (Task 2's relay transport; installed now to license-check per Task 1.)
+# cbor2: already an SDK dependency (sdk/python/pyproject.toml), permissive,
+#   listed here too since plugins consume the SDK via sys.path, not pip.
+# strfry (GPL) is reference-only per project memory -- NEVER pip-installed
+#   or vendored.
+coincurve==21.0.0
+websockets==17.0.1
+cbor2
