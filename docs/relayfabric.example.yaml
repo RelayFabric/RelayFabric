@@ -99,6 +99,23 @@ plugins:
   #       primary: {index: 0}
   #       secondary: {index: 1}
 
+  # nostr:
+  #   enabled: true
+  #   # Runs under sh -c, so it needs an absolute path and the venv's
+  #   # python (a bare `relayfabric-nostr` isn't on PATH and the script's
+  #   # shebang won't see venv deps). venv must have run:
+  #   #   pip install -r plugins/nostr/requirements.txt
+  #   command: /path/to/RelayFabric/.venv/bin/python /path/to/RelayFabric/plugins/nostr/relayfabric-nostr
+  #   config:
+  #     identity_file: /var/lib/relayfabric/nostr.nsec  # optional; generated if absent
+  #     relays: ["wss://relay.example.com"]              # default relay set
+  #     channels:
+  #       regional:
+  #         relays: ["wss://relay.example.com"]           # optional; falls back to default
+  #         filter: {kinds: [1], "#t": ["pasadena"]}       # NIP-01 REQ filter
+  #         publish_tags: [["t", "pasadena"]]              # tags on outbound events
+  #     max_text_bytes: 280
+
 # Identity linking (opt-in, challenge-verified — docs/SPEC.md §19/§21/§22):
 # a route's identity_mode: linked renders a VERIFIED link's display_name
 # instead of the per-route pseudonym at egress; default is "pseudonymous"

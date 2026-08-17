@@ -16,13 +16,12 @@ this is zero-knowledge payload routing, not traffic anonymity).
 
 - `switchyardd` — the core daemon: routing, deduplication, policy
   enforcement, persistence, and an admin API, all headless.
-- `switchyardctl` — CLI client for the admin API (status, plugins, routes,
-  queue, trace).
+- `switchyardctl` — CLI client for the admin API (status, plugins, routes, queue, trace).
 - Plugins — separate processes speaking a small CBOR-over-Unix-socket IPC
-  protocol to the daemon. MQTT, LXMF, Signal, Meshtastic, and MeshCore plugins
-  available; see [LXMF](plugins/lxmf/README.md), [Signal](plugins/signal/README.md),
-  [Meshtastic](plugins/meshtastic/README.md), or [MeshCore](plugins/meshcore/README.md)
-  docs for configuration.
+  protocol to the daemon. MQTT, LXMF, Signal, Meshtastic, MeshCore, and Nostr
+  plugins available; see [LXMF](plugins/lxmf/README.md), [Signal](plugins/signal/README.md),
+  [Meshtastic](plugins/meshtastic/README.md), [MeshCore](plugins/meshcore/README.md), or
+  [Nostr](plugins/nostr/README.md) docs.
 
 ## Build
 
