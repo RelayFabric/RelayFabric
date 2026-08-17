@@ -32,6 +32,15 @@ pub static FED_REJECTED: AtomicU64 = AtomicU64::new(0);
 pub static ADVERT_RX: AtomicU64 = AtomicU64::new(0);
 pub static ADVERT_TX: AtomicU64 = AtomicU64::new(0);
 pub static ADVERT_REJECTED: AtomicU64 = AtomicU64::new(0);
+// Sealed routing (design §4/§6, SPEC §113.4, cycle H, Task 4): sealed fed
+// egress counter, same zero-until-wired posture as FED_*/ADVERT_* above.
+// `engine::process_due_fed`'s `security_mode: sealed` branch is the sole
+// incrementer, on every `Fed::Sealed` frame actually handed to a live
+// connection's channel (mirrors `FED_EGRESS`'s own bump point exactly, one
+// security_mode over). SEALED_INGRESS/SEALED_REJECTED (design §6) are a
+// later cycle-H task (Task 5), once ingress handling for `Fed::Sealed`
+// exists to increment them from.
+pub static SEALED_EGRESS: AtomicU64 = AtomicU64::new(0);
 
 // design §3 (cycle D): received_at -> delivered wall-clock latency, accrued
 // as a micros sum + count pair (rendered in seconds) rather than a
@@ -237,6 +246,7 @@ pub fn render(
         ("relayfabric_advert_rx_total", &ADVERT_RX),
         ("relayfabric_advert_tx_total", &ADVERT_TX),
         ("relayfabric_advert_rejected_total", &ADVERT_REJECTED),
+        ("relayfabric_sealed_egress_total", &SEALED_EGRESS),
     ];
     for (name, c) in counters {
         out.push_str(&format!("# TYPE {name} counter\n{name} {}\n", c.load(Ordering::Relaxed)));
@@ -304,6 +314,7 @@ mod tests {
         assert!(out.contains("relayfabric_advert_rx_total"));
         assert!(out.contains("relayfabric_advert_tx_total"));
         assert!(out.contains("relayfabric_advert_rejected_total"));
+        assert!(out.contains("relayfabric_sealed_egress_total"));
     }
 
     // ---- federation peer up/down gauge --------------------------------

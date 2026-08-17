@@ -13,10 +13,11 @@
 //! `unseal` asserts they match the header after decrypting -- see
 //! `unseal`'s doc comment.
 //!
-//! `seal`/`unseal` are not yet wired into federation egress/ingress (later
-//! cycle-H tasks: `engine::process_due_fed`'s sealed branch, design §4;
-//! `engine::fed_ingress`'s `Fed::Sealed` arm, design §5) -- this task is
-//! the pure format.
+//! `seal` is wired into federation egress (`engine::process_due_fed`'s
+//! `security_mode: sealed` branch, Task 4, design §4). `unseal` is not yet
+//! wired into federation ingress (`engine::fed_ingress`'s `Fed::Sealed`
+//! arm, Task 5, design §5) -- that remains this module's one open
+//! consumer.
 
 use crypto_box::aead::{Aead, AeadCore};
 use crypto_box::{ChaChaBox, PublicKey, SecretKey};
@@ -161,9 +162,11 @@ fn parse_nonce(nonce: &[u8]) -> Result<crypto_box::Nonce, SealError> {
 /// output is never byte-reproducible -- see `seal_with_ephemeral` for the
 /// deterministic test seam).
 ///
-/// `#[allow(dead_code)]`: not yet wired into federation egress (consumed
-/// by `engine::process_due_fed`'s sealed branch, Task 4, design §4).
-#[allow(dead_code)]
+/// Wired into federation egress: `engine::process_due_fed`'s
+/// `security_mode: sealed` branch calls this directly (never
+/// `seal_with_ephemeral`, per the Task 2 review binding note -- production
+/// egress must always use a fresh ephemeral key, never a persisted/reused
+/// one).
 pub fn seal(
     canonical_env_cbor: &[u8],
     id: &str,
@@ -186,11 +189,9 @@ pub fn seal(
 /// -- kept reachable for any later task's own test module without reaching
 /// back into this one's private internals.
 ///
-/// `#[allow(dead_code)]`: `seal` is this function's only production
-/// caller and `seal` itself isn't wired in yet either (see `seal`'s doc
-/// comment) -- this one becomes live again the moment Task 4 wires `seal`
-/// in, at which point the allow can be dropped from both.
-#[allow(dead_code)]
+/// `seal` is this function's only production caller (Task 4 wired `seal`
+/// itself into federation egress -- see `seal`'s doc comment); egress
+/// never calls this one directly, only through `seal`.
 pub(crate) fn seal_with_ephemeral(
     canonical_env_cbor: &[u8],
     id: &str,
@@ -482,6 +483,36 @@ mod tests {
         let mut sealed = seal(b"body", "msg-13", 1, &recipient_pub);
         sealed.epk = Vec::new();
         sealed.nonce = Vec::new();
+        assert_eq!(unseal(&sealed, &recipient_secret), Err(SealError::BadSeal));
+    }
+
+    /// Carried from the Task 2 review (round 1): probed live but never
+    /// committed as a permanent test. `epk`/`nonce` are both still
+    /// well-formed (32/24 bytes) and `alg` is the one this build supports
+    /// -- only `ct` itself is empty, so this exercises the AEAD open call
+    /// directly (`ChaChaBox::decrypt`), not the length pre-checks
+    /// `parse_epk`/`parse_nonce` already cover above. An empty ciphertext
+    /// can never contain a valid 16-byte Poly1305 tag, so decryption must
+    /// fail closed (`SealError::BadSeal`) rather than panic on an
+    /// out-of-bounds read while trying to split off a tag that isn't there.
+    #[test]
+    fn empty_ct_under_a_valid_alg_fails_bad_seal_not_panic() {
+        let (recipient_secret, recipient_pub) = recipient_keypair();
+        let mut sealed = seal(b"body", "msg-14", 1, &recipient_pub);
+        assert_eq!(sealed.alg, SEAL_ALG_V1, "fixture sanity check: alg must be the valid one");
+        sealed.ct = Vec::new();
+        assert_eq!(unseal(&sealed, &recipient_secret), Err(SealError::BadSeal));
+    }
+
+    /// Same carried case, the other shape: `ct` present but truncated to
+    /// fewer bytes than the 16-byte AEAD tag alone would need -- still a
+    /// valid `alg`, still fails closed rather than panicking.
+    #[test]
+    fn truncated_ct_under_a_valid_alg_fails_bad_seal_not_panic() {
+        let (recipient_secret, recipient_pub) = recipient_keypair();
+        let mut sealed = seal(b"body", "msg-15", 1, &recipient_pub);
+        assert_eq!(sealed.alg, SEAL_ALG_V1, "fixture sanity check: alg must be the valid one");
+        sealed.ct.truncate(3); // well short of the 16-byte AEAD tag alone
         assert_eq!(unseal(&sealed, &recipient_secret), Err(SealError::BadSeal));
     }
 

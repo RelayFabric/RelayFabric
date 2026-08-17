@@ -20,11 +20,17 @@
 //! `unknown_tag_with_unrecognized_fields_decodes_to_unknown` below, which
 //! deliberately includes fields no known variant has.
 //!
-//! Consumed by `fed::conn` (Task 4), which drives
-//! `FedChannel::send_frame`/`recv_frame` with CBOR bytes of these variants
-//! on every live connection.
+//! Consumed by `fed::conn`, which drives `FedChannel::send_frame`/
+//! `recv_frame` with CBOR bytes of these variants on every live connection.
+//! `Sealed` (design §4, SPEC §113.4, cycle H) is this cycle's additive
+//! variant: `engine::process_due_fed`'s `security_mode: sealed` branch
+//! sends it (Task 4); `fed::conn::handle_frame` decodes and ignores it for
+//! now (real ingress is Task 5) -- exactly the tolerance every OTHER
+//! variant here already extends to a tag it doesn't recognize at all,
+//! just for one it does.
 
 use super::advert::Advert;
+use super::seal::SealedEnvelope;
 use relay_core::Envelope;
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +75,25 @@ pub enum Fed {
     /// (subject to the local discovery scope gate, `fed::conn::
     /// advert_scope_allows`), and carries no fields of its own.
     AdvertReq {},
+    /// Sealed-routing egress (design §4, SPEC §113.4, cycle H, Task 4): a
+    /// routed message whose payload the ORIGIN edge gateway has AEAD-sealed
+    /// (`fed::seal::seal`) for the destination edge gateway's stable
+    /// `sealed_key` -- the fabric between them (phase-1: the direct peer
+    /// only, no relay-through yet) routes opaque ciphertext. `sealed.id`/
+    /// `sealed.expires_at` are the CLEARTEXT routing/dedup/expiry header a
+    /// receiver reads without decrypting (`fed::seal::SealedEnvelope`'s own
+    /// doc comment); `target_route` is the same "which local route on the
+    /// RECEIVER'S side" addressing `Fed::Envelope::target_route` already
+    /// uses, cleartext for the identical reason (routing metadata, not
+    /// payload). Ingress handling (`fed::seal::unseal` -> CBOR-decode as
+    /// `Envelope` -> `fed::sign::verify_chain` -> trust -> downgrade
+    /// refusal -> dedup -> deliver, design §5) is Task 5 -- this cycle's
+    /// `fed::conn::handle_frame` only decodes and ignores it (matching
+    /// `Unknown`'s "not yet handled" posture, not a real receive path yet).
+    Sealed {
+        sealed: SealedEnvelope,
+        target_route: String,
+    },
     /// Decode-only fallback for a `t` this build doesn't recognize (design
     /// §5 "additive versioning: unknown `t` ignored (fleet precedent)").
     /// Callers ignore it outright -- there is nothing on it to act on.
@@ -173,6 +198,31 @@ mod tests {
     fn advert_req_frame_roundtrips() {
         let msg = Fed::AdvertReq {};
         assert!(matches!(roundtrip(&msg), Fed::AdvertReq {}));
+    }
+
+    // --- Sealed frame (design §4, SPEC §113.4, cycle H, Task 4) -----------
+
+    fn sample_sealed() -> SealedEnvelope {
+        SealedEnvelope {
+            alg: "x25519-xchacha20poly1305-v1".into(),
+            id: "0189f1e4-4444-7000-8000-000000000004".into(),
+            expires_at: 1_800_000_000,
+            epk: vec![7u8; 32],
+            nonce: vec![9u8; 24],
+            ct: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        }
+    }
+
+    #[test]
+    fn sealed_frame_roundtrips() {
+        let msg = Fed::Sealed { sealed: sample_sealed(), target_route: "regional-chat".into() };
+        match roundtrip(&msg) {
+            Fed::Sealed { sealed, target_route } => {
+                assert_eq!(sealed, sample_sealed());
+                assert_eq!(target_route, "regional-chat");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     // --- unknown-tag tolerance --------------------------------------------

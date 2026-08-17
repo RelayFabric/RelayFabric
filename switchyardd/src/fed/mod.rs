@@ -20,8 +20,11 @@
 //! per-node stable X25519 keypair a sealed-routing origin encrypts to
 //! (SPEC §113.3 "keys anchor to §112.6 node identities"), published via
 //! `advert::SecurityCaps::sealed_key`. `seal` defines the AEAD envelope
-//! format itself (`SealedEnvelope`, `seal`/`unseal`, design §2) -- wiring
-//! it into federation egress/ingress is a later cycle-H task.
+//! format itself (`SealedEnvelope`, `seal`/`unseal`, design §2). `wire::
+//! Fed::Sealed` is the wire frame carrying it; `engine::process_due_fed`'s
+//! `security_mode: sealed` branch is the egress wiring (design §4, Task
+//! 4). Ingress wiring (`engine::fed_ingress`'s `Fed::Sealed` handling,
+//! design §5) is a later cycle-H task.
 
 pub mod advert;
 pub mod conn;

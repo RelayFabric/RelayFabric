@@ -1768,6 +1768,27 @@ async fn process_due_fed(d: &Arc<Daemon>, del: storage::Delivery, env: Envelope,
     }
     out_env.hops += 1;
 
+    // Design §3/§4, SPEC §113.1/§113.4, cycle H, Task 4: the shared prefix
+    // above (connection lookup, budget, pseudonymize/sign/attest/hops) is
+    // IDENTICAL for `gateway` and `sealed` routes -- that machinery is
+    // cycle-F identity exposure/provenance, not a §113.4 "transform"
+    // (render/truncate/attachment-note; this function never applied any of
+    // those to EITHER mode -- process_due's own render pipeline is only
+    // ever reached for a non-fed destination, see `process_due`'s dispatch
+    // order above). Only the FINAL wire-encoding step branches: a
+    // `gateway` route sends `out_env` cleartext (`Fed::Envelope`, below,
+    // unchanged from cycle F); a `sealed` route seals it first
+    // (`process_due_fed_sealed`, design §4) and sends `Fed::Sealed`
+    // instead -- never both, never a cleartext fallback if sealing can't
+    // proceed (fail-closed: see that function's own doc comment).
+    let security_mode = d.route_cfg(&del.route)
+        .map(|r| r.security_mode)
+        .unwrap_or_else(|| "gateway".to_string());
+    if security_mode == "sealed" {
+        process_due_fed_sealed(d, &del, out_env, peer_name, remote_route, tx, now).await;
+        return;
+    }
+
     let result = d.store.lock().unwrap().mark_attempting(del.id);
     warn_if_mark_failed(del.id, "attempting", result);
 
@@ -1790,6 +1811,163 @@ async fn process_due_fed(d: &Arc<Daemon>, del: storage::Delivery, env: Envelope,
             warn_if_mark_failed(del.id, "pending", result);
             warn!(delivery = del.id, peer = peer_name, reason = closed_or_full,
                   "federation connection unavailable, requeued");
+        }
+    }
+}
+
+/// Hard ceiling on a sealed envelope's PRE-seal canonical CBOR size (design
+/// §4, SPEC §113.4: "oversized sealed payloads for constrained transports
+/// are rejected at origin, not shrunk in transit"). Phase-1 has no
+/// per-peer ADVERTISED constrained-transport max to check against yet --
+/// `fed::advert::ProtoCaps::max_payload` is always `None` this cycle (see
+/// that field's doc comment: live-capability enrichment is future work) --
+/// so this reuses `fed::noise::MAX_FRAME` (16 MiB), the actual Noise
+/// transport frame ceiling ANY sealed frame would have to fit under to
+/// cross the wire at all (`fed::noise::FedChannel::send_frame`/
+/// `recv_frame`), rather than inventing a second, narrower number with no
+/// operator-visible meaning yet. Checked against the PRE-seal canonical
+/// envelope bytes, not the post-seal `SealedEnvelope`'s serialized size --
+/// cheaper (no AEAD call wasted on something already too big), and close
+/// enough: sealing adds a small, roughly-constant overhead (a 32-byte
+/// ephemeral public key, a 24-byte nonce, a 16-byte AEAD tag, plus CBOR
+/// framing) that is negligible against a 16 MiB ceiling.
+const SEALED_MAX_BYTES: u64 = fed::noise::MAX_FRAME as u64;
+
+/// Resolves the peer's sealed X25519 recipient key for sealed egress
+/// (design §1/§4, SPEC §113.3): the config pin (`PeerConfig::sealed_key`)
+/// wins when present, even over a DIFFERENT advert-learned key (logged as
+/// a warn rather than silently overridden -- design §1: "if both present
+/// and disagree -> config wins + a warn"); otherwise the peer's own
+/// verified, stored `Fed::Advert::security.sealed_key`. The stored advert
+/// row is re-decoded and re-`advert::verify`d here, and its embedded
+/// `node_id` re-checked against the row key it's stored under -- the same
+/// "never trust a stored row without re-verifying its own signature and
+/// node_id binding on every use" posture `admin::discovery`'s peer listing
+/// already takes (a DB-write-capable attacker with no victim private key
+/// could otherwise insert a row keyed under a trusted peer's `node_id`
+/// carrying attacker-chosen advert content, self-signed under the
+/// attacker's OWN key -- `advert::verify` alone would pass it right
+/// through). `None` when NEITHER source has a usable key (absent, or
+/// present but not valid 64-hex-char/32-byte X25519 key material) -- the
+/// caller's fail-closed contract (`NO_SEALED_KEY` dead-letter, never
+/// unsealed egress) depends on this never silently defaulting to "somehow
+/// proceed anyway".
+fn resolve_sealed_key(d: &Daemon, peer_name: &str) -> Option<crypto_box::PublicKey> {
+    let (config_pin, node_id) = d.cfg_snapshot(|c| {
+        c.federation.as_ref()
+            .and_then(|f| f.peers.iter().find(|p| p.name == peer_name))
+            .map(|p| (p.sealed_key.clone(), p.node_id.clone()))
+    })?;
+
+    let advert_key = d.store.lock().unwrap()
+        .list_peer_adverts(Utc::now())
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(nid, _, _)| nid == &node_id)
+        .and_then(|(nid, cbor, _)| {
+            let decoded: fed::advert::Advert = ciborium::from_reader(cbor.as_slice()).ok()?;
+            (fed::advert::verify(&decoded).is_ok() && decoded.node_id == nid)
+                .then_some(decoded.security.sealed_key)
+                .flatten()
+        });
+
+    let chosen_hex = match (&config_pin, &advert_key) {
+        (Some(cfg), Some(adv)) => {
+            if cfg != adv {
+                warn!(peer = peer_name,
+                      "sealed_key config pin disagrees with advert-learned key; config wins");
+            }
+            cfg.clone()
+        }
+        (Some(cfg), None) => cfg.clone(),
+        (None, Some(adv)) => adv.clone(),
+        (None, None) => return None,
+    };
+
+    let bytes = hex::decode(&chosen_hex).ok()?;
+    crypto_box::PublicKey::from_slice(&bytes).ok()
+}
+
+/// Sealed fed egress (design §4, SPEC §113.4, cycle H, Task 4): the
+/// `security_mode: sealed` counterpart to `process_due_fed`'s gateway-mode
+/// tail. `out_env` has already been pseudonymized (if applicable)/
+/// origin-signed/attested/hop-incremented by the shared prefix in the
+/// caller -- see that call site's doc comment for why sealed mode reuses
+/// that step unchanged rather than skipping it.
+///
+/// NO TRANSFORM (§113.4): `out_env` -- body, attachments, everything -- is
+/// sealed EXACTLY as the caller left it. There is no render/truncate/
+/// attachment-note call anywhere on this path.
+///
+/// Fail-closed key resolution: no sealed key for this peer (neither a
+/// config pin nor a verified advert-learned one, `resolve_sealed_key`) ->
+/// dead-letter `NO_SEALED_KEY`, NEVER falls back to sending `out_env`
+/// unsealed.
+///
+/// Fail-closed size guard (SPEC §113.4: "oversized sealed payloads for
+/// constrained transports are rejected at origin, not shrunk in
+/// transit"): the pre-seal canonical envelope CBOR over `SEALED_MAX_BYTES`
+/// -> dead-letter `SEALED_OVERSIZE`, never shrunk.
+///
+/// `seal::seal` (plain, ephemeral-per-call), never `seal::
+/// seal_with_ephemeral` -- Task 2 review binding note: production egress
+/// must always use a fresh ephemeral key, never a persisted/reused one.
+///
+/// Ack unchanged: `SealedEnvelope::id` (the cleartext header field, set
+/// here to `out_env.id.to_string()`) is exactly what a peer's `Fed::
+/// Ack{id}` reply will carry back -- `storage::Store::
+/// deliveries_for_fed_ack`'s `(message_id, peer_key)` lookup matches it
+/// the same way it already matches a gateway-mode `Fed::Envelope`'s id.
+async fn process_due_fed_sealed(
+    d: &Arc<Daemon>, del: &storage::Delivery, out_env: Envelope,
+    peer_name: &str, remote_route: &str, tx: mpsc::Sender<fed::wire::Fed>, now: DateTime<Utc>,
+) {
+    let Some(recipient_pub) = resolve_sealed_key(d, peer_name) else {
+        let result = d.store.lock().unwrap()
+            .mark_terminal(del.id, "dead_letter", "NO_SEALED_KEY");
+        warn_if_mark_failed(del.id, "dead_letter", result);
+        warn!(delivery = del.id, peer = peer_name,
+              "sealed egress dead-lettered: no sealed key for this peer (config pin or verified advert)");
+        emit_delivery(d, del.message_id, del.route.clone(), "dead_letter");
+        return;
+    };
+
+    let mut canonical_env_cbor = Vec::new();
+    ciborium::into_writer(&out_env, &mut canonical_env_cbor)
+        .expect("Envelope always serializes to CBOR");
+    if canonical_env_cbor.len() as u64 > SEALED_MAX_BYTES {
+        let result = d.store.lock().unwrap()
+            .mark_terminal(del.id, "dead_letter", "SEALED_OVERSIZE");
+        warn_if_mark_failed(del.id, "dead_letter", result);
+        warn!(delivery = del.id, peer = peer_name, size = canonical_env_cbor.len(),
+              "sealed egress dead-lettered: envelope exceeds the sealed size ceiling, rejected at origin");
+        emit_delivery(d, del.message_id, del.route.clone(), "dead_letter");
+        return;
+    }
+
+    let max_ttl_secs = d.cfg_snapshot(|c| c.federation.as_ref().map(|f| f.max_ttl_secs))
+        .unwrap_or(86_400);
+    let expires_at = (out_env.created_at + CDuration::seconds(max_ttl_secs as i64)).timestamp();
+    let sealed =
+        fed::seal::seal(&canonical_env_cbor, &out_env.id.to_string(), expires_at, &recipient_pub);
+
+    let result = d.store.lock().unwrap().mark_attempting(del.id);
+    warn_if_mark_failed(del.id, "attempting", result);
+
+    let frame = fed::wire::Fed::Sealed { sealed, target_route: remote_route.to_string() };
+    // try_send, not send().await -- same rationale as the gateway path.
+    match tx.try_send(frame) {
+        Ok(()) => metrics::inc(&metrics::SEALED_EGRESS),
+        Err(e) => {
+            let closed_or_full = match e {
+                mpsc::error::TrySendError::Full(_) => "full",
+                mpsc::error::TrySendError::Closed(_) => "closed",
+            };
+            let result = d.store.lock().unwrap()
+                .mark_retry(del.id, now + CDuration::seconds(5));
+            warn_if_mark_failed(del.id, "pending", result);
+            warn!(delivery = del.id, peer = peer_name, reason = closed_or_full,
+                  "federation connection unavailable, requeued (sealed)");
         }
     }
 }
@@ -4895,19 +5073,46 @@ routes:
         )
     }
 
-    /// Persists `env` and queues one `pending` delivery row addressed to
-    /// `fed:<dest_endpoint>` -- bypassing `fan_out_deliveries`/route config
-    /// entirely (process_due_fed reads only `del.destination.endpoint` and
-    /// `del.route`/`del.message_id` for bookkeeping, never a real
-    /// `RouteConfig`), so these tests can drive `process_due_fed` directly
+    /// Persists `env` and queues one `pending` delivery row under `route`,
+    /// addressed to `fed:<dest_endpoint>` -- bypassing `fan_out_deliveries`
+    /// entirely, so these tests can drive `process_due_fed` directly
     /// against a hand-picked `dest_endpoint` shape. Returns the delivery
     /// row's own id.
-    fn queue_fed_delivery(d: &Daemon, env: &Envelope, dest_endpoint: &str) -> i64 {
+    ///
+    /// `route` matters as of Task 4 (design §4, cycle H): `process_due_fed`
+    /// resolves `security_mode` via `Daemon::route_cfg(&del.route)`, so a
+    /// sealed-mode test needs this row's `route` to actually name a
+    /// `RouteConfig` in the test fixture (`queue_fed_delivery` below keeps
+    /// the pre-Task-4 gateway-mode tests' `"outbound"` sentinel, which
+    /// deliberately does NOT match any configured route -- `route_cfg`
+    /// returns `None` for it, and `process_due_fed`'s `unwrap_or_else(||
+    /// "gateway".to_string())` default keeps those tests on the gateway
+    /// path exactly as before).
+    fn queue_fed_delivery_on_route(d: &Daemon, env: &Envelope, dest_endpoint: &str, route: &str) -> i64 {
         let now = Utc::now();
         let dest = Endpoint { protocol: FED_PROTOCOL.to_string(), endpoint: dest_endpoint.to_string() };
         let store = d.store.lock().unwrap();
         store.insert_message(env).unwrap();
-        store.insert_delivery(env.id, "outbound", &dest, now, env.expires_at, 2).unwrap()
+        store.insert_delivery(env.id, route, &dest, now, env.expires_at, 2).unwrap()
+    }
+
+    fn queue_fed_delivery(d: &Daemon, env: &Envelope, dest_endpoint: &str) -> i64 {
+        queue_fed_delivery_on_route(d, env, dest_endpoint, "outbound")
+    }
+
+    /// Sets `route_name`'s `security_mode` to `mode` via `apply_config`
+    /// (design §3: live, no restart) -- the sealed-egress test fixture
+    /// setup shared by every `process_due_fed_sealed` test below. Panics if
+    /// `route_name` isn't in the fixture config, since that would silently
+    /// test nothing (the tests using this always pair it with
+    /// `queue_fed_delivery_on_route(.., route_name)`, see that function's
+    /// doc comment for why the two must name the same route).
+    fn set_route_security_mode(d: &Daemon, route_name: &str, mode: &str) {
+        let mut cfg = d.cfg.read().unwrap().clone();
+        let route = cfg.routes.iter_mut().find(|r| r.name == route_name)
+            .unwrap_or_else(|| panic!("route '{route_name}' not found in test fixture config"));
+        route.security_mode = mode.to_string();
+        d.apply_config(cfg);
     }
 
     fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
@@ -4919,6 +5124,39 @@ routes:
             fed::wire::Fed::Envelope { env, target_route } => (*env, target_route),
             other => panic!("expected Fed::Envelope, got {other:?}"),
         }
+    }
+
+    fn unwrap_sealed_frame(frame: fed::wire::Fed) -> (fed::seal::SealedEnvelope, String) {
+        match frame {
+            fed::wire::Fed::Sealed { sealed, target_route } => (sealed, target_route),
+            other => panic!("expected Fed::Sealed, got {other:?}"),
+        }
+    }
+
+    /// Builds and signs an `Advert` claiming `sealed_key_hex` as `node_id`'s
+    /// sealed-routing key, ready to `upsert_peer_advert` -- the shared
+    /// fixture for the sealed-egress "advert-learned key" test pair below.
+    /// Minimal on everything else (`services`/`protocols` empty): only
+    /// `security.sealed_key` matters to `resolve_sealed_key`.
+    fn signed_sealed_key_advert(
+        identity: &NodeIdentity, node_id: &str, sealed_key_hex: &str,
+    ) -> fed::advert::Advert {
+        fed::advert::sign(
+            fed::advert::Advert {
+                rf_version: 1,
+                node_id: node_id.to_string(),
+                name: "phoenix".into(),
+                services: std::collections::BTreeMap::from([("federation".to_string(), true)]),
+                protocols: std::collections::BTreeMap::new(),
+                security: fed::advert::SecurityCaps {
+                    translate: true, signed: true, sealed: true,
+                    sealed_key: Some(sealed_key_hex.to_string()),
+                },
+                expires: (Utc::now() + CDuration::hours(1)).timestamp(),
+                sig: Vec::new(),
+            },
+            identity,
+        )
     }
 
     #[tokio::test]
@@ -5021,6 +5259,280 @@ routes:
         assert_eq!(sent_env.hops, 2, "hops increments by exactly one on top of the relayed value");
         assert_eq!(fed::sign::verify_chain(&sent_env), Ok(()),
             "the full chain -- untouched origin + all attestations including this new one -- must verify");
+    }
+
+    // ==== process_due_fed sealed egress (design §4, SPEC §113.4, cycle H,
+    // Task 4) ================================================================
+
+    #[tokio::test]
+    async fn process_due_fed_sealed_mode_produces_fed_sealed_frame_that_unseals_and_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let recipient_secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_pub = recipient_secret.public_key();
+        let node_id = format!("rf:{}", "44".repeat(32));
+
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        let mut peer = fed_peer_cfg("phoenix", &node_id, "verified");
+        peer.sealed_key = Some(hex::encode(recipient_pub.to_bytes()));
+        fed_cfg.peers = vec![peer];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+        set_route_security_mode(&d, "general", "sealed");
+        let mut rx = register_fed_conn(&d, "phoenix", &node_id);
+
+        let raw_ref = "!secret-ref";
+        let raw_body = "SENTINEL-PLAINTEXT-BODY-must-never-appear-in-the-clear";
+        let env = local_env(raw_ref, raw_body);
+        let env_id = env.id;
+        let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+
+        let before = metrics::SEALED_EGRESS.load(std::sync::atomic::Ordering::Relaxed);
+        process_due(&d, del, Utc::now()).await;
+
+        let frame = rx.try_recv().expect("process_due_fed must send a Fed::Sealed frame");
+        let (sealed, target_route) = unwrap_sealed_frame(frame);
+        assert_eq!(target_route, "regional-chat");
+        assert_eq!(sealed.id, env_id.to_string());
+
+        // Sentinel (design §113.4/§2): the raw body/ref must not appear
+        // ANYWHERE in the serialized Fed::Sealed wire bytes -- sealing must
+        // actually hide the sentinel/alias behind AEAD ciphertext, not just
+        // leave it reachable via some other field.
+        let mut buf = Vec::new();
+        ciborium::into_writer(
+            &fed::wire::Fed::Sealed { sealed: sealed.clone(), target_route: target_route.clone() },
+            &mut buf,
+        ).unwrap();
+        assert!(!bytes_contain(&buf, raw_body.as_bytes()),
+            "the plaintext body must never reach the wire unsealed");
+        assert!(!bytes_contain(&buf, raw_ref.as_bytes()),
+            "the raw native ref must never reach the wire under identity_exposure: pseudonymous");
+
+        // Round-trip: unseal with the recipient's own key, decode as an
+        // Envelope, and the ENTIRE cycle-F signature chain must verify --
+        // proof the sealed plaintext really is the full canonical envelope
+        // (origin sig + attestations included), not merely the narrower
+        // signing tuple.
+        let opened = fed::seal::unseal(&sealed, &recipient_secret)
+            .expect("must decrypt with the intended recipient's own sealed key");
+        let decoded: Envelope = ciborium::from_reader(opened.as_slice())
+            .expect("sealed plaintext must CBOR-decode as a full Envelope");
+        assert_eq!(decoded.id, env_id);
+        assert_eq!(decoded.body, raw_body, "no-transform: the unsealed body is the ORIGINAL, untruncated");
+        assert!(decoded.origin.is_some());
+        assert_eq!(fed::sign::verify_chain(&decoded), Ok(()));
+
+        assert!(metrics::SEALED_EGRESS.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "SEALED_EGRESS must increment on a successful sealed send");
+        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert_eq!(after.state, "attempting");
+    }
+
+    /// No-transform (design §4, SPEC §113.4): a route with BOTH
+    /// `render.max_chars` and `render.tag` set is a `gateway`-mode config
+    /// habit that must have zero effect once the route is `sealed` --
+    /// `process_due_fed_sealed` never calls `transform::render`/
+    /// `truncate_body`/`attachment_notes` at all, so the unsealed body must
+    /// come back exactly as long as the original, never cut down to
+    /// `max_chars`.
+    #[tokio::test]
+    async fn process_due_fed_sealed_mode_ignores_route_render_max_chars_body_is_untruncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let recipient_secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_pub = recipient_secret.public_key();
+        let node_id = format!("rf:{}", "45".repeat(32));
+
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        let mut peer = fed_peer_cfg("phoenix", &node_id, "verified");
+        peer.sealed_key = Some(hex::encode(recipient_pub.to_bytes()));
+        fed_cfg.peers = vec![peer];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+        {
+            let mut cfg = d.cfg.read().unwrap().clone();
+            let route = cfg.routes.iter_mut().find(|r| r.name == "general").unwrap();
+            route.security_mode = "sealed".to_string();
+            route.render = crate::config::RenderConfig { tag: "alias".to_string(), max_chars: 16 };
+            d.apply_config(cfg);
+        }
+        let mut rx = register_fed_conn(&d, "phoenix", &node_id);
+
+        let long_body = "this body is deliberately much longer than sixteen characters and must \
+                          survive sealing completely whole, with no truncation applied anywhere";
+        assert!(long_body.chars().count() > 16, "fixture sanity check");
+        let env = local_env("!ref", long_body);
+        let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        process_due(&d, del, Utc::now()).await;
+
+        let (sealed, _) = unwrap_sealed_frame(rx.try_recv().unwrap());
+        let opened = fed::seal::unseal(&sealed, &recipient_secret).unwrap();
+        let decoded: Envelope = ciborium::from_reader(opened.as_slice()).unwrap();
+        assert_eq!(decoded.body, long_body,
+            "route render.max_chars must never truncate a sealed route's body");
+    }
+
+    #[tokio::test]
+    async fn process_due_fed_sealed_mode_with_no_sealed_key_anywhere_dead_letters_no_sealed_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_id = format!("rf:{}", "46".repeat(32));
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        // No `sealed_key` config pin, and no advert stored for this peer
+        // either -- `resolve_sealed_key` has NO source to draw from.
+        fed_cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+        set_route_security_mode(&d, "general", "sealed");
+        let mut rx = register_fed_conn(&d, "phoenix", &node_id);
+
+        let env = local_env("!ref", "body");
+        let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        process_due(&d, del, Utc::now()).await;
+
+        assert!(rx.try_recv().is_err(),
+            "must never send unsealed when no sealed key is available (fail-closed)");
+        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert_eq!(after.state, "dead_letter");
+        assert_eq!(after.reason.as_deref(), Some("NO_SEALED_KEY"));
+    }
+
+    #[tokio::test]
+    async fn process_due_fed_sealed_mode_oversized_envelope_dead_letters_sealed_oversize_not_shrunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let recipient_secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_pub = recipient_secret.public_key();
+        let node_id = format!("rf:{}", "47".repeat(32));
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        let mut peer = fed_peer_cfg("phoenix", &node_id, "verified");
+        peer.sealed_key = Some(hex::encode(recipient_pub.to_bytes()));
+        fed_cfg.peers = vec![peer];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+        set_route_security_mode(&d, "general", "sealed");
+        let mut rx = register_fed_conn(&d, "phoenix", &node_id);
+
+        let huge_body = "x".repeat(SEALED_MAX_BYTES as usize + 1024);
+        let env = local_env("!ref", &huge_body);
+        let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        process_due(&d, del, Utc::now()).await;
+
+        assert!(rx.try_recv().is_err(),
+            "an oversized sealed envelope must be rejected at origin, never sent (not even shrunk)");
+        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert_eq!(after.state, "dead_letter");
+        assert_eq!(after.reason.as_deref(), Some("SEALED_OVERSIZE"));
+    }
+
+    #[tokio::test]
+    async fn process_due_fed_sealed_mode_uses_advert_learned_key_when_no_config_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let recipient_secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_pub = recipient_secret.public_key();
+        let peer_identity = test_peer_identity(dir.path(), "phoenix-node");
+        let node_id = peer_identity.node_id();
+
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        // No config-pinned sealed_key for this peer.
+        fed_cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+        set_route_security_mode(&d, "general", "sealed");
+
+        let advert = signed_sealed_key_advert(
+            &peer_identity, &node_id, &hex::encode(recipient_pub.to_bytes()));
+        let mut raw = Vec::new();
+        ciborium::into_writer(&advert, &mut raw).unwrap();
+        d.store.lock().unwrap()
+            .upsert_peer_advert(&node_id, &raw, "phoenix", Utc::now() + CDuration::hours(1), Utc::now())
+            .unwrap();
+
+        let mut rx = register_fed_conn(&d, "phoenix", &node_id);
+        let env = local_env("!ref", "advert-learned-key body");
+        let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        process_due(&d, del, Utc::now()).await;
+
+        let (sealed, _) = unwrap_sealed_frame(rx.try_recv().expect("sealed frame expected"));
+        let opened = fed::seal::unseal(&sealed, &recipient_secret)
+            .expect("must decrypt with the advert-learned key");
+        let decoded: Envelope = ciborium::from_reader(opened.as_slice()).unwrap();
+        assert_eq!(decoded.body, "advert-learned-key body");
+    }
+
+    #[tokio::test]
+    async fn process_due_fed_sealed_mode_config_pin_wins_over_a_disagreeing_advert_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let correct_secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
+        let correct_pub = correct_secret.public_key();
+        let wrong_secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
+        let wrong_pub = wrong_secret.public_key();
+
+        let peer_identity = test_peer_identity(dir.path(), "phoenix-node-2");
+        let node_id = peer_identity.node_id();
+
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        let mut peer = fed_peer_cfg("phoenix", &node_id, "verified");
+        peer.sealed_key = Some(hex::encode(correct_pub.to_bytes())); // the config pin
+        fed_cfg.peers = vec![peer];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+        set_route_security_mode(&d, "general", "sealed");
+
+        // The peer's own advert claims a DIFFERENT (wrong) sealed_key.
+        let advert = signed_sealed_key_advert(
+            &peer_identity, &node_id, &hex::encode(wrong_pub.to_bytes()));
+        let mut raw = Vec::new();
+        ciborium::into_writer(&advert, &mut raw).unwrap();
+        d.store.lock().unwrap()
+            .upsert_peer_advert(&node_id, &raw, "phoenix", Utc::now() + CDuration::hours(1), Utc::now())
+            .unwrap();
+
+        let mut rx = register_fed_conn(&d, "phoenix", &node_id);
+        let env = local_env("!ref", "config-pin-wins body");
+        let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        process_due(&d, del, Utc::now()).await;
+
+        let (sealed, _) = unwrap_sealed_frame(rx.try_recv().unwrap());
+        assert!(fed::seal::unseal(&sealed, &wrong_secret).is_err(),
+            "must NOT have sealed to the disagreeing advert-learned key");
+        let opened = fed::seal::unseal(&sealed, &correct_secret)
+            .expect("the config pin must win over a disagreeing advert-learned key");
+        let decoded: Envelope = ciborium::from_reader(opened.as_slice()).unwrap();
+        assert_eq!(decoded.body, "config-pin-wins body");
+    }
+
+    #[tokio::test]
+    async fn process_due_fed_sealed_mode_ack_by_id_marks_delivery_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let recipient_secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_pub = recipient_secret.public_key();
+        let node_id = format!("rf:{}", "48".repeat(32));
+
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        let mut peer = fed_peer_cfg("phoenix", &node_id, "verified");
+        peer.sealed_key = Some(hex::encode(recipient_pub.to_bytes()));
+        fed_cfg.peers = vec![peer];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+        set_route_security_mode(&d, "general", "sealed");
+        let mut rx = register_fed_conn(&d, "phoenix", &node_id);
+
+        let env = local_env("!ref", "ack me");
+        let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        process_due(&d, del, Utc::now()).await;
+
+        let (sealed, _) = unwrap_sealed_frame(rx.try_recv().unwrap());
+        assert_eq!(
+            d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap().state,
+            "attempting",
+        );
+
+        // The peer acks by the sealed header's `id` (the cleartext field a
+        // receiver reads before ever decrypting) -- the same
+        // `deliveries_for_fed_ack` lookup gateway-mode `Fed::Ack{id}`
+        // already resolves against, unchanged.
+        fed::conn::handle_fed_ack(&d, "phoenix", &sealed.id);
+
+        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert_eq!(after.state, "delivered");
     }
 
     #[tokio::test]
