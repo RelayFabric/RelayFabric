@@ -46,7 +46,7 @@ impl SealedKey {
     /// load_or_create`.
     pub fn load_or_create(path: &Path) -> io::Result<SealedKey> {
         if !path.exists() {
-            let key: [u8; 32] = rand::random();
+            let mut key: [u8; 32] = rand::random();
             use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
             let mut f = std::fs::OpenOptions::new()
@@ -54,7 +54,20 @@ impl SealedKey {
                 .create_new(true)
                 .mode(0o600)
                 .open(path)?;
-            f.write_all(hex::encode(key).as_bytes())?;
+            let write_result = f.write_all(hex::encode(key).as_bytes());
+            // Final-review polish (defense-in-depth, cycle H): this
+            // transient generation buffer is a SEPARATE stack copy of the
+            // raw secret scalar from the one `SecretKey::from_bytes` holds
+            // below (re-derived from the file we just read back) -- zero
+            // it here rather than letting it linger until the frame
+            // unwinds, on both the success and the (disk-full-class)
+            // error path. This closes only the LOCAL transient-copy gap;
+            // `crypto_box::SecretKey` itself not zeroizing on drop is a
+            // documented, out-of-scope, upstream crate gap, not something
+            // this change attempts to fix.
+            use zeroize::Zeroize;
+            key.zeroize();
+            write_result?;
         }
         let raw = std::fs::read_to_string(path)?;
         let bytes = hex::decode(raw.trim()).map_err(io::Error::other)?;

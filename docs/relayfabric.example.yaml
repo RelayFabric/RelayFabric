@@ -132,7 +132,10 @@ routes:
     # requires every destination to be a fed:<peer> peer with a
     # config-pinned sealed_key (see federation.peers[].sealed_key below);
     # a plaintext local plugin like mqtt above cannot be a sealed
-    # destination.
+    # destination. This route-level setting is best-effort only -- an
+    # in-place edit back to "gateway" reloads cleanly; for a hard,
+    # reload-enforced guarantee, set the node's privacy.minimum_security:
+    # sealed below instead.
     # security_mode: gateway
 
   # - name: lxmf_mqtt_bridge

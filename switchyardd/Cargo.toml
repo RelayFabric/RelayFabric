@@ -53,6 +53,13 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"] }
 # design §2) -- `chacha20`/`std`/`alloc`/`getrandom`/`rand_core` are the
 # minimum feature set that compiles `ChaChaBox::new`/`.encrypt`/`.decrypt`.
 crypto_box = { version = "0.9.1", default-features = false, features = ["chacha20", "std", "alloc", "getrandom", "rand_core"] }
+# Final-review polish (cycle H, sealed routing): promoted from an existing
+# transitive dep (already locked via crypto_box/curve25519-dalek/
+# ed25519-dalek, `Apache-2.0 OR MIT`, zero new crates in the tree) to a
+# direct one, so `fed::sealkey::SealedKey::load_or_create` can zeroize its
+# own transient key-generation buffer rather than reaching for a crate
+# Cargo wouldn't otherwise let it name directly.
+zeroize = "1"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -147,6 +147,12 @@ otherwise. Node-level `privacy.minimum_security` (`gateway` default,
 `sealed`) is a floor: `--check-config` rejects any route whose effective mode
 falls below it, rather than silently allowing a downgrade.
 
+A route's own `security_mode: sealed` is best-effort only — an operator can
+still edit that same route to `security_mode: gateway` in place, and the
+edit reloads cleanly (already-queued deliveries then egress as cleartext);
+for a hard, reload-enforced guarantee that a route can never be downgraded,
+set the node's `privacy.minimum_security: sealed` instead.
+
 **Downgrade refusal (§113.2):** a sealed inbound message is never silently
 decrypted onto a route that refuses to terminate it. That refusal is gated
 by `privacy.allow_gateway_decryption` (node-level, default `true`) or its
