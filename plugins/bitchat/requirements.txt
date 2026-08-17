@@ -1,0 +1,19 @@
+# License gate (2026-08-16), Task 2: no new dependency. Bitchat's public
+# geohash channels are standard NIP-01 events (kind 20000 + g/n tags) over
+# Nostr relays, so this plugin reuses exactly what plugins/nostr/ already
+# license-checked and installed -- see plugins/nostr/requirements.txt for
+# the full verification notes:
+#   coincurve==21.0.0  License-Expression "MIT OR Apache-2.0" (schnorr sign/
+#     verify, via relayfabric_sdk.nip01).
+#   websockets==17.0.1 License-Expression "BSD-3-Clause" (Task 3's relay
+#     transport).
+#   cbor2               already an SDK dependency (sdk/python/pyproject.toml),
+#     permissive; listed here too since plugins consume the SDK via
+#     sys.path, not pip.
+# Reference-only, NEVER pip-installed or vendored (design "Architecture" +
+# .superpowers/bitchat-feasibility-spike.md Sec2):
+#   strfry (a Nostr relay) -- GPL.
+#   Spl0itable/NYM (nymchat, a Bitchat-Nostr bridge) -- AGPL-3.0.
+coincurve==21.0.0
+websockets==17.0.1
+cbor2
