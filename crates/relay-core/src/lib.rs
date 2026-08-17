@@ -4,6 +4,9 @@ use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
 
+mod transport;
+pub use transport::{Bandwidth, Latency, TransportCharacteristics, TransportClass, TransportPolicy};
+
 pub const ENVELOPE_VERSION: u8 = 1;
 
 /// Priority classes (spec §39), highest urgency first. Index in this array
