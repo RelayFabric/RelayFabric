@@ -1,18 +1,27 @@
-"""RelayFabric Nostr plugin: NIP-01 event helpers + config (helpers half;
-the backend/bridge/main half lands in a follow-up task).
+"""RelayFabric Nostr plugin: bridges Nostr relays (NIP-01 kind-1 notes) over
+Plugin Protocol v1 (relayfabric_sdk).
 
-Module top level is stdlib-only (hashlib/json/logging) so config/event
-helpers stay importable without coincurve, websockets, cbor2, or
-relayfabric_sdk. Those are imported lazily inside the functions that need
-them (verify_event/sign_event import coincurve; the bridge half to come
-imports websockets/cbor2/relayfabric_sdk the same way meshcore/signal do).
-Note bytes/content are never logged, only pubkeys/kinds/channel names.
+Module top level is stdlib-only (asyncio/copy/hashlib/json/logging/os/queue/
+socket/sys/threading/time) so config/event helpers stay importable without
+coincurve, websockets, cbor2, or relayfabric_sdk. Those are imported lazily
+inside the functions/methods that need them (verify_event/sign_event/
+load_or_create_identity import coincurve; NostrBackend.start() imports
+websockets; Bridge and main() import relayfabric_sdk) -- the same lazy-import
+shape meshcore/signal use. Note bytes/content are never logged, only
+pubkeys/kinds/channel names.
 """
 
+import asyncio
 import copy
 import hashlib
 import json
 import logging
+import os
+import queue
+import socket
+import sys
+import threading
+import time
 
 log = logging.getLogger(__name__)
 
@@ -206,3 +215,360 @@ def hello_max_payload(cfg):
     advertised cap; a higher one can never loosen it past NOSTR_MAX_PAYLOAD).
     """
     return min(NOSTR_MAX_PAYLOAD, cfg["max_text_bytes"])
+
+
+def load_or_create_identity(identity_file):
+    """Load this plugin's Nostr keypair, generating one on first run.
+
+    If `identity_file` is set and already holds a key (one line, 32-byte
+    hex privkey -- the same "nsec hex" form sign_event takes), load it.
+    Otherwise generate a fresh secp256k1 key via coincurve; if
+    `identity_file` is set, persist the new key there with mode 0600
+    (os.open O_CREAT so the restrictive mode is atomic with creation, no
+    window where the key sits world-readable) so restarts reuse the same
+    identity. A None `identity_file` means a fresh identity every start
+    (no path to persist to) -- config-valid per load_config, but every
+    restart then publishes under a new pubkey.
+
+    Logs the public key (hex; loosely "npub", though this is the raw hex
+    form, not bech32) exactly once. Never logs the private key.
+
+    Returns (privkey_hex, pubkey_hex).
+    """
+    from coincurve import PrivateKey, PublicKeyXOnly
+
+    if identity_file and os.path.exists(identity_file):
+        with open(identity_file) as f:
+            privkey_hex = f.read().strip()
+    else:
+        privkey_hex = PrivateKey().secret.hex()
+        if identity_file:
+            fd = os.open(identity_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(privkey_hex + "\n")
+
+    pubkey_hex = PublicKeyXOnly.from_valid_secret(
+        PrivateKey(bytes.fromhex(privkey_hex)).secret).format().hex()
+    log.info(f"Nostr identity pubkey (npub, hex): {pubkey_hex}")
+    return privkey_hex, pubkey_hex
+
+
+class NostrBackend:
+    """websockets-library transport -- the backend seam Bridge depends on
+    (swappable for a FakeBackend in Bridge tests; exercised directly via a
+    fake `websockets` module injected into sys.modules for backend-level
+    tests, per the fleet's meshcore precedent).
+
+    One WebSocket connection per UNIQUE relay across the union of all
+    configured channels' relay sets (a relay used by two channels gets one
+    connection, two REQ subscriptions). Each connection runs as an
+    independent asyncio task on a private event-loop daemon thread
+    (asyncio.new_event_loop() + run_forever(), meshcore precedent) and
+    reconnects with exponential backoff on drop/error -- one relay being
+    down never blocks another, and start() does not block waiting for any
+    relay to actually connect (unlike meshcore's single-transport
+    ready.wait(), there is no single "connected" state to gate on here).
+
+    Inbound: on each (re)connect, sends `["REQ", subid, filter]` for every
+    channel whose relay set includes that relay (subid = "rf-<channel>", a
+    stable per-channel id -- see __init__); the read loop parses each
+    incoming frame via _handle_message, which normalizes `["EVENT", subid,
+    event]` frames (verifying the event's schnorr sig -- design Sec80, a
+    relay is untrusted) into a bounded queue.Queue(256), drop-newest with a
+    debug log on Full; `["OK"|"EOSE"|"NOTICE", ...]` are logged at debug and
+    otherwise ignored. events() yields the normalized (channel, sender,
+    text, ts) tuples forever.
+
+    Outbound: publish(channel, text) signs a kind-1 event (channel's
+    publish_tags) and best-effort sends it to every relay in the channel's
+    relay set that currently has a live connection, via
+    run_coroutine_threadsafe(...).result(timeout=30); success is "sent to
+    at least one relay" (delivered = accepted by this backend, not a
+    relay-level OK ack -- same posture as meshcore's send_channel), and
+    RuntimeError only when every relay send failed/there was no live
+    connection to any of them.
+    """
+
+    def __init__(self, relays, channels, identity):
+        self.relays = list(relays)
+        self.channels = channels
+        self.privkey_hex, self.pubkey_hex = identity
+        self._queue = queue.Queue(maxsize=256)
+        self._loop = None
+        # relay url -> live websocket connection; populated/cleared only
+        # from the backend's own loop thread (_relay_loop), read from
+        # publish()'s coroutine (also loop-thread, via run_coroutine_threadsafe).
+        self._connections = {}
+        self._subid_to_channel = {f"rf-{name}": name for name in self.channels}
+        self._channel_to_subid = {name: subid for subid, name in
+                                   self._subid_to_channel.items()}
+        self._relay_channels = {}
+        for name, spec in self.channels.items():
+            for relay_url in (spec.get("relays") or self.relays):
+                self._relay_channels.setdefault(relay_url, []).append(name)
+
+    def start(self):
+        import websockets  # lazy: keeps module import stdlib-only (see module docstring)
+
+        self._loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _run():
+            asyncio.set_event_loop(self._loop)
+            ready.set()
+            self._loop.run_forever()
+
+        threading.Thread(target=_run, daemon=True).start()
+        ready.wait(timeout=5)
+        for relay_url in self._relay_channels:
+            asyncio.run_coroutine_threadsafe(
+                self._relay_loop(relay_url, websockets), self._loop)
+
+    async def _relay_loop(self, relay_url, websockets_mod):
+        """Connect to one relay forever, resubscribing on every (re)connect
+        and reconnecting with exponential backoff (capped at 60s) on drop
+        or error -- runs as an independent task per relay so one dead relay
+        never blocks another's connection or resubscription.
+        """
+        backoff = 1
+        while True:
+            try:
+                async with websockets_mod.connect(relay_url) as ws:
+                    self._connections[relay_url] = ws
+                    backoff = 1
+                    for name in self._relay_channels[relay_url]:
+                        subid = self._channel_to_subid[name]
+                        filt = self.channels[name]["filter"]
+                        await ws.send(json.dumps(["REQ", subid, filt]))
+                    async for raw in ws:
+                        self._handle_message(raw)
+            except Exception as e:  # noqa: BLE001 - a relay drop must not kill the task
+                log.debug(f"nostr relay {relay_url} connection error: {e}")
+            finally:
+                self._connections.pop(relay_url, None)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+    def _handle_message(self, raw):
+        """Parse and route one relay-delivered frame. Never raises: a relay
+        is untrusted (design Sec80) and this runs inside _relay_loop's
+        per-relay task, so a malformed/adversarial frame must not kill that
+        relay's connection.
+        """
+        try:
+            msg = json.loads(raw)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(msg, list) or not msg:
+            return
+        kind = msg[0]
+        if kind == "EVENT":
+            if len(msg) < 3:
+                return
+            sub_id, event = msg[1], msg[2]
+            try:
+                parsed = normalize_event(event, sub_id, self._subid_to_channel)
+            except TypeError:
+                # e.g. an unhashable sub_id (a list/dict) from a malformed
+                # frame -- normalize_event's dict.get(sub_id) would raise.
+                return
+            if parsed is None:
+                return
+            try:
+                self._queue.put_nowait(parsed)
+            except queue.Full:
+                log.debug("Dropping nostr event: queue full")
+        elif kind == "OK":
+            log.debug(f"nostr OK: {msg[1:]}")
+        elif kind == "EOSE":
+            log.debug(f"nostr EOSE: {msg[1:]}")
+        elif kind == "NOTICE":
+            log.debug(f"nostr NOTICE: {msg[1:]}")
+        # unknown message kind: ignore
+
+    def events(self):
+        """Yield normalized (channel, sender, text, ts) tuples from the
+        queue forever."""
+        while True:
+            yield self._queue.get()
+
+    def publish(self, channel, text):
+        if self._loop is None:
+            raise RuntimeError("nostr backend not started")
+        spec = self.channels.get(channel)
+        if spec is None:
+            raise RuntimeError(f"unknown channel {channel!r}")
+        tags = spec.get("publish_tags") or []
+        relays = spec.get("relays") or self.relays
+        event = sign_event(self.privkey_hex, int(time.time()), 1, tags, text)
+        fut = asyncio.run_coroutine_threadsafe(
+            self._publish_to_relays(event, relays), self._loop)
+        try:
+            any_ok = fut.result(timeout=30)
+        except Exception as e:
+            raise RuntimeError(f"nostr publish to '{channel}' failed: {e}") from e
+        if not any_ok:
+            raise RuntimeError(
+                f"nostr publish to '{channel}' failed: no reachable relay "
+                f"among {relays}")
+
+    async def _publish_to_relays(self, event, relays):
+        msg = json.dumps(["EVENT", event])
+        any_ok = False
+        for relay_url in relays:
+            ws = self._connections.get(relay_url)
+            if ws is None:
+                continue  # not currently connected to this relay
+            try:
+                await ws.send(msg)
+                any_ok = True
+            except Exception as e:  # noqa: BLE001 - try the remaining relays
+                log.debug(f"nostr publish to {relay_url} failed: {e}")
+        return any_ok
+
+
+class Bridge:
+    """Bridges normalized Nostr events <-> Plugin Protocol frames. Mirrors
+    plugins/meshcore's Bridge shape (write lock, _send_frame, SentCache loop
+    guard, deny-by-default, oversize defensive drop) with one difference:
+    NostrBackend.events() already yields fully normalized (channel, sender,
+    text, ts) tuples (normalize_event needs the sub_id -> channel map, which
+    only the backend holds, so verification/normalization happens
+    backend-side before the queue -- see NostrBackend), so handle_event has
+    no "normalize returned None" case of its own to handle.
+
+    handle_event runs on the backend's reader thread; handle_send runs on
+    the main thread; all daemon-socket writes go through _send_frame,
+    serialized by one lock.
+    """
+
+    def __init__(self, cfg, backend, sock_file):
+        from relayfabric_sdk import SentCache
+
+        self.cfg = cfg
+        self.backend = backend
+        self.sock_file = sock_file
+        self.write_lock = threading.Lock()
+        # 1h, not SentCache's 86400s default: mirrors meshcore/meshtastic's
+        # echo loop-guard window (bounds how long a lost echo/ack can leave
+        # a stale entry able to swallow one genuine identical-text message).
+        self.sent_cache = SentCache(ttl_secs=3600)
+
+    def _send_frame(self, obj):
+        from relayfabric_sdk import ipc as relay_ipc
+
+        with self.write_lock:
+            relay_ipc.write_frame(self.sock_file, obj)
+
+    # ----- inbound (Nostr -> daemon); called from the backend's reader thread -----
+
+    def handle_event(self, parsed):
+        channel, sender, text, ts = parsed
+
+        if self.sent_cache.match(channel, text):
+            return  # loop guard: our own published note came back on the subscription
+
+        from relayfabric_sdk import ipc as relay_ipc
+
+        self._send_frame(relay_ipc.inbound(channel, sender, text, ts))
+        log.info(f"Bridged Nostr event from {sender} to '{channel}' "
+                 f"({len(text)} chars)")
+
+    # ----- egress (daemon -> Nostr); called from the main thread -----
+
+    def handle_send(self, frame):
+        from relayfabric_sdk import ipc as relay_ipc
+
+        corr = frame["corr"]
+        endpoint = frame["endpoint"]
+        body = frame["body"]
+        channel_spec = self.cfg["channels"].get(endpoint)
+        if channel_spec is None:
+            log.warning(f"Nostr send to unknown endpoint {endpoint!r}")
+            self._send_frame(relay_ipc.delivery_result(corr, False, "unknown endpoint"))
+            return
+
+        body_bytes = len(body.encode("utf-8"))
+        max_bytes = self.cfg["max_text_bytes"]
+        if body_bytes > max_bytes:
+            # defensive: the daemon should have already truncated to our
+            # advertised capabilities.max_payload before it ever sends us
+            # this frame.
+            detail = f"body {body_bytes} B exceeds max_text_bytes {max_bytes} B"
+            log.warning(f"Nostr send to '{endpoint}' dropped: {detail}")
+            self._send_frame(relay_ipc.delivery_result(corr, False, detail))
+            return
+
+        try:
+            self.backend.publish(endpoint, body)
+        except Exception as e:  # noqa: BLE001 - report the failure, don't crash
+            log.warning(f"Nostr send to '{endpoint}' failed: {e}")
+            self._send_frame(relay_ipc.delivery_result(corr, False, str(e)))
+            return
+        # delivered = send accepted by the backend (spec Sec70), not a
+        # relay-level OK acknowledgement.
+        self.sent_cache.record(endpoint, body)
+        self._send_frame(relay_ipc.delivery_result(corr, True))
+        log.info(f"Sent Nostr event to '{endpoint}' ({body_bytes} B)")
+
+
+def main():
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+
+    sock_path = os.environ["RELAYFABRIC_SOCKET"]
+    plugin_name = os.environ.get("RELAYFABRIC_PLUGIN_NAME", "nostr")
+    raw_cfg = json.loads(os.environ.get("RELAYFABRIC_PLUGIN_CONFIG", "{}"))
+    # Scrub the resolved config (may carry secrets substituted by the daemon
+    # from a ${env:}/${file:} reference) out of our own environment so any
+    # child process this plugin spawns doesn't inherit it.
+    os.environ.pop("RELAYFABRIC_PLUGIN_CONFIG", None)
+    try:
+        cfg = load_config(raw_cfg)
+    except (ValueError, TypeError) as e:
+        print(f"relayfabric-nostr: invalid config: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    from relayfabric_sdk import ipc as relay_ipc
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(sock_path)
+    rfile = sock.makefile("rb")
+    wfile = sock.makefile("wb")
+
+    caps = relay_ipc.capabilities(text=True, max_payload=hello_max_payload(cfg))
+    relay_ipc.write_frame(wfile, relay_ipc.hello(plugin_name, PLUGIN_VERSION, caps))
+    ack = relay_ipc.read_frame(rfile)
+    if ack.get("t") != "hello_ack" or ack.get("error"):
+        print(f"relayfabric-nostr: hello rejected: {ack.get('error')}",
+             file=sys.stderr)
+        sys.exit(1)
+
+    identity = load_or_create_identity(cfg["identity_file"])
+    backend = NostrBackend(cfg["relays"], cfg["channels"], identity)
+    bridge = Bridge(cfg, backend, wfile)
+    backend.start()
+
+    def reader_loop():
+        for ev in backend.events():
+            try:
+                bridge.handle_event(ev)
+            except Exception as e:  # noqa: BLE001 - one bad event must not kill the reader
+                log.error(f"Nostr event handler error: {e}")
+
+    threading.Thread(target=reader_loop, daemon=True).start()
+
+    while True:
+        try:
+            frame = relay_ipc.read_frame(rfile)
+        except (EOFError, OSError, ValueError) as e:
+            # ValueError: oversize/corrupt frame (relay_ipc.read_frame's own
+            # MAX_FRAME check). The stream is desynced at that point, so exit
+            # rather than continue -- there is no way to resume mid-frame.
+            log.error(f"Daemon connection lost, exiting: {e}")
+            sys.exit(1)
+        kind = frame.get("t")
+        if kind == "send":
+            bridge.handle_send(frame)
+        elif kind == "shutdown":
+            sys.exit(0)
