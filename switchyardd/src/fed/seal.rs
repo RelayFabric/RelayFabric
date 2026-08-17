@@ -116,10 +116,32 @@ impl std::error::Error for SealError {}
 /// some unrelated struct grew a field. ciborium encodes a Rust tuple as a
 /// definite-length CBOR array in field order, which is what makes the KAT
 /// byte-stability test below possible.
-type SealedPlaintext = (Vec<u8>, String, i64);
+///
+/// The envelope-bytes slot is `serde_bytes::ByteBuf`, NOT a bare
+/// `Vec<u8>` (Task 4 review fix round 1, discovered via a real
+/// near-`MAX_FRAME` sealed egress test -- carried back into Task 2's
+/// format): unlike a STRUCT field, a tuple element has nowhere to hang a
+/// `#[serde(with = "serde_bytes")]` attribute, so a bare `Vec<u8>` here
+/// serializes via serde's generic `Vec<T>` impl -- a CBOR array of
+/// individual per-byte integers, NOT a compact CBOR byte string. For
+/// mostly-random AEAD-adjacent bytes (every value 24..=255 costs 2 CBOR
+/// bytes instead of 1), that inflates the encoded plaintext to roughly
+/// DOUBLE `canonical_env_cbor`'s length before it's even encrypted --
+/// invisible at the tiny sizes Task 2's own tests used, but fatal at
+/// anything approaching `SEALED_MAX_BYTES` (`engine::process_due_fed_sealed`
+/// checks the PRE-seal length, on the assumption -- true again now -- that
+/// sealing adds only a small, roughly-constant overhead). `ByteBuf` is
+/// `serde_bytes`' owned type: it round-trips through the SAME derive-free
+/// tuple shape (`Serialize`/`Deserialize` as a CBOR byte string, not a
+/// sequence) without needing a wrapper struct just to attach an attribute.
+type SealedPlaintext = (serde_bytes::ByteBuf, String, i64);
 
 fn encode_plaintext(canonical_env_cbor: &[u8], id: &str, expires_at: i64) -> Vec<u8> {
-    let tuple: SealedPlaintext = (canonical_env_cbor.to_vec(), id.to_string(), expires_at);
+    let tuple: SealedPlaintext = (
+        serde_bytes::ByteBuf::from(canonical_env_cbor.to_vec()),
+        id.to_string(),
+        expires_at,
+    );
     let mut buf = Vec::new();
     ciborium::into_writer(&tuple, &mut buf)
         .expect("canonical tuple of a byte vec/string/i64 always serializes");
@@ -279,7 +301,7 @@ pub fn unseal(sealed: &SealedEnvelope, own_secret: &SecretKey) -> Result<Vec<u8>
         return Err(SealError::BadBinding);
     }
 
-    Ok(canonical_env_cbor)
+    Ok(canonical_env_cbor.into_vec())
 }
 
 #[cfg(test)]
@@ -304,7 +326,17 @@ mod tests {
     const FIXED_RECIPIENT: [u8; 32] = [0x33; 32];
     // Computed once from the fixed ephemeral/nonce/recipient triple above
     // -- see `kat_fixed_ephemeral_and_nonce_locks_exact_sealed_bytes`.
-    const KAT_LOCKED_HEX: &str = "a663616c67781b7832353531392d786368616368613230706f6c79313330352d7631626964666b61742d69646a657870697265735f61741a6553f1006365706b58207b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13656e6f6e636558182222222222222222222222222222222222222222222222226263745840652f941ea6c9f29fa35914873529f64d7c94904926bf422221d396c8fdc94fb5a32ab6b1fe6b73b265356763813972f764215ae89575ec23df82e0b634301179";
+    // Relocked, Task 4 review fix round 1: `SealedPlaintext`'s envelope-
+    // bytes slot changed from a bare `Vec<u8>` (serialized as a CBOR array
+    // of per-byte integers -- a real bug, not a cosmetic one; see
+    // `SealedPlaintext`'s doc comment) to `serde_bytes::ByteBuf`
+    // (serialized as a compact CBOR byte string). That is a genuine,
+    // intentional wire-format change to what `ct` decrypts to -- this is
+    // exactly the "breaking wire-format event" every `canonical_bytes`-
+    // style golden vector in this codebase is documented to represent when
+    // it moves, not a test casually re-pinned to whatever the code
+    // happens to output.
+    const KAT_LOCKED_HEX: &str = "a663616c67781b7832353531392d786368616368613230706f6c79313330352d7631626964666b61742d69646a657870697265735f61741a6553f1006365706b58207b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13656e6f6e63655818222222222222222222222222222222222222222222222222626374582fee42b869eb3a1fe5ad00e418a1c8ad3e7c54c3436ade3f184f96e2c295c277a1d42bd7bb8d651fef14346526caaa6a";
 
     /// Test-only seam completing the byte-stability KAT: given the
     /// already-`pub(crate)` `seal_with_ephemeral`'s fixed ephemeral secret

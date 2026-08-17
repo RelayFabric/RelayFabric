@@ -1768,8 +1768,9 @@ async fn process_due_fed(d: &Arc<Daemon>, del: storage::Delivery, env: Envelope,
     }
     out_env.hops += 1;
 
-    // Design §3/§4, SPEC §113.1/§113.4, cycle H, Task 4: the shared prefix
-    // above (connection lookup, budget, pseudonymize/sign/attest/hops) is
+    // Design §3/§4, SPEC §113.1/§113.4, cycle H, Task 4, review fix round 1
+    // (CRITICAL, cleartext-downgrade finding): the shared prefix above
+    // (connection lookup, budget, pseudonymize/sign/attest/hops) is
     // IDENTICAL for `gateway` and `sealed` routes -- that machinery is
     // cycle-F identity exposure/provenance, not a §113.4 "transform"
     // (render/truncate/attachment-note; this function never applied any of
@@ -1781,10 +1782,31 @@ async fn process_due_fed(d: &Arc<Daemon>, del: storage::Delivery, env: Envelope,
     // (`process_due_fed_sealed`, design §4) and sends `Fed::Sealed`
     // instead -- never both, never a cleartext fallback if sealing can't
     // proceed (fail-closed: see that function's own doc comment).
-    let security_mode = d.route_cfg(&del.route)
-        .map(|r| r.security_mode)
-        .unwrap_or_else(|| "gateway".to_string());
-    if security_mode == "sealed" {
+    //
+    // `del.route` NOT resolving to a CURRENT `RouteConfig` -- the route was
+    // renamed/removed from config since this delivery was queued (a live
+    // `PUT /v1/config` reload, or a restart against an edited config file:
+    // deliveries persist across restarts) -- MUST fail closed, never
+    // silently default to `"gateway"`. Defaulting to gateway would send a
+    // delivery that was queued under a `sealed` route as a CLEARTEXT
+    // `Fed::Envelope`, carrying the original unsealed body -- an unknown
+    // security posture is never safe to treat as "least private". This
+    // applies uniformly regardless of what the route USED to be: an
+    // unresolvable route means the posture literally cannot be determined,
+    // so this never guesses either way (a gateway-mode delivery whose
+    // route vanished ALSO dead-letters here, not just a sealed one).
+    let Some(route_cfg) = d.route_cfg(&del.route) else {
+        let result = d.store.lock().unwrap()
+            .mark_terminal(del.id, "dead_letter", "ROUTE_CONFIG_MISSING");
+        warn_if_mark_failed(del.id, "dead_letter", result);
+        warn!(delivery = del.id, route = %del.route, peer = peer_name,
+              "fed egress dead-lettered: route config not found (renamed/removed since this \
+               delivery was queued) -- security posture cannot be determined, failing closed \
+               rather than defaulting to gateway");
+        emit_delivery(d, del.message_id, del.route.clone(), "dead_letter");
+        return;
+    };
+    if route_cfg.security_mode == "sealed" {
         process_due_fed_sealed(d, &del, out_env, peer_name, remote_route, tx, now).await;
         return;
     }
@@ -1815,6 +1837,25 @@ async fn process_due_fed(d: &Arc<Daemon>, del: storage::Delivery, env: Envelope,
     }
 }
 
+/// Margin subtracted from `fed::noise::MAX_FRAME` to get `SEALED_MAX_BYTES`
+/// (Task 4 review fix round 1, minor #2): the check below runs against the
+/// PRE-seal canonical envelope bytes, but what actually has to fit under
+/// `MAX_FRAME` on the wire is the POST-seal, POST-frame-wrap bytes -- the
+/// `SealedEnvelope` adds a 32-byte ephemeral pubkey + 24-byte nonce +
+/// 16-byte AEAD tag (72 bytes) over the plaintext, and ciborium CBOR-map
+/// framing for both the `SealedEnvelope` struct itself and the wrapping
+/// `Fed::Sealed { sealed, target_route }` frame adds a further (small,
+/// bounded-by-field-count) handful of bytes. At exactly the old
+/// (margin-less) ceiling, that overhead pushed the real wire frame just
+/// PAST `MAX_FRAME` -- `FedChannel::send_frame` would then reject it
+/// AFTER `mark_attempting` had already been recorded, silently stranding
+/// the delivery in `attempting` with no dead-letter and no retry. 512
+/// bytes is comfortably more than the ~100 bytes of actual overhead (any
+/// realistic `target_route`/`id`/`alg` string length included), so
+/// `SEALED_MAX_BYTES` guarantees headroom rather than tracking the exact
+/// overhead byte-for-byte.
+const SEALED_OVERHEAD_MARGIN: u64 = 512;
+
 /// Hard ceiling on a sealed envelope's PRE-seal canonical CBOR size (design
 /// §4, SPEC §113.4: "oversized sealed payloads for constrained transports
 /// are rejected at origin, not shrunk in transit"). Phase-1 has no
@@ -1824,14 +1865,14 @@ async fn process_due_fed(d: &Arc<Daemon>, del: storage::Delivery, env: Envelope,
 /// so this reuses `fed::noise::MAX_FRAME` (16 MiB), the actual Noise
 /// transport frame ceiling ANY sealed frame would have to fit under to
 /// cross the wire at all (`fed::noise::FedChannel::send_frame`/
-/// `recv_frame`), rather than inventing a second, narrower number with no
-/// operator-visible meaning yet. Checked against the PRE-seal canonical
-/// envelope bytes, not the post-seal `SealedEnvelope`'s serialized size --
-/// cheaper (no AEAD call wasted on something already too big), and close
-/// enough: sealing adds a small, roughly-constant overhead (a 32-byte
-/// ephemeral public key, a 24-byte nonce, a 16-byte AEAD tag, plus CBOR
-/// framing) that is negligible against a 16 MiB ceiling.
-const SEALED_MAX_BYTES: u64 = fed::noise::MAX_FRAME as u64;
+/// `recv_frame`), minus `SEALED_OVERHEAD_MARGIN` (see that constant's doc
+/// comment for why a margin is needed at all) rather than inventing a
+/// second, narrower operator-visible number from scratch. Checked against
+/// the PRE-seal canonical envelope bytes, not the post-seal
+/// `SealedEnvelope`'s serialized size -- cheaper (no AEAD call wasted on
+/// something already too big), and the margin above is what makes that
+/// substitution safe.
+const SEALED_MAX_BYTES: u64 = fed::noise::MAX_FRAME as u64 - SEALED_OVERHEAD_MARGIN;
 
 /// Resolves the peer's sealed X25519 recipient key for sealed egress
 /// (design §1/§4, SPEC §113.3): the config pin (`PeerConfig::sealed_key`)
@@ -1859,6 +1900,16 @@ fn resolve_sealed_key(d: &Daemon, peer_name: &str) -> Option<crypto_box::PublicK
             .map(|p| (p.sealed_key.clone(), p.node_id.clone()))
     })?;
 
+    // Task 4 review fix round 1 (minor #3, doc-only): as of today,
+    // `config::validate_sealed_route`'s "each `sealed` route's peer must
+    // carry a CONFIG-PINNED `sealed_key`" rule means no config that passes
+    // `--check-config` can ever reach this function with a config-pin-less
+    // peer on a sealed route -- this advert-learned branch is currently
+    // unreachable through any validated config, exercised only by tests
+    // that build a `Daemon` directly (bypassing `validate`). It stays as
+    // forward-compat defense-in-depth (design §1: advert-learned keys are
+    // real API surface, e.g. once a future phase relaxes the config-pin
+    // requirement), not dead code to delete.
     let advert_key = d.store.lock().unwrap()
         .list_peer_adverts(Utc::now())
         .unwrap_or_default()
@@ -5080,14 +5131,19 @@ routes:
     /// row's own id.
     ///
     /// `route` matters as of Task 4 (design §4, cycle H): `process_due_fed`
-    /// resolves `security_mode` via `Daemon::route_cfg(&del.route)`, so a
-    /// sealed-mode test needs this row's `route` to actually name a
-    /// `RouteConfig` in the test fixture (`queue_fed_delivery` below keeps
-    /// the pre-Task-4 gateway-mode tests' `"outbound"` sentinel, which
-    /// deliberately does NOT match any configured route -- `route_cfg`
-    /// returns `None` for it, and `process_due_fed`'s `unwrap_or_else(||
-    /// "gateway".to_string())` default keeps those tests on the gateway
-    /// path exactly as before).
+    /// resolves `security_mode` via `Daemon::route_cfg(&del.route)`, and
+    /// (Task 4 review fix round 1, CRITICAL finding) a `route` that does
+    /// NOT resolve to a current `RouteConfig` now fails closed
+    /// (`ROUTE_CONFIG_MISSING` dead-letter, nothing sent) rather than
+    /// defaulting to gateway -- so every test driving `process_due_fed`
+    /// via this helper needs `route` to actually name a `RouteConfig` in
+    /// the fixture. `queue_fed_delivery` below uses `"general"`, the
+    /// fixture's one real route (`tests_support::test_daemon_full`,
+    /// `security_mode: "gateway"` by default) -- pre-Task-4 tests used a
+    /// deliberately-nonexistent `"outbound"` sentinel here (relying on the
+    /// old "unknown route defaults to gateway" behavior the CRITICAL fix
+    /// removed); `"general"` reproduces the same gateway-mode behavior
+    /// through a route that genuinely exists instead.
     fn queue_fed_delivery_on_route(d: &Daemon, env: &Envelope, dest_endpoint: &str, route: &str) -> i64 {
         let now = Utc::now();
         let dest = Endpoint { protocol: FED_PROTOCOL.to_string(), endpoint: dest_endpoint.to_string() };
@@ -5097,7 +5153,7 @@ routes:
     }
 
     fn queue_fed_delivery(d: &Daemon, env: &Envelope, dest_endpoint: &str) -> i64 {
-        queue_fed_delivery_on_route(d, env, dest_endpoint, "outbound")
+        queue_fed_delivery_on_route(d, env, dest_endpoint, "general")
     }
 
     /// Sets `route_name`'s `security_mode` to `mode` via `apply_config`
@@ -5535,6 +5591,175 @@ routes:
         assert_eq!(after.state, "delivered");
     }
 
+    // ---- route-config-missing fail-closed (Task 4 review fix round 1,
+    // CRITICAL: cleartext-downgrade finding) -----------------------------
+
+    /// The reproduction: a delivery queued while its route was
+    /// `security_mode: sealed` must NOT egress as a cleartext `Fed::
+    /// Envelope` when that route is later removed from a live-reloaded
+    /// config -- it must dead-letter `ROUTE_CONFIG_MISSING` and send
+    /// NOTHING at all (neither `Fed::Envelope` nor `Fed::Sealed`).
+    #[tokio::test]
+    async fn process_due_fed_sealed_route_removed_before_send_dead_letters_route_config_missing_never_sends() {
+        let dir = tempfile::tempdir().unwrap();
+        let recipient_secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_pub = recipient_secret.public_key();
+        let node_id = format!("rf:{}", "49".repeat(32));
+
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        let mut peer = fed_peer_cfg("phoenix", &node_id, "verified");
+        peer.sealed_key = Some(hex::encode(recipient_pub.to_bytes()));
+        fed_cfg.peers = vec![peer];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+        set_route_security_mode(&d, "general", "sealed");
+        let mut rx = register_fed_conn(&d, "phoenix", &node_id);
+
+        let env = local_env("!ref", "should never reach the wire either way");
+        let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
+
+        // The route this delivery was queued under vanishes from config
+        // BEFORE process_due ever runs -- a live PUT /v1/config reload, or
+        // a restart against an edited config file (deliveries persist
+        // across restarts).
+        {
+            let mut cfg = d.cfg.read().unwrap().clone();
+            cfg.routes.retain(|r| r.name != "general");
+            d.apply_config(cfg);
+        }
+
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        process_due(&d, del, Utc::now()).await;
+
+        assert!(rx.try_recv().is_err(),
+            "an unresolvable route's security posture is unknown -- NOTHING may be sent, \
+             sealed or cleartext");
+        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert_eq!(after.state, "dead_letter");
+        assert_eq!(after.reason.as_deref(), Some("ROUTE_CONFIG_MISSING"));
+    }
+
+    /// Same fail-closed posture for a `gateway`-mode delivery: an
+    /// unresolvable route must dead-letter too, not fall back to sending
+    /// cleartext just because gateway mode "has nothing to lose" -- the
+    /// point is the daemon can no longer determine what posture this
+    /// delivery was queued under, at all.
+    #[tokio::test]
+    async fn process_due_fed_gateway_route_removed_before_send_also_dead_letters_route_config_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_config("verified", 4, 86_400)));
+        let mut rx = register_fed_conn(&d, "phoenix", &format!("rf:{}", "4a".repeat(32)));
+
+        let env = local_env("!ref", "gateway body");
+        // "general" is gateway-mode by default in the fixture -- no
+        // `set_route_security_mode` call needed.
+        let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
+
+        {
+            let mut cfg = d.cfg.read().unwrap().clone();
+            cfg.routes.retain(|r| r.name != "general");
+            d.apply_config(cfg);
+        }
+
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        process_due(&d, del, Utc::now()).await;
+
+        assert!(rx.try_recv().is_err(), "must never send cleartext when the route is gone");
+        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert_eq!(after.state, "dead_letter");
+        assert_eq!(after.reason.as_deref(), Some("ROUTE_CONFIG_MISSING"));
+    }
+
+    /// The normal case, unaffected by the fix: a `del.route` that DOES
+    /// resolve to a current `RouteConfig` still sends sealed/gateway
+    /// exactly as before -- guards against the fix having overcorrected
+    /// into dead-lettering everything.
+    #[tokio::test]
+    async fn process_due_fed_route_present_still_sends_sealed_and_gateway_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let recipient_secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_pub = recipient_secret.public_key();
+        let node_id = format!("rf:{}", "4b".repeat(32));
+
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        let mut peer = fed_peer_cfg("phoenix", &node_id, "verified");
+        peer.sealed_key = Some(hex::encode(recipient_pub.to_bytes()));
+        fed_cfg.peers = vec![peer];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+
+        // Sealed, route present and unmolested.
+        set_route_security_mode(&d, "general", "sealed");
+        let mut rx = register_fed_conn(&d, "phoenix", &node_id);
+        let sealed_env = local_env("!ref", "sealed still works");
+        let sealed_delivery = queue_fed_delivery_on_route(&d, &sealed_env, "phoenix/regional-chat", "general");
+        let del = d.store.lock().unwrap().deliveries_for_id(sealed_delivery).unwrap();
+        process_due(&d, del, Utc::now()).await;
+        let (sealed, _) = unwrap_sealed_frame(rx.try_recv().expect("sealed send must still work"));
+        let opened = fed::seal::unseal(&sealed, &recipient_secret).unwrap();
+        let decoded: Envelope = ciborium::from_reader(opened.as_slice()).unwrap();
+        assert_eq!(decoded.body, "sealed still works");
+
+        // Back to gateway, route present and unmolested.
+        set_route_security_mode(&d, "general", "gateway");
+        let gateway_env = local_env("!ref", "gateway still works");
+        let gateway_delivery = queue_fed_delivery_on_route(&d, &gateway_env, "phoenix/regional-chat", "general");
+        let del2 = d.store.lock().unwrap().deliveries_for_id(gateway_delivery).unwrap();
+        process_due(&d, del2, Utc::now()).await;
+        let (sent_env, _) = unwrap_envelope_frame(rx.try_recv().expect("gateway send must still work"));
+        assert_eq!(sent_env.body, "gateway still works");
+    }
+
+    // ---- SEALED_MAX_BYTES margin (Task 4 review fix round 1, minor #2) --
+
+    /// A body sized right at `SEALED_MAX_BYTES` must produce a serialized
+    /// `Fed::Sealed` wire frame that still fits under `fed::noise::
+    /// MAX_FRAME` -- proving `SEALED_OVERHEAD_MARGIN` actually covers the
+    /// seal/frame overhead, not just that the pre-seal check fires at
+    /// some boundary. Before the fix, a body at the (margin-less) ceiling
+    /// produced a frame that exceeded `MAX_FRAME` and would have been
+    /// rejected by `FedChannel::send_frame` AFTER `mark_attempting` had
+    /// already run.
+    #[tokio::test]
+    async fn process_due_fed_sealed_mode_frame_at_the_size_ceiling_still_fits_under_max_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let recipient_secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
+        let recipient_pub = recipient_secret.public_key();
+        let node_id = format!("rf:{}", "4c".repeat(32));
+
+        let mut fed_cfg = fed_config("verified", 4, 86_400);
+        let mut peer = fed_peer_cfg("phoenix", &node_id, "verified");
+        peer.sealed_key = Some(hex::encode(recipient_pub.to_bytes()));
+        fed_cfg.peers = vec![peer];
+        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg));
+        set_route_security_mode(&d, "general", "sealed");
+        let mut rx = register_fed_conn(&d, "phoenix", &node_id);
+
+        // Leave slack for the rest of the envelope's own CBOR fields (id,
+        // source, sender, kind, timestamps, priority, ...) so the TOTAL
+        // canonical envelope size sits just under SEALED_MAX_BYTES, not
+        // over it -- this test is about the margin between SEALED_MAX_BYTES
+        // and MAX_FRAME, not a second oversize-rejection test.
+        let body_len = SEALED_MAX_BYTES as usize - 4096;
+        let body = "y".repeat(body_len);
+        let env = local_env("!ref", &body);
+        let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
+        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        process_due(&d, del, Utc::now()).await;
+
+        let frame = rx.try_recv().expect("a body under SEALED_MAX_BYTES must still be sent");
+        let (sealed, target_route) = unwrap_sealed_frame(frame);
+        let mut wire_bytes = Vec::new();
+        ciborium::into_writer(
+            &fed::wire::Fed::Sealed { sealed, target_route },
+            &mut wire_bytes,
+        ).unwrap();
+        assert!(wire_bytes.len() as u64 <= u64::from(fed::noise::MAX_FRAME),
+            "sealed wire frame ({} bytes) must fit under MAX_FRAME ({} bytes)",
+            wire_bytes.len(), fed::noise::MAX_FRAME);
+
+        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert_eq!(after.state, "attempting", "must not have been oversize-rejected");
+    }
+
     #[tokio::test]
     async fn process_due_fed_retries_with_backoff_when_no_live_connection() {
         let dir = tempfile::tempdir().unwrap();
@@ -5683,7 +5908,7 @@ routes:
         let second_id = {
             let store = d.store.lock().unwrap();
             store.insert_message(&env).unwrap();
-            store.insert_delivery(env.id, "outbound", &dest, Utc::now(), env.expires_at, 0).unwrap()
+            store.insert_delivery(env.id, "general", &dest, Utc::now(), env.expires_at, 0).unwrap()
         };
 
         let now = Utc::now();
