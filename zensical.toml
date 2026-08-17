@@ -1,10 +1,10 @@
 [project]
 site_name = "RelayFabric Documentation"
 copyright = "Copyright &copy; 2026 RelayFabric contributors"
-site_url = "https://jaschadub.github.io/RelayFabric/"
+site_url = "https://relayfabric.github.io/RelayFabric/"
 site_description = "A protocol-independent, plugin-based communications routing fabric — bridge Reticulum/LXMF, Signal, Meshtastic, MeshCore, Nostr, Bitchat, and MQTT through one routing, policy, identity, and security layer."
-repo_url = "https://github.com/jaschadub/RelayFabric"
-repo_name = "jaschadub/RelayFabric"
+repo_url = "https://github.com/RelayFabric/RelayFabric"
+repo_name = "RelayFabric/RelayFabric"
 nav = [
   {"Home" = "index.md"},
   {"Getting Started" = "getting-started.md"},
@@ -50,5 +50,5 @@ content = ["content.code.copy", "content.code.annotate"]
 
 [[project.extra.social]]
 icon = "fontawesome/brands/github"
-link = "https://github.com/jaschadub/RelayFabric"
+link = "https://github.com/RelayFabric/RelayFabric"
 name = "RelayFabric on GitHub"
