@@ -88,6 +88,108 @@ pub struct Config {
     /// `apply_config` needing any new diff logic at all.
     #[serde(default)]
     pub privacy: PrivacyConfig,
+    /// Design §2 (transport-class cycle, task 2): plugin name -> a
+    /// `TransportEntry` picking a `relay_core::TransportClass` (with
+    /// optional per-field policy overrides on top of that class's
+    /// defaults). Absent entirely (every pre-transport-class config,
+    /// including the shipped v0.3 example) means every plugin resolves its
+    /// class from `default_transport_class_for` alone -- see
+    /// `Config::transport_policy`. Read live via `cfg.read()` at egress
+    /// (a later task); `Daemon::apply_config`'s restart-required diff
+    /// (engine.rs) never compares this field, so a `transports`-only
+    /// config change is live on the very next resolution, the same
+    /// "nothing special-cases it so it's already live" posture as
+    /// routes/limits/render/identity_mode -- unlike `federation`/
+    /// `discovery`/`node`, which the diff explicitly flags "daemon".
+    #[serde(default)]
+    pub transports: BTreeMap<String, TransportEntry>,
+}
+
+/// One `transports:` config entry (design §2, transport-class cycle task
+/// 2): `class` selects the `relay_core::TransportClass` whose built-in
+/// `TransportPolicy::for_class` defaults become this plugin's egress
+/// policy baseline; each `Option<_>` override field below, when `Some`,
+/// replaces the corresponding default field (`None` defers to the class
+/// default). Deliberately explicit optional fields rather than
+/// `#[serde(flatten)]`-ing a nested overrides struct: flatten's
+/// `#[serde(default)]` interaction is unreliable when the outer type is a
+/// `BTreeMap` value (the map's own per-key deserialization doesn't compose
+/// cleanly with a flattened struct's field defaults in `serde_yaml`), so
+/// explicit fields on `TransportEntry` itself is the shape that parses
+/// cleanly and predictably from
+/// `transports: { plugin: { class: satellite_internet, max_payload_bytes:
+/// 32768, allow_images: false } }`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TransportEntry {
+    pub class: relay_core::TransportClass,
+    #[serde(default)]
+    pub max_payload_bytes: Option<u64>,
+    #[serde(default)]
+    pub allow_images: Option<bool>,
+    #[serde(default)]
+    pub allow_video: Option<bool>,
+    #[serde(default)]
+    pub compress: Option<bool>,
+    #[serde(default)]
+    pub batch_telemetry: Option<bool>,
+}
+
+/// Per-protocol default `TransportClass` (design §2) for a plugin with no
+/// matching `transports:` entry: `mqtt`/`signal`/`nostr`/`bitchat` ride
+/// ordinary internet links (`TerrestrialInternet`); `meshtastic`/
+/// `meshcore`/`lxmf` are inherently constrained/mesh transports (LoRa,
+/// LoRa, Reticulum/RNS respectively); any other plugin name -- including
+/// one this mapping doesn't recognize at all -- defaults to
+/// `TerrestrialInternet`, the non-constraining backward-compat anchor
+/// (`relay_core::transport`'s doc comment on `TERRESTRIAL_MAX_PAYLOAD_
+/// BYTES`): introducing the transports feature must never newly constrain
+/// a plugin nobody has classified. Matches on the plugin NAME exactly as
+/// it appears as a `cfg.plugins` key (e.g. the key under which a plugin is
+/// enabled in the example config), not on any wire protocol string.
+pub fn default_transport_class_for(plugin_name: &str) -> relay_core::TransportClass {
+    match plugin_name {
+        "mqtt" | "signal" | "nostr" | "bitchat" => relay_core::TransportClass::TerrestrialInternet,
+        "meshtastic" => relay_core::TransportClass::Meshtastic,
+        "meshcore" => relay_core::TransportClass::MeshCore,
+        "lxmf" => relay_core::TransportClass::Reticulum,
+        _ => relay_core::TransportClass::TerrestrialInternet,
+    }
+}
+
+impl Config {
+    /// Resolves the effective `TransportPolicy` for a plugin (design §2):
+    /// config class+overrides win when a `transports[plugin]` entry
+    /// exists; else the per-protocol default class's policy
+    /// (`default_transport_class_for`); an unrecognized plugin name falls
+    /// into that same default (`TerrestrialInternet`, non-constraining).
+    /// Does NOT check whether `plugin` is an enabled (or even known)
+    /// plugin -- `validate` is where `transports` keys are required to
+    /// name enabled plugins; this method is a pure resolution function
+    /// callable for any plugin name, matching `transport_budgets`-style
+    /// lookups elsewhere in the engine.
+    pub fn transport_policy(&self, plugin: &str) -> relay_core::TransportPolicy {
+        let entry = self.transports.get(plugin);
+        let class = entry.map(|e| e.class).unwrap_or_else(|| default_transport_class_for(plugin));
+        let mut policy = relay_core::TransportPolicy::for_class(class);
+        if let Some(e) = entry {
+            if let Some(v) = e.max_payload_bytes {
+                policy.max_payload_bytes = v;
+            }
+            if let Some(v) = e.allow_images {
+                policy.allow_images = v;
+            }
+            if let Some(v) = e.allow_video {
+                policy.allow_video = v;
+            }
+            if let Some(v) = e.compress {
+                policy.compress = v;
+            }
+            if let Some(v) = e.batch_telemetry {
+                policy.batch_telemetry = v;
+            }
+        }
+        policy
+    }
 }
 
 fn default_ttl() -> u64 { 86_400 }
@@ -849,12 +951,47 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         }
     }
 
+    // Validate transports keys are enabled plugins, and any override
+    // numeric field is sane (design §2). `class` itself is already
+    // validated by serde at parse time -- an unknown class name fails to
+    // deserialize into `Config` before `validate` ever runs (see the
+    // `transport_class_deserialize_rejects_unknown_class` KAT in
+    // relay-core and this module's own
+    // `unknown_transport_class_is_a_clear_deserialize_error` test).
+    for (proto, entry) in &cfg.transports {
+        match cfg.plugins.get(proto) {
+            Some(p) if p.enabled => {}
+            Some(_) => {
+                return Err(format!(
+                    "transports entry '{proto}' references a disabled plugin; enable the plugin or remove the entry"))
+            }
+            None => {
+                return Err(format!(
+                    "transports entry '{proto}' references an unknown plugin; enable the plugin or remove the entry"))
+            }
+        }
+        if let Some(max_payload_bytes) = entry.max_payload_bytes {
+            if max_payload_bytes < TRANSPORT_MAX_PAYLOAD_BYTES_FLOOR {
+                return Err(format!(
+                    "transports entry '{proto}' has max_payload_bytes {max_payload_bytes} which is \
+                     below the minimum of {TRANSPORT_MAX_PAYLOAD_BYTES_FLOOR} bytes"));
+            }
+        }
+    }
+
     validate_federation(cfg)?;
     validate_discovery(cfg)?;
     validate_privacy(cfg)?;
 
     Ok(())
 }
+
+/// Floor for a `transports:` entry's `max_payload_bytes` override (design
+/// §2): small enough to still admit the smallest real class default today
+/// (`Meshtastic`/`MeshCore`'s 237-byte advertised max payload), large
+/// enough to reject an obviously-broken override (e.g. `0` or a handful of
+/// bytes) that would make a route unusable.
+const TRANSPORT_MAX_PAYLOAD_BYTES_FLOOR: u64 = 64;
 
 /// Design §3 validation for the node-level `privacy` block (SPEC §113.2,
 /// cycle H). Never absent -- `Config::privacy` defaults to
@@ -2946,5 +3083,178 @@ federation:
             assert_eq!(r.allow_gateway_decryption, None, "route '{}' should default to None", r.name);
         }
         assert!(validate(&cfg).is_ok());
+    }
+
+    // ---- transports (design §2, transport-class cycle task 2) -------------
+
+    #[test]
+    fn transports_block_absent_is_valid_and_map_is_empty() {
+        let cfg = parse(GOOD).unwrap();
+        assert!(cfg.transports.is_empty());
+    }
+
+    #[test]
+    fn transports_parses_class_and_overrides() {
+        let yaml = format!(
+            "{GOOD}transports:\n  mocka: {{ class: satellite_internet, max_payload_bytes: 32768, allow_images: false }}\n"
+        );
+        let cfg = parse(&yaml).unwrap();
+        let entry = &cfg.transports["mocka"];
+        assert_eq!(entry.class, relay_core::TransportClass::SatelliteInternet);
+        assert_eq!(entry.max_payload_bytes, Some(32768));
+        assert_eq!(entry.allow_images, Some(false));
+        assert_eq!(entry.allow_video, None);
+        assert_eq!(entry.compress, None);
+        assert_eq!(entry.batch_telemetry, None);
+    }
+
+    #[test]
+    fn transports_entry_with_class_only_has_no_overrides() {
+        let yaml = format!("{GOOD}transports:\n  mocka: {{ class: meshtastic }}\n");
+        let cfg = parse(&yaml).unwrap();
+        let entry = &cfg.transports["mocka"];
+        assert_eq!(entry.class, relay_core::TransportClass::Meshtastic);
+        assert_eq!(entry.max_payload_bytes, None);
+        assert_eq!(entry.allow_images, None);
+        assert_eq!(entry.allow_video, None);
+        assert_eq!(entry.compress, None);
+        assert_eq!(entry.batch_telemetry, None);
+    }
+
+    #[test]
+    fn default_transport_class_for_maps_known_protocols() {
+        for name in ["mqtt", "signal", "nostr", "bitchat"] {
+            assert_eq!(
+                default_transport_class_for(name),
+                relay_core::TransportClass::TerrestrialInternet,
+                "{name} should default to terrestrial_internet"
+            );
+        }
+        assert_eq!(default_transport_class_for("meshtastic"), relay_core::TransportClass::Meshtastic);
+        assert_eq!(default_transport_class_for("meshcore"), relay_core::TransportClass::MeshCore);
+        assert_eq!(default_transport_class_for("lxmf"), relay_core::TransportClass::Reticulum);
+        assert_eq!(
+            default_transport_class_for("some_future_plugin"),
+            relay_core::TransportClass::TerrestrialInternet,
+            "an unrecognized plugin name must default to the non-constraining anchor"
+        );
+    }
+
+    #[test]
+    fn transport_policy_no_entry_uses_per_protocol_default_class_policy() {
+        let cfg = parse(GOOD).unwrap();
+        assert_eq!(
+            cfg.transport_policy("mocka"),
+            relay_core::TransportPolicy::for_class(relay_core::TransportClass::TerrestrialInternet),
+        );
+
+        let yaml = r#"
+node:
+  name: test-node
+  data_dir: /tmp/relayfabric-test
+plugins:
+  meshtastic:
+    enabled: true
+  mockb:
+    enabled: true
+routes:
+  - name: general
+    sources: ["meshtastic:chan", "mockb:chan"]
+    destinations: ["meshtastic:chan", "mockb:chan"]
+"#;
+        let cfg = parse(yaml).unwrap();
+        assert_eq!(
+            cfg.transport_policy("meshtastic"),
+            relay_core::TransportPolicy::for_class(relay_core::TransportClass::Meshtastic),
+        );
+    }
+
+    #[test]
+    fn transport_policy_config_class_and_overrides_win_over_default() {
+        let yaml = format!(
+            "{GOOD}transports:\n  mocka: {{ class: satellite_internet, max_payload_bytes: 32768, allow_images: false }}\n"
+        );
+        let cfg = parse(&yaml).unwrap();
+        let policy = cfg.transport_policy("mocka");
+        let base = relay_core::TransportPolicy::for_class(relay_core::TransportClass::SatelliteInternet);
+        // Overridden fields take the config value...
+        assert_eq!(policy.max_payload_bytes, 32768);
+        assert!(!policy.allow_images);
+        // ...fields with no override fall back to the chosen class's default.
+        assert_eq!(policy.allow_video, base.allow_video);
+        assert_eq!(policy.compress, base.compress);
+        assert_eq!(policy.batch_telemetry, base.batch_telemetry);
+    }
+
+    #[test]
+    fn transport_policy_unknown_plugin_defaults_to_terrestrial_internet_non_constraining() {
+        let cfg = parse(GOOD).unwrap();
+        let policy = cfg.transport_policy("some_plugin_never_mentioned_anywhere");
+        assert!(policy.max_payload_bytes >= 16 * 1024 * 1024);
+        assert!(policy.allow_images);
+        assert!(policy.allow_video);
+    }
+
+    #[test]
+    fn unknown_transport_class_is_a_clear_deserialize_error() {
+        let yaml = format!("{GOOD}transports:\n  mocka: {{ class: warp_drive }}\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("unknown variant"), "expected a clear unknown-variant error, got: {err}");
+        assert!(err.contains("warp_drive"), "error should name the bad value: {err}");
+    }
+
+    #[test]
+    fn transports_entry_disabled_plugin_err() {
+        let bad = GOOD.replace("mockb:\n    enabled: true", "mockb:\n    enabled: false");
+        let yaml = format!("{bad}transports:\n  mockb: {{ class: meshtastic }}\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("mockb"), "error should name plugin: {err}");
+        assert!(err.contains("disabled"), "error should say disabled: {err}");
+    }
+
+    #[test]
+    fn transports_entry_unknown_plugin_err() {
+        let yaml = format!("{GOOD}transports:\n  ghost: {{ class: meshtastic }}\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("ghost"), "error should name plugin: {err}");
+        assert!(err.contains("unknown"), "error should say unknown: {err}");
+    }
+
+    #[test]
+    fn transports_entry_max_payload_bytes_below_floor_err() {
+        let yaml = format!("{GOOD}transports:\n  mocka: {{ class: meshtastic, max_payload_bytes: 10 }}\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("mocka"), "error should name entry: {err}");
+        assert!(err.contains("max_payload_bytes"), "err was: {err}");
+        assert!(err.contains("10"), "err was: {err}");
+    }
+
+    #[test]
+    fn transports_entry_max_payload_bytes_at_floor_ok() {
+        let yaml = format!("{GOOD}transports:\n  mocka: {{ class: meshtastic, max_payload_bytes: 64 }}\n");
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.transports["mocka"].max_payload_bytes, Some(64));
+    }
+
+    /// v0.3 example config has no `transports:` block at all -- it must
+    /// keep `--check-config` valid AND every enabled plugin (just `mqtt`
+    /// today) must resolve, via the per-protocol default, to the
+    /// `TerrestrialInternet` non-constraining anchor policy: introducing
+    /// the transports feature must not change today's behavior for any
+    /// config that predates it (design §2 backward-compat invariant).
+    #[test]
+    fn example_config_has_no_transports_block_and_mqtt_resolves_to_non_constraining_internet_default() {
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/relayfabric.example.yaml"),
+        ).unwrap();
+        let cfg: Config = serde_yaml::from_str(&raw).unwrap();
+        assert!(cfg.transports.is_empty());
+        assert!(validate(&cfg).is_ok());
+
+        let policy = cfg.transport_policy("mqtt");
+        assert_eq!(policy, relay_core::TransportPolicy::for_class(relay_core::TransportClass::TerrestrialInternet));
+        assert!(policy.max_payload_bytes >= 16 * 1024 * 1024);
+        assert!(policy.allow_images);
+        assert!(policy.allow_video);
     }
 }

@@ -2499,6 +2499,7 @@ pub mod tests_support {
             federation,
             discovery: crate::config::DiscoveryConfig::default(),
             privacy: crate::config::PrivacyConfig::default(),
+            transports: BTreeMap::new(),
         };
         Daemon::new(cfg, dir).unwrap()
     }
@@ -4284,6 +4285,45 @@ mod tests {
         new_cfg.routes[0].security_mode = "sealed".to_string();
         let outcome = d.apply_config(new_cfg);
         assert!(outcome.restart_required.is_empty(), "outcome was: {outcome:?}");
+    }
+
+    /// Design §2 (transport-class cycle, task 2): a `transports:`-only
+    /// config change is live -- same posture as `security_mode`/`render`/
+    /// `identity_mode`/the `privacy` floor above (`apply_config`'s
+    /// restart-required diff never inspects `transports` at all, so the
+    /// swap alone makes it live). Asserts BOTH halves: no `"daemon"` entry
+    /// in `restart_required`, AND `Config::transport_policy` reflects the
+    /// new config immediately after `apply_config` returns -- not just
+    /// "no restart reported" but "actually took effect".
+    #[test]
+    fn apply_config_transports_change_is_live_no_restart_required_and_takes_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path()); // "mocka" plugin, default: no transports entry
+        let before = d.cfg_snapshot(|c| c.transport_policy("mocka"));
+        assert_eq!(
+            before,
+            relay_core::TransportPolicy::for_class(relay_core::TransportClass::TerrestrialInternet),
+            "default (no transports entry) should be the non-constraining internet anchor"
+        );
+
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.transports.insert(
+            "mocka".to_string(),
+            crate::config::TransportEntry {
+                class: relay_core::TransportClass::SatelliteInternet,
+                max_payload_bytes: Some(32768),
+                allow_images: Some(false),
+                allow_video: None,
+                compress: None,
+                batch_telemetry: None,
+            },
+        );
+        let outcome = d.apply_config(new_cfg);
+        assert!(outcome.restart_required.is_empty(), "outcome was: {outcome:?}");
+
+        let after = d.cfg_snapshot(|c| c.transport_policy("mocka"));
+        assert_eq!(after.max_payload_bytes, 32768);
+        assert!(!after.allow_images);
     }
 
     /// Design §3, SPEC §113.2, cycle H: unlike `federation`/`discovery`

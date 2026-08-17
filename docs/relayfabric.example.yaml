@@ -221,6 +221,21 @@ policies:
 #   lxmf:
 #     messages_per_minute: 200
 
+# Transport classes: the LINK a plugin's traffic actually rides, distinct
+# from its protocol -- drives egress payload caps and media
+# allow/disallow. Keys must be enabled plugin names. Absent entirely (as
+# here) means every plugin gets a default class by protocol name (mqtt/
+# signal/nostr/bitchat -> terrestrial_internet; meshtastic -> meshtastic;
+# meshcore -> mesh_core; lxmf -> reticulum; anything else ->
+# terrestrial_internet), which reproduces today's behavior exactly (no
+# transport-level cap beyond the daemon's own 16 MiB frame limit, images
+# and video allowed). An entry here overrides the class and/or individual
+# policy fields on top of that class's built-in defaults; takes effect
+# live, no daemon restart.
+# transports:
+#   meshtastic: { class: meshtastic }                       # class -> its built-in default policy
+#   mqtt:       { class: satellite_internet, max_payload_bytes: 32768, allow_images: false }
+
 # Federation (switchyardd-to-switchyardd, cycle F — docs/SPEC.md §30/§31/
 # §33/§85-87/§112.6-112.7): authenticated Noise links between daemons,
 # signed envelopes with a gateway attestation chain, a persistent trust
