@@ -1,19 +1,20 @@
 """RelayFabric Nostr plugin: bridges Nostr relays (NIP-01 kind-1 notes) over
 Plugin Protocol v1 (relayfabric_sdk).
 
-Module top level is stdlib-only (asyncio/copy/hashlib/json/logging/os/queue/
-socket/sys/threading/time) so config/event helpers stay importable without
-coincurve, websockets, cbor2, or relayfabric_sdk. Those are imported lazily
-inside the functions/methods that need them (verify_event/sign_event/
-load_or_create_identity import coincurve; NostrBackend.start() imports
-websockets; Bridge and main() import relayfabric_sdk) -- the same lazy-import
-shape meshcore/signal use. Note bytes/content are never logged, only
-pubkeys/kinds/channel names.
+Module top level is stdlib-only (asyncio/copy/json/logging/os/queue/socket/
+sys/threading/time) so config helpers stay importable without coincurve,
+websockets, cbor2, or relayfabric_sdk. Those are imported lazily inside the
+functions/methods that need them: the NIP-01 event primitives (event id,
+schnorr sign/verify, identity load/generate) live in relayfabric_sdk.nip01
+(promoted there in cycle J so the bitchat plugin can share the same tested
+crypto) and are imported where normalize_event/NostrBackend.publish/main()
+call them; NostrBackend.start() imports websockets; Bridge and main() import
+the rest of relayfabric_sdk -- the same lazy-import shape meshcore/signal
+use. Note bytes/content are never logged, only pubkeys/kinds/channel names.
 """
 
 import asyncio
 import copy
-import hashlib
 import json
 import logging
 import os
@@ -107,72 +108,6 @@ def load_config(raw):
     return cfg
 
 
-def event_id(pubkey_hex, created_at, kind, tags, content):
-    """NIP-01 event id: sha256 hex of the canonical serialization
-    `[0, pubkey, created_at, kind, tags, content]` -- compact separators,
-    UTF-8, no extra whitespace, exactly as NIP-01 specifies. See
-    test_relayfabric_nostr.py's EventIdGoldenVectorTests for the locked
-    known-answer vector (nsec=1, the secp256k1 generator scalar).
-    """
-    serialized = json.dumps(
-        [0, pubkey_hex, created_at, kind, tags, content],
-        separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-
-
-def verify_event(event):
-    """True iff event's id matches the recomputed NIP-01 sha256 AND its
-    schnorr sig verifies (BIP-340) over that id, under event['pubkey'].
-
-    MUST NOT raise: a relay sends arbitrary dicts (design Sec80 -- a relay
-    is untrusted), so any KeyError/TypeError/ValueError from a malformed or
-    adversarial event (missing keys, wrong types, non-hex/wrong-length
-    id/pubkey/sig, non-dict input entirely) is caught and treated as an
-    invalid event, never propagated.
-    """
-    try:
-        pubkey_hex = event["pubkey"]
-        created_at = event["created_at"]
-        kind = event["kind"]
-        tags = event["tags"]
-        content = event["content"]
-        claimed_id = event["id"]
-        sig_hex = event["sig"]
-
-        recomputed_id = event_id(pubkey_hex, created_at, kind, tags, content)
-        if recomputed_id != claimed_id:
-            return False
-
-        from coincurve import PublicKeyXOnly
-
-        pub = PublicKeyXOnly(bytes.fromhex(pubkey_hex))
-        return pub.verify(bytes.fromhex(sig_hex), bytes.fromhex(recomputed_id))
-    except Exception:  # noqa: BLE001 - malformed/adversarial input, never propagate
-        return False
-
-
-def sign_event(privkey_hex, created_at, kind, tags, content):
-    """Build a full signed NIP-01 event {id, pubkey, created_at, kind, tags,
-    content, sig} from a 32-byte hex private key ("nsec hex", design Sec1 --
-    the raw hex form, not bech32). Round-trips through verify_event().
-    """
-    from coincurve import PrivateKey, PublicKeyXOnly
-
-    priv = PrivateKey(bytes.fromhex(privkey_hex))
-    pubkey_hex = PublicKeyXOnly.from_valid_secret(priv.secret).format().hex()
-    eid = event_id(pubkey_hex, created_at, kind, tags, content)
-    sig_hex = priv.sign_schnorr(bytes.fromhex(eid)).hex()
-    return {
-        "id": eid,
-        "pubkey": pubkey_hex,
-        "created_at": created_at,
-        "kind": kind,
-        "tags": tags,
-        "content": content,
-        "sig": sig_hex,
-    }
-
-
 def normalize_event(event, sub_id, channels_by_sub):
     """Parse a relay-delivered Nostr event into (channel, sender, text, ts)
     or None.
@@ -194,6 +129,8 @@ def normalize_event(event, sub_id, channels_by_sub):
     On success: sender = "nostr:<pubkey hex>" (stable per-author identity,
     design Sec3); ts = event['created_at'].
     """
+    from relayfabric_sdk.nip01 import verify_event
+
     if not isinstance(event, dict) or event.get("kind") != 1:
         return None
     if not verify_event(event):
@@ -215,42 +152,6 @@ def hello_max_payload(cfg):
     advertised cap; a higher one can never loosen it past NOSTR_MAX_PAYLOAD).
     """
     return min(NOSTR_MAX_PAYLOAD, cfg["max_text_bytes"])
-
-
-def load_or_create_identity(identity_file):
-    """Load this plugin's Nostr keypair, generating one on first run.
-
-    If `identity_file` is set and already holds a key (one line, 32-byte
-    hex privkey -- the same "nsec hex" form sign_event takes), load it.
-    Otherwise generate a fresh secp256k1 key via coincurve; if
-    `identity_file` is set, persist the new key there with mode 0600
-    (os.open O_CREAT so the restrictive mode is atomic with creation, no
-    window where the key sits world-readable) so restarts reuse the same
-    identity. A None `identity_file` means a fresh identity every start
-    (no path to persist to) -- config-valid per load_config, but every
-    restart then publishes under a new pubkey.
-
-    Logs the public key (hex; loosely "npub", though this is the raw hex
-    form, not bech32) exactly once. Never logs the private key.
-
-    Returns (privkey_hex, pubkey_hex).
-    """
-    from coincurve import PrivateKey, PublicKeyXOnly
-
-    if identity_file and os.path.exists(identity_file):
-        with open(identity_file) as f:
-            privkey_hex = f.read().strip()
-    else:
-        privkey_hex = PrivateKey().secret.hex()
-        if identity_file:
-            fd = os.open(identity_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as f:
-                f.write(privkey_hex + "\n")
-
-    pubkey_hex = PublicKeyXOnly.from_valid_secret(
-        PrivateKey(bytes.fromhex(privkey_hex)).secret).format().hex()
-    log.info(f"Nostr identity pubkey (npub, hex): {pubkey_hex}")
-    return privkey_hex, pubkey_hex
 
 
 class NostrBackend:
@@ -393,6 +294,8 @@ class NostrBackend:
             yield self._queue.get()
 
     def publish(self, channel, text):
+        from relayfabric_sdk.nip01 import sign_event
+
         if self._loop is None:
             raise RuntimeError("nostr backend not started")
         spec = self.channels.get(channel)
@@ -543,6 +446,8 @@ def main():
         print(f"relayfabric-nostr: hello rejected: {ack.get('error')}",
              file=sys.stderr)
         sys.exit(1)
+
+    from relayfabric_sdk.nip01 import load_or_create_identity
 
     identity = load_or_create_identity(cfg["identity_file"])
     backend = NostrBackend(cfg["relays"], cfg["channels"], identity)
