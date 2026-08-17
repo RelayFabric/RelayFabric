@@ -27,7 +27,20 @@ tracing-subscriber.workspace = true
 snow.workspace = true
 ciborium.workspace = true
 curve25519-dalek.workspace = true
+# Task 2 (design §2) license+offline gate, PASSED: `utoipa-swagger-ui` and
+# every one of its ~53 newly-locked transitive deps (rust-embed, zip,
+# walkdir, url/idna/ICU, mime_guess, ...) are MIT / Apache-2.0 / 0BSD /
+# Unlicense / Zlib / Unicode-3.0 (recorded verbatim in the Task 2 report;
+# no AGPL/GPL/restrictive license anywhere in the tree). The `vendored`
+# feature pulls in `utoipa-swagger-ui-vendored` (MIT/Apache-2.0), which
+# embeds the actual Swagger UI dist zip as `include_bytes!` at ITS OWN
+# publish time -- our build.rs extracts THAT local zip, never downloads
+# one (the crate's own doc comment: "provides the means to serve Swagger
+# UI in sandboxed environments where network access ... is not possible").
+# Confirmed empirically: `cargo build -p switchyardd --offline` succeeds
+# after `cargo fetch`, which a build-time network fetch would not survive.
 utoipa = { version = "5.5.0", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"] }
 
 [dev-dependencies]
 tempfile.workspace = true

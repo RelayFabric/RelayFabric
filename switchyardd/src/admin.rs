@@ -96,7 +96,17 @@ pub fn router(d: Arc<Daemon>, config_path: PathBuf) -> Router {
     for (path, method_router) in admin_routes() {
         r = r.route(path, method_router);
     }
+    // `/docs` (Task 2, design §2) is deliberately NOT in `admin_routes()`:
+    // it's the interactive UI, not part of the API contract, so it must
+    // never be documented in `ApiDoc`'s `paths(...)` -- if it lived in
+    // `admin_routes()`, `every_admin_route_is_documented_in_the_openapi_spec`
+    // would demand a matching `#[utoipa::path]` entry for it, which would
+    // then wrongly put the UI itself into the OpenAPI contract. Mounted
+    // here, after `with_state`, on the fully-built `Router` instead.
     r.with_state(state)
+        .route("/docs", get(docs_index))
+        .route("/docs/", get(docs_index))
+        .route("/docs/{*rest}", get(docs_asset))
 }
 
 /// Takes an already-bound listener (bind failures must fail startup loudly in
@@ -1551,6 +1561,58 @@ async fn events_stream(
 )]
 async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
     Json(ApiDoc::openapi())
+}
+
+// ---- GET /docs -- Swagger UI (Task 2, design §2) ---------------------
+
+/// `utoipa-swagger-ui`'s Swagger UI config (Task 2, design §2): points at
+/// the SAME `/v1/openapi.json` this daemon already serves, as a relative
+/// path -- so it works over whatever transport reaches the admin socket
+/// (direct unix-socket HTTP, a `socat`/SSH TCP forward, ...), never a
+/// baked-in absolute host. `validator_url("none")` disables Swagger UI's
+/// DEFAULT behavior of calling out to swagger.io's hosted spec validator
+/// on load: the vendored dist assets (`utoipa-swagger-ui-vendored`,
+/// MIT/Apache-2.0, embedded at compile time, see Cargo.toml) are already
+/// fully self-contained, but that default config setting would still make
+/// the *browser* place an external request the project's no-CDN posture
+/// doesn't want.
+fn swagger_config() -> Arc<utoipa_swagger_ui::Config<'static>> {
+    Arc::new(utoipa_swagger_ui::Config::from("/v1/openapi.json").validator_url("none"))
+}
+
+/// Serves one file out of the vendored Swagger UI dist -- `path` is `""`
+/// for the index page (`utoipa_swagger_ui::serve` maps that to
+/// `index.html`) or the tail segment for an asset (`swagger-ui-bundle.js`,
+/// `swagger-ui.css`, `favicon-32x32.png`, ...). Deliberately bypasses
+/// `utoipa_swagger_ui`'s own axum `Router::from(SwaggerUi)` glue, which
+/// 303-redirects a bare `/docs` (no trailing slash) to `/docs/` -- the
+/// brief requires `GET /docs` itself to be a direct 200, not a redirect a
+/// plain (non-following) HTTP client would have to chase.
+fn serve_swagger_asset(path: &str) -> axum::response::Response {
+    match utoipa_swagger_ui::serve(path, swagger_config()) {
+        Ok(Some(file)) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, file.content_type)],
+            file.bytes.into_owned(),
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `GET /docs` and `GET /docs/` (Task 2, design §2): both serve the
+/// Swagger UI index page directly (200), not one redirecting to the
+/// other -- see `serve_swagger_asset`'s doc comment for why this doesn't
+/// go through the crate's own router glue.
+async fn docs_index() -> axum::response::Response {
+    serve_swagger_asset("")
+}
+
+/// `GET /docs/{*rest}` (Task 2, design §2): the Swagger UI's own JS/CSS/
+/// image assets, all same-origin under `/docs/`.
+async fn docs_asset(AxPath(rest): AxPath<String>) -> axum::response::Response {
+    serve_swagger_asset(&rest)
 }
 
 /// The generated OpenAPI document for the switchyardd admin API (Task 1,
@@ -3481,5 +3543,96 @@ routes:
             ]
         });
         assert_eq!(serde_json::to_string(&resp).unwrap(), serde_json::to_string(&old).unwrap());
+    }
+
+    // ---- Task 2 (design §2): Swagger UI at GET /docs -----------------
+
+    /// `/docs` (no trailing slash) must be a direct 200, NOT a redirect to
+    /// `/docs/` -- that's the whole reason `serve_swagger_asset` bypasses
+    /// `utoipa_swagger_ui`'s own axum glue (see its doc comment). A plain
+    /// (non-redirect-following) client hitting `/docs` must get the page.
+    #[tokio::test]
+    async fn docs_serves_the_swagger_ui_index_directly_at_200() {
+        let (status, body) = get(router(daemon()), "/docs").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("swagger-ui"), "expected a Swagger UI marker in the body: {body}");
+    }
+
+    /// `/docs/` (trailing slash) is the same page, also a direct 200.
+    #[tokio::test]
+    async fn docs_with_trailing_slash_also_serves_200_html() {
+        let (status, body) = get(router(daemon()), "/docs/").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("swagger-ui"), "expected a Swagger UI marker in the body: {body}");
+    }
+
+    /// `/docs` response is actually served as `text/html`, matching what a
+    /// browser needs to render it (not e.g. `application/octet-stream`).
+    #[tokio::test]
+    async fn docs_is_served_as_text_html() {
+        let resp = router(daemon())
+            .oneshot(Request::builder().uri("/docs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(content_type.starts_with("text/html"), "unexpected content-type: {content_type}");
+    }
+
+    /// Self-contained assertion (design §2 Security invariants / brief):
+    /// the served `/docs` bytes reference no external host in an `href=`/
+    /// `src=` attribute -- every asset is same-origin/relative, matching
+    /// the project's no-CDN posture. Checked against the literal served
+    /// index.html bytes, not the (huge, vendored, third-party) JS bundles
+    /// it loads -- those aren't rewritten by this project and can contain
+    /// incidental `https://` substrings (license headers, XML namespaces)
+    /// that aren't resource-loading `src=`/`href=` attributes at all.
+    #[tokio::test]
+    async fn docs_html_has_no_external_href_or_src() {
+        let (status, body) = get(router(daemon()), "/docs").await;
+        assert_eq!(status, 200);
+        for needle in ["href=\"http://", "href=\"https://", "src=\"http://", "src=\"https://"] {
+            assert!(!body.contains(needle), "self-contained /docs must not reference {needle}: {body}");
+        }
+    }
+
+    /// `/docs` actually points the Swagger UI at THIS daemon's own
+    /// `/v1/openapi.json` (relative, same-origin), not some other spec --
+    /// the reference lives in `swagger-initializer.js` (the `{{config}}`
+    /// substitution `swagger_config()` drives), which is what a browser
+    /// loading `/docs` fetches next.
+    #[tokio::test]
+    async fn docs_initializer_references_the_relative_openapi_json_url() {
+        let (status, body) = get(router(daemon()), "/docs/swagger-initializer.js").await;
+        assert_eq!(status, 200);
+        assert!(
+            body.contains("/v1/openapi.json"),
+            "swagger-initializer.js must reference the relative /v1/openapi.json: {body}"
+        );
+        assert!(
+            !body.contains("http://") && !body.contains("https://"),
+            "swagger-initializer.js must not reference an external host: {body}"
+        );
+    }
+
+    /// An unknown asset tail under `/docs/` (not part of the vendored
+    /// dist) is a plain 404, not a panic or a fallback to the index page.
+    #[tokio::test]
+    async fn docs_unknown_asset_is_404() {
+        let (status, _) = get(router(daemon()), "/docs/no-such-asset.js").await;
+        assert_eq!(status, 404);
+    }
+
+    /// `/docs` is a UI route, deliberately outside `admin_routes()` (see
+    /// `router`'s doc comment) -- it must never show up in the generated
+    /// OpenAPI document's paths, since it isn't part of the API contract.
+    #[test]
+    fn docs_is_not_documented_in_the_openapi_spec() {
+        let doc = ApiDoc::openapi();
+        assert!(
+            !doc.paths.paths.keys().any(|p| p.starts_with("/docs")),
+            "/docs is UI, not API contract, and must not appear in ApiDoc's paths: {:?}",
+            doc.paths.paths.keys().collect::<Vec<_>>()
+        );
     }
 }

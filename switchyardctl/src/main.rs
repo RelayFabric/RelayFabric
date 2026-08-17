@@ -27,6 +27,7 @@ fn request_for(args: &[String]) -> Result<(&'static str, String, Option<String>)
         Some("identities") => Ok(("GET", "/v1/identities".into(), None)),
         Some("federation") => Ok(("GET", "/v1/federation".into(), None)),
         Some("discovery") => Ok(("GET", "/v1/discovery".into(), None)),
+        Some("openapi") => Ok(("GET", "/v1/openapi.json".into(), None)),
         Some("link") => {
             let (requester, target, name_parts) = (args.get(1), args.get(2), args.get(3..));
             match (requester, target, name_parts) {
@@ -61,7 +62,7 @@ fn request_for(args: &[String]) -> Result<(&'static str, String, Option<String>)
         _ => Err("usage: switchyardctl [--socket <path>] \
                   status|plugins|routes|queue|trace <id>|identities|federation|discovery|\
                   link <requester> <target> <display_name...>|unlink <id>|\
-                  config show|validate <file>|apply <file>|rollback|events".into()),
+                  config show|validate <file>|apply <file>|rollback|events|openapi|docs".into()),
     }
 }
 
@@ -189,6 +190,38 @@ fn stream_events(socket: &str) -> Result<(), String> {
     emit_data_lines(&mut reader, &mut out).map_err(|e| e.to_string())
 }
 
+/// `switchyardctl docs`'s printed body (Task 2, design §2): the admin API
+/// (including `/docs`) is served ONLY over the admin Unix socket -- design's
+/// "served over the existing admin Unix socket, NOT a new TCP bind" ruling
+/// -- so there is no URL to just open in a browser. This prints the local
+/// browse recipe instead: a `socat` one-liner forwarding a local TCP port
+/// to the socket (the common case), and an SSH unix-socket-forward for a
+/// remote host (OpenSSH's `-L port:remote_socket_path` form, no `socat`
+/// needed on the remote end). Split out from `main` (like
+/// `emit_data_lines`/`skip_http_headers` above) purely so it's unit-
+/// testable without a live socket or a running daemon.
+fn docs_message(socket: &str) -> String {
+    [
+        format!("Admin socket: {socket}"),
+        String::new(),
+        "The admin API (including /docs) is served only over that Unix socket --".to_string(),
+        "there is no TCP listener to browse it directly.".to_string(),
+        String::new(),
+        "Browse locally by forwarding a TCP port to the socket:".to_string(),
+        String::new(),
+        format!("  socat TCP-LISTEN:8099,fork UNIX-CONNECT:{socket} &"),
+        "  xdg-open http://localhost:8099/docs".to_string(),
+        String::new(),
+        "On a remote host, tunnel the socket over SSH instead (no socat needed there):".to_string(),
+        String::new(),
+        format!("  ssh -L 8099:{socket} <user>@<host>"),
+        "  xdg-open http://localhost:8099/docs".to_string(),
+        String::new(),
+        "Headless (no browser): switchyardctl openapi > relayfabric-openapi.json".to_string(),
+    ]
+    .join("\n")
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut socket = String::from("/var/lib/relayfabric/admin.sock");
@@ -208,6 +241,14 @@ fn main() {
         }
         return;
     }
+    // `docs` (Task 2, design §2) is a pure local print -- no request over
+    // the socket at all -- so it's special-cased ahead of `request_for`
+    // the same way `events` is, rather than round-tripping through `fetch`.
+    if args.first().map(String::as_str) == Some("docs") {
+        println!("{}", docs_message(&socket));
+        return;
+    }
+    let is_openapi = args.first().map(String::as_str) == Some("openapi");
     let (method, path, body) = match request_for(&args) {
         Ok(r) => r,
         Err(e) => {
@@ -216,6 +257,13 @@ fn main() {
         }
     };
     match fetch(&socket, method, &path, body.as_deref(), expected_status(method, &path)) {
+        // `openapi` (Task 2, design §2) prints the response RAW, not
+        // reformatted -- so `switchyardctl openapi > relayfabric-
+        // openapi.json` is pipeable to a file byte-for-byte, unlike every
+        // other subcommand below which re-serializes through
+        // `serde_json::to_string_pretty` for terminal readability (which
+        // would also re-sort/re-format the OpenAPI document's keys).
+        Ok(body) if is_openapi => print!("{body}"),
         Ok(body) if body.trim().is_empty() => println!("ok"),
         Ok(body) => {
             let pretty = serde_json::from_str::<serde_json::Value>(&body)
@@ -250,6 +298,8 @@ mod tests {
             ("GET", "/v1/federation".into(), None));
         assert_eq!(request_for(&["discovery".into()]).unwrap(),
             ("GET", "/v1/discovery".into(), None));
+        assert_eq!(request_for(&["openapi".into()]).unwrap(),
+            ("GET", "/v1/openapi.json".into(), None));
         assert!(request_for(&[]).is_err());
         assert!(request_for(&["trace".into()]).is_err());
         assert!(request_for(&["bogus".into()]).is_err());
@@ -389,6 +439,37 @@ mod tests {
         // guards against `events` silently regaining a `request_for` arm
         // that main's early dispatch would then always shadow.
         assert!(request_for(&["events".into()]).is_err());
+    }
+
+    // ---- openapi / docs (Task 2, design §2) -----------------------------
+
+    /// Like `events`, "docs" is special-cased in `main` ahead of
+    /// `request_for` (it's a pure local print, no request at all), so
+    /// `request_for` alone must treat it as an unrecognized token. Guards
+    /// against `docs` silently regaining a `request_for` arm that main's
+    /// early dispatch would then always shadow.
+    #[test]
+    fn docs_requires_no_extra_usage_error_and_is_routed_before_request_for() {
+        assert!(request_for(&["docs".into()]).is_err());
+    }
+
+    #[test]
+    fn docs_message_includes_socket_socat_oneliner_and_ssh_alternative() {
+        let msg = docs_message("/var/lib/relayfabric/admin.sock");
+        assert!(msg.contains("/var/lib/relayfabric/admin.sock"));
+        assert!(msg.contains(
+            "socat TCP-LISTEN:8099,fork UNIX-CONNECT:/var/lib/relayfabric/admin.sock"
+        ));
+        assert!(msg.contains("http://localhost:8099/docs"));
+        assert!(msg.contains("ssh -L 8099:/var/lib/relayfabric/admin.sock"));
+        assert!(msg.contains("switchyardctl openapi"), "must note the headless alternative");
+    }
+
+    #[test]
+    fn docs_message_uses_the_socket_path_ctl_was_given_not_a_hardcoded_default() {
+        let msg = docs_message("/tmp/custom-admin.sock");
+        assert!(msg.contains("/tmp/custom-admin.sock"));
+        assert!(!msg.contains("/var/lib/relayfabric/admin.sock"));
     }
 
     #[test]
