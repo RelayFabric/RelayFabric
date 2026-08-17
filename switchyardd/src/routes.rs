@@ -36,6 +36,8 @@ mod tests {
             destinations: vec![ep("mocka:chan"), ep("mockb:chan")],
             identity_mode: "pseudonymous".into(),
             render: RenderConfig::default(),
+            security_mode: "gateway".into(),
+            allow_gateway_decryption: None,
         }]
     }
 

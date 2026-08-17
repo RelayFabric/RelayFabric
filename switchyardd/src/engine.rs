@@ -1955,6 +1955,8 @@ pub mod tests_support {
                 destinations: vec!["mocka:chan".parse().unwrap(), "mockb:chan".parse().unwrap()],
                 identity_mode: "pseudonymous".into(),
                 render: RenderConfig::default(),
+                security_mode: "gateway".into(),
+                allow_gateway_decryption: None,
             }],
             policies: vec![],
             ttl_default_secs: 3600,
@@ -1966,6 +1968,7 @@ pub mod tests_support {
             transport_budgets,
             federation,
             discovery: crate::config::DiscoveryConfig::default(),
+            privacy: crate::config::PrivacyConfig::default(),
         };
         Daemon::new(cfg, dir).unwrap()
     }
@@ -3738,6 +3741,38 @@ mod tests {
         assert!(outcome.restart_required.is_empty(), "outcome was: {outcome:?}");
     }
 
+    /// Design §3, SPEC §113.1/§113.2, cycle H: a route's `security_mode`
+    /// takes effect live -- same posture as `identity_mode`/`render` above
+    /// it (`apply_config`'s restart-required diff never inspects `routes`
+    /// at all; every per-message read goes through `cfg.read()`/
+    /// `route_cfg`, so the next attempt already sees the new value).
+    #[test]
+    fn apply_config_security_mode_change_is_live_no_restart_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path()); // default security_mode: "gateway"
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.routes[0].security_mode = "sealed".to_string();
+        let outcome = d.apply_config(new_cfg);
+        assert!(outcome.restart_required.is_empty(), "outcome was: {outcome:?}");
+    }
+
+    /// Design §3, SPEC §113.2, cycle H: unlike `federation`/`discovery`
+    /// (both `"daemon"` restart-required on ANY change), the node-level
+    /// `privacy` floor is deliberately NOT part of the restart diff at all
+    /// (see `Config::privacy`'s doc comment) -- a floor edit takes effect
+    /// live, the same as `routes`/`render`/`identity_mode`.
+    #[test]
+    fn apply_config_privacy_floor_change_is_live_no_restart_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path()); // default privacy: no floor
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.privacy.minimum_security = "sealed".to_string();
+        new_cfg.privacy.allow_gateway_decryption = false;
+        new_cfg.privacy.allow_protocol_downgrade = false;
+        let outcome = d.apply_config(new_cfg);
+        assert!(outcome.restart_required.is_empty(), "outcome was: {outcome:?}");
+    }
+
     #[test]
     fn apply_config_multiple_changes_are_all_reported_sorted_and_deduped() {
         let dir = tempfile::tempdir().unwrap();
@@ -3772,6 +3807,8 @@ mod tests {
             destinations: vec!["mockb:chan".parse().unwrap()],
             identity_mode: "pseudonymous".into(),
             render: crate::config::RenderConfig::default(),
+            security_mode: "gateway".into(),
+            allow_gateway_decryption: None,
         });
         let outcome = d.apply_config(new_cfg);
         assert!(outcome.restart_required.is_empty(),

@@ -71,6 +71,23 @@ pub struct Config {
     /// the next daemon start this cycle.
     #[serde(default)]
     pub discovery: DiscoveryConfig,
+    /// Node-level sealed-routing privacy floor (design §3, SPEC §113.2,
+    /// cycle H). Absent entirely (every pre-cycle-H config) defaults to
+    /// `PrivacyConfig::default()` -- `minimum_security: "gateway"`,
+    /// `allow_gateway_decryption: true`, `allow_protocol_downgrade: true` --
+    /// which imposes no floor at all and reproduces today's behavior
+    /// exactly. Deliberately a TOP-LEVEL `Config` field, NOT nested inside
+    /// `NodeConfig`: `Daemon::apply_config`'s restart-required diff compares
+    /// `cfg.node` as one unit and reports `"daemon"` on ANY change to it
+    /// (see `NodeConfig`'s doc comment) -- but a privacy-floor edit is meant
+    /// to take effect live, the same as `routes`/`render`/`identity_mode`
+    /// (every read goes through `cfg.read()`/`route_cfg`, so the next
+    /// per-message check sees the new value with no restart needed). Nesting
+    /// this under `node` would have silently forced a restart for a field
+    /// that doesn't need one; keeping it a sibling avoids that trap without
+    /// `apply_config` needing any new diff logic at all.
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
 }
 
 fn default_ttl() -> u64 { 86_400 }
@@ -169,9 +186,38 @@ pub struct RouteConfig {
     /// {alias, none} and `max_chars` in 1..16.
     #[serde(default)]
     pub render: RenderConfig,
+    /// Design §3, SPEC §113.1/§113.2, cycle H: "gateway" (default -- current
+    /// transform/translate behavior, cycle-F's pseudonymize+sign+cleartext
+    /// egress) or "sealed" (the origin edge AEAD-seals the payload for the
+    /// destination edge's key; the fabric routes ciphertext only -- design
+    /// §2/§4). Default `gateway` preserves ALL existing route behavior
+    /// (v0.1/v0.2/v0.3 configs unchanged). "native" (SPEC §113.1's
+    /// per-protocol-bridge concept) is documented as an alias of "gateway"
+    /// today, NOT a separate value this cycle -- `validate()` rejects it
+    /// (and anything else outside {gateway, sealed}) with a message saying
+    /// so. Egress/ingress behavior driven by this field is Task 4/5's job;
+    /// this task only parses/validates it (design §3's --check-config
+    /// downgrade-refusal matrix).
+    #[serde(default = "default_security_mode")]
+    pub security_mode: String,
+    /// Design §3, SPEC §113.2, cycle H: per-route override of the node's
+    /// `privacy.allow_gateway_decryption` floor -- `Some(_)` wins over the
+    /// node default when set, `None` (default, every pre-cycle-H config)
+    /// defers to `privacy.allow_gateway_decryption`. Governs whether THIS
+    /// route may terminate a sealed inbound envelope by decrypting it for
+    /// delivery to a plaintext leg (§113.3's unavoidable phase-1 gateway
+    /// decryption point) -- `false` means the route refuses to be that
+    /// termination point (SECURITY_DOWNGRADE_REFUSED). Not validated at
+    /// --check-config (only `security_mode` + `privacy.minimum_security` +
+    /// a sealed peer's `sealed_key` are, per design §3's three-item
+    /// rejection list); resolving/consuming this override is Task 5's job
+    /// (ingress downgrade refusal) -- inert this task beyond shape parsing.
+    #[serde(default)]
+    pub allow_gateway_decryption: Option<bool>,
 }
 
 fn default_identity_mode() -> String { "pseudonymous".to_string() }
+fn default_security_mode() -> String { "gateway".to_string() }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RenderConfig {
@@ -339,6 +385,60 @@ fn default_discovery_mode() -> String {
 fn default_advert_ttl_secs() -> u64 {
     3600
 }
+
+/// Node-level sealed-routing privacy floor (design §3, SPEC §113.2, cycle
+/// H) -- see `Config::privacy`'s doc comment for why this is a top-level
+/// `Config` field rather than nested inside `NodeConfig`. YAML shape matches
+/// SPEC §113.2's example exactly:
+/// ```yaml
+/// privacy:
+///   minimum_security: sealed
+///   allow_gateway_decryption: false
+///   allow_protocol_downgrade: false
+/// ```
+/// No `PartialEq`/`Eq` derive: unlike `federation`/`discovery`, this block
+/// is deliberately NOT part of `Daemon::apply_config`'s restart-required
+/// diff (see `Config::privacy`), so nothing ever needs to compare two
+/// `PrivacyConfig` values for that purpose.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrivacyConfig {
+    /// "gateway" (default) or "sealed" -- the minimum `RouteConfig::
+    /// security_mode` this node accepts; `validate()` rejects any route
+    /// whose `security_mode` ranks below this (sealed > gateway, design
+    /// §113.2 downgrade refusal).
+    #[serde(default = "default_minimum_security")]
+    pub minimum_security: String,
+    /// Whether a route may terminate a sealed inbound envelope by
+    /// decrypting it for delivery to a plaintext leg (§113.3's phase-1
+    /// gateway decryption point). Default `true` (today's only possible
+    /// behavior -- every pre-cycle-H node IS such a termination point).
+    /// `RouteConfig::allow_gateway_decryption` overrides this per route when
+    /// set. Read at ingress (Task 5), not validated at --check-config.
+    #[serde(default = "default_allow_gateway_decryption")]
+    pub allow_gateway_decryption: bool,
+    /// Whether a `sealed`-floor node may still accept/emit a lower-security
+    /// leg elsewhere in the fabric (as opposed to the per-route
+    /// `minimum_security` floor rejection, which is absolute). Default
+    /// `true`. Parsed/stored/defaulted here only -- not read by `validate()`
+    /// or anywhere else this task; consumed by egress Task 4 / ingress
+    /// Task 5.
+    #[serde(default = "default_allow_protocol_downgrade")]
+    pub allow_protocol_downgrade: bool,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        PrivacyConfig {
+            minimum_security: default_minimum_security(),
+            allow_gateway_decryption: default_allow_gateway_decryption(),
+            allow_protocol_downgrade: default_allow_protocol_downgrade(),
+        }
+    }
+}
+
+fn default_minimum_security() -> String { "gateway".to_string() }
+fn default_allow_gateway_decryption() -> bool { true }
+fn default_allow_protocol_downgrade() -> bool { true }
 
 /// Protocol name reserved for federation (design §4/§5): no plugin may
 /// claim it, and no route SOURCE may claim it as a source protocol -- a fed
@@ -594,6 +694,21 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
                 r.name, r.identity_mode
             ));
         }
+        if r.security_mode != "gateway" && r.security_mode != "sealed" {
+            return Err(format!(
+                "route '{}' has invalid security_mode '{}' (expected \"gateway\" or \"sealed\" -- \
+                 \"native\" per SPEC §113.1 is an alias of \"gateway\" today, not a separate mode \
+                 this cycle; use \"gateway\")",
+                r.name, r.security_mode
+            ));
+        }
+        if security_rank(&r.security_mode) < security_rank(&cfg.privacy.minimum_security) {
+            return Err(format!(
+                "route '{}' has security_mode '{}' which is below the node's privacy.minimum_security \
+                 floor '{}' (design §113.2 downgrade refusal: a route may never load below the floor)",
+                r.name, r.security_mode, cfg.privacy.minimum_security
+            ));
+        }
         if r.render.tag != "alias" && r.render.tag != "none" {
             return Err(format!(
                 "route '{}' has invalid render.tag '{}' (expected \"alias\" or \"none\")",
@@ -638,6 +753,9 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             if ep.protocol == FED_PROTOCOL {
                 validate_fed_destination(cfg, &r.name, &ep.endpoint)?;
             }
+        }
+        if r.security_mode == "sealed" {
+            validate_sealed_route(cfg, r)?;
         }
     }
     for p in &cfg.policies {
@@ -729,7 +847,97 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
 
     validate_federation(cfg)?;
     validate_discovery(cfg)?;
+    validate_privacy(cfg)?;
 
+    Ok(())
+}
+
+/// Design §3 validation for the node-level `privacy` block (SPEC §113.2,
+/// cycle H). Never absent -- `Config::privacy` defaults to
+/// `PrivacyConfig::default()` (`minimum_security: "gateway"`) via
+/// `#[serde(default)]`, so this runs unconditionally; every pre-cycle-H
+/// config (no `privacy:` block at all) validates against that default and
+/// passes trivially, imposing no floor.
+fn validate_privacy(cfg: &Config) -> Result<(), String> {
+    let p = &cfg.privacy;
+    if p.minimum_security != "gateway" && p.minimum_security != "sealed" {
+        return Err(format!(
+            "privacy.minimum_security '{}' is invalid (expected \"gateway\" or \"sealed\")",
+            p.minimum_security
+        ));
+    }
+    Ok(())
+}
+
+/// Rank for `RouteConfig::security_mode`/`PrivacyConfig::minimum_security`
+/// ordering comparisons (design §113.2: "sealed > gateway"). Callers only
+/// ever pass an already-validated value (`validate()` runs the {gateway,
+/// sealed} value check on both fields before any ranking comparison); any
+/// other string ranks as `gateway`'s floor (0) defensively rather than
+/// panicking, since a rank comparison must never be the thing that panics
+/// on operator input.
+fn security_rank(mode: &str) -> u8 {
+    match mode {
+        "sealed" => 1,
+        _ => 0,
+    }
+}
+
+/// Design §3/§113.2 validation specific to a `security_mode: sealed` route,
+/// run only when `r.security_mode == "sealed"` (see `validate`'s routes
+/// loop). Two --check-config rejections (design §3's downgrade-refusal
+/// list, items b/c):
+///
+/// (b) EVERY destination must be a `fed:<peer>/<route>` destination --
+///     sealed routing requires a federation peer this cycle (a plaintext
+///     local plugin is not a sealed-capable endpoint: it's the plaintext
+///     edge sealing exists to protect against, design §113.1/§3).
+/// (c) each such peer must carry a CONFIG-PINNED `sealed_key` --
+///     `--check-config` cannot see advert-learned keys (those only exist at
+///     runtime, once a peer connection has actually exchanged adverts), so
+///     sealed egress can only pass config-time validation when the peer's
+///     key is pinned in `federation.peers[].sealed_key` (design §1/§113.2).
+///     An advert-learned key alone is a Task 4 runtime concern, not a
+///     --check-config pass condition.
+///
+/// Runs AFTER `validate_fed_destination` has already accepted every `fed:`
+/// destination on this route (same loop, called earlier per destination) --
+/// so by the time this runs, any non-fed destination has NOT yet been
+/// caught (fed-ness is exactly what this function's first check adds), but
+/// every `fed:` destination it does see is already known to name a
+/// configured peer with a well-formed `<peer>/<route>` shape.
+fn validate_sealed_route(cfg: &Config, r: &RouteConfig) -> Result<(), String> {
+    for ep in &r.destinations {
+        if ep.protocol != FED_PROTOCOL {
+            return Err(format!(
+                "route '{}' has security_mode 'sealed' but destination '{}:{}' is not a fed:<peer> \
+                 destination (sealed routing requires every destination to be a federation peer this \
+                 cycle -- a plaintext local plugin cannot be a sealed endpoint, design §3/§113.1)",
+                r.name, ep.protocol, ep.endpoint
+            ));
+        }
+        let Some((peer_name, _remote_route)) = ep.endpoint.split_once('/') else {
+            // Malformed shape -- `validate_fed_destination` (called earlier
+            // in the same routes-loop iteration) already rejected this.
+            continue;
+        };
+        let Some(peer) =
+            cfg.federation.as_ref().and_then(|fed| fed.peers.iter().find(|p| p.name == peer_name))
+        else {
+            // Unknown peer / absent federation block -- likewise already
+            // rejected by `validate_fed_destination`.
+            continue;
+        };
+        if peer.sealed_key.is_none() {
+            return Err(format!(
+                "route '{}' has security_mode 'sealed' to peer '{}' which has no config-pinned \
+                 sealed_key -- --check-config cannot see advert-learned keys at load time, so a \
+                 sealed destination requires federation.peers[].sealed_key to be set for this peer \
+                 (design §1/§113.2)",
+                r.name, peer_name
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -2439,5 +2647,252 @@ federation:
         );
         let cfg = parse(&yaml).unwrap();
         assert_eq!(cfg.federation.unwrap().peers[0].messages_per_minute, 1);
+    }
+
+    // ---- security_mode + privacy floor (design §3, SPEC §113.1/§113.2, cycle H) ----
+
+    #[test]
+    fn security_mode_defaults_to_gateway_when_absent() {
+        // v0.1/.../v0.3 (pre-cycle-H) config has no security_mode key at all.
+        let cfg = parse(GOOD).unwrap();
+        assert_eq!(cfg.routes[0].security_mode, "gateway");
+    }
+
+    #[test]
+    fn security_mode_gateway_is_explicitly_accepted() {
+        let yaml = GOOD.replace(
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]\n    security_mode: gateway",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.routes[0].security_mode, "gateway");
+    }
+
+    #[test]
+    fn security_mode_unknown_value_is_rejected() {
+        let yaml = GOOD.replace(
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]\n    security_mode: opaque",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("general"), "err should name the route: {err}");
+        assert!(err.contains("opaque"), "err should quote the bad value: {err}");
+    }
+
+    /// SPEC §113.1: `native` is documented as an alias of `gateway` today,
+    /// not a distinct mode this cycle -- the rejection message must say so
+    /// (not just "invalid value"), so an operator reading it knows exactly
+    /// what to write instead.
+    #[test]
+    fn security_mode_native_is_rejected_as_an_alias_of_gateway_not_a_separate_mode() {
+        let yaml = GOOD.replace(
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]\n    security_mode: native",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("native"), "err should quote the value: {err}");
+        assert!(err.contains("alias"), "err should explain native is an alias of gateway: {err}");
+        assert!(err.contains("gateway"), "err was: {err}");
+    }
+
+    #[test]
+    fn allow_gateway_decryption_route_override_defaults_to_none() {
+        let cfg = parse(GOOD).unwrap();
+        assert_eq!(cfg.routes[0].allow_gateway_decryption, None);
+    }
+
+    #[test]
+    fn allow_gateway_decryption_route_override_parses_explicit_false() {
+        let yaml = GOOD.replace(
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]\n    allow_gateway_decryption: false",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(cfg.routes[0].allow_gateway_decryption, Some(false));
+    }
+
+    #[test]
+    fn security_rank_orders_sealed_above_gateway() {
+        assert!(security_rank("sealed") > security_rank("gateway"));
+    }
+
+    // ---- privacy floor (node-level, design §3, SPEC §113.2, cycle H) ------
+
+    #[test]
+    fn privacy_block_absent_defaults_to_no_floor() {
+        // v0.1/.../v0.3 (pre-cycle-H) config has no privacy: key at all.
+        let cfg = parse(GOOD).unwrap();
+        assert_eq!(cfg.privacy.minimum_security, "gateway");
+        assert!(cfg.privacy.allow_gateway_decryption);
+        assert!(cfg.privacy.allow_protocol_downgrade);
+    }
+
+    #[test]
+    fn privacy_allow_gateway_decryption_and_allow_protocol_downgrade_parse_explicit_false() {
+        let yaml = format!(
+            "{GOOD}\nprivacy:\n  allow_gateway_decryption: false\n  allow_protocol_downgrade: false\n"
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert!(!cfg.privacy.allow_gateway_decryption);
+        assert!(!cfg.privacy.allow_protocol_downgrade);
+    }
+
+    #[test]
+    fn privacy_minimum_security_invalid_value_is_rejected() {
+        let yaml = format!("{GOOD}\nprivacy:\n  minimum_security: paranoid\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("minimum_security"), "err was: {err}");
+        assert!(err.contains("paranoid"), "err was: {err}");
+    }
+
+    #[test]
+    fn privacy_minimum_security_gateway_accepts_a_gateway_route() {
+        // The default floor -- explicit here for clarity -- imposes no
+        // restriction beyond what GOOD already validates.
+        let yaml = format!("{GOOD}\nprivacy:\n  minimum_security: gateway\n");
+        assert!(parse(&yaml).is_ok());
+    }
+
+    /// Downgrade-refusal rejection (a) (design §113.2): a `gateway` route
+    /// loading under a `sealed` node floor is below the floor and must be
+    /// rejected at --check-config, naming both the route and the floor.
+    #[test]
+    fn privacy_minimum_security_sealed_rejects_a_gateway_route() {
+        let yaml = format!("{GOOD}\nprivacy:\n  minimum_security: sealed\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("general"), "err should name the route: {err}");
+        assert!(err.contains("gateway"), "err should name the route's mode: {err}");
+        assert!(err.contains("sealed"), "err should name the floor: {err}");
+        assert!(err.contains("floor"), "err should say 'floor': {err}");
+    }
+
+    /// Floor ordering (sealed > gateway): a `sealed` route to a peer with a
+    /// config-pinned `sealed_key` satisfies a `sealed` node floor -- the
+    /// floor check must not reject a route that already meets or exceeds it.
+    #[test]
+    fn privacy_minimum_security_sealed_accepts_a_sealed_route_to_a_keyed_peer() {
+        let sealed_key = "33".repeat(32);
+        let yaml = format!(
+            "{}\nprivacy:\n  minimum_security: sealed\nfederation:\n  peers:\n    - name: phoenix\n      \
+             node_id: \"{}\"\n      addr: \"10.0.0.2:47000\"\n      sealed_key: \"{}\"\n",
+            GOOD.replace(
+                "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+                "    destinations: [\"fed:phoenix/regional-chat\"]\n    security_mode: sealed",
+            ),
+            node_id_a(), sealed_key,
+        );
+        let cfg = parse(&yaml)
+            .unwrap_or_else(|e| panic!("a sealed route to a keyed peer should satisfy a sealed floor: {e}"));
+        assert_eq!(cfg.privacy.minimum_security, "sealed");
+        assert_eq!(cfg.routes[0].security_mode, "sealed");
+    }
+
+    // ---- sealed routes require a fed: dest + a config-pinned peer key -----
+    // (design §3's --check-config downgrade-refusal list, items b/c)
+
+    /// Rejection (b): every destination on a `sealed` route must be a
+    /// `fed:<peer>` destination -- GOOD's route has two plain plugin
+    /// destinations, neither of which can be a sealed endpoint.
+    #[test]
+    fn sealed_route_to_a_non_fed_destination_is_rejected() {
+        let yaml = GOOD.replace(
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]\n    security_mode: sealed",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("general"), "err should name the route: {err}");
+        assert!(err.contains("sealed"), "err was: {err}");
+        assert!(err.contains("mocka:chan"), "err should name the offending destination: {err}");
+    }
+
+    /// Rejection (b), mixed case: one `fed:` destination and one plain
+    /// plugin destination on the same `sealed` route -- still rejected
+    /// (EVERY destination must be fed:, not just at least one).
+    #[test]
+    fn sealed_route_with_a_mix_of_fed_and_non_fed_destinations_is_rejected() {
+        let yaml = format!(
+            "{}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{}\"\n      \
+             addr: \"10.0.0.2:47000\"\n      sealed_key: \"{}\"\n",
+            GOOD.replace(
+                "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+                "    destinations: [\"fed:phoenix/regional-chat\", \"mockb:chan\"]\n    security_mode: sealed",
+            ),
+            node_id_a(), "44".repeat(32),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("sealed"), "err was: {err}");
+        assert!(err.contains("mockb:chan"), "err should name the non-fed destination: {err}");
+    }
+
+    /// Rejection (c): a `sealed` route to a `fed:` peer that has NO
+    /// config-pinned `sealed_key` -- --check-config cannot see
+    /// advert-learned keys, so this must fail even though the peer is
+    /// otherwise fully configured (valid node_id/addr).
+    #[test]
+    fn sealed_route_to_fed_peer_without_a_configured_sealed_key_is_rejected() {
+        let yaml = format!(
+            "{}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{}\"\n      addr: \"10.0.0.2:47000\"\n",
+            GOOD.replace(
+                "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+                "    destinations: [\"fed:phoenix/regional-chat\"]\n    security_mode: sealed",
+            ),
+            node_id_a(),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("general"), "err should name the route: {err}");
+        assert!(err.contains("phoenix"), "err should name the peer: {err}");
+        assert!(err.contains("sealed_key"), "err was: {err}");
+    }
+
+    /// Positive control for rejection (c): the same route/peer, but with a
+    /// config-pinned `sealed_key` this time -- must pass.
+    #[test]
+    fn sealed_route_to_fed_peer_with_a_configured_sealed_key_is_accepted() {
+        let sealed_key = "22".repeat(32);
+        let yaml = format!(
+            "{}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{}\"\n      \
+             addr: \"10.0.0.2:47000\"\n      sealed_key: \"{}\"\n",
+            GOOD.replace(
+                "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+                "    destinations: [\"fed:phoenix/regional-chat\"]\n    security_mode: sealed",
+            ),
+            node_id_a(), sealed_key,
+        );
+        parse(&yaml).unwrap_or_else(|e| panic!("sealed route to a keyed peer should be valid: {e}"));
+    }
+
+    /// Rejection (b) takes priority when `federation` is entirely absent --
+    /// same posture as the plain (non-sealed) `fed_destination_is_rejected_
+    /// when_federation_block_is_absent` test above, just confirming a
+    /// `sealed` route doesn't bypass that check.
+    #[test]
+    fn sealed_route_to_fed_destination_with_no_federation_block_is_rejected() {
+        let yaml = GOOD.replace(
+            "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
+            "    destinations: [\"fed:phoenix/regional-chat\"]\n    security_mode: sealed",
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.contains("general"), "err should name the route: {err}");
+        assert!(err.contains("federation"), "err was: {err}");
+    }
+
+    /// v0.2 example config carries no `security_mode`/`privacy` keys at
+    /// all -- every route must keep defaulting to "gateway" and the node
+    /// floor must keep defaulting to no restriction, exactly as before this
+    /// task's additions.
+    #[test]
+    fn example_config_has_no_privacy_block_and_every_route_defaults_to_gateway() {
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/relayfabric.example.yaml"),
+        ).unwrap();
+        let cfg: Config = serde_yaml::from_str(&raw).unwrap();
+        assert_eq!(cfg.privacy.minimum_security, "gateway");
+        assert!(cfg.privacy.allow_gateway_decryption);
+        assert!(cfg.privacy.allow_protocol_downgrade);
+        for r in &cfg.routes {
+            assert_eq!(r.security_mode, "gateway", "route '{}' should default to gateway", r.name);
+            assert_eq!(r.allow_gateway_decryption, None, "route '{}' should default to None", r.name);
+        }
+        assert!(validate(&cfg).is_ok());
     }
 }

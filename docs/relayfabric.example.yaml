@@ -126,6 +126,14 @@ routes:
     # render:
     #   tag: alias
     #   max_chars: 900
+    # security_mode (design §3, SPEC §113.1/§113.2, cycle H): "gateway"
+    # (default) is today's transform/translate behavior above. "sealed"
+    # AEAD-seals the payload end-to-end between federation gateways --
+    # requires every destination to be a fed:<peer> peer with a
+    # config-pinned sealed_key (see federation.peers[].sealed_key below);
+    # a plaintext local plugin like mqtt above cannot be a sealed
+    # destination.
+    # security_mode: gateway
 
   # - name: lxmf_mqtt_bridge
   #   sources: ["lxmf:pasadena", "mqtt:lxmf_bridge"]
@@ -208,6 +216,17 @@ policies:
 #   mode: federation                 # disabled (default) | federation | public
 #                                     # public requires node.public: true
 #   advert_ttl_secs: 3600            # default 3600; min 300, max 86400
+
+# Sealed-routing privacy floor (design §3, SPEC §113.2, cycle H): a
+# node-level minimum a route's security_mode must meet, checked at
+# --check-config (a route below the floor is rejected at load, never
+# silently downgraded). Absent entirely (as here) = no floor, matching
+# every pre-cycle-H config.
+# privacy:
+#   minimum_security: gateway        # gateway (default) | sealed
+#   allow_gateway_decryption: true   # default true; false = this node refuses to be a
+#                                     # sealed→plaintext termination point (ingress, §113.3)
+#   allow_protocol_downgrade: true   # default true
 
 # TTLs and limits (seconds)
 ttl_default_secs: 86400
