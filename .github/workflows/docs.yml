@@ -31,6 +31,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/configure-pages@v5
+        with:
+          # Create the Pages site on first run instead of requiring it to be
+          # enabled by hand in Settings -> Pages first.
+          enablement: true
       - uses: actions/setup-python@v5
         with:
           python-version: 3.x
