@@ -111,6 +111,33 @@ routes:
     destinations: ["mockb:chan"]
 "#;
 
+// Transport-class cycle Task 4 (design §3/§113.4, e2e): "mixed" fans one
+// inbound message out to two destinations that differ only in transport
+// class -- mockb is pinned to Meshtastic (237 B payload cap, images/video
+// forbidden) via the transports: block; mockc has NO entry at all and
+// resolves to the TerrestrialInternet default (non-constraining, per
+// `Config::transport_policy`'s documented backward-compat anchor). Mirrors
+// `attachment_egress_is_capability_aware`'s fan-out shape, swapping the
+// capability axis for the transport-class axis.
+const TRANSPORT_CLASS_CONFIG: &str = r#"
+node:
+  name: e2e-transport-class
+  data_dir: DATA_DIR
+plugins:
+  mocka:
+    enabled: true
+  mockb:
+    enabled: true
+  mockc:
+    enabled: true
+routes:
+  - name: mixed
+    sources: ["mocka:achan"]
+    destinations: ["mockb:achan", "mockc:achan"]
+transports:
+  mockb: { class: meshtastic }
+"#;
+
 // keep test output pristine: the daemon logs via tracing to stdout/stderr,
 // which is irrelevant noise for these tests and must not pollute `cargo test`
 // output.
@@ -555,6 +582,115 @@ async fn attachment_egress_is_capability_aware() {
     write_frame(&mut wc, &PluginToDaemon::DeliveryResult {
         corr: corr_c, delivered: true, detail: None,
     }).await.unwrap();
+}
+
+/// Transport-class cycle Task 4 (design §3/§113.4, e2e): the destination
+/// plugin's TRANSPORT -- not just its protocol `Capabilities` -- degrades
+/// an outgoing message. mockb is pinned to Meshtastic (237 B payload cap,
+/// images/video forbidden); mockc has no `transports:` entry at all and
+/// resolves to the non-constraining TerrestrialInternet default. Each
+/// inbound message fans out to both over the "mixed" route.
+///
+/// Two sends split the two composed behaviors so each is asserted on its
+/// own terms rather than fighting each other for space in the same body:
+/// - send 1 (short body + image): proves image->note demotion LITERALLY --
+///   mockb's body contains the exact `"[image '<file>' omitted --
+///   constrained transport]"` note and carries zero attachments; mockc
+///   gets the image intact and no demotion note.
+/// - send 2 (oversize body + video): proves the payload-cap composition
+///   min(plugin cap, transport cap) -- mockb's body is hard-capped to
+///   Meshtastic's 237 B with a visible ellipsis tail (the demotion note,
+///   appended AFTER the body in `engine::process_due`, is itself truncated
+///   away by that same cap here -- render() keeps the FRONT of the
+///   assembled string, so a body already exceeding the cap always evicts
+///   any note behind it; that's exactly why send 1 above, not this one, is
+///   what proves the note text survives). mockc's body arrives byte-for-
+///   byte untruncated, since its transport imposes no cap.
+///
+/// `relayfabric_transport_demoted_total` is polled after each send and
+/// asserted at an EXACT count (unlike the unit-test caution documented on
+/// `load_attachments`'s callers in engine.rs) because this e2e test spawns
+/// its own daemon subprocess -- the counter isn't shared with any other
+/// test.
+#[tokio::test]
+async fn transport_class_constrained_route_demotes_media() {
+    let d = start_daemon_with_config(tempfile::tempdir().unwrap(), TRANSPORT_CLASS_CONFIG);
+    wait_for(&d.plugin_sock()).await;
+    let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
+    let (mut rb, mut wb) = connect_plugin_with_caps(&d.plugin_sock(), "mockb",
+        Capabilities { attachments: true, ..Default::default() }).await;
+    let (mut rc, mut wc) = connect_plugin_with_caps(&d.plugin_sock(), "mockc",
+        Capabilities { attachments: true, ..Default::default() }).await;
+
+    // ---- send 1: short body + image -- proves the literal note text and
+    // selective (image-only) demotion.
+    let payload = b"\x89PNGfake-image-bytes-not-really-a-png".to_vec();
+    let expected_sha = hex::encode(Sha256::digest(&payload));
+    inbound_with_attachments(&mut wa, "achan", "!abcd1234", "constrained link test",
+        chrono::Utc::now(),
+        vec![IpcAttachment {
+            filename: "photo.png".into(),
+            mime: "image/png".into(),
+            data: payload.clone(),
+        }],
+    ).await;
+
+    let (corr_b1, _, body_b1, att_b1) = expect_send(&mut rb).await;
+    assert!(att_b1.is_empty(), "an image must never reach a transport that forbids images");
+    assert!(body_b1.contains("[image 'photo.png' omitted — constrained transport]"),
+        "body was: {body_b1}");
+    assert!(body_b1.len() <= 237,
+        "body must stay within the Meshtastic transport cap: {} bytes", body_b1.len());
+    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
+        corr: corr_b1, delivered: true, detail: None,
+    }).await.unwrap();
+
+    let (corr_c1, _, body_c1, att_c1) = expect_send(&mut rc).await;
+    assert_eq!(att_c1.len(), 1, "the internet-default sibling must still receive the image");
+    assert_eq!(att_c1[0].data, payload, "attachment bytes were altered in transit");
+    assert_eq!(hex::encode(Sha256::digest(&att_c1[0].data)), expected_sha);
+    assert!(body_c1.contains("constrained link test"), "body was: {body_c1}");
+    assert!(!body_c1.contains("omitted"),
+        "the non-constraining sibling must apply no demotion: {body_c1}");
+    write_frame(&mut wc, &PluginToDaemon::DeliveryResult {
+        corr: corr_c1, delivered: true, detail: None,
+    }).await.unwrap();
+
+    poll_until_contains(&d.admin_sock(), "/metrics", "relayfabric_transport_demoted_total 1").await;
+
+    // ---- send 2: oversize body + video -- proves the payload-cap
+    // composition (transport cap tighter than the plugin's own, which is
+    // unset here i.e. unlimited).
+    let big_body = "Y".repeat(2000);
+    inbound_with_attachments(&mut wa, "achan", "!abcd1234", &big_body,
+        chrono::Utc::now(),
+        vec![IpcAttachment {
+            filename: "clip.mp4".into(),
+            mime: "video/mp4".into(),
+            data: vec![3u8; 40],
+        }],
+    ).await;
+
+    let (corr_b2, _, body_b2, att_b2) = expect_send(&mut rb).await;
+    assert!(att_b2.is_empty(), "a video must never reach a transport that forbids video");
+    assert!(body_b2.len() <= 237,
+        "body must be capped to the tighter TRANSPORT limit, not left unbounded: {} bytes",
+        body_b2.len());
+    assert!(body_b2.ends_with('…'), "an oversize body must show visible truncation: {body_b2}");
+    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
+        corr: corr_b2, delivered: true, detail: None,
+    }).await.unwrap();
+
+    let (corr_c2, _, body_c2, att_c2) = expect_send(&mut rc).await;
+    assert_eq!(att_c2.len(), 1, "the internet-default sibling must receive the video too");
+    assert!(body_c2.contains(&big_body),
+        "the non-constraining sibling must deliver the body byte-for-byte, untruncated: len {}",
+        body_c2.len());
+    write_frame(&mut wc, &PluginToDaemon::DeliveryResult {
+        corr: corr_c2, delivered: true, detail: None,
+    }).await.unwrap();
+
+    poll_until_contains(&d.admin_sock(), "/metrics", "relayfabric_transport_demoted_total 2").await;
 }
 
 #[tokio::test]

@@ -9,8 +9,9 @@ preferred style), while Meshtastic uses MQTT (licensing favors it). Initial
 target networks: Reticulum/LXMF, Signal, Meshtastic, MeshCore, Bitchat, Nostr.
 
 **Status:** v0.3 in progress: federation, RFDP, documented API + /docs, sealed
-routing (gateway-to-gateway AEAD payload sealing; see `docs/SPEC.md` §113 —
-this is zero-knowledge payload routing, not traffic anonymity).
+routing (`docs/SPEC.md` §113 — zero-knowledge routing, not traffic
+anonymity), and transport-class-aware egress (constrained links degrade
+gracefully: payload capped, media dropped to a note).
 
 ## Components
 
@@ -70,8 +71,7 @@ Commands assume `target/release/` is on your `PATH`.
 The routing, policy, and security model — including deny-by-default
 routing, route-scoped pseudonyms, TTL/dedup/retry semantics, and the plugin
 IPC protocol — is specified in [`docs/SPEC.md`](docs/SPEC.md). Notes on the
-(not-yet-built) administrative web UI are in
-[`docs/webui-notes.md`](docs/webui-notes.md).
+(not-yet-built) administrative web UI are in [`docs/webui-notes.md`](docs/webui-notes.md).
 
 ## License
 

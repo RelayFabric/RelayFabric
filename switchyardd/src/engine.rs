@@ -2413,7 +2413,10 @@ fn load_attachments(
             None
         };
         if let Some(kind) = demote {
-            notes.push_str(&format!("\n[{kind} omitted — constrained transport]"));
+            notes.push_str(&format!(
+                "\n[{kind} '{}' omitted — constrained transport]",
+                meta.filename
+            ));
             metrics::inc(&metrics::TRANSPORT_DEMOTED);
             continue;
         }
@@ -3136,7 +3139,7 @@ mod tests {
         };
         assert!(attachments.is_empty(),
             "an image must never reach a transport that forbids images");
-        assert!(body.contains("[image omitted — constrained transport]"), "body was: {body}");
+        assert!(body.contains("[image 'photo.jpg' omitted — constrained transport]"), "body was: {body}");
         let after = metrics::TRANSPORT_DEMOTED.load(std::sync::atomic::Ordering::Relaxed);
         assert!(after > before, "TRANSPORT_DEMOTED must increment on a media demotion");
     }
@@ -3181,7 +3184,7 @@ mod tests {
         };
         assert_eq!(attachments.len(), 1, "only the video should be demoted, the PDF must pass through");
         assert_eq!(attachments[0].filename, "notes.pdf");
-        assert!(body.contains("[video omitted — constrained transport]"), "body was: {body}");
+        assert!(body.contains("[video 'clip.mp4' omitted — constrained transport]"), "body was: {body}");
         let after = metrics::TRANSPORT_DEMOTED.load(std::sync::atomic::Ordering::Relaxed);
         assert!(after > before);
     }

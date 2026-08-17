@@ -231,7 +231,11 @@ policies:
 # transport-level cap beyond the daemon's own 16 MiB frame limit, images
 # and video allowed). An entry here overrides the class and/or individual
 # policy fields on top of that class's built-in defaults; takes effect
-# live, no daemon restart.
+# live, no daemon restart. At egress the composed policy caps the payload
+# to min(plugin cap, transport cap), and an image/video attachment the
+# class forbids is dropped and replaced with a body note (e.g. "[image
+# 'photo.jpg' omitted -- constrained transport]") rather than sent --
+# sealed routes are exempt (no transform ever touches a sealed payload).
 # transports:
 #   meshtastic: { class: meshtastic }                       # class -> its built-in default policy
 #   mqtt:       { class: satellite_internet, max_payload_bytes: 32768, allow_images: false }
