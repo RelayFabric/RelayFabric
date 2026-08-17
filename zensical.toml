@@ -17,6 +17,7 @@ nav = [
   {"Security & Sealed Routing" = "security.md"},
   {"Federation & Discovery" = "federation.md"},
   {"Operations" = "operations.md"},
+  {"Docker" = "docker.md"},
   {"Live & Field Testing" = "live-testing.md"},
   {"Plugin Authoring" = "plugin-authors.md"},
   {"API Reference" = "api-reference.md"},

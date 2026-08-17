@@ -1,0 +1,14 @@
+# Keep the build context small and reproducible.
+target/
+**/__pycache__/
+.venv/
+.git/
+.github/
+site/
+.cache/
+livetest/run/
+docs/superpowers/
+.claude/
+.superpowers/
+*.md
+!docs/relayfabric.example.yaml

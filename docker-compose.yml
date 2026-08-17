@@ -1,0 +1,35 @@
+# RelayFabric with an optional local MQTT broker.
+#
+#   mkdir -p config && cp docs/relayfabric.example.yaml config/relayfabric.yaml
+#   # edit config/relayfabric.yaml: point plugin `command`s at the in-image
+#   # paths (/opt/venv/bin/python /opt/relayfabric/plugins/<name>/relayfabric-<name>)
+#   # and set node.data_dir: /data ; brokers reachable as mqtt://mosquitto:1883
+#   docker compose up -d
+#
+# Inspect: docker compose exec switchyardd switchyardctl --socket /data/admin.sock status
+
+services:
+  switchyardd:
+    build: .
+    image: relayfabric:latest
+    restart: unless-stopped
+    depends_on:
+      - mosquitto
+    volumes:
+      - ./config:/config:ro     # your relayfabric.yaml
+      - relayfabric-data:/data  # queue db, CAS attachments, admin.sock, plugin identities
+    # Federation listens on a TCP port only if you configure it; publish it here:
+    # ports:
+    #   - "8443:8443"
+
+  # Optional broker for the MQTT and Meshtastic (MQTT-gateway) plugins.
+  # Remove this service if you point the plugins at an external broker.
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    command: mosquitto -c /mosquitto-no-auth.conf
+    ports:
+      - "127.0.0.1:1883:1883"
+
+volumes:
+  relayfabric-data:
