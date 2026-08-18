@@ -1,4 +1,4 @@
-# Proposal: Federation over Tor (and, later, I2P)
+# Proposal: Federation over Tor and I2P
 
 **Status:** proposed, v0.2 · **Scope:** bounded — a transport option on the
 existing RFDP link, no new wire protocol · **Date:** 2026-08-17
@@ -13,69 +13,101 @@ metadata to a passive network observer: which nodes peer, when, and how much
 traffic flows. Operators behind NAT also can't accept inbound federation
 without a public IP and port-forwarding.
 
-Routing an RFDP link through a Tor onion service closes both gaps: peer IPs
-stay hidden from network observers, and an onion service gives inbound
-reachability with no public IP or forwarded port.
+Routing an RFDP link through a Tor onion service (or an I2P hidden service)
+closes both gaps: peer IPs stay hidden from network observers, and the hidden
+service gives inbound reachability with no public IP or forwarded port.
+
+## Scope: the two transport planes
+
+RelayFabric has two independent transport planes, and this proposal touches
+only the second:
+
+| Plane | Transport | Where anonymity lives |
+|---|---|---|
+| **Edge / plugin** (lxmf ↔ NomadNet, Sideband, other RNS apps) | Reticulum, per the plugin's `rns_configdir` `[interfaces]` | **RNS itself** |
+| **Federation** (switchyardd ↔ switchyardd, RFDP) | raw TCP + Noise | this proposal |
+
+**LXMF/NomadNet anonymity is not a RelayFabric concern.** Reticulum already
+ships a native `I2PInterface` (i2pd/SAM), and its `TCPClientInterface` can be
+SOCKS/torsocks-tunnelled. An operator who wants edge traffic over I2P adds an
+`I2PInterface` to the lxmf plugin's RNS config — zero RelayFabric change.
+NomadNet is an edge *application* on Reticulum, reached through the lxmf plugin
+as an LXMF destination; it is never an RFDP federation peer. This proposal is
+solely about the federation plane, which does **not** ride Reticulum.
 
 ## Non-goals
 
 - No new framing or handshake — RFDP/Noise runs unchanged over the tunnelled
   TCP stream.
-- Not a replacement for sealed routing (content) or end-to-end privacy: Tor
-  hides transport metadata from the *network*, not from the peer you federate
-  with.
+- Not a replacement for sealed routing (content) or end-to-end privacy: the
+  tunnel hides transport metadata from the *network*, not from the peer you
+  federate with.
 - Does not anonymize plugin transports that hit third-party servers (Nostr
-  relays, MQTT, Signal); those only benefit if the endpoint itself offers an
-  onion address. This proposal covers the RFDP inter-node links only.
+  relays, MQTT, Signal), nor the RNS edge plane (that's an RNS-config concern,
+  above). This proposal covers the RFDP inter-node links only.
 
-## Design (Tor)
+## Design (Approach A — SOCKS5 proxy, operator-run tor/i2pd)
 
-Two independent halves; either can ship alone.
+Tor and I2P are the *same* code path: both expose a local SOCKS proxy, and
+`.onion` and `.b32.i2p` hostnames dial identically through it. Two independent
+halves; either can ship alone.
 
 ### Outbound — dial peers through a SOCKS5 proxy
 
-1. **Config.** Add an optional proxy to `FederationConfig` (`config.rs:368`):
+1. **Config.** One optional field on `FederationConfig` (`config.rs:368`):
 
    ```yaml
    federation:
      listen: "127.0.0.1:47000"
-     socks5: "127.0.0.1:9050"        # optional; Tor's default SOCKS port
+     socks5: "127.0.0.1:9050"          # local Tor (9050) or i2pd (4447) SOCKS port
      peers:
-       - name: peer-b
-         node_id: "rf:<64 hex>"
-         addr: "abcd…xyz.onion:47000"  # onion host:port
+       - { name: peer-b, node_id: "rf:<64 hex>", addr: "abcd…xyz.onion:47000" }
+       - { name: peer-c, node_id: "rf:<64 hex>", addr: "xyz…def.b32.i2p:47000" }
+       - { name: peer-d, node_id: "rf:<64 hex>", addr: "10.0.0.5:47000" }  # clearnet
    ```
 
-   `socks5: Option<String>` (default `None` = today's direct-connect
-   behaviour, fully back-compatible).
+   `socks5: Option<String>` — a single field, not a per-peer flag. Default
+   `None` = today's direct-connect behaviour, fully back-compatible.
 
-2. **Dial path.** In `spawn_outbound` (`fed/conn.rs:307`), when `socks5` is
-   set, replace the direct `TcpStream::connect(&peer.addr)` with a SOCKS5
-   CONNECT to `peer.addr` through the proxy. The proxy resolves the `.onion`
-   name (Tor does the resolution — the daemon never does a clearnet DNS
-   lookup for it). Everything after the connected stream is unchanged.
+2. **Dial path — proxy chosen by address type, not a flag.** In
+   `spawn_outbound` (`fed/conn.rs:307`): if the peer `addr`'s host is a
+   hidden-service name (`.onion` / `.i2p` suffix) **and** `socks5` is set, dial
+   via SOCKS5 CONNECT to `peer.addr` through the proxy (the proxy resolves the
+   name — the daemon never does a clearnet DNS lookup for it); otherwise a
+   direct `TcpStream::connect` exactly as today. **Clearnet peers stay direct
+   even when `socks5` is set** — the daemon does not silently route clearnet
+   federation through Tor; an operator who wants that uses onion addresses.
+   *(Open option: a `federation.proxy_all: true` toggle to force every dial
+   through the proxy, for operators who want to hide clearnet peering too. Left
+   out of the first slice unless wanted.)*
 
 3. **Address validation (the one real gotcha).** `config.rs:1206` currently
-   rejects any `addr` that doesn't parse as a `std::net::SocketAddr`, which an
-   `.onion` hostname never will. Relax it: when `socks5` is set, validate
-   `addr` as `host:port` (non-empty host, `u16` port) instead of a numeric
-   `SocketAddr`. Keep the strict `SocketAddr` check for direct (no-proxy)
-   peers so a typo in a clearnet address is still caught.
+   rejects any `addr` that doesn't parse as a `std::net::SocketAddr`, which a
+   `.onion`/`.i2p` hostname never will. Relax it: a hidden-service host
+   validates as `host:port` (non-empty host, `u16` port); clearnet addrs keep
+   the strict `SocketAddr` check so a typo is still caught. A hidden-service
+   `addr` with no `socks5` set is a config error naming the peer.
 
-### Inbound — run as an onion service (no code change)
+### Inbound — run as a hidden service (no code change)
 
-An onion service is configured in `torrc`, not in RelayFabric: Tor maps
-`<onion>:47000` to the daemon's existing local `listen` address. So inbound
-needs **zero daemon changes** — bind `listen` to loopback and point an onion
-service at it:
+The hidden service is configured in the anonymity daemon, not in RelayFabric:
+it maps the public address to the daemon's existing loopback `listen`. Inbound
+needs **zero daemon changes**.
 
 ```
-# /etc/tor/torrc
+# Tor — /etc/tor/torrc
 HiddenServiceDir /var/lib/tor/relayfabric/
 HiddenServicePort 47000 127.0.0.1:47000
-```
+# hostname file → the .onion address to share with peers
 
-The generated `hostname` file is the `.onion` address to share with peers.
+# I2P — i2pd tunnels.conf
+[relayfabric]
+type = server
+host = 127.0.0.1
+port = 47000
+keys = relayfabric.dat
+# the tunnel's .b32.i2p address is what peers put in addr
+```
 
 ### Dependency
 
@@ -86,26 +118,46 @@ implementation time.
 
 ## Operational notes
 
-- **Latency.** Onion circuits add latency and occasional reconnects. The
+- **Latency.** Onion/I2P circuits add latency and occasional reconnects. The
   outbound redial/backoff loop already tolerates this; the transport-class
-  layer should treat onion peers as higher-latency/constrained so egress
+  layer should treat proxied peers as higher-latency/constrained so egress
   degrades gracefully rather than timing out aggressively.
-- **Bootstrap.** The daemon depends on a running local `tor`. Document it as
-  an external service (like `mosquitto` for the MQTT demo); the daemon should
-  log a clear error if the SOCKS port is unreachable and keep retrying.
+- **Bootstrap.** The daemon depends on a running local `tor` or `i2pd`.
+  Document it as an external service (like `mosquitto` for the MQTT demo); the
+  daemon should log a clear error if the SOCKS port is unreachable and keep
+  retrying.
 
-## I2P — deferred
+## Considered alternative — Approach D: federate over Reticulum
 
-I2P offers a similar hidden-service model with stronger sustained-anonymity
-properties, reachable through its SOCKS proxy (or SAM). If `socks5` lands as
-above, pointing it at I2P's SOCKS port is most of the work — but I2P is
-heavier to operate and has a smaller ecosystem, so defer it until there's
-demand rather than carrying the extra dependency and docs up front.
+Instead of tunnelling the raw TCP federation link, RelayFabric gateways could
+announce RNS destinations and carry RFDP **over a Reticulum link**, inheriting
+I2P transport (`I2PInterface`), Tor-ability, NAT traversal, store-and-forward,
+and end-to-end encryption from RNS for free — and collapsing the edge and
+federation planes into one. This is the "Reticulum-native" design NomadNet
+makes obvious.
+
+Rejected for the bounded v0.2 add because it is a far larger change:
+
+- RNS becomes a hard dependency for the federation plane (today only the lxmf
+  plugin needs it).
+- RNS's own transport encryption partly duplicates Noise (§86) + gateway
+  attestation (§33), so the trust model would need reconciling, not just
+  reusing.
+- RFDP framing assumes a reliable TCP byte stream; RNS packet/MTU/link
+  semantics differ, so the wire framing would need rework — violating this
+  proposal's "no new wire protocol" scope.
+
+Worth revisiting as a v0.4+ architectural direction (alongside the companion
+client and user-to-user SEALED), where unifying the planes may pay for itself.
+Recorded here so the question "why not just federate over Reticulum?" has an
+answer.
 
 ## Test plan
 
-- Unit: `socks5`-set config accepts an `.onion` `addr`; unset config still
-  rejects a non-`SocketAddr` addr (guards the relaxed validation).
-- Unit: `spawn_outbound` issues a SOCKS5 CONNECT when `socks5` is set (against
-  a stub SOCKS server), a direct connect when it isn't.
-- Manual: two daemons federating over local onion services end to end.
+- Unit: a `.onion`/`.i2p` `addr` validates only when `socks5` is set, and is a
+  config error without it; a malformed clearnet `addr` still fails.
+- Unit: `spawn_outbound` issues a SOCKS5 CONNECT for a hidden-service `addr`
+  when `socks5` is set (against a stub SOCKS server), and a direct connect for
+  a clearnet `addr` regardless.
+- Manual: two daemons federating over local Tor onion services, and over local
+  i2pd tunnels, end to end.
