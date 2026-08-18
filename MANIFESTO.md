@@ -1,5 +1,7 @@
 # RelayFabric Manifesto
 
+*by Jascha Wanger · 2026-08-17*
+
 RelayFabric exists because communications networks should be able to interoperate without demanding that users surrender privacy, autonomy, or control.
 
 The world does not need one winning mesh, one messaging platform, or one communications protocol. Reticulum, MeshCore, Meshtastic, Signal, Bitchat, Nostr, radio networks, and systems that have not yet been invented should be able to coexist.
