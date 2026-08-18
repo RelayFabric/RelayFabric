@@ -49,4 +49,5 @@ see `docs/webui-notes.md`.
   compact spacing, outlined actions.
 - Phosphor icons and the Inter font load from a CDN; swap them for vendored
   copies for a fully air-gapped deployment.
-- Replace `web/logo.svg` with your own mark if you like.
+- The brand mark is `web/logo.png` (a 128×128 web copy); replace it with your
+  own if you like.

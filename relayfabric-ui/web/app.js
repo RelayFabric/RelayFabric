@@ -324,7 +324,7 @@ class App extends Component {
     return html`
     <aside style="width:216px;flex:none;display:flex;flex-direction:column;gap:4px;padding:18px 12px 14px;border-right:1px solid var(--color-divider);background:color-mix(in srgb,var(--color-surface) 45%,transparent);position:sticky;top:0;height:100vh">
       <div style="display:flex;align-items:center;gap:10px;padding:0 10px 14px">
-        <img src="logo.svg" alt="RelayFabric" style="width:44px;height:44px;flex:none"/>
+        <img src="logo.png" alt="RelayFabric" style="width:44px;height:44px;flex:none;border-radius:8px"/>
         <div>
           <div style="font-family:var(--font-heading);font-weight:500;font-size:17px;letter-spacing:-0.01em">RelayFabric</div>
           <div class="text-muted" style="font-size:11px;margin-top:2px">switchyardd · admin</div>
