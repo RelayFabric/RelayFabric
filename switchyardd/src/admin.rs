@@ -497,25 +497,38 @@ async fn config_yaml(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/yaml")], yaml)
 }
 
-/// `GET /v1/config/prev`: the single kept previous revision (`<config>.prev`),
-/// byte-verbatim from disk with secret references unresolved -- the revision a
-/// `POST /v1/config/rollback` would restore. 404 when no previous revision
-/// exists yet (nothing has been applied since the daemon last had a clean
-/// slate). Read straight from the file, not the in-memory config, since `.prev`
-/// is exactly a file the `PUT`/rollback renames juggle.
+/// `?n=` selector for `GET /v1/config/prev`: which retained revision to
+/// read, 1 (newest, the default) to `CONFIG_HISTORY` (oldest kept).
+#[derive(serde::Deserialize)]
+struct PrevQuery {
+    n: Option<usize>,
+}
+
+/// `GET /v1/config/prev[?n=N]`: a retained previous revision, byte-verbatim
+/// from disk with secret references unresolved. `n` selects the revision,
+/// 1 (newest, default) to `CONFIG_HISTORY`; `n=1` is what a
+/// `POST /v1/config/rollback` would restore. 404 when that slot holds no
+/// revision (nothing applied yet, or `n` beyond the kept history). Read
+/// straight from the file, not the in-memory config, since these are exactly
+/// the files the `PUT`/rollback renames juggle.
 #[utoipa::path(
     get,
     path = "/v1/config/prev",
     tag = "config",
-    summary = "Previous config revision (.prev)",
-    description = "The single kept previous config revision (`<config>.prev`), byte-verbatim with secret references UNRESOLVED. 404 if no previous revision exists yet. This is what `POST /v1/config/rollback` would restore.",
+    summary = "Previous config revision (.prev, up to 5 kept)",
+    description = "A retained previous config revision, byte-verbatim with secret references UNRESOLVED. `?n=` selects which (1 = newest and the default, up to 5 kept — the daemon rotates `.prev`, `.prev.2` … `.prev.5` on each apply). `n=1` is what `POST /v1/config/rollback` would restore. 404 if that slot holds no revision.",
+    params(("n" = Option<usize>, Query, description = "Which revision to read: 1 = newest (default) .. 5 = oldest kept")),
     responses(
         (status = 200, description = "Previous config YAML", content_type = "text/yaml", body = String),
-        (status = 404, description = "No previous revision exists"),
+        (status = 404, description = "No revision in that slot"),
     ),
 )]
-async fn config_prev(State(state): State<AdminState>) -> Response {
-    let prev = prev_path_for(&state.config_path);
+async fn config_prev(State(state): State<AdminState>, Query(q): Query<PrevQuery>) -> Response {
+    let n = q.n.unwrap_or(1);
+    if !(1..=CONFIG_HISTORY).contains(&n) {
+        return (StatusCode::NOT_FOUND, "no revision in that slot").into_response();
+    }
+    let prev = prev_slot_path(&state.config_path, n);
     match std::fs::read_to_string(&prev) {
         Ok(text) => (
             StatusCode::OK,
@@ -523,15 +536,31 @@ async fn config_prev(State(state): State<AdminState>) -> Response {
             text,
         )
             .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "no previous revision").into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "no revision in that slot").into_response(),
     }
 }
 
-/// `<path>.prev` — the single-revision history slot `PUT`/`rollback` swap
-/// into and out of (design §3: "one-revision history", not a stack).
+/// How many previous config revisions to retain. Slot 1 (newest) is
+/// `<path>.prev`; slots 2..=CONFIG_HISTORY are `<path>.prev.2`..`.prev.N`.
+const CONFIG_HISTORY: usize = 5;
+
+/// `<path>.prev` — the newest previous revision (slot 1), the one
+/// `rollback` swaps into and out of. Older revisions live at
+/// `prev_slot_path(path, 2..=CONFIG_HISTORY)`.
 fn prev_path_for(path: &Path) -> PathBuf {
+    prev_slot_path(path, 1)
+}
+
+/// History slot `n` (1 = newest). Slot 1 keeps the legacy `<path>.prev`
+/// name so pre-existing single-revision backups and `GET /v1/config/prev`
+/// keep working unchanged; slots 2.. append the ordinal (`.prev.2`, …).
+fn prev_slot_path(path: &Path, n: usize) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
-    s.push(".prev");
+    if n <= 1 {
+        s.push(".prev");
+    } else {
+        s.push(format!(".prev.{n}"));
+    }
     PathBuf::from(s)
 }
 
@@ -548,10 +577,11 @@ fn tmp_path_for(path: &Path) -> PathBuf {
 /// file FIRST (mode 0600 via `OpenOptionsExt`, `alias.rs`'s key-file
 /// precedent) — the one genuinely I/O-heavy step, the one that can fail
 /// partway (ENOSPC, permissions, …) — and only once that has fully
-/// succeeded does it touch `path`/`.prev` at all: renames whatever is
-/// currently at `path` to `<path>.prev` (overwriting any older `.prev` —
-/// one revision, not a stack), then renames the tmp file into place at
-/// `path`. A failure during the write leaves `path` and `.prev`
+/// succeeded does it touch `path`/`.prev` at all: rotates the retained
+/// history down one slot (dropping the oldest of `CONFIG_HISTORY` kept),
+/// renames whatever is currently at `path` to `<path>.prev`, then renames
+/// the tmp file into place at `path`. A failure during the write leaves
+/// `path` and `.prev`
 /// byte-identical to before the call (a stray `.tmp` is harmless — the
 /// next attempt overwrites it); a failure during either rename is
 /// vanishingly unlikely (same-filesystem directory-entry operations, no
@@ -581,10 +611,25 @@ fn write_config_replacing_current(path: &Path, new_text: &str) -> std::io::Resul
             .open(&tmp_path)?;
         f.write_all(new_text.as_bytes())?;
     }
-    // Both renames run back-to-back with nothing fallible between them, so
-    // the only crash window where `path` is transiently absent is the gap
-    // between two same-directory rename() calls. The chmods run after both
-    // renames: a chmod failure then leaves complete files at final names.
+    // Rotate the retained history down by one BEFORE touching the live
+    // config: drop the oldest slot, then shift each remaining slot down
+    // (`.prev.4`->`.prev.5`, … `.prev`->`.prev.2`). This happens only after
+    // the tmp write succeeded, and it never moves `path` itself, so a
+    // failure here still leaves the live config byte-identical to before.
+    let _ = std::fs::remove_file(prev_slot_path(path, CONFIG_HISTORY));
+    for n in (1..CONFIG_HISTORY).rev() {
+        let from = prev_slot_path(path, n);
+        if from.exists() {
+            let to = prev_slot_path(path, n + 1);
+            std::fs::rename(&from, &to)?;
+            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    // The current-config -> slot 1 rename and the tmp -> path rename run
+    // back-to-back with nothing fallible between them, so the only crash
+    // window where `path` is transiently absent is the gap between those two
+    // same-directory rename() calls. The chmods run after both renames: a
+    // chmod failure then leaves complete files at final names.
     let had_prev = path.exists();
     let prev_path = prev_path_for(path);
     if had_prev {
@@ -2971,6 +3016,52 @@ routes:
 
         // daemon state actually applied: GET /v1/config would now serve the new text.
         assert_eq!(d.cfg_snapshot(|c| c.raw_yaml.clone()), new_yaml);
+    }
+
+    #[tokio::test]
+    async fn config_put_keeps_five_previous_revisions_and_drops_the_oldest() {
+        let (d, cfg_path) = daemon_with_config_file();
+        let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
+        let cfg = |tag: &str| {
+            format!(
+                "node:\n  name: rev-{tag}\n  data_dir: {}\nplugins:\n  mocka:\n    enabled: true\n  mockb:\n    enabled: true\nroutes:\n  - name: general\n    sources: [\"mocka:chan\"]\n    destinations: [\"mockb:chan\"]\n",
+                data_dir.display()
+            )
+        };
+
+        // Apply six distinct configs (v1..v6). With CONFIG_HISTORY = 5, the
+        // five most recent PRIOR revisions (v5..v1) must survive, v6 is live,
+        // and the original + v-nothing beyond five are dropped.
+        let versions: Vec<String> = (1..=6).map(|i| cfg(&i.to_string())).collect();
+        for v in &versions {
+            let (code, body) =
+                req(super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(v)).await;
+            assert_eq!(code, 200, "apply must succeed: {body}");
+        }
+
+        assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), versions[5], "live config = v6");
+        // slot 1 (newest prior) = v5, slot 2 = v4, … slot 5 (oldest kept) = v1.
+        for (slot, vi) in (1..=5).zip([4usize, 3, 2, 1, 0]) {
+            let text = std::fs::read_to_string(super::prev_slot_path(&cfg_path, slot))
+                .unwrap_or_else(|_| panic!("slot {slot} must exist"));
+            assert_eq!(text, versions[vi], "slot {slot} must hold v{}", vi + 1);
+        }
+        // Nothing kept beyond the five-deep history.
+        assert!(!super::prev_slot_path(&cfg_path, 6).exists(),
+            "no revision may be retained beyond CONFIG_HISTORY");
+
+        // The API surfaces each slot: ?n=1 = newest prior (v5), ?n=5 = v1.
+        let (code, newest) =
+            req(super::router(d.clone(), cfg_path.clone()), "GET", "/v1/config/prev", None).await;
+        assert_eq!(code, 200);
+        assert_eq!(newest, versions[4], "GET /v1/config/prev (default n=1) = v5");
+        let (code, oldest) =
+            req(super::router(d.clone(), cfg_path.clone()), "GET", "/v1/config/prev?n=5", None).await;
+        assert_eq!(code, 200);
+        assert_eq!(oldest, versions[0], "GET /v1/config/prev?n=5 = v1");
+        let (code, _) =
+            req(super::router(d, cfg_path), "GET", "/v1/config/prev?n=6", None).await;
+        assert_eq!(code, 404, "n beyond the kept history is 404");
     }
 
     #[tokio::test]

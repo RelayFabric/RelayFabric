@@ -17,7 +17,8 @@ can.
 | GET | `/v1/plugins` | Per-plugin state and capabilities |
 | GET | `/v1/routes` | Configured routes with policy/render detail |
 | GET | `/v1/config` | Loaded config as YAML (secrets unresolved) |
-| PUT | `/v1/config` | Replace and apply the config |
+| GET | `/v1/config/prev` | A retained previous revision (`?n=1..5`, newest first) |
+| PUT | `/v1/config` | Replace and apply the config (keeps up to 5 rotated backups) |
 | POST | `/v1/config/validate` | Validate a config document without applying it |
 | POST | `/v1/config/rollback` | Roll back to the previous applied config |
 | GET | `/v1/queue` | Queue counts, or a delivery listing with `?state=` |

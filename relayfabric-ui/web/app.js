@@ -118,7 +118,7 @@ class App extends Component {
     identities: { links: [] }, challenges: [], limits: null, metricsText: '',
     filter: 'pending', deliveries: [], sel: null,
     events: [], paused: false, demoPlay: false,
-    cfgText: '', cfgMsg: null, restartList: [], prevText: null, prevAvailable: false, viewingPrev: false,
+    cfgText: '', cfgMsg: null, restartList: [], prevList: [], prevAvailable: false, viewingPrev: null,
     showRollback: false, showLink: false,
     linkRequester: '', linkTarget: '', linkName: '',
     toast: null,
@@ -184,9 +184,18 @@ class App extends Component {
     catch (_) { this.setState({ deliveries: [] }); }
   }
   async loadConfig() {
-    try { this.setState({ cfgText: await api('/v1/config'), cfgMsg: null, viewingPrev: false }); } catch (_) {}
-    try { this.setState({ prevText: await api('/v1/config/prev'), prevAvailable: true }); }
-    catch (_) { this.setState({ prevText: null, prevAvailable: false }); }
+    try { this.setState({ cfgText: await api('/v1/config'), cfgMsg: null, viewingPrev: null }); } catch (_) {}
+    await this.loadPrev();
+  }
+  // Probe the retained revisions (daemon keeps up to 5: .prev, .prev.2 …).
+  // Stop at the first empty slot — they're contiguous newest-first.
+  async loadPrev() {
+    const list = [];
+    for (let n = 1; n <= 5; n++) {
+      try { list.push({ n, text: await api('/v1/config/prev?n=' + n) }); }
+      catch (_) { break; }
+    }
+    this.setState({ prevList: list, prevAvailable: list.length > 0 });
   }
   async loadIdentities() {
     try { this.setState({ identities: await api('/v1/identities') }); } catch (_) {}
@@ -265,8 +274,8 @@ class App extends Component {
       const rr = (res && res.restart_required) || [];
       this.setState({ cfgMsg: 'applied · 200', restartList: rr.map((n) => ({ n })) });
       this.toastMsg('PUT /v1/config → 200' + (rr.length ? ' · restart_required: [' + rr.join(', ') + ']' : ''));
-      // Apply just wrote the replaced config to .prev — refresh availability.
-      try { this.setState({ prevText: await api('/v1/config/prev'), prevAvailable: true }); } catch (_) {}
+      // Apply rotated the history — refresh the retained-revision list.
+      await this.loadPrev();
     } catch (e) { this.setState({ cfgMsg: 'error · ' + (e.status || 'err') }); this.toastMsg('PUT /v1/config → ' + (e.status || 'error')); }
   };
   confirmRollback = async () => {
@@ -283,9 +292,12 @@ class App extends Component {
         (c === 404 ? '404 · no previous revision' : c === 409 ? '409 · env drift, no change' : (c || 'error')));
     }
   };
-  viewPrev = () => {
-    if (this.state.viewingPrev) { this.loadConfig(); }
-    else { this.setState({ cfgText: this.state.prevText || '', viewingPrev: true, cfgMsg: 'viewing .prev (Apply to restore it, or Roll back to swap)' }); }
+  viewPrev = (n) => () => {
+    if (this.state.viewingPrev === n) { this.loadConfig(); return; }
+    const rev = (this.state.prevList || []).find((r) => r.n === n);
+    if (!rev) return;
+    const label = n === 1 ? '.prev' : '.prev.' + n;
+    this.setState({ cfgText: rev.text, viewingPrev: n, cfgMsg: 'viewing ' + label + ' — Apply to restore it' + (n === 1 ? ', or Roll back to swap' : '') });
   };
   unlink = (id) => async () => {
     if (this.state.live) { try { await api('/v1/identities/link/' + id, { method: 'DELETE' }); } catch (_) {} }
@@ -513,15 +525,22 @@ class App extends Component {
         <textarea class="input" value=${s.cfgText} onInput=${(e) => this.setState({ cfgText: e.target.value, cfgMsg: null })} spellcheck="false" style="min-height:470px;font-family:ui-monospace,Menlo,monospace;font-size:12.5px;line-height:1.6;padding:14px"></textarea>
         <div style="display:flex;flex-direction:column;gap:12px">
           <div class="card elev-sm" style="gap:var(--space-2)">
-            <span class="card-kicker">Previous revision · .prev</span>
+            <span class="card-kicker">Previous revisions · up to 5 kept</span>
             ${s.prevAvailable ? html`
-              <div style="display:flex;align-items:center;gap:8px;font-size:12.5px">
-                <span class="tag tag-accent">available${s.prevText ? ' · ' + s.prevText.length + ' B' : ''}</span>
+              <div style="display:flex;flex-direction:column;gap:5px">
+                ${s.prevList.map((r) => html`
+                  <div style="display:flex;align-items:center;gap:8px;font-size:12px">
+                    <span style="font-family:ui-monospace,Menlo,monospace">${r.n === 1 ? '.prev' : '.prev.' + r.n}</span>
+                    <span class="text-muted">${r.text.length} B</span>
+                    <span style="flex:1"></span>
+                    <button class="btn btn-ghost" onClick=${this.viewPrev(r.n)} style="font-size:11px">${s.viewingPrev === r.n ? 'view current' : 'view'}</button>
+                  </div>`)}
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;margin-top:2px">
                 <span style="flex:1"></span>
-                <button class="btn btn-ghost" onClick=${this.viewPrev} style="font-size:11.5px">${s.viewingPrev ? 'view current' : 'view'}</button>
                 <button class="btn btn-ghost" onClick=${() => this.setState({ showRollback: true })} style="font-size:11.5px">roll back</button>
               </div>
-              <div class="card-meta">GET /v1/config/prev. Apply saves the replaced config here (one revision). Roll back re-validates .prev then swaps; env drift returns 409.</div>
+              <div class="card-meta">Newest first (.prev). Each Apply rotates the history one slot; the oldest of 5 drops off. View any, then Apply to restore it. Roll back re-validates .prev and swaps it in (env drift → 409).</div>
             ` : html`<div class="text-muted" style="font-size:12.5px">No previous revision yet — Apply saves one.</div>`}
           </div>
           ${s.restartList.length > 0 && html`

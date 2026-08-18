@@ -41,9 +41,10 @@ inside it:
 - A SQLite-backed store for the message/delivery queue, dedup state, and
   identity links.
 - Node identity keys, under their own subdirectory.
-- `relayfabric.yaml` / `relayfabric.yaml.prev` — the applied config and its
-  single-revision backup, when config is managed through the admin API
-  rather than edited on disk directly (see [Config hot-reload](#config-hot-reload)).
+- `relayfabric.yaml` / `relayfabric.yaml.prev` / `relayfabric.yaml.prev.2` …
+  `.prev.5` — the applied config and up to five rotated backups, when config is
+  managed through the admin API rather than edited on disk directly (see
+  [Config hot-reload](#config-hot-reload)).
 
 !!! note "0700 directory, 0600 sockets"
     The `0700` directory is the actual access-control boundary — see
@@ -182,14 +183,19 @@ Config changes go through the admin API rather than a `SIGHUP` or restart:
    discards the result. Returns `{"valid": true}` (200) or
    `{"valid": false, "errors": [...]}` (422). No filesystem changes either way.
 2. **`PUT /v1/config`** — validates first (422, nothing written, on
-   failure), then writes the new config to disk (`0600`, atomic — the old
-   file is kept as a single-revision `<path>.prev` backup, also forced to
-   `0600`) and applies it live. Returns
-   `{"applied": true, "restart_required": [...]}`.
-3. **`POST /v1/config/rollback`** — re-validates `.prev` before touching
-   anything, then swaps it back in as the live config (current becomes the
-   new `.prev`) and applies it. 404 if no `.prev` exists yet. Same
-   `{"applied": true, "restart_required": [...]}` response shape.
+   failure), then writes the new config to disk (`0600`, atomic) and applies
+   it live. The replaced file is kept as `<path>.prev`, and the previous
+   backups rotate down one slot (`.prev` → `.prev.2` → … → `.prev.5`, oldest
+   dropped) — **up to five revisions** are retained, each forced to `0600`.
+   Returns `{"applied": true, "restart_required": [...]}`.
+3. **`GET /v1/config/prev[?n=N]`** — reads a retained revision byte-verbatim
+   (secret refs unresolved), `n=1` newest (default) to `n=5` oldest kept;
+   404 for an empty slot. To restore an older revision, read it and `PUT` it.
+4. **`POST /v1/config/rollback`** — undoes the last apply: re-validates the
+   newest backup (`.prev`) before touching anything, then swaps it back in as
+   the live config (current becomes the new `.prev`) and applies it. 404 if
+   no `.prev` exists yet. Same `{"applied": true, "restart_required": [...]}`
+   response shape.
 
 `restart_required` names any enabled plugin whose process must be
 restarted for the change to take full effect (e.g. its `command` or
