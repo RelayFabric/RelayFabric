@@ -18,6 +18,9 @@ COPY crates ./crates
 COPY switchyardd ./switchyardd
 COPY switchyardctl ./switchyardctl
 COPY plugins/mqtt ./plugins/mqtt
+# relayfabric-ui is a workspace member, so its manifest must exist for the
+# workspace to resolve — copied even though we don't build its binary here.
+COPY relayfabric-ui ./relayfabric-ui
 RUN cargo build -j2 --release \
       --bin switchyardd --bin switchyardctl --bin relayfabric-mqtt
 
