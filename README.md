@@ -33,7 +33,13 @@ gracefully: payload capped, media dropped to a note).
 cargo build -j2 --release
 ```
 
-Binaries in `target/release/`.
+Binaries in `target/release/`. This builds the minimal set — the daemon,
+CLI, and MQTT plugin. The web admin UI is **optional** and excluded from the
+default build; add it explicitly when you want it:
+
+```
+cargo build -j2 --release -p relayfabric-ui
+```
 
 ## Quick start
 

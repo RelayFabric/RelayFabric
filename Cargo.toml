@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/relay-core", "crates/relay-ipc", "switchyardd", "switchyardctl", "plugins/mqtt", "relayfabric-ui"]
+# relayfabric-ui (web admin UI + proxy) is an OPTIONAL component: it's a
+# workspace member so it shares deps and the lockfile, but excluded from the
+# default set so a bare `cargo build --release` produces the minimal daemon +
+# CLI + MQTT plugin. Build the UI explicitly with `-p relayfabric-ui`.
+default-members = ["crates/relay-core", "crates/relay-ipc", "switchyardd", "switchyardctl", "plugins/mqtt"]
 
 [workspace.package]
 edition = "2021"

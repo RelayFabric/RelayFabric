@@ -10,6 +10,11 @@ socket, so this binary:
 - transparently reverse-proxies `/v1/*`, `/metrics`, and `/docs/*` to the
   admin socket — streaming preserved, so the `/v1/events` SSE feed works.
 
+This is an **optional** component: it's a workspace member but excluded from
+the default build set, so a bare `cargo build --release` ships only the
+daemon, CLI, and MQTT plugin. Build the UI explicitly with `-p relayfabric-ui`
+(or `--bin relayfabric-ui`).
+
 ## Build & run
 
 ```bash
@@ -25,8 +30,9 @@ Flags: `--socket <admin.sock>` (required), `--listen` (default
 `127.0.0.1:8087`), `--web-dir` (default `relayfabric-ui/web`).
 
 The UI has eight screens — Overview, Queue, Config (validate / apply /
-rollback), Identities, Federation & discovery, Routes & plugins, Live events
-(SSE), and Limits & metrics — each backed by the matching `/v1/...` endpoint.
+rollback, with the last five revisions viewable), Identities, Federation &
+discovery, Routes & plugins, Live events (SSE), and Limits & metrics — each
+backed by the matching `/v1/...` endpoint.
 When the admin socket is unreachable it drops into an offline demo with
 sample data so the interface stays browsable.
 
