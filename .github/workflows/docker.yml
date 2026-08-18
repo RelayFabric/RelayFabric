@@ -3,32 +3,13 @@ name: Docker
 # Builds the RelayFabric image on every commit and PR; on pushes to main it
 # also publishes to the GitHub Container Registry (ghcr.io). Runs on the
 # GitHub mirror of the canonical git.dx.pe repository.
+# No paths filters: this job is the repo's only compile gate, so it runs on
+# every push/PR rather than risking a skipped build on a path the twin
+# filter lists forgot.
 on:
   push:
     branches: [main]
-    paths:
-      - 'Dockerfile'
-      - '.dockerignore'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/**'
-      - 'switchyardd/**'
-      - 'switchyardctl/**'
-      - 'plugins/**'
-      - 'sdk/**'
-      - '.github/workflows/docker.yml'
   pull_request:
-    paths:
-      - 'Dockerfile'
-      - '.dockerignore'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/**'
-      - 'switchyardd/**'
-      - 'switchyardctl/**'
-      - 'plugins/**'
-      - 'sdk/**'
-      - '.github/workflows/docker.yml'
   workflow_dispatch:
 
 permissions:

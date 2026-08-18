@@ -6,7 +6,6 @@ import { html, render, Component } from './vendor/preact-htm.js';
 
 // ---- helpers ---------------------------------------------------------------
 
-const j = (r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)));
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -111,7 +110,6 @@ class App extends Component {
   state = {
     screen: validScreen(location.hash.slice(1)) || 'overview',
     theme: localStorage.getItem('rf-theme') || 'dark',
-    density: localStorage.getItem('rf-density') || 'comfortable',
     live: false, ready: false,
     status: null, plugins: {}, routes: [], federation: { peers: [] },
     discovery: { mode: 'disabled', our_advert: null, peers: [] },
@@ -328,7 +326,7 @@ class App extends Component {
   render() {
     const s = this.state;
     if (!s.ready) return html`<div style="display:grid;place-items:center;height:100vh;color:var(--color-text)">Connecting…</div>`;
-    const rootClass = 'rf-root' + (s.theme === 'light' ? ' rf-light' : '') + (s.density === 'compact' ? ' rf-compact' : '');
+    const rootClass = 'rf-root' + (s.theme === 'light' ? ' rf-light' : '');
     const q = (s.status && s.status.queue) || {};
     return html`
     <div class=${rootClass} style="display:flex;min-height:100vh;background:var(--color-bg);color:var(--color-text);font-family:var(--font-body)">
