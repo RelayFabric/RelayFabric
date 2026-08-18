@@ -85,6 +85,20 @@ plugins:
   #       zone1: {index: 0, topic_channel: "general"}
   #       zone2: {index: 1, topic_channel: "tactics"}
 
+  # potatomesh:
+  #   enabled: true
+  #   # Ingest-only: feeds a PotatoMesh community dashboard from the same
+  #   # Meshtastic MQTT JSON stream the meshtastic plugin consumes; never
+  #   # bridges traffic into the fabric. venv must have run:
+  #   #   pip install -r plugins/potatomesh/requirements.txt
+  #   command: /path/to/RelayFabric/.venv/bin/python /path/to/RelayFabric/plugins/potatomesh/relayfabric-potatomesh
+  #   config:
+  #     broker: mqtt://127.0.0.1:1883
+  #     topic_root: msh/US              # same values as the meshtastic plugin
+  #     gateway_id: null                # null = accept all gateways; set to filter by hex ID
+  #     url: https://potato.example.org # PotatoMesh instance base URL
+  #     token: ${env:POTATOMESH_TOKEN}  # its API bearer token
+
   # meshcore:
   #   enabled: true
   #   # Runs under sh -c, so it needs an absolute path and the venv's

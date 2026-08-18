@@ -372,3 +372,50 @@ configured geohashes are subscribed).
       live cross-check yet. See [Live & Field Testing](live-testing.md).
     - A coarser (shorter) geohash is a wider channel — more traffic
       bridged.
+
+---
+
+## PotatoMesh
+
+Feeds a [PotatoMesh](https://github.com/l5yth/potato-mesh) community
+dashboard from the Meshtastic MQTT JSON stream. Unlike every other plugin
+this one bridges no channel traffic into the fabric — it is **ingest-only**:
+it subscribes to the same `<root>/2/json/#` topics the Meshtastic plugin
+uses, maps `text` / `position` / `telemetry` / `nodeinfo` events onto
+PotatoMesh's documented ingest contract, and POSTs them with a bearer
+token (`/api/messages`, `/api/positions`, `/api/telemetry`, `/api/nodes`).
+Routed sends are rejected.
+
+!!! note "Why this exists"
+    PotatoMesh's own ingestors attach to a radio directly — their project
+    charter bans MQTT. RelayFabric fills the complementary niche: an
+    operator already running the Meshtastic MQTT JSON stream gets the
+    community map and dashboard with no extra radio connection and no
+    GPL dependency (the stream is JSON; PotatoMesh's contract is
+    Apache-2.0).
+
+| Key | Default | Notes |
+|---|---|---|
+| `broker` | — | `mqtt://host:port` (same as the Meshtastic plugin) |
+| `topic_root` | — | Node's full MQTT root incl. region, e.g. `msh/US` |
+| `gateway_id` | `null` | `null` = accept all gateways; else filter by hex ID |
+| `url` | — | PotatoMesh instance base URL |
+| `token` | — | API bearer token — use `${env:...}` or `${file:...}` |
+
+```yaml
+plugins:
+  potatomesh:
+    enabled: true
+    config:
+      broker: mqtt://127.0.0.1:1883
+      topic_root: msh/US
+      url: https://potato.example.org
+      token: ${env:POTATOMESH_TOKEN}
+```
+
+Delivery is best-effort: HTTP failures are logged and counted (`posted` /
+`http_failures` gauges), never retried — node and position rows are
+re-upserted by the next beacon. GPS sentinels (`(0,0)` coordinates,
+`time<=0`) are stripped at source per the PotatoMesh contract; hardware and
+role enum codes are not mapped to names (that would need the GPL protobuf
+tables) and are omitted.

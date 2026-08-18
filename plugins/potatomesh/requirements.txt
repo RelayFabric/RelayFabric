@@ -1,0 +1,2 @@
+cbor2
+paho-mqtt  # paho-mqtt used under its EDL-1.0 (BSD-3) license option
