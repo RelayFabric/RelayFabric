@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RelayFabric Admin</title>
+<link rel="icon" href="logo.svg">
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css">
+<style>
+  body{margin:0;background:var(--color-bg)}
+  a{color:var(--color-accent)}a:hover{color:var(--color-accent-300)}
+  /* Light theme: re-map the ground tokens (the dark set lives in styles.css) */
+  .rf-light{--color-bg:#e4e7f5;--color-surface:#f3f5fe;--color-text:#292b31;--color-divider:color-mix(in srgb,#292b31 14%,transparent);--color-accent:#5d5294;--shadow-sm:0 0 0 1px #cfd3e5;--shadow-md:0 0 0 1px #cfd3e5,0 6px 18px rgba(41,43,49,.10);--shadow-lg:0 0 0 1px #b2b6ca,0 16px 40px rgba(41,43,49,.14)}
+  .rf-light .tag-accent{background:var(--color-accent-200);color:var(--color-accent-800)}
+  .rf-light .tag-neutral{background:var(--color-neutral-300);color:var(--color-neutral-800)}
+  .rf-light .tag-accent-2{background:var(--color-accent-2-200);color:var(--color-accent-2-800)}
+  .rf-light a:hover{color:var(--color-accent-700)}
+  .rf-compact .table td{padding:3px var(--space-2)}
+  @keyframes rf-pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  #app{min-height:100vh}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>

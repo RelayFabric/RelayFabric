@@ -1,0 +1,18 @@
+<svg width="44" height="44" viewBox="0 0 44 44" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="RelayFabric">
+  <rect x="0.5" y="0.5" width="43" height="43" rx="10" fill="#232532" stroke="#9184d9" stroke-opacity="0.35"/>
+  <!-- routing fabric: a hub relaying between three endpoints -->
+  <g stroke="#9184d9" stroke-width="2" stroke-linecap="round">
+    <path d="M22 22 L11 13" stroke-opacity="0.55"/>
+    <path d="M22 22 L33 13" stroke-opacity="0.9"/>
+    <path d="M22 22 L11 31" stroke-opacity="0.9"/>
+    <path d="M22 22 L33 31" stroke-opacity="0.55"/>
+  </g>
+  <g fill="#161826" stroke="#9184d9" stroke-width="2">
+    <circle cx="11" cy="13" r="3.4"/>
+    <circle cx="33" cy="13" r="3.4"/>
+    <circle cx="11" cy="31" r="3.4"/>
+    <circle cx="33" cy="31" r="3.4"/>
+  </g>
+  <circle cx="22" cy="22" r="5" fill="#9184d9"/>
+  <circle cx="22" cy="22" r="2" fill="#161826"/>
+</svg>
