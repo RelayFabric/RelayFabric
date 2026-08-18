@@ -27,6 +27,9 @@ flowchart LR
 
 Plugins are separate, supervised processes that speak a small CBOR-over-Unix-socket protocol to the daemon. The daemon owns routing, deduplication, hop limits, store-and-forward queuing, identity pseudonymization, and the security envelope. A plugin crash never takes the fabric down.
 
+!!! quote "Why RelayFabric exists"
+    Networks should interoperate without demanding that users surrender privacy, autonomy, or control. Read the [**Manifesto**](manifesto.md).
+
 ## What it does
 
 | Capability | Summary |

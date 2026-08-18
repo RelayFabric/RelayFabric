@@ -7,6 +7,7 @@ repo_url = "https://github.com/RelayFabric/RelayFabric"
 repo_name = "RelayFabric/RelayFabric"
 nav = [
   {"Home" = "index.md"},
+  {"Manifesto" = "manifesto.md"},
   {"Getting Started" = "getting-started.md"},
   {"Architecture" = "architecture.md"},
   {"Configuration" = "configuration.md"},

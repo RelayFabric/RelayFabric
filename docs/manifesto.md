@@ -1,0 +1,1 @@
+../MANIFESTO.md
