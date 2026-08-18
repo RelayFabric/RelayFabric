@@ -749,6 +749,18 @@ fn warn_if_federation_node_id_overlap(cfg: &Config) {
     }
 }
 
+/// The "referenced plugin exists and is enabled" check that `routes`,
+/// `public_services`, `transport_budgets`, and `transports` validation each
+/// used to carry verbatim. `what` names the failing entry; `hint` is an
+/// optional trailing remediation.
+fn require_enabled_plugin(cfg: &Config, proto: &str, what: &str, hint: &str) -> Result<(), String> {
+    match cfg.plugins.get(proto) {
+        Some(p) if p.enabled => Ok(()),
+        Some(_) => Err(format!("{what} references disabled plugin '{proto}'{hint}")),
+        None => Err(format!("{what} references unknown plugin '{proto}'{hint}")),
+    }
+}
+
 pub fn validate(cfg: &Config) -> Result<(), String> {
     if cfg.plugins.contains_key(FED_PROTOCOL) {
         return Err(format!(
@@ -843,17 +855,7 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
                 // never a `cfg.plugins` entry (it's reserved, not a plugin).
                 continue;
             }
-            match cfg.plugins.get(&ep.protocol) {
-                Some(p) if p.enabled => {}
-                Some(_) => {
-                    return Err(format!(
-                        "route '{}' references disabled plugin '{}'", r.name, ep.protocol))
-                }
-                None => {
-                    return Err(format!(
-                        "route '{}' references unknown plugin '{}'", r.name, ep.protocol))
-                }
-            }
+            require_enabled_plugin(cfg, &ep.protocol, &format!("route '{}'", r.name), "")?;
         }
         for ep in &r.destinations {
             if ep.protocol == FED_PROTOCOL {
@@ -878,19 +880,8 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
     // Validate public_services protocols are enabled plugins
     for svc in &cfg.public_services {
         for proto in svc.ingress.iter().chain(&svc.egress) {
-            match cfg.plugins.get(proto) {
-                Some(p) if p.enabled => {}
-                Some(_) => {
-                    return Err(format!(
-                        "public_services '{}' references disabled plugin '{}'; enable the plugin or remove the entry",
-                        svc.name, proto))
-                }
-                None => {
-                    return Err(format!(
-                        "public_services '{}' references unknown plugin '{}'; enable the plugin or remove the entry",
-                        svc.name, proto))
-                }
-            }
+            require_enabled_plugin(cfg, proto, &format!("public_services '{}'", svc.name),
+                                   "; enable the plugin or remove the entry")?;
         }
     }
 
@@ -938,17 +929,8 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
                 "transport_budgets '{}' has messages_per_minute 0 which would block all egress; omit the entry instead",
                 proto));
         }
-        match cfg.plugins.get(proto) {
-            Some(p) if p.enabled => {}
-            Some(_) => {
-                return Err(format!(
-                    "transport_budgets entry '{proto}' references a disabled plugin; enable the plugin or remove the entry"))
-            }
-            None => {
-                return Err(format!(
-                    "transport_budgets entry '{proto}' references an unknown plugin; enable the plugin or remove the entry"))
-            }
-        }
+        require_enabled_plugin(cfg, proto, &format!("transport_budgets entry '{proto}'"),
+                               "; enable the plugin or remove the entry")?;
     }
 
     // Validate transports keys are enabled plugins, and any override
@@ -959,17 +941,8 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
     // relay-core and this module's own
     // `unknown_transport_class_is_a_clear_deserialize_error` test).
     for (proto, entry) in &cfg.transports {
-        match cfg.plugins.get(proto) {
-            Some(p) if p.enabled => {}
-            Some(_) => {
-                return Err(format!(
-                    "transports entry '{proto}' references a disabled plugin; enable the plugin or remove the entry"))
-            }
-            None => {
-                return Err(format!(
-                    "transports entry '{proto}' references an unknown plugin; enable the plugin or remove the entry"))
-            }
-        }
+        require_enabled_plugin(cfg, proto, &format!("transports entry '{proto}'"),
+                               "; enable the plugin or remove the entry")?;
         if let Some(max_payload_bytes) = entry.max_payload_bytes {
             if max_payload_bytes < TRANSPORT_MAX_PAYLOAD_BYTES_FLOOR {
                 return Err(format!(

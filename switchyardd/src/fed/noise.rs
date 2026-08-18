@@ -65,23 +65,7 @@ pub struct StaticKey {
 
 impl StaticKey {
     pub fn load_or_create(path: &Path) -> io::Result<StaticKey> {
-        if !path.exists() {
-            let key: [u8; 32] = rand::random();
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?;
-            f.write_all(hex::encode(key).as_bytes())?;
-        }
-        let raw = std::fs::read_to_string(path)?;
-        let bytes = hex::decode(raw.trim()).map_err(io::Error::other)?;
-        let private: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| io::Error::other("fed static key must be 32 bytes of hex"))?;
-        Ok(StaticKey { private })
+        Ok(StaticKey { private: crate::keyfile::load_or_create_key32(path, "fed static key")? })
     }
 
     fn private_bytes(&self) -> [u8; 32] {

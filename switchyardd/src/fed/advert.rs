@@ -26,7 +26,6 @@ use crate::node_identity::{self, NodeIdentity};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
 
 /// A signed, expiring Node Advertisement (SPEC §111.1). `sig` is empty on
 /// a freshly `build_from_config`'d advert -- `sign` fills it in.
@@ -110,17 +109,6 @@ pub enum AdvertError {
     /// domain-separated canonical bytes.
     BadSignature,
 }
-
-impl fmt::Display for AdvertError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AdvertError::InvalidExpiry => write!(f, "advert has a non-positive expires"),
-            AdvertError::BadSignature => write!(f, "advert signature did not verify"),
-        }
-    }
-}
-
-impl std::error::Error for AdvertError {}
 
 /// Deterministic CBOR tuple of the fields an advert signature covers
 /// (design §1; extended cycle H design §1/SPEC §113.3): `(rf_version,

@@ -5,7 +5,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 mod transport;
-pub use transport::{Bandwidth, Latency, TransportCharacteristics, TransportClass, TransportPolicy};
+pub use transport::{TransportClass, TransportPolicy};
 
 pub const ENVELOPE_VERSION: u8 = 1;
 

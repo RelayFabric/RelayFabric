@@ -458,25 +458,15 @@ fn register_down(d: &Daemon, peer_key: &str, instance: u64) {
 /// treated exactly like a stream error: the loop breaks, `admit_and_run`
 /// deregisters, and (for an outbound connection) `spawn_outbound`'s redial
 /// loop resumes -- see `SEND_TIMEOUT`'s doc comment for the wedge this
-/// closes. `channel.recv_frame()` is ALSO wrapped in `tokio::time::timeout
-/// (DEAD_AFTER, ..)`, kept as a backstop, but that per-iteration timeout
-/// is NOT the authoritative dead-peer detector (Task 2 review regression
-/// finding): it's an inline `select!` branch expression, freshly
-/// reconstructed every time the loop goes back around regardless of WHICH
-/// branch won -- including the `tick` branch, which fires every `TICK` =
-/// 5s -- so as long as something else keeps the loop iterating (the
-/// housekeeping tick always does), this per-recv timeout's 90s budget
-/// never gets an uninterrupted window long enough to elapse. A peer that
-/// completes the Noise handshake and then sends nothing would otherwise
-/// never be dropped until the 8h `REKEY_INTERVAL`, holding one of
-/// `MAX_INBOUND_CONNS` slots the whole time. The AUTHORITATIVE dead-timer
-/// is `last_activity` (a `tokio::time::Instant`, set at connect and
-/// updated on every successful `recv_frame`) checked against `DEAD_AFTER`
-/// from INSIDE the `tick` branch -- the same "compare a stable `Instant`
-/// against the always-firing 5s tick" shape `REKEY_INTERVAL`/`started`
-/// already used below, which is exactly why `started` never had this bug:
-/// it's set once and never reset, so it correctly accumulates across
-/// ticks no matter how often the loop iterates in between.
+/// closes. The dead-peer detector is `last_activity` (a `tokio::time::
+/// Instant`, set at connect and updated on every successful `recv_frame`)
+/// checked against `DEAD_AFTER` from INSIDE the `tick` branch -- the same
+/// "compare a stable `Instant` against the always-firing 5s tick" shape
+/// `REKEY_INTERVAL`/`started` use. (A per-recv `timeout(DEAD_AFTER, ..)`
+/// wrapper used to sit on `recv_frame` as a "backstop", but a `select!`
+/// branch expression is reconstructed every iteration regardless of which
+/// branch won, and the 5s tick always wins first -- its 90s budget could
+/// never elapse, so it was removed as dead.)
 async fn run_conn<S>(
     d: &Arc<Daemon>,
     mut channel: FedChannel<S>,
@@ -488,9 +478,7 @@ async fn run_conn<S>(
 {
     let mut last_ping = Instant::now();
     let started = Instant::now();
-    // Authoritative dead-peer detector (Task 2 review fix round 1) -- see
-    // this function's doc comment for why the per-recv `timeout(DEAD_AFTER,
-    // ..)` below is a backstop only, not sufficient on its own. Set at
+    // Dead-peer detector (see this function's doc comment). Set at
     // connect (a fresh connection that never receives anything must still
     // be dropped after `DEAD_AFTER`, not given an unlimited grace period),
     // and refreshed on every successful `recv_frame` regardless of whether
@@ -530,9 +518,9 @@ async fn run_conn<S>(
 
     loop {
         tokio::select! {
-            frame = tokio::time::timeout(DEAD_AFTER, channel.recv_frame()) => {
+            frame = channel.recv_frame() => {
                 match frame {
-                    Ok(Ok(bytes)) => {
+                    Ok(bytes) => {
                         last_activity = Instant::now();
                         if let Ok(decoded) = ciborium::from_reader::<Fed, _>(bytes.as_slice()) {
                             if let Some(reply) = handle_frame(d, node_id, peer_key, decoded) {
@@ -546,11 +534,7 @@ async fn run_conn<S>(
                         // frame via `Fed::Unknown`; this is the same
                         // tolerance extended to outright garbage).
                     }
-                    Ok(Err(_)) => break, // stream error: EOF, decrypt failure, etc.
-                    Err(_) => {
-                        warn!(peer = %peer_key, "federation connection silent for {DEAD_AFTER:?}, closing");
-                        break;
-                    }
+                    Err(_) => break, // stream error: EOF, decrypt failure, etc.
                 }
             }
             msg = rx.recv() => {
@@ -793,17 +777,8 @@ static ADVERT_REJECT_WARN_THROTTLE: std::sync::LazyLock<Mutex<HashMap<String, st
 /// Noise handshake).
 fn reject_advert(peer_node_id: &str, reason: &str) {
     metrics::inc(&metrics::ADVERT_REJECTED);
-    let now = std::time::Instant::now();
-    let mut throttle = ADVERT_REJECT_WARN_THROTTLE.lock().unwrap();
-    let should_warn = match throttle.get(peer_node_id) {
-        Some(last) => now.duration_since(*last) >= ADVERT_REJECT_WARN_INTERVAL,
-        None => true,
-    };
-    if should_warn {
-        throttle.insert(peer_node_id.to_string(), now);
-    }
-    drop(throttle);
-    if should_warn {
+    if super::warn_throttle_due(&ADVERT_REJECT_WARN_THROTTLE, peer_node_id,
+                                ADVERT_REJECT_WARN_INTERVAL) {
         warn!(peer = %short_node_id(peer_node_id), reason,
             "federation advert rejected (not persisted; further repeats from this peer are \
              throttled to 1/min)");

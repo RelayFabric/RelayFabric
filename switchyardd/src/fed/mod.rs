@@ -26,6 +26,29 @@
 //! 4). Ingress wiring (`engine::fed_ingress`'s `Fed::Sealed` handling,
 //! design §5) is a later cycle-H task.
 
+/// One warn per key per `interval` -- the shared bookkeeping behind
+/// `engine::warn_pre_trust_rejection` / `engine::sealed_reject` /
+/// `conn::reject_advert`, which keep SEPARATE maps (separate throttle
+/// domains, separate log wording) but used to carry three verbatim copies
+/// of this get/compare/stamp dance. Returns whether this call won the
+/// throttle window (and stamps it if so).
+pub(crate) fn warn_throttle_due(
+    map: &std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    key: &str,
+    interval: std::time::Duration,
+) -> bool {
+    let now = std::time::Instant::now();
+    let mut throttle = map.lock().unwrap();
+    let due = match throttle.get(key) {
+        Some(last) => now.duration_since(*last) >= interval,
+        None => true,
+    };
+    if due {
+        throttle.insert(key.to_string(), now);
+    }
+    due
+}
+
 pub mod advert;
 pub mod conn;
 pub mod domains;

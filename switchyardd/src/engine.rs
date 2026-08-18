@@ -679,17 +679,8 @@ static PRE_TRUST_REJECT_WARN_THROTTLE: std::sync::LazyLock<Mutex<HashMap<String,
 const PRE_TRUST_REJECT_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn warn_pre_trust_rejection(peer_node_id: &str, reason: &str) {
-    let now = Instant::now();
-    let mut throttle = PRE_TRUST_REJECT_WARN_THROTTLE.lock().unwrap();
-    let should_warn = match throttle.get(peer_node_id) {
-        Some(last) => now.duration_since(*last) >= PRE_TRUST_REJECT_WARN_INTERVAL,
-        None => true,
-    };
-    if should_warn {
-        throttle.insert(peer_node_id.to_string(), now);
-    }
-    drop(throttle);
-    if should_warn {
+    if fed::warn_throttle_due(&PRE_TRUST_REJECT_WARN_THROTTLE, peer_node_id,
+                              PRE_TRUST_REJECT_WARN_INTERVAL) {
         warn!(peer = %fed::short_node_id(peer_node_id), reason,
               "federation ingress rejected pre-trust (not persisted; further repeats from this \
                peer are throttled to 1/min)");
@@ -741,6 +732,84 @@ fn reject(
         Err(e) => warn!(error = %e, reason, "failed to record rejected federation delivery"),
     }
     FedIngressOutcome::Rejected(reason)
+}
+
+/// The trust gate `fed_ingress` and `fed_sealed_ingress` share: true when
+/// `peer_node_id`'s stored trust level ranks below the configured
+/// `accept_from` floor.
+fn fed_trust_denied(d: &Daemon, peer_node_id: &str, accept_from: &str) -> bool {
+    let level = d.store.lock().unwrap().trust_level(peer_node_id).unwrap_or(None);
+    let level_str = level.as_deref().unwrap_or("unknown");
+    trust_rank(level_str) < trust_rank(accept_from)
+}
+
+/// Replay-window bound + TTL clamp shared verbatim by `fed_ingress` and
+/// `fed_sealed_ingress` (final-review I-1, SPEC §113.5): effective expiry
+/// is computed from the SIGNED `created_at` + this accept side's OWN
+/// `max_ttl_secs` -- NEVER from the envelope's `expires_at`/TTL claim,
+/// which is deliberately unsigned (any on-path relay can rewrite it) and
+/// therefore worthless as a replay defense. A far-future `created_at` is
+/// rejected too (clock-skew abuse: a window that only STARTS later would
+/// outlive the bound); honest inter-node skew gets a small fixed
+/// allowance. On success, clamps `env.expires_at` DOWN to `max_ttl_secs`
+/// from now -- never extended, never a rejection.
+fn bound_replay_and_clamp_ttl(env: &mut Envelope, max_ttl_secs: u64) -> Result<(), &'static str> {
+    const MAX_CREATED_AT_SKEW_SECS: i64 = 300;
+    let ingress_now = Utc::now();
+    let stale = env.created_at + CDuration::seconds(max_ttl_secs as i64) < ingress_now;
+    let far_future = env.created_at > ingress_now + CDuration::seconds(MAX_CREATED_AT_SKEW_SECS);
+    if stale || far_future {
+        return Err("EXPIRED");
+    }
+    let capped = Utc::now() + CDuration::seconds(max_ttl_secs as i64);
+    if env.expires_at > capped {
+        env.expires_at = capped;
+    }
+    Ok(())
+}
+
+/// The persist + fan-out tail shared verbatim by `fed_ingress` and
+/// `fed_sealed_ingress` once every gate has passed: insert the message and
+/// its attachment refs, fan deliveries into the route's destinations, emit
+/// dead_letter events for queue-full routes, bump `accept_metric`. `what`
+/// labels the storage-failure warns.
+fn persist_and_fan_out(
+    d: &Daemon,
+    env: &Envelope,
+    target_route: &str,
+    route_cfg: &RouteConfig,
+    what: &str,
+    accept_metric: &std::sync::atomic::AtomicU64,
+) -> FedIngressOutcome {
+    let now = Utc::now();
+    let priority_rank = relay_core::priority_rank(&env.priority);
+    let targets: Vec<(String, Endpoint)> = route_cfg
+        .destinations
+        .iter()
+        .map(|dest| (target_route.to_string(), dest.clone()))
+        .collect();
+    let (route_max, global_max) =
+        d.cfg_snapshot(|c| (c.limits.per_route.queue_max, c.limits.global.queue_max));
+
+    let store = d.store.lock().unwrap();
+    if let Err(e) = store.insert_message(env) {
+        warn!(error = %e, "failed to persist {what} message");
+        drop(store);
+        return FedIngressOutcome::Rejected("STORAGE_ERROR");
+    }
+    let shas: Vec<String> = env.attachments.iter().map(|a| a.sha256.clone()).collect();
+    if let Err(e) = store.insert_attachment_refs(env.id, &shas) {
+        warn!(error = %e, "failed to persist {what} attachment refs");
+    }
+    let queue_full_routes = fan_out_deliveries(
+        &store, env.id, env.expires_at, priority_rank, &targets, route_max, global_max, now);
+    drop(store);
+    for route in &queue_full_routes {
+        emit_delivery(d, env.id, route.clone(), "dead_letter");
+    }
+
+    metrics::inc(accept_metric);
+    FedIngressOutcome::Accepted(env.id)
 }
 
 /// Federation ingress (design §5): dispatches a verified `Fed::Envelope`
@@ -810,45 +879,25 @@ pub fn fed_ingress(
         return reject(d, &env, &target_route, peer_node_id, "FED_CONFIG_MISSING", Persistence::Persist);
     };
 
-    let level = d.store.lock().unwrap().trust_level(peer_node_id).unwrap_or(None);
-    let level_str = level.as_deref().unwrap_or("unknown");
-    if trust_rank(level_str) < trust_rank(&fed_cfg.accept_from) {
+    if fed_trust_denied(d, peer_node_id, &fed_cfg.accept_from) {
         return reject(d, &env, &target_route, peer_node_id, "TRUST_DENIED", Persistence::NoPersist);
     }
 
-    // Replay-window bound (final-review I-1, SPEC §113.5): effective expiry
-    // is computed from the SIGNED `created_at` + this accept side's OWN
-    // `max_ttl_secs` -- NEVER from the envelope's `expires_at`/TTL claim,
-    // which is deliberately unsigned (any on-path relay can rewrite it) and
-    // therefore worthless as a replay defense. The in-memory dedup below is
-    // only a within-window guard: it's TTL-bounded (`dedup_ttl_secs`) and
-    // cleared on restart, so without this check a trusted-but-hostile relay
-    // could replay a captured, genuinely-signed envelope after the dedup
-    // window or after this daemon reboots. This bounds the replay window to
-    // `max_ttl_secs` regardless of dedup state. A far-future `created_at`
-    // is rejected too (clock-skew abuse: a window that only STARTS later
-    // would outlive the bound); honest inter-node skew gets a small fixed
-    // allowance. Post-trust, so `Persistence::Persist` (dead_letter row) --
-    // reachable only by a peer that already cleared the trust gate.
-    const MAX_CREATED_AT_SKEW_SECS: i64 = 300;
-    let ingress_now = Utc::now();
-    let stale = env.created_at + CDuration::seconds(fed_cfg.max_ttl_secs as i64) < ingress_now;
-    let far_future = env.created_at > ingress_now + CDuration::seconds(MAX_CREATED_AT_SKEW_SECS);
-    if stale || far_future {
-        return reject(d, &env, &target_route, peer_node_id, "EXPIRED", Persistence::Persist);
+    // Replay-window bound + TTL clamp (see `bound_replay_and_clamp_ttl`).
+    // The in-memory dedup below is only a within-window guard (TTL-bounded,
+    // cleared on restart); this bounds the replay window to `max_ttl_secs`
+    // regardless of dedup state. Post-trust, so `Persistence::Persist`
+    // (dead_letter row) -- reachable only by a peer that already cleared
+    // the trust gate. The hop check sits between the bound and the clamp
+    // by original gate order; `bound_replay_and_clamp_ttl` only mutates
+    // `expires_at` AFTER its rejection check, so splitting it around the
+    // hop check is unnecessary.
+    if let Err(reason) = bound_replay_and_clamp_ttl(&mut env, fed_cfg.max_ttl_secs) {
+        return reject(d, &env, &target_route, peer_node_id, reason, Persistence::Persist);
     }
 
     if env.hops >= fed_cfg.max_hops {
         return reject(d, &env, &target_route, peer_node_id, "HOP_LIMIT", Persistence::Persist);
-    }
-
-    // TTL clamp (design §4): the remote-claimed `expires_at` is clamped
-    // DOWN to `max_ttl_secs` from now -- never extended, and applied
-    // regardless of accept/reject outcome from this point forward, so
-    // every dead_letter row recorded after this line already reflects it.
-    let capped = Utc::now() + CDuration::seconds(fed_cfg.max_ttl_secs as i64);
-    if env.expires_at > capped {
-        env.expires_at = capped;
     }
 
     if !fed_cfg.ingress_routes.contains(&target_route) {
@@ -897,35 +946,8 @@ pub fn fed_ingress(
     // `handle_inbound`'s own ordering.
     d.dedup.lock().unwrap().record(&dedup_key, Instant::now());
 
-    let now = Utc::now();
-    let priority_rank = relay_core::priority_rank(&env.priority);
-    let targets: Vec<(String, Endpoint)> = route_cfg
-        .destinations
-        .iter()
-        .map(|dest| (target_route.clone(), dest.clone()))
-        .collect();
-    let (route_max, global_max) =
-        d.cfg_snapshot(|c| (c.limits.per_route.queue_max, c.limits.global.queue_max));
-
-    let store = d.store.lock().unwrap();
-    if let Err(e) = store.insert_message(&env) {
-        warn!(error = %e, "failed to persist federated message");
-        drop(store);
-        return FedIngressOutcome::Rejected("STORAGE_ERROR");
-    }
-    let shas: Vec<String> = env.attachments.iter().map(|a| a.sha256.clone()).collect();
-    if let Err(e) = store.insert_attachment_refs(env.id, &shas) {
-        warn!(error = %e, "failed to persist federated attachment refs");
-    }
-    let queue_full_routes = fan_out_deliveries(
-        &store, env.id, env.expires_at, priority_rank, &targets, route_max, global_max, now);
-    drop(store);
-    for route in &queue_full_routes {
-        emit_delivery(d, env.id, route.clone(), "dead_letter");
-    }
-
-    metrics::inc(&metrics::FED_INGRESS);
-    FedIngressOutcome::Accepted(env.id)
+    persist_and_fan_out(d, &env, &target_route, &route_cfg, "federated",
+                        &metrics::FED_INGRESS)
 }
 
 /// Per-peer throttle for `fed_sealed_ingress`'s rejection warn lines --
@@ -964,17 +986,8 @@ static SEALED_REJECT_WARN_THROTTLE: std::sync::LazyLock<Mutex<HashMap<String, In
 /// rejection, full stop" is a single, easily-audited invariant.
 fn sealed_reject(peer_node_id: &str, reason: &'static str) -> FedIngressOutcome {
     metrics::inc(&metrics::SEALED_REJECTED);
-    let now = Instant::now();
-    let mut throttle = SEALED_REJECT_WARN_THROTTLE.lock().unwrap();
-    let should_warn = match throttle.get(peer_node_id) {
-        Some(last) => now.duration_since(*last) >= PRE_TRUST_REJECT_WARN_INTERVAL,
-        None => true,
-    };
-    if should_warn {
-        throttle.insert(peer_node_id.to_string(), now);
-    }
-    drop(throttle);
-    if should_warn {
+    if fed::warn_throttle_due(&SEALED_REJECT_WARN_THROTTLE, peer_node_id,
+                              PRE_TRUST_REJECT_WARN_INTERVAL) {
         warn!(peer = %fed::short_node_id(peer_node_id), reason,
               "sealed federation ingress rejected (not persisted; further repeats from this \
                peer are throttled to 1/min)");
@@ -1129,33 +1142,18 @@ pub fn fed_sealed_ingress(
         return sealed_reject(peer_node_id, "FED_CONFIG_MISSING");
     };
 
-    let level = d.store.lock().unwrap().trust_level(peer_node_id).unwrap_or(None);
-    let level_str = level.as_deref().unwrap_or("unknown");
-    if trust_rank(level_str) < trust_rank(&fed_cfg.accept_from) {
+    if fed_trust_denied(d, peer_node_id, &fed_cfg.accept_from) {
         return sealed_reject(peer_node_id, "TRUST_DENIED");
     }
 
-    // Replay-window bound (final-review I-1, reused verbatim from
-    // `fed_ingress` -- see this function's doc comment, step 10, for why
-    // this is independent of the header-level expiry check above): the
-    // SIGNED `created_at` is the only trustworthy time claim; the sealed
-    // header's `expires_at` and the envelope's own `expires_at` are both
-    // unsigned and peer-controlled.
-    const MAX_CREATED_AT_SKEW_SECS: i64 = 300;
-    let ingress_now = Utc::now();
-    let stale = env.created_at + CDuration::seconds(fed_cfg.max_ttl_secs as i64) < ingress_now;
-    let far_future = env.created_at > ingress_now + CDuration::seconds(MAX_CREATED_AT_SKEW_SECS);
-    if stale || far_future {
-        return sealed_reject(peer_node_id, "EXPIRED");
-    }
-
-    // TTL clamp (mirrors `fed_ingress`'s own, design §4): never a
-    // rejection, just bounds what gets persisted -- the envelope's own
-    // `expires_at` is unsigned and peer-controlled, same as the sealed
-    // header's.
-    let capped = Utc::now() + CDuration::seconds(fed_cfg.max_ttl_secs as i64);
-    if env.expires_at > capped {
-        env.expires_at = capped;
+    // Replay-window bound + TTL clamp (`bound_replay_and_clamp_ttl`,
+    // shared with `fed_ingress` -- see this function's doc comment, step
+    // 10, for why this is independent of the header-level expiry check
+    // above): the SIGNED `created_at` is the only trustworthy time claim;
+    // the sealed header's `expires_at` and the envelope's own `expires_at`
+    // are both unsigned and peer-controlled.
+    if let Err(reason) = bound_replay_and_clamp_ttl(&mut env, fed_cfg.max_ttl_secs) {
+        return sealed_reject(peer_node_id, reason);
     }
 
     if !fed_cfg.ingress_routes.contains(&target_route) {
@@ -1196,35 +1194,8 @@ pub fn fed_sealed_ingress(
     // `fed_ingress`'s own ordering.
     d.dedup.lock().unwrap().record(&dedup_key, Instant::now());
 
-    let now = Utc::now();
-    let priority_rank = relay_core::priority_rank(&env.priority);
-    let targets: Vec<(String, Endpoint)> = route_cfg
-        .destinations
-        .iter()
-        .map(|dest| (target_route.clone(), dest.clone()))
-        .collect();
-    let (route_max, global_max) =
-        d.cfg_snapshot(|c| (c.limits.per_route.queue_max, c.limits.global.queue_max));
-
-    let store = d.store.lock().unwrap();
-    if let Err(e) = store.insert_message(&env) {
-        warn!(error = %e, "failed to persist sealed federated message");
-        drop(store);
-        return FedIngressOutcome::Rejected("STORAGE_ERROR");
-    }
-    let shas: Vec<String> = env.attachments.iter().map(|a| a.sha256.clone()).collect();
-    if let Err(e) = store.insert_attachment_refs(env.id, &shas) {
-        warn!(error = %e, "failed to persist sealed federated attachment refs");
-    }
-    let queue_full_routes = fan_out_deliveries(
-        &store, env.id, env.expires_at, priority_rank, &targets, route_max, global_max, now);
-    drop(store);
-    for route in &queue_full_routes {
-        emit_delivery(d, env.id, route.clone(), "dead_letter");
-    }
-
-    metrics::inc(&metrics::SEALED_INGRESS);
-    FedIngressOutcome::Accepted(env.id)
+    persist_and_fan_out(d, &env, &target_route, &route_cfg, "sealed federated",
+                        &metrics::SEALED_INGRESS)
 }
 
 /// Initiates an identity-link challenge (design §Lifecycle step 1, admin API

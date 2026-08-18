@@ -45,35 +45,7 @@ impl SealedKey {
     /// (not a directory), unlike `node_identity::NodeIdentity::
     /// load_or_create`.
     pub fn load_or_create(path: &Path) -> io::Result<SealedKey> {
-        if !path.exists() {
-            let mut key: [u8; 32] = rand::random();
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?;
-            let write_result = f.write_all(hex::encode(key).as_bytes());
-            // Final-review polish (defense-in-depth, cycle H): this
-            // transient generation buffer is a SEPARATE stack copy of the
-            // raw secret scalar from the one `SecretKey::from_bytes` holds
-            // below (re-derived from the file we just read back) -- zero
-            // it here rather than letting it linger until the frame
-            // unwinds, on both the success and the (disk-full-class)
-            // error path. This closes only the LOCAL transient-copy gap;
-            // `crypto_box::SecretKey` itself not zeroizing on drop is a
-            // documented, out-of-scope, upstream crate gap, not something
-            // this change attempts to fix.
-            use zeroize::Zeroize;
-            key.zeroize();
-            write_result?;
-        }
-        let raw = std::fs::read_to_string(path)?;
-        let bytes = hex::decode(raw.trim()).map_err(io::Error::other)?;
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| io::Error::other("sealed key must be 32 bytes of hex"))?;
+        let bytes = crate::keyfile::load_or_create_key32(path, "sealed key")?;
         Ok(SealedKey { secret: SecretKey::from_bytes(bytes) })
     }
 

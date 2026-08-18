@@ -9,23 +9,7 @@ pub struct Aliaser {
 
 impl Aliaser {
     pub fn load_or_create(path: &Path) -> io::Result<Aliaser> {
-        if !path.exists() {
-            let key: [u8; 32] = rand::random();
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?;
-            f.write_all(hex::encode(key).as_bytes())?;
-        }
-        let raw = std::fs::read_to_string(path)?;
-        let bytes = hex::decode(raw.trim()).map_err(io::Error::other)?;
-        let key: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| io::Error::other("alias key must be 32 bytes of hex"))?;
-        Ok(Aliaser { key })
+        Ok(Aliaser { key: crate::keyfile::load_or_create_key32(path, "alias key")? })
     }
 
     pub fn alias(&self, protocol: &str, native_ref: &str, scope: &str) -> String {

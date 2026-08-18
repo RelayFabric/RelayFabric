@@ -22,7 +22,6 @@ use crypto_box::aead::{Aead, AeadCore};
 use crypto_box::{ChaChaBox, PublicKey, SecretKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
 /// The only sealed-envelope algorithm tag this cycle understands (design
 /// §2: "recipient rejects unknown alg -> dead-letter UNSUPPORTED_SEAL_ALG
@@ -91,20 +90,6 @@ pub enum SealError {
     /// folding into `BadSeal`.
     BadBinding,
 }
-
-impl fmt::Display for SealError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SealError::UnsupportedAlg => write!(f, "sealed envelope alg is not supported"),
-            SealError::BadSeal => write!(f, "sealed envelope failed to decrypt"),
-            SealError::BadBinding => {
-                write!(f, "sealed envelope header id/expiry does not match the sealed inner copy")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SealError {}
 
 /// The plaintext `ct` wraps (design §2): the full canonical signed
 /// envelope CBOR, plus a duplicate `id`/`expires_at` for the header
@@ -180,14 +165,12 @@ fn parse_nonce(nonce: &[u8]) -> Result<crypto_box::Nonce, SealError> {
 /// random 24-byte nonce per call (design §2: "the origin's static sealed
 /// key is NOT used as sender -- forward-compat with §113.3's
 /// sealed-sender"; a fresh ephemeral key every message is also why the
-/// output is never byte-reproducible -- see `seal_with_ephemeral` for the
-/// deterministic test seam).
+/// output is never byte-reproducible -- the test module's `seal_fixed_for_
+/// kat` seam fixes both for the KAT).
 ///
 /// Wired into federation egress: `engine::process_due_fed`'s
-/// `security_mode: sealed` branch calls this directly (never
-/// `seal_with_ephemeral`, per the Task 2 review binding note -- production
-/// egress must always use a fresh ephemeral key, never a persisted/reused
-/// one).
+/// `security_mode: sealed` branch calls this directly -- production egress
+/// must always use a fresh ephemeral key, never a persisted/reused one.
 pub fn seal(
     canonical_env_cbor: &[u8],
     id: &str,
@@ -195,42 +178,16 @@ pub fn seal(
     recipient_pub: &PublicKey,
 ) -> SealedEnvelope {
     let ephemeral_secret = SecretKey::generate(&mut OsRng);
-    seal_with_ephemeral(canonical_env_cbor, id, expires_at, recipient_pub, ephemeral_secret)
-}
-
-/// `seal` with the ephemeral X25519 secret supplied by the caller instead
-/// of freshly generated -- the byte-stability test seam the brief calls
-/// for ("a KAT test injects a FIXED ephemeral secret ... to lock exact
-/// sealed bytes for cross-version stability"). The nonce is still random
-/// here (`seal`'s own posture); the KAT test below additionally fixes the
-/// nonce via a second, test-only seam (`seal_fixed`) since a random nonce
-/// alone still makes the output non-reproducible.
-///
-/// `pub(crate)`, not `#[cfg(test)]`-gated, per the brief's exact interface
-/// -- kept reachable for any later task's own test module without reaching
-/// back into this one's private internals.
-///
-/// `seal` is this function's only production caller (Task 4 wired `seal`
-/// itself into federation egress -- see `seal`'s doc comment); egress
-/// never calls this one directly, only through `seal`.
-pub(crate) fn seal_with_ephemeral(
-    canonical_env_cbor: &[u8],
-    id: &str,
-    expires_at: i64,
-    recipient_pub: &PublicKey,
-    ephemeral_secret: SecretKey,
-) -> SealedEnvelope {
     let nonce = ChaChaBox::generate_nonce(&mut OsRng);
     seal_fixed(canonical_env_cbor, id, expires_at, recipient_pub, ephemeral_secret, nonce)
 }
 
-/// The fully-deterministic core both `seal_with_ephemeral` (random nonce)
-/// and the KAT test (fixed nonce) build on: given an already-chosen
+/// The fully-deterministic core `seal` (fresh randomness) and the KAT
+/// test (fixed randomness) both build on: given an already-chosen
 /// ephemeral secret AND nonce, seals with no further randomness. Not
-/// exposed beyond this module -- `seal_with_ephemeral` is the brief's
-/// named test seam for the ephemeral key; fixing the nonce too is purely
-/// an internal test-module concern (see `tests::seal_fixed_for_kat`),
-/// never a knob production code should reach for.
+/// exposed beyond this module -- fixing the inputs is purely a test-module
+/// concern (see `tests::seal_fixed_for_kat`), never a knob production
+/// code should reach for.
 fn seal_fixed(
     canonical_env_cbor: &[u8],
     id: &str,
@@ -334,7 +291,7 @@ mod tests {
     const KAT_LOCKED_HEX: &str = "a663616c67781b7832353531392d786368616368613230706f6c79313330352d7631626964666b61742d69646a657870697265735f61741a6553f1006365706b58207b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13656e6f6e63655818222222222222222222222222222222222222222222222222626374582fee42b869eb3a1fe5ad00e418a1c8ad3e7c54c3436ade3f184f96e2c295c277a1d42bd7bb8d651fef14346526caaa6a";
 
     /// Test-only seam completing the byte-stability KAT: given the
-    /// already-`pub(crate)` `seal_with_ephemeral`'s fixed ephemeral secret
+    /// a fixed ephemeral secret
     /// PLUS a fixed nonce (both required -- a random nonce alone still
     /// makes the ciphertext non-reproducible), produce a fully
     /// deterministic `SealedEnvelope`. Lives in the test module rather
@@ -372,7 +329,8 @@ mod tests {
         let env_cbor = b"another canonical envelope body".to_vec();
         let ephemeral = SecretKey::generate(&mut OsRng);
         let sealed =
-            seal_with_ephemeral(&env_cbor, "msg-2", 1_800_000_001, &recipient_pub, ephemeral);
+            seal_fixed(&env_cbor, "msg-2", 1_800_000_001, &recipient_pub, ephemeral,
+                       ChaChaBox::generate_nonce(&mut OsRng));
 
         let opened = unseal(&sealed, &recipient_secret).unwrap();
         assert_eq!(opened, env_cbor);

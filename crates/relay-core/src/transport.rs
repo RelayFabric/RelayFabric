@@ -10,8 +10,6 @@
 //! `relay-ipc` assert their byte shape stays untouched by this module.
 
 use serde::Deserialize;
-use std::fmt;
-use std::str::FromStr;
 
 /// The class of link a plugin's traffic actually rides. Distinct from the
 /// plugin's protocol: e.g. an MQTT-based plugin bridged over a LoRa radio is
@@ -36,138 +34,8 @@ pub enum TransportClass {
     LocalNetwork,
 }
 
-impl FromStr for TransportClass {
-    type Err = String;
-
-    /// Parses the same snake_case names `Deserialize` accepts from config
-    /// (e.g. `"satellite_internet"`), for callers that have a bare `&str`
-    /// rather than a config value to deserialize.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "terrestrial_internet" => Ok(TransportClass::TerrestrialInternet),
-            "satellite_internet" => Ok(TransportClass::SatelliteInternet),
-            "reticulum" => Ok(TransportClass::Reticulum),
-            "meshtastic" => Ok(TransportClass::Meshtastic),
-            "mesh_core" => Ok(TransportClass::MeshCore),
-            "bluetooth" => Ok(TransportClass::Bluetooth),
-            "local_network" => Ok(TransportClass::LocalNetwork),
-            other => Err(format!("unknown transport class '{other}'")),
-        }
-    }
-}
-
-impl fmt::Display for TransportClass {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            TransportClass::TerrestrialInternet => "terrestrial_internet",
-            TransportClass::SatelliteInternet => "satellite_internet",
-            TransportClass::Reticulum => "reticulum",
-            TransportClass::Meshtastic => "meshtastic",
-            TransportClass::MeshCore => "mesh_core",
-            TransportClass::Bluetooth => "bluetooth",
-            TransportClass::LocalNetwork => "local_network",
-        };
-        f.write_str(s)
-    }
-}
-
-/// Link throughput, coarse-grained for policy purposes (not a measured
-/// figure).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Bandwidth {
-    High,
-    Medium,
-    Low,
-    VeryLow,
-}
-
-/// Link round-trip latency, coarse-grained for policy purposes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Latency {
-    Low,
-    Medium,
-    High,
-}
-
-/// The link characteristics of a `TransportClass` — inputs to policy
-/// derivation (`TransportPolicy::for_class`), not policy itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransportCharacteristics {
-    pub bandwidth: Bandwidth,
-    pub latency: Latency,
-    /// Gaps/timeouts are expected in normal operation (satellite passes,
-    /// LoRa duty cycling, BLE range) — not just failure conditions.
-    pub intermittent: bool,
-    /// The link has a meaningful per-byte or per-connection cost.
-    pub metered: bool,
-    /// Undeliverable traffic should be queued for opportunistic delivery
-    /// rather than dropped.
-    pub store_and_forward: bool,
-}
-
-impl TransportClass {
-    /// The built-in default characteristics table (design §1). Exact values
-    /// per class — see the task-1 report for the rationale behind each.
-    pub fn characteristics(self) -> TransportCharacteristics {
-        match self {
-            TransportClass::SatelliteInternet => TransportCharacteristics {
-                bandwidth: Bandwidth::VeryLow,
-                latency: Latency::High,
-                intermittent: true,
-                metered: true,
-                store_and_forward: true,
-            },
-            TransportClass::Meshtastic => TransportCharacteristics {
-                bandwidth: Bandwidth::VeryLow,
-                latency: Latency::High,
-                intermittent: true,
-                metered: false,
-                store_and_forward: true,
-            },
-            TransportClass::MeshCore => TransportCharacteristics {
-                bandwidth: Bandwidth::VeryLow,
-                latency: Latency::High,
-                intermittent: true,
-                metered: false,
-                store_and_forward: true,
-            },
-            TransportClass::Reticulum => TransportCharacteristics {
-                bandwidth: Bandwidth::Low,
-                latency: Latency::High,
-                intermittent: true,
-                metered: false,
-                store_and_forward: true,
-            },
-            TransportClass::TerrestrialInternet => TransportCharacteristics {
-                bandwidth: Bandwidth::High,
-                latency: Latency::Low,
-                intermittent: false,
-                metered: false,
-                store_and_forward: true,
-            },
-            TransportClass::Bluetooth => TransportCharacteristics {
-                bandwidth: Bandwidth::Medium,
-                latency: Latency::Low,
-                intermittent: true,
-                metered: false,
-                store_and_forward: true,
-            },
-            TransportClass::LocalNetwork => TransportCharacteristics {
-                bandwidth: Bandwidth::Medium,
-                latency: Latency::Low,
-                intermittent: false,
-                metered: false,
-                store_and_forward: true,
-            },
-        }
-    }
-}
-
-/// Effective egress rules for a transport class, derived from its
-/// `TransportCharacteristics`. Config (Phase 1 §2, a later task) can
-/// override individual fields on top of these defaults.
+/// Effective egress rules for a transport class. Config (`transports:`)
+/// can override individual fields on top of these defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportPolicy {
     /// Hard payload cap the link imposes, in bytes. This is the TRANSPORT
@@ -192,8 +60,7 @@ pub struct TransportPolicy {
 const TERRESTRIAL_MAX_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 
 impl TransportPolicy {
-    /// Derives the default policy for a class from its characteristics.
-    /// Per-class `max_payload_bytes` are example values chosen to be
+    /// The built-in default policy per class. Per-class `max_payload_bytes` are example values chosen to be
     /// representative of the class, not protocol mandates — a real
     /// deployment can override them via config (Phase 1 §2):
     ///
@@ -213,25 +80,28 @@ impl TransportPolicy {
     /// is the guarantee that today's internet routes are unaffected by
     /// introducing transport classes at all.
     pub fn for_class(class: TransportClass) -> TransportPolicy {
-        let c = class.characteristics();
-        let very_low = matches!(c.bandwidth, Bandwidth::VeryLow);
-
-        let max_payload_bytes = match class {
-            TransportClass::SatelliteInternet => 32 * 1024,
-            TransportClass::Meshtastic => 237,
-            TransportClass::MeshCore => 237,
-            TransportClass::Reticulum => 32 * 1024,
-            TransportClass::TerrestrialInternet => TERRESTRIAL_MAX_PAYLOAD_BYTES,
-            TransportClass::Bluetooth => 65536,
-            TransportClass::LocalNetwork => TERRESTRIAL_MAX_PAYLOAD_BYTES,
-        };
-
-        TransportPolicy {
+        // Values per class are locked by for_class_derives_expected_policy_
+        // per_class below; the very-low-bandwidth LoRa/satellite classes
+        // disallow media and want compression/batching.
+        let policy = |max_payload_bytes, media, compress, batch_telemetry| TransportPolicy {
             max_payload_bytes,
-            allow_images: !very_low,
-            allow_video: !very_low,
-            compress: c.metered || very_low,
-            batch_telemetry: c.intermittent || very_low,
+            allow_images: media,
+            allow_video: media,
+            compress,
+            batch_telemetry,
+        };
+        match class {
+            TransportClass::SatelliteInternet => policy(32 * 1024, false, true, true),
+            TransportClass::Meshtastic => policy(237, false, true, true),
+            TransportClass::MeshCore => policy(237, false, true, true),
+            TransportClass::Reticulum => policy(32 * 1024, true, false, true),
+            TransportClass::TerrestrialInternet => {
+                policy(TERRESTRIAL_MAX_PAYLOAD_BYTES, true, false, false)
+            }
+            TransportClass::Bluetooth => policy(65536, true, false, true),
+            TransportClass::LocalNetwork => {
+                policy(TERRESTRIAL_MAX_PAYLOAD_BYTES, true, false, false)
+            }
         }
     }
 }
@@ -239,86 +109,6 @@ impl TransportPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn characteristics_table_matches_spec_per_class() {
-        let cases = [
-            (
-                TransportClass::SatelliteInternet,
-                TransportCharacteristics {
-                    bandwidth: Bandwidth::VeryLow,
-                    latency: Latency::High,
-                    intermittent: true,
-                    metered: true,
-                    store_and_forward: true,
-                },
-            ),
-            (
-                TransportClass::Meshtastic,
-                TransportCharacteristics {
-                    bandwidth: Bandwidth::VeryLow,
-                    latency: Latency::High,
-                    intermittent: true,
-                    metered: false,
-                    store_and_forward: true,
-                },
-            ),
-            (
-                TransportClass::MeshCore,
-                TransportCharacteristics {
-                    bandwidth: Bandwidth::VeryLow,
-                    latency: Latency::High,
-                    intermittent: true,
-                    metered: false,
-                    store_and_forward: true,
-                },
-            ),
-            (
-                TransportClass::Reticulum,
-                TransportCharacteristics {
-                    bandwidth: Bandwidth::Low,
-                    latency: Latency::High,
-                    intermittent: true,
-                    metered: false,
-                    store_and_forward: true,
-                },
-            ),
-            (
-                TransportClass::TerrestrialInternet,
-                TransportCharacteristics {
-                    bandwidth: Bandwidth::High,
-                    latency: Latency::Low,
-                    intermittent: false,
-                    metered: false,
-                    store_and_forward: true,
-                },
-            ),
-            (
-                TransportClass::Bluetooth,
-                TransportCharacteristics {
-                    bandwidth: Bandwidth::Medium,
-                    latency: Latency::Low,
-                    intermittent: true,
-                    metered: false,
-                    store_and_forward: true,
-                },
-            ),
-            (
-                TransportClass::LocalNetwork,
-                TransportCharacteristics {
-                    bandwidth: Bandwidth::Medium,
-                    latency: Latency::Low,
-                    intermittent: false,
-                    metered: false,
-                    store_and_forward: true,
-                },
-            ),
-        ];
-
-        for (class, expected) in cases {
-            assert_eq!(class.characteristics(), expected, "characteristics mismatch for {class:?}");
-        }
-    }
 
     #[test]
     fn for_class_derives_expected_policy_per_class() {
@@ -466,37 +256,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn transport_class_from_str_parses_and_rejects_unknown() {
-        for (s, expected) in [
-            ("terrestrial_internet", TransportClass::TerrestrialInternet),
-            ("satellite_internet", TransportClass::SatelliteInternet),
-            ("reticulum", TransportClass::Reticulum),
-            ("meshtastic", TransportClass::Meshtastic),
-            ("mesh_core", TransportClass::MeshCore),
-            ("bluetooth", TransportClass::Bluetooth),
-            ("local_network", TransportClass::LocalNetwork),
-        ] {
-            assert_eq!(s.parse::<TransportClass>().unwrap(), expected);
-        }
-
-        let err = "warp_drive".parse::<TransportClass>().unwrap_err();
-        assert!(err.contains("warp_drive"), "error should name the bad input, got: {err}");
-    }
-
-    #[test]
-    fn transport_class_display_round_trips_through_from_str() {
-        for class in [
-            TransportClass::TerrestrialInternet,
-            TransportClass::SatelliteInternet,
-            TransportClass::Reticulum,
-            TransportClass::Meshtastic,
-            TransportClass::MeshCore,
-            TransportClass::Bluetooth,
-            TransportClass::LocalNetwork,
-        ] {
-            let s = class.to_string();
-            assert_eq!(s.parse::<TransportClass>().unwrap(), class);
-        }
-    }
 }

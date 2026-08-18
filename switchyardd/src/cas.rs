@@ -25,19 +25,13 @@ pub struct Cas {
     total_bytes: AtomicU64,
 }
 
-/// Sentinel message for `put`'s budget-exceeded error. `is_budget_exceeded`
-/// is the one sanctioned way to test for it — callers must not match on the
-/// string directly, so the text can change without hunting down every call
-/// site.
-const BUDGET_EXCEEDED_MSG: &str = "cas budget exceeded";
-
 /// True iff `e` is the specific error `put` returns when a write would push
-/// `total_bytes` over `budget_bytes`. `engine::handle_inbound` uses this to
-/// give a budget refusal its own drop note (`cas budget exceeded`) instead
-/// of the generic "attachment unavailable" one used for every other I/O
-/// failure.
+/// `total_bytes` over `budget_bytes` — discriminated by `ErrorKind`, not by
+/// message text. `engine::handle_inbound` uses this to give a budget
+/// refusal its own drop note (`cas budget exceeded`) instead of the generic
+/// "attachment unavailable" one used for every other I/O failure.
 pub fn is_budget_exceeded(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::Other && e.to_string() == BUDGET_EXCEEDED_MSG
+    e.kind() == io::ErrorKind::QuotaExceeded
 }
 
 /// Sums the size of every regular file directly under `dir`. Used once, at
@@ -103,7 +97,7 @@ impl Cas {
         if self.budget_bytes > 0
             && self.total_bytes.load(Ordering::Relaxed) + size > self.budget_bytes
         {
-            return Err(io::Error::other(BUDGET_EXCEEDED_MSG));
+            return Err(io::Error::new(io::ErrorKind::QuotaExceeded, "cas budget exceeded"));
         }
         let tmp = self.dir.join(format!(".{sha}.{}.tmp", std::process::id()));
         std::fs::write(&tmp, data)?;

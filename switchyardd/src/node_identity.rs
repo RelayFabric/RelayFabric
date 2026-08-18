@@ -16,27 +16,7 @@ impl NodeIdentity {
 
         let key_path = identity_dir.join("node.key");
 
-        let seed_bytes = if !key_path.exists() {
-            // Generate new 32-byte seed
-            let seed: [u8; 32] = rand::random();
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&key_path)?;
-            f.write_all(hex::encode(seed).as_bytes())?;
-            seed
-        } else {
-            // Read existing key
-            let raw = std::fs::read_to_string(&key_path)?;
-            let bytes = hex::decode(raw.trim()).map_err(io::Error::other)?;
-            let seed: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| io::Error::other("node.key must be 32 bytes of hex"))?;
-            seed
-        };
+        let seed_bytes = crate::keyfile::load_or_create_key32(&key_path, "node.key")?;
 
         let signing_key = SigningKey::from_bytes(&seed_bytes);
         let verifying_key = signing_key.verifying_key();

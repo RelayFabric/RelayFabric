@@ -7,6 +7,7 @@ mod engine;
 mod events;
 mod fed;
 mod identity_links;
+mod keyfile;
 mod limits;
 mod metrics;
 mod node_identity;
