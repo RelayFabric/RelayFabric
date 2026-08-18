@@ -161,6 +161,10 @@ class App extends Component {
   async refreshLight() {
     if (!this.state.live) return;
     try { this.setState({ status: await api('/v1/status') }); } catch (_) {}
+    // Keep the plugin roster fresh (connect/disconnect, gauges) — the Overview
+    // and Routes screens both read it, so a plugin (re)connecting shows up
+    // without a manual reload.
+    try { this.setState({ plugins: await api('/v1/plugins') }); } catch (_) {}
     if (this.state.screen === 'queue') this.loadQueue(this.state.filter);
   }
   loadScreen(screen) {
@@ -700,9 +704,9 @@ class App extends Component {
 function hex(n) { return Array.from({ length: n }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join(''); }
 function capList(caps) { return caps ? Object.entries(caps).filter(([, v]) => v === true).map(([k]) => k) : []; }
 function gaugeNote(g) {
-  if (!g) return '{}';
+  if (!g) return '';
   const ent = Object.entries(g);
-  if (ent.length === 0) return '{}';
+  if (ent.length === 0) return '';
   return ent.slice(0, 2).map(([k, v]) => k + ' ' + v).join(' · ');
 }
 
