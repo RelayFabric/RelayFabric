@@ -1,6 +1,6 @@
 [project]
 site_name = "RelayFabric Documentation"
-copyright = "Copyright &copy; 2026 RelayFabric contributors"
+copyright = "Copyright &copy; 2026 Jascha Wanger / Tarnover, LLC &middot; Sponsored by <a href=\"https://tarnover.com\" target=\"_blank\" rel=\"noopener\">Tarnover</a> &middot; Apache-2.0"
 site_url = "https://relayfabric.github.io/RelayFabric/"
 site_description = "A protocol-independent, plugin-based communications routing fabric — bridge Reticulum/LXMF, Signal, Meshtastic, MeshCore, Nostr, Bitchat, and MQTT through one routing, policy, identity, and security layer."
 repo_url = "https://github.com/RelayFabric/RelayFabric"

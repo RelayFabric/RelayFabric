@@ -118,7 +118,7 @@ class App extends Component {
     identities: { links: [] }, challenges: [], limits: null, metricsText: '',
     filter: 'pending', deliveries: [], sel: null,
     events: [], paused: false, demoPlay: false,
-    cfgText: '', cfgMsg: null, restartList: [],
+    cfgText: '', cfgMsg: null, restartList: [], prevText: null, prevAvailable: false, viewingPrev: false,
     showRollback: false, showLink: false,
     linkRequester: '', linkTarget: '', linkName: '',
     toast: null,
@@ -129,7 +129,10 @@ class App extends Component {
       const status = await api('/v1/status');
       this.setState({ live: true, status, ready: true });
       this.loadCommon();
-      this.loadScreen(this.state.screen);
+      // setState is async in Preact — this.state.live isn't committed yet, so
+      // pass live explicitly or loadScreen's guard skips the initial load
+      // (blank editor / "no previous revision" on a reload while deep-linked).
+      this.loadScreen(this.state.screen, true);
       this.openEvents();
       this.poll = setInterval(() => { this.refreshLight(); }, 4000);
     } catch (_e) {
@@ -167,8 +170,8 @@ class App extends Component {
     try { this.setState({ plugins: await api('/v1/plugins') }); } catch (_) {}
     if (this.state.screen === 'queue') this.loadQueue(this.state.filter);
   }
-  loadScreen(screen) {
-    if (!this.state.live) return;
+  loadScreen(screen, live = this.state.live) {
+    if (!live) return;
     if (screen === 'queue') this.loadQueue(this.state.filter);
     if (screen === 'config') this.loadConfig();
     if (screen === 'identities') this.loadIdentities();
@@ -181,7 +184,9 @@ class App extends Component {
     catch (_) { this.setState({ deliveries: [] }); }
   }
   async loadConfig() {
-    try { this.setState({ cfgText: await api('/v1/config'), cfgMsg: null }); } catch (_) {}
+    try { this.setState({ cfgText: await api('/v1/config'), cfgMsg: null, viewingPrev: false }); } catch (_) {}
+    try { this.setState({ prevText: await api('/v1/config/prev'), prevAvailable: true }); }
+    catch (_) { this.setState({ prevText: null, prevAvailable: false }); }
   }
   async loadIdentities() {
     try { this.setState({ identities: await api('/v1/identities') }); } catch (_) {}
@@ -260,13 +265,27 @@ class App extends Component {
       const rr = (res && res.restart_required) || [];
       this.setState({ cfgMsg: 'applied · 200', restartList: rr.map((n) => ({ n })) });
       this.toastMsg('PUT /v1/config → 200' + (rr.length ? ' · restart_required: [' + rr.join(', ') + ']' : ''));
+      // Apply just wrote the replaced config to .prev — refresh availability.
+      try { this.setState({ prevText: await api('/v1/config/prev'), prevAvailable: true }); } catch (_) {}
     } catch (e) { this.setState({ cfgMsg: 'error · ' + (e.status || 'err') }); this.toastMsg('PUT /v1/config → ' + (e.status || 'error')); }
   };
   confirmRollback = async () => {
     this.setState({ showRollback: false });
-    if (this.state.live) { try { await api('/v1/config/rollback', { method: 'POST' }); this.loadConfig(); } catch (_) {} }
-    this.setState({ restartList: [] });
-    this.toastMsg('POST /v1/config/rollback → 200 · swapped with .prev');
+    if (!this.state.live) { this.setState({ restartList: [] }); this.toastMsg('POST /v1/config/rollback → 200 (demo)'); return; }
+    try {
+      await api('/v1/config/rollback', { method: 'POST' });
+      await this.loadConfig();
+      this.setState({ restartList: [] });
+      this.toastMsg('POST /v1/config/rollback → 200 · swapped with .prev');
+    } catch (e) {
+      const c = e.status;
+      this.toastMsg('POST /v1/config/rollback → ' +
+        (c === 404 ? '404 · no previous revision' : c === 409 ? '409 · env drift, no change' : (c || 'error')));
+    }
+  };
+  viewPrev = () => {
+    if (this.state.viewingPrev) { this.loadConfig(); }
+    else { this.setState({ cfgText: this.state.prevText || '', viewingPrev: true, cfgMsg: 'viewing .prev (Apply to restore it, or Roll back to swap)' }); }
   };
   unlink = (id) => async () => {
     if (this.state.live) { try { await api('/v1/identities/link/' + id, { method: 'DELETE' }); } catch (_) {} }
@@ -345,6 +364,10 @@ class App extends Component {
           <a href="/v1/openapi.json" target="_blank" style="text-decoration:none">/v1/openapi.json</a>
         </div>
         <button class="btn btn-secondary" onClick=${this.toggleTheme} style="justify-content:flex-start;font-size:12.5px"><i class=${s.theme === 'dark' ? 'ph ph-sun' : 'ph ph-moon'} style="font-size:15px"></i>${s.theme === 'dark' ? 'Light theme' : 'Dark theme'}</button>
+        <div class="text-muted" style="margin-top:4px;font-size:10px;line-height:1.6">
+          Sponsored by <a href="https://tarnover.com" target="_blank" rel="noopener" style="text-decoration:none">Tarnover</a><br/>
+          © Jascha Wanger / Tarnover, LLC · <a href="https://github.com/RelayFabric/RelayFabric/blob/main/LICENSE" target="_blank" rel="noopener" style="text-decoration:none">Apache-2.0</a>
+        </div>
       </div>
     </aside>`;
   }
@@ -491,12 +514,15 @@ class App extends Component {
         <div style="display:flex;flex-direction:column;gap:12px">
           <div class="card elev-sm" style="gap:var(--space-2)">
             <span class="card-kicker">Previous revision · .prev</span>
-            <div style="display:flex;align-items:center;gap:8px;font-size:12.5px">
-              <span style="font-family:ui-monospace,Menlo,monospace">relayfabric.yaml.prev</span>
-              <span style="flex:1"></span>
-              <button class="btn btn-ghost" onClick=${() => this.setState({ showRollback: true })} style="font-size:11.5px">roll back</button>
-            </div>
-            <div class="card-meta">One revision kept — apply swaps current into .prev. Rollback re-validates before touching any file; env drift returns 409.</div>
+            ${s.prevAvailable ? html`
+              <div style="display:flex;align-items:center;gap:8px;font-size:12.5px">
+                <span class="tag tag-accent">available${s.prevText ? ' · ' + s.prevText.length + ' B' : ''}</span>
+                <span style="flex:1"></span>
+                <button class="btn btn-ghost" onClick=${this.viewPrev} style="font-size:11.5px">${s.viewingPrev ? 'view current' : 'view'}</button>
+                <button class="btn btn-ghost" onClick=${() => this.setState({ showRollback: true })} style="font-size:11.5px">roll back</button>
+              </div>
+              <div class="card-meta">GET /v1/config/prev. Apply saves the replaced config here (one revision). Roll back re-validates .prev then swaps; env drift returns 409.</div>
+            ` : html`<div class="text-muted" style="font-size:12.5px">No previous revision yet — Apply saves one.</div>`}
           </div>
           ${s.restartList.length > 0 && html`
             <div class="card elev-sm" style="gap:var(--space-2)">
@@ -506,7 +532,13 @@ class App extends Component {
             </div>`}
           <div class="card elev-sm" style="gap:var(--space-2)">
             <span class="card-kicker">Endpoints</span>
-            <div style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:2;opacity:.85">GET&nbsp;&nbsp;/v1/config<br/>PUT&nbsp;&nbsp;/v1/config<br/>POST /v1/config/validate<br/>POST /v1/config/rollback</div>
+            <div style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.9;opacity:.85">
+              <div>GET · /v1/config</div>
+              <div>GET · /v1/config/prev</div>
+              <div>PUT · /v1/config</div>
+              <div>POST · /v1/config/validate</div>
+              <div>POST · /v1/config/rollback</div>
+            </div>
           </div>
         </div>
       </div>`;

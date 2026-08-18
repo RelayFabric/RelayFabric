@@ -9,7 +9,7 @@ use axum::body::Bytes;
 use axum::extract::{FromRef, Path as AxPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, MethodRouter};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -72,6 +72,7 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<AdminState>)> {
         ("/v1/plugins", get(plugins)),
         ("/v1/routes", get(routes)),
         ("/v1/config", get(config_yaml).put(config_put)),
+        ("/v1/config/prev", get(config_prev)),
         ("/v1/config/validate", post(config_validate)),
         ("/v1/config/rollback", post(config_rollback)),
         ("/v1/queue", get(queue)),
@@ -494,6 +495,36 @@ async fn routes(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
 async fn config_yaml(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let yaml = d.cfg_snapshot(|c| c.raw_yaml.clone());
     (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/yaml")], yaml)
+}
+
+/// `GET /v1/config/prev`: the single kept previous revision (`<config>.prev`),
+/// byte-verbatim from disk with secret references unresolved -- the revision a
+/// `POST /v1/config/rollback` would restore. 404 when no previous revision
+/// exists yet (nothing has been applied since the daemon last had a clean
+/// slate). Read straight from the file, not the in-memory config, since `.prev`
+/// is exactly a file the `PUT`/rollback renames juggle.
+#[utoipa::path(
+    get,
+    path = "/v1/config/prev",
+    tag = "config",
+    summary = "Previous config revision (.prev)",
+    description = "The single kept previous config revision (`<config>.prev`), byte-verbatim with secret references UNRESOLVED. 404 if no previous revision exists yet. This is what `POST /v1/config/rollback` would restore.",
+    responses(
+        (status = 200, description = "Previous config YAML", content_type = "text/yaml", body = String),
+        (status = 404, description = "No previous revision exists"),
+    ),
+)]
+async fn config_prev(State(state): State<AdminState>) -> Response {
+    let prev = prev_path_for(&state.config_path);
+    match std::fs::read_to_string(&prev) {
+        Ok(text) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/yaml")],
+            text,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "no previous revision").into_response(),
+    }
 }
 
 /// `<path>.prev` — the single-revision history slot `PUT`/`rollback` swap
@@ -1640,7 +1671,7 @@ async fn docs_asset(AxPath(rest): AxPath<String>) -> axum::response::Response {
             without adding an auth layer in front of it.",
     ),
     paths(
-        status, plugins, routes, config_yaml, config_put, config_validate, config_rollback,
+        status, plugins, routes, config_yaml, config_prev, config_put, config_validate, config_rollback,
         queue, trace, public, limits, identities, create_link, delete_link, challenges,
         federation, discovery, events_stream, metrics_text, openapi_json,
     ),

@@ -51,3 +51,8 @@ see `docs/webui-notes.md`.
   copies for a fully air-gapped deployment.
 - The brand mark is `web/logo.png` (a 128×128 web copy); replace it with your
   own if you like.
+
+## License
+
+Apache-2.0, Copyright © 2026 Jascha Wanger / Tarnover, LLC. Sponsored by
+[Tarnover](https://tarnover.com).
