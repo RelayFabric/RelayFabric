@@ -18,6 +18,9 @@ gracefully: payload capped, media dropped to a note).
 - `switchyardd` — the core daemon: routing, deduplication, policy
   enforcement, persistence, and an admin API, all headless.
 - `switchyardctl` — CLI client for the admin API (status, plugins, routes, queue, trace).
+- `relayfabric-ui` — web admin UI plus a thin reverse-proxy that fronts the
+  daemon's Unix-socket admin API for the browser; see
+  [`relayfabric-ui/README.md`](relayfabric-ui/README.md).
 - Plugins — separate processes speaking a small CBOR-over-Unix-socket IPC
   protocol to the daemon. MQTT, LXMF, Signal, Meshtastic, MeshCore, Nostr, and
   Bitchat plugins available; see [LXMF](plugins/lxmf/README.md), [Signal](plugins/signal/README.md),
@@ -70,8 +73,11 @@ Commands assume `target/release/` is on your `PATH`.
 
 The routing, policy, and security model — including deny-by-default
 routing, route-scoped pseudonyms, TTL/dedup/retry semantics, and the plugin
-IPC protocol — is specified in [`docs/SPEC.md`](docs/SPEC.md). Notes on the
-(not-yet-built) administrative web UI are in [`docs/webui-notes.md`](docs/webui-notes.md).
+IPC protocol — is specified in [`docs/SPEC.md`](docs/SPEC.md). The
+administrative web UI (`relayfabric-ui`) and its reverse-proxy are documented
+in [`relayfabric-ui/README.md`](relayfabric-ui/README.md); the architecture and
+the still-deferred auth/RBAC work are in
+[`docs/webui-notes.md`](docs/webui-notes.md).
 
 ## License
 

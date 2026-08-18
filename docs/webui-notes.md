@@ -1,7 +1,10 @@
 # RelayFabric WebUI — Design Notes
 
-Status: future work (v0.3 in staging plan). The administrative API is designed
-for the WebUI from day one, even while the only client is `switchyardctl`.
+Status: the UI and its reverse-proxy are built — see `relayfabric-ui/`. What
+remains deferred is authentication/RBAC on the proxy; today it binds to
+loopback with no auth of its own. The administrative API was designed for the
+WebUI from day one, and these notes capture that architecture and the deferred
+auth work.
 
 ## Architecture
 
