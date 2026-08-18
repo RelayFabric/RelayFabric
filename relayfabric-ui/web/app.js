@@ -104,9 +104,12 @@ const bytes = (n) => {
 
 // ---- component -------------------------------------------------------------
 
+const SCREENS = NAV.map(([id]) => id);
+const validScreen = (x) => (SCREENS.includes(x) ? x : null);
+
 class App extends Component {
   state = {
-    screen: 'overview',
+    screen: validScreen(location.hash.slice(1)) || 'overview',
     theme: localStorage.getItem('rf-theme') || 'dark',
     density: localStorage.getItem('rf-density') || 'comfortable',
     live: false, ready: false,
@@ -114,7 +117,7 @@ class App extends Component {
     discovery: { mode: 'disabled', our_advert: null, peers: [] },
     identities: { links: [] }, challenges: [], limits: null, metricsText: '',
     filter: 'pending', deliveries: [], sel: null,
-    events: [], paused: false,
+    events: [], paused: false, demoPlay: false,
     cfgText: '', cfgMsg: null, restartList: [],
     showRollback: false, showLink: false,
     linkRequester: '', linkTarget: '', linkName: '',
@@ -139,8 +142,7 @@ class App extends Component {
         deliveries: DEMO.deliveries,
         cfgText: DEMO_CONFIG,
       });
-      this.demoTimer = setInterval(() => this.tickDemoEvents(), 3000);
-      this.tickDemoEvents(true);
+      this.startDemo();
     }
   }
   componentWillUnmount() {
@@ -218,8 +220,24 @@ class App extends Component {
     }
   }
 
+  // Synthetic event playback — lets an operator see the live views populate
+  // (Overview + Live events) without waiting on real traffic. Auto-runs in
+  // offline mode; a toggle drives it in live mode.
+  startDemo() {
+    if (this.demoTimer) return;
+    this.tickDemoEvents(true);
+    this.demoTimer = setInterval(() => this.tickDemoEvents(), 2500);
+    this.setState({ demoPlay: true });
+  }
+  stopDemo() {
+    clearInterval(this.demoTimer);
+    this.demoTimer = null;
+    this.setState({ demoPlay: false });
+  }
+  toggleDemo = () => { if (this.demoTimer) this.stopDemo(); else this.startDemo(); };
+
   // --- actions ---
-  go = (id) => () => { this.setState({ screen: id, sel: null }); this.loadScreen(id); };
+  go = (id) => () => { location.hash = id; this.setState({ screen: id, sel: null }); this.loadScreen(id); };
   toggleTheme = () => { const t = this.state.theme === 'dark' ? 'light' : 'dark'; localStorage.setItem('rf-theme', t); this.setState({ theme: t }); };
   toastMsg(m) { this.setState({ toast: m }); clearTimeout(this.toastT); this.toastT = setTimeout(() => this.setState({ toast: null }), 3200); }
 
@@ -484,7 +502,7 @@ class App extends Component {
             </div>`}
           <div class="card elev-sm" style="gap:var(--space-2)">
             <span class="card-kicker">Endpoints</span>
-            <div style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:2;opacity:.85">GET&nbsp;&nbsp;/v1/config<br>PUT&nbsp;&nbsp;/v1/config<br>POST /v1/config/validate<br>POST /v1/config/rollback</div>
+            <div style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:2;opacity:.85">GET&nbsp;&nbsp;/v1/config<br/>PUT&nbsp;&nbsp;/v1/config<br/>POST /v1/config/validate<br/>POST /v1/config/rollback</div>
           </div>
         </div>
       </div>`;
@@ -603,6 +621,7 @@ class App extends Component {
   eventsScreen(s) {
     return html`
       ${this.header('Live events', 'GET /v1/events · text/event-stream · advisory, REST is source of truth', html`
+        <button class=${'btn ' + (s.demoPlay ? 'btn-primary' : 'btn-secondary')} onClick=${this.toggleDemo}><i class=${s.demoPlay ? 'ph ph-stop' : 'ph ph-flask'} style="font-size:15px"></i>${s.demoPlay ? 'Stop sample events' : 'Play sample events'}</button>
         <button class="btn btn-secondary" onClick=${() => this.setState({ paused: !s.paused })}><i class=${s.paused ? 'ph ph-play' : 'ph ph-pause'} style="font-size:15px"></i>${s.paused ? 'Resume' : 'Pause'}</button>`)}
       <div style="display:flex;flex-direction:column">
         ${s.events.slice(0, 40).map((e) => html`
