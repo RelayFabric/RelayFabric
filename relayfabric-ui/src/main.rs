@@ -123,7 +123,11 @@ async fn main() {
     let app = Router::new()
         .route("/v1/{*rest}", any(proxy))
         .route("/metrics", any(proxy))
-        .route("/docs", any(proxy))
+        // Swagger UI's HTML uses relative asset refs (./swagger-ui.css), which
+        // only resolve when the page is loaded at /docs/ (with the trailing
+        // slash); the daemon serves /docs without redirecting, so send the
+        // browser to /docs/ ourselves.
+        .route("/docs", any(|| async { axum::response::Redirect::permanent("/docs/") }))
         .route("/docs/", any(proxy))
         .route("/docs/{*rest}", any(proxy))
         .fallback(static_file)
