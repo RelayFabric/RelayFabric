@@ -46,12 +46,23 @@ def text_event(**overrides):
 
 class ConfigTests(unittest.TestCase):
     def test_defaults(self):
-        cfg = plug.load_config(base_cfg())
+        with self.assertLogs(plug.log, level="WARNING"):
+            cfg = plug.load_config(base_cfg())
         self.assertIsNone(cfg["gateway_id"])
         self.assertEqual(cfg["url"], "https://potato.example.org")
 
+    def test_null_gateway_id_warns(self):
+        with self.assertLogs(plug.log, level="WARNING") as cm:
+            plug.load_config(base_cfg())
+        self.assertTrue(any("gateway_id" in line for line in cm.output))
+
+    def test_set_gateway_id_no_warning(self):
+        with self.assertNoLogs(plug.log, level="WARNING"):
+            plug.load_config(base_cfg(gateway_id="!aabbccdd"))
+
     def test_url_trailing_slash_stripped(self):
-        cfg = plug.load_config(base_cfg(url="https://potato.example.org/"))
+        cfg = plug.load_config(
+            base_cfg(url="https://potato.example.org/", gateway_id="!aabbccdd"))
         self.assertEqual(cfg["url"], "https://potato.example.org")
 
     def test_required_fields(self):
@@ -72,7 +83,9 @@ class CanonicalIdTests(unittest.TestCase):
 
 class MapperTextTests(unittest.TestCase):
     def setUp(self):
-        self.mapper = plug.Mapper(plug.load_config(base_cfg()), now_fn=lambda: 1700000000)
+        self.mapper = plug.Mapper(
+            plug.load_config(base_cfg(gateway_id="!aabbccdd")),
+            now_fn=lambda: 1700000000)
 
     def test_text_maps_to_messages_post(self):
         posts = self.mapper.handle(TOPIC, text_event())
@@ -138,7 +151,9 @@ def position_event(**payload_overrides):
 
 class MapperPositionTests(unittest.TestCase):
     def setUp(self):
-        self.mapper = plug.Mapper(plug.load_config(base_cfg()), now_fn=lambda: 1700000000)
+        self.mapper = plug.Mapper(
+            plug.load_config(base_cfg(gateway_id="!aabbccdd")),
+            now_fn=lambda: 1700000000)
 
     def test_position_maps_to_positions_and_nodes(self):
         posts = dict(self.mapper.handle(TOPIC, position_event()))
@@ -193,7 +208,9 @@ def telemetry_event(**payload_overrides):
 
 class MapperTelemetryTests(unittest.TestCase):
     def setUp(self):
-        self.mapper = plug.Mapper(plug.load_config(base_cfg()), now_fn=lambda: 1700000000)
+        self.mapper = plug.Mapper(
+            plug.load_config(base_cfg(gateway_id="!aabbccdd")),
+            now_fn=lambda: 1700000000)
 
     def test_device_telemetry_maps(self):
         posts = dict(self.mapper.handle(TOPIC, telemetry_event()))
@@ -249,7 +266,9 @@ def nodeinfo_event(**payload_overrides):
 
 class MapperNodeinfoTests(unittest.TestCase):
     def setUp(self):
-        self.mapper = plug.Mapper(plug.load_config(base_cfg()), now_fn=lambda: 1700000000)
+        self.mapper = plug.Mapper(
+            plug.load_config(base_cfg(gateway_id="!aabbccdd")),
+            now_fn=lambda: 1700000000)
 
     def test_nodeinfo_maps_to_nodes_post(self):
         posts = self.mapper.handle(TOPIC, nodeinfo_event())

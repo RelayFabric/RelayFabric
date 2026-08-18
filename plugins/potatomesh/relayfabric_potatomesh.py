@@ -104,6 +104,14 @@ def load_config(raw):
             raise ValueError(f"config requires '{field}'")
     cfg["url"] = cfg["url"].rstrip("/")
     cfg.setdefault("gateway_id", None)
+    if cfg["gateway_id"] is None:
+        # PotatoMesh's premise is a dashboard fed by radios the community
+        # operates; on a shared/public broker a null filter forwards every
+        # gateway's traffic — the worldwide soup that premise exists to avoid.
+        log.warning(
+            "gateway_id is null: accepting packets from ALL gateways on the "
+            "topic. On a shared or public broker this feeds PotatoMesh "
+            "non-local traffic; set gateway_id to your own node's hex ID.")
     return cfg
 
 

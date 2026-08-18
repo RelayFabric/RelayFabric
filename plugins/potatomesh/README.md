@@ -39,6 +39,16 @@ plugins:
       token: ${env:POTATOMESH_TOKEN}
 ```
 
+> **Warning — keep the feed local.** PotatoMesh's premise is a dashboard fed
+> by radios its community actually operates ("no MQTT clutter, just local
+> LoRa aether"). That holds only when `broker` is your own node's own broker.
+> Pointing this plugin at a shared or public broker (e.g.
+> `mqtt.meshtastic.org`) pipes worldwide, non-local traffic into the
+> dashboard — exactly what PotatoMesh exists to avoid. On any broker that
+> carries more than your own gateway, set `gateway_id` to your node's hex ID
+> so only packets your own radio heard over RF are forwarded; the plugin
+> logs a startup warning when `gateway_id` is null.
+
 ## What gets posted
 
 | MQTT JSON event | PotatoMesh route(s) |

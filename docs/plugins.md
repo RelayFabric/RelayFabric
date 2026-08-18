@@ -402,6 +402,14 @@ Routed sends are rejected.
 | `url` | — | PotatoMesh instance base URL |
 | `token` | — | API bearer token — use `${env:...}` or `${file:...}` |
 
+!!! warning "Keep the feed local"
+    PotatoMesh's premise is a dashboard fed by radios its community
+    operates. Pointing this plugin at a shared or public broker (e.g.
+    `mqtt.meshtastic.org`) pipes worldwide traffic into the dashboard —
+    exactly what PotatoMesh exists to avoid. On any broker carrying more
+    than your own gateway, set `gateway_id` to your node's hex ID; the
+    plugin logs a startup warning when it is null.
+
 ```yaml
 plugins:
   potatomesh:
