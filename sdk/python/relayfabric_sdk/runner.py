@@ -34,9 +34,14 @@ def run_plugin(plugin_name, version, bridge_factory, capabilities, *,
     - Missing `socket_env` -> stderr line + exit 2.
     - Connects, sends Hello(plugin_name, version, capabilities), reads
       HelloAck; a non-"hello_ack" frame or a truthy "error" -> stderr line +
-      exit 1.
+      exit 1. `capabilities` may be a callable taking the parsed config dict
+      and returning the caps dict, for plugins whose advertised caps depend
+      on config (e.g. a config-derived max_payload).
     - Calls `bridge_factory(cfg_dict, sock)`; if the returned object has a
       `start()`, calls it before entering the read loop.
+    - A ValueError/TypeError from the capabilities callable or
+      bridge_factory (the plugins' load_config validation errors) -> clean
+      "invalid config" stderr line + exit 1.
     - Read loop: "send" -> bridge.handle_send(frame); "send_direct" ->
       bridge.handle_send_direct(frame) if present, else ignored; "shutdown"
       -> bridge.stop() if present, then exit 0; unknown "t" -> ignored;
@@ -56,13 +61,23 @@ def run_plugin(plugin_name, version, bridge_factory, capabilities, *,
     os.environ.pop(config_env, None)
     sock = connect(sock_path)
 
-    write_frame(sock, hello(plugin_name, version, capabilities))
+    try:
+        caps = capabilities(raw_cfg) if callable(capabilities) else capabilities
+    except (ValueError, TypeError) as e:
+        print(f"{plugin_name}: invalid config: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    write_frame(sock, hello(plugin_name, version, caps))
     ack = read_frame(sock)
     if ack.get("t") != "hello_ack" or ack.get("error"):
         print(f"{plugin_name}: hello rejected: {ack.get('error')}", file=sys.stderr)
         sys.exit(1)
 
-    bridge = bridge_factory(raw_cfg, sock)
+    try:
+        bridge = bridge_factory(raw_cfg, sock)
+    except (ValueError, TypeError) as e:
+        print(f"{plugin_name}: invalid config: {e}", file=sys.stderr)
+        sys.exit(1)
     start = getattr(bridge, "start", None)
     if start is not None:
         start()

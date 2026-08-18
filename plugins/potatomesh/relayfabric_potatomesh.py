@@ -7,9 +7,11 @@ contract (data/mesh_ingestor/CONTRACTS.md in l5yth/potato-mesh, Apache-2.0),
 and POSTs them with a bearer token. It never sends to the mesh; routed `send`
 frames are rejected.
 
-Module top level is stdlib-only (mirrors the meshtastic plugin): relayfabric_sdk
-and paho.mqtt are imported lazily so config/mapping helpers stay importable
-without them. Message text is posted to PotatoMesh but never logged here.
+Module top level imports only stdlib plus the stdlib-only
+relayfabric_sdk.bridge (mirrors the meshtastic plugin): the rest of
+relayfabric_sdk and paho.mqtt are imported lazily so config/mapping helpers
+stay importable without them. Message text is posted to PotatoMesh but never
+logged here.
 """
 
 import datetime
@@ -18,11 +20,12 @@ import logging
 import math
 import os
 import queue
-import socket
-import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
+
+from relayfabric_sdk.bridge import FrameWriter
 
 log = logging.getLogger(__name__)
 
@@ -122,17 +125,10 @@ def canonical_node_id(num):
 
 def parse_broker_url(url):
     """mqtt://host[:port] -> (host, port); mirrors the meshtastic plugin."""
-    if not url.startswith("mqtt://"):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "mqtt" or not parsed.hostname:
         raise ValueError("broker must be mqtt://host[:port]")
-    rest = url[len("mqtt://"):]
-    if ":" in rest:
-        host, port_str = rest.split(":", 1)
-        try:
-            port = int(port_str)
-        except ValueError as e:
-            raise ValueError(f"bad port in broker url: {port_str!r}") from e
-        return host, port
-    return rest, 1883
+    return parsed.hostname, parsed.port or 1883
 
 
 def _finite(value):
@@ -362,18 +358,15 @@ class Poster:
         return True
 
 
-class Bridge:
-    """Plugin Protocol side: rejects sends (ingest-only), emits gauges."""
+class Bridge(FrameWriter):
+    """Plugin Protocol side: rejects sends (ingest-only); owns the MQTT
+    backend, mapper, and poster, and runs the map-and-POST worker."""
 
-    def __init__(self, sock_file):
-        self.sock_file = sock_file
-        self.write_lock = threading.Lock()
-
-    def _send_frame(self, obj):
-        from relayfabric_sdk import ipc as relay_ipc
-
-        with self.write_lock:
-            relay_ipc.write_frame(self.sock_file, obj)
+    def __init__(self, cfg, sock_file):
+        super().__init__(sock_file)
+        self.mapper = Mapper(cfg)
+        self.poster = Poster(cfg["url"], cfg["token"])
+        self.backend = MqttJsonBackend(cfg["broker"], cfg["topic_root"])
 
     def handle_send(self, frame):
         from relayfabric_sdk import ipc as relay_ipc
@@ -381,10 +374,28 @@ class Bridge:
         self._send_frame(relay_ipc.delivery_result(
             frame["corr"], False, "potatomesh is ingest-only"))
 
-    def emit_gauges(self, values):
+    def start(self):
+        self.backend.start()
+        threading.Thread(target=self._worker_loop, daemon=True).start()
+
+    def _worker_loop(self):
         from relayfabric_sdk import ipc as relay_ipc
 
-        self._send_frame(relay_ipc.gauges(values))
+        last_gauges_at = time.monotonic()
+        for topic, event in self.backend.events():
+            try:
+                for path, payload in self.mapper.handle(topic, event):
+                    self.poster.post(path, payload)
+            except Exception as e:  # noqa: BLE001 - one bad event must not kill the worker
+                log.error(f"PotatoMesh event handler error: {e}")
+            now = time.monotonic()
+            if now - last_gauges_at >= GAUGES_INTERVAL_SECS:
+                last_gauges_at = now
+                self._send_frame(relay_ipc.gauges({
+                    "posted": self.poster.posted,
+                    "http_failures": self.poster.failures,
+                    "queue_depth": self.backend.queue_depth(),
+                }))
 
 
 class MqttJsonBackend:
@@ -437,68 +448,16 @@ class MqttJsonBackend:
         return self._queue.qsize()
 
 
+def _make_bridge(raw_cfg, sock):
+    return Bridge(load_config(raw_cfg), sock)
+
+
 def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
 
-    sock_path = os.environ["RELAYFABRIC_SOCKET"]
-    plugin_name = os.environ.get("RELAYFABRIC_PLUGIN_NAME", "potatomesh")
-    raw_cfg = json.loads(os.environ.get("RELAYFABRIC_PLUGIN_CONFIG", "{}"))
-    os.environ.pop("RELAYFABRIC_PLUGIN_CONFIG", None)
-    try:
-        cfg = load_config(raw_cfg)
-    except ValueError as e:
-        print(f"relayfabric-potatomesh: invalid config: {e}", file=sys.stderr)
-        sys.exit(1)
-
     from relayfabric_sdk import ipc as relay_ipc
+    from relayfabric_sdk import run_plugin
 
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(sock_path)
-    rfile = sock.makefile("rb")
-    wfile = sock.makefile("wb")
-
-    relay_ipc.write_frame(wfile, relay_ipc.hello(
-        plugin_name, PLUGIN_VERSION, relay_ipc.capabilities()))
-    ack = relay_ipc.read_frame(rfile)
-    if ack.get("t") != "hello_ack" or ack.get("error"):
-        print(f"relayfabric-potatomesh: hello rejected: {ack.get('error')}",
-              file=sys.stderr)
-        sys.exit(1)
-
-    bridge = Bridge(wfile)
-    mapper = Mapper(cfg)
-    poster = Poster(cfg["url"], cfg["token"])
-    backend = MqttJsonBackend(cfg["broker"], cfg["topic_root"])
-    backend.start()
-
-    def worker_loop():
-        last_gauges_at = time.monotonic()
-        for topic, event in backend.events():
-            try:
-                for path, payload in mapper.handle(topic, event):
-                    poster.post(path, payload)
-            except Exception as e:  # noqa: BLE001 - one bad event must not kill the worker
-                log.error(f"PotatoMesh event handler error: {e}")
-            now = time.monotonic()
-            if now - last_gauges_at >= GAUGES_INTERVAL_SECS:
-                last_gauges_at = now
-                bridge.emit_gauges({
-                    "posted": poster.posted,
-                    "http_failures": poster.failures,
-                    "queue_depth": backend.queue_depth(),
-                })
-
-    threading.Thread(target=worker_loop, daemon=True).start()
-
-    while True:
-        try:
-            frame = relay_ipc.read_frame(rfile)
-        except (EOFError, OSError, ValueError) as e:
-            log.error(f"Daemon connection lost, exiting: {e}")
-            sys.exit(1)
-        kind = frame.get("t")
-        if kind == "send":
-            bridge.handle_send(frame)
-        elif kind == "shutdown":
-            sys.exit(0)
+    run_plugin(os.environ.get("RELAYFABRIC_PLUGIN_NAME", "potatomesh"),
+               PLUGIN_VERSION, _make_bridge, relay_ipc.capabilities())

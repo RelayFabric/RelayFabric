@@ -141,6 +141,48 @@ class HandshakeTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 1)
 
 
+class CallableCapabilitiesTests(unittest.TestCase):
+    def test_callable_capabilities_receives_cfg_and_result_sent_in_hello(self):
+        sock = FakeSock(queued_frames=[HELLO_ACK_OK, {"t": "shutdown"}])
+        seen = {}
+
+        def caps_fn(cfg):
+            seen["cfg"] = cfg
+            return relay_ipc.capabilities(max_payload=123)
+
+        env = _env(**{CONFIG_ENV: '{"max_text_bytes": 123}'})
+        with mock.patch.dict(os.environ, env, clear=True), self.assertRaises(SystemExit) as ctx:
+            run_plugin("p", "1.0", _MinimalBridge, caps_fn,
+                       socket_env=SOCKET_ENV, config_env=CONFIG_ENV,
+                       connect=lambda path: sock)
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(seen["cfg"], {"max_text_bytes": 123})
+        hello_frame = sock.frames()[0]
+        self.assertEqual(hello_frame["capabilities"]["max_payload"], 123)
+
+    def test_invalid_config_from_caps_callable_exits_1(self):
+        def caps_fn(cfg):
+            raise ValueError("config requires 'broker'")
+
+        sock = FakeSock(queued_frames=[HELLO_ACK_OK])
+        with mock.patch.dict(os.environ, _env(), clear=True), self.assertRaises(SystemExit) as ctx:
+            run_plugin("p", "1.0", _MinimalBridge, caps_fn,
+                       socket_env=SOCKET_ENV, config_env=CONFIG_ENV,
+                       connect=lambda path: sock)
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_invalid_config_from_bridge_factory_exits_1(self):
+        def factory(cfg, s):
+            raise TypeError("max_text_bytes must be int")
+
+        sock = FakeSock(queued_frames=[HELLO_ACK_OK])
+        with mock.patch.dict(os.environ, _env(), clear=True), self.assertRaises(SystemExit) as ctx:
+            run_plugin("p", "1.0", factory, relay_ipc.capabilities(),
+                       socket_env=SOCKET_ENV, config_env=CONFIG_ENV,
+                       connect=lambda path: sock)
+        self.assertEqual(ctx.exception.code, 1)
+
+
 class DispatchTests(unittest.TestCase):
     def _run(self, bridge_cls, frames):
         sock = FakeSock(queued_frames=[HELLO_ACK_OK, *frames])

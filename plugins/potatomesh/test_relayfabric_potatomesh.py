@@ -343,7 +343,7 @@ class PosterTests(unittest.TestCase):
 class BridgeTests(unittest.TestCase):
     def test_send_rejected_as_ingest_only(self):
         sock = FakeSock()
-        bridge = plug.Bridge(sock)
+        bridge = plug.Bridge(plug.load_config(base_cfg(gateway_id="!aabbccdd")), sock)
         bridge.handle_send({"t": "send", "corr": "c1", "endpoint": "x", "body": "hi"})
         frames = sock.frames()
         self.assertEqual(len(frames), 1)

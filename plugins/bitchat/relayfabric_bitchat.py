@@ -11,12 +11,12 @@ UTF-8 content. This is a thin specialization of the Nostr plugin
 Bridge/main shape, Bitchat wire conventions instead of arbitrary NIP-01
 filters/tags.
 
-Module top level is stdlib-only (asyncio/copy/json/logging/os/queue/socket/
-sys/threading/time) so config/geohash helpers stay importable without
-coincurve, websockets, cbor2, or relayfabric_sdk. The NIP-01 event
+Module top level imports only stdlib plus the stdlib-only
+relayfabric_sdk.bridge, so config/geohash helpers stay importable without
+coincurve, websockets, or cbor2. The NIP-01 event
 primitives (sign_event/verify_event/load_or_create_identity, promoted to
 relayfabric_sdk.nip01 in cycle J) are imported lazily inside
-build_bitchat_event/normalize_event/BitchatBackend.publish/main() --
+build_bitchat_event/normalize_event/BitchatBackend.publish/_make_bridge --
 the same lazy-import convention plugins/nostr/relayfabric_nostr.py uses (see
 its module docstring); BitchatBackend.start() imports websockets; Bridge and
 main() import the rest of relayfabric_sdk. Note: content bytes are never
@@ -29,10 +29,10 @@ import json
 import logging
 import os
 import queue
-import socket
-import sys
 import threading
 import time
+
+from relayfabric_sdk.bridge import FrameWriter, capped_text_send
 
 log = logging.getLogger(__name__)
 
@@ -285,7 +285,7 @@ class BitchatBackend:
     def __init__(self, relays, channels, identity):
         self.relays = list(relays)
         self.channels = channels
-        self.privkey_hex, self.pubkey_hex = identity
+        self.privkey_hex, _ = identity
         self._queue = queue.Queue(maxsize=256)
         self._loop = None
         # relay url -> live websocket connection; populated/cleared only
@@ -423,7 +423,7 @@ class BitchatBackend:
         return any_ok
 
 
-class Bridge:
+class Bridge(FrameWriter):
     """Bridges normalized Bitchat events <-> Plugin Protocol frames. Mirrors
     plugins/nostr's Bridge shape (write lock, _send_frame, SentCache loop
     guard, deny-by-default, oversize defensive drop) with one difference:
@@ -444,20 +444,24 @@ class Bridge:
     def __init__(self, cfg, backend, sock_file):
         from relayfabric_sdk import SentCache
 
+        super().__init__(sock_file)
         self.cfg = cfg
         self.backend = backend
-        self.sock_file = sock_file
-        self.write_lock = threading.Lock()
         # 1h, not SentCache's 86400s default: mirrors meshcore/nostr's echo
         # loop-guard window (bounds how long a lost echo/ack can leave a
         # stale entry able to swallow one genuine identical-text message).
         self.sent_cache = SentCache(ttl_secs=3600)
 
-    def _send_frame(self, obj):
-        from relayfabric_sdk import ipc as relay_ipc
+    def start(self):
+        self.backend.start()
+        threading.Thread(target=self._reader_loop, daemon=True).start()
 
-        with self.write_lock:
-            relay_ipc.write_frame(self.sock_file, obj)
+    def _reader_loop(self):
+        for ev in self.backend.events():
+            try:
+                self.handle_event(ev)
+            except Exception as e:  # noqa: BLE001 - one bad event must not kill the reader
+                log.error(f"Bitchat event handler error: {e}")
 
     # ----- inbound (Bitchat -> daemon); called from the backend's reader thread -----
 
@@ -476,100 +480,30 @@ class Bridge:
     # ----- egress (daemon -> Bitchat); called from the main thread -----
 
     def handle_send(self, frame):
-        from relayfabric_sdk import ipc as relay_ipc
+        capped_text_send(self, frame, "Bitchat", "Bitchat event",
+                         lambda spec, endpoint, body: self.backend.publish(endpoint, body))
 
-        corr = frame["corr"]
-        endpoint = frame["endpoint"]
-        body = frame["body"]
-        channel_spec = self.cfg["channels"].get(endpoint)
-        if channel_spec is None:
-            log.warning(f"Bitchat send to unknown endpoint {endpoint!r}")
-            self._send_frame(relay_ipc.delivery_result(corr, False, "unknown endpoint"))
-            return
 
-        body_bytes = len(body.encode("utf-8"))
-        max_bytes = self.cfg["max_text_bytes"]
-        if body_bytes > max_bytes:
-            # defensive: the daemon should have already truncated to our
-            # advertised capabilities.max_payload before it ever sends us
-            # this frame.
-            detail = f"body {body_bytes} B exceeds max_text_bytes {max_bytes} B"
-            log.warning(f"Bitchat send to '{endpoint}' dropped: {detail}")
-            self._send_frame(relay_ipc.delivery_result(corr, False, detail))
-            return
+def _caps(raw_cfg):
+    from relayfabric_sdk import ipc as relay_ipc
 
-        try:
-            self.backend.publish(endpoint, body)
-        except Exception as e:  # noqa: BLE001 - report the failure, don't crash
-            log.warning(f"Bitchat send to '{endpoint}' failed: {e}")
-            self._send_frame(relay_ipc.delivery_result(corr, False, str(e)))
-            return
-        # delivered = send accepted by the backend (spec Sec70), not a
-        # relay-level OK acknowledgement.
-        self.sent_cache.record(endpoint, body)
-        self._send_frame(relay_ipc.delivery_result(corr, True))
-        log.info(f"Sent Bitchat event to '{endpoint}' ({body_bytes} B)")
+    return relay_ipc.capabilities(text=True,
+                                  max_payload=hello_max_payload(load_config(raw_cfg)))
+
+
+def _make_bridge(raw_cfg, sock):
+    from relayfabric_sdk.nip01 import load_or_create_identity
+
+    cfg = load_config(raw_cfg)
+    identity = load_or_create_identity(cfg["identity_file"])
+    return Bridge(cfg, BitchatBackend(cfg["relays"], cfg["channels"], identity), sock)
 
 
 def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
 
-    sock_path = os.environ["RELAYFABRIC_SOCKET"]
-    plugin_name = os.environ.get("RELAYFABRIC_PLUGIN_NAME", "bitchat")
-    raw_cfg = json.loads(os.environ.get("RELAYFABRIC_PLUGIN_CONFIG", "{}"))
-    # Scrub the resolved config (may carry secrets substituted by the daemon
-    # from a ${env:}/${file:} reference) out of our own environment so any
-    # child process this plugin spawns doesn't inherit it.
-    os.environ.pop("RELAYFABRIC_PLUGIN_CONFIG", None)
-    try:
-        cfg = load_config(raw_cfg)
-    except (ValueError, TypeError) as e:
-        print(f"relayfabric-bitchat: invalid config: {e}", file=sys.stderr)
-        sys.exit(1)
+    from relayfabric_sdk import run_plugin
 
-    from relayfabric_sdk import ipc as relay_ipc
-
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(sock_path)
-    rfile = sock.makefile("rb")
-    wfile = sock.makefile("wb")
-
-    caps = relay_ipc.capabilities(text=True, max_payload=hello_max_payload(cfg))
-    relay_ipc.write_frame(wfile, relay_ipc.hello(plugin_name, PLUGIN_VERSION, caps))
-    ack = relay_ipc.read_frame(rfile)
-    if ack.get("t") != "hello_ack" or ack.get("error"):
-        print(f"relayfabric-bitchat: hello rejected: {ack.get('error')}",
-             file=sys.stderr)
-        sys.exit(1)
-
-    from relayfabric_sdk.nip01 import load_or_create_identity
-
-    identity = load_or_create_identity(cfg["identity_file"])
-    backend = BitchatBackend(cfg["relays"], cfg["channels"], identity)
-    bridge = Bridge(cfg, backend, wfile)
-    backend.start()
-
-    def reader_loop():
-        for ev in backend.events():
-            try:
-                bridge.handle_event(ev)
-            except Exception as e:  # noqa: BLE001 - one bad event must not kill the reader
-                log.error(f"Bitchat event handler error: {e}")
-
-    threading.Thread(target=reader_loop, daemon=True).start()
-
-    while True:
-        try:
-            frame = relay_ipc.read_frame(rfile)
-        except (EOFError, OSError, ValueError) as e:
-            # ValueError: oversize/corrupt frame (relay_ipc.read_frame's own
-            # MAX_FRAME check). The stream is desynced at that point, so exit
-            # rather than continue -- there is no way to resume mid-frame.
-            log.error(f"Daemon connection lost, exiting: {e}")
-            sys.exit(1)
-        kind = frame.get("t")
-        if kind == "send":
-            bridge.handle_send(frame)
-        elif kind == "shutdown":
-            sys.exit(0)
+    run_plugin(os.environ.get("RELAYFABRIC_PLUGIN_NAME", "bitchat"),
+               PLUGIN_VERSION, _make_bridge, _caps)

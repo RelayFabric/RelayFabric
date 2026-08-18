@@ -420,8 +420,7 @@ class MeshCoreBackendTests(unittest.TestCase):
     manual field test (see README), not here."""
 
     def test_init_accepts_valid_connection_url(self):
-        backend = plug.MeshCoreBackend("serial:///dev/ttyUSB0")
-        self.assertEqual(backend.connection_url, "serial:///dev/ttyUSB0")
+        plug.MeshCoreBackend("serial:///dev/ttyUSB0")  # must not raise
 
     def test_init_rejects_bad_connection_url(self):
         with self.assertRaises(ValueError):

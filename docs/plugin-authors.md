@@ -95,11 +95,14 @@ present, then dispatches `send`/`send_direct`/`shutdown` to
 `bridge.handle_send(frame)` / `bridge.handle_send_direct(frame)` (skipped
 if absent) / `bridge.stop()` + exit 0. An IO error mid-loop exits 1.
 
-Adoption is opt-in: it fits cleanly when a plugin's Hello capabilities don't
-depend on its (validated) config. When they do — e.g. a `max_payload` derived
-from a config field with a default — the plugin keeps its own `main()`
-rather than duplicating that default outside the SDK's single validation
-point; see the plugin's own source comments for the specific reason.
+`capabilities` may be a plain dict, or a callable taking the parsed config
+dict and returning the caps dict — for plugins whose advertised caps depend
+on config (e.g. a `max_payload` derived from a validated config field). A
+`ValueError`/`TypeError` raised by the callable or by `bridge_factory`
+(the plugins' `load_config` validation errors) exits 1 with a clean
+"invalid config" line. Every shipped Python plugin runs on this scaffold;
+`relayfabric_sdk.bridge` additionally provides the shared `FrameWriter`
+write-lock base and the `capped_text_send` egress dance.
 
 ## Golden frames, for new-language authors
 

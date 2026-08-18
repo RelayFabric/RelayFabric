@@ -246,19 +246,21 @@ class SentCacheImportSmokeTests(unittest.TestCase):
 
 
 class ImportCleanlinessTests(unittest.TestCase):
-    """Module top level must be stdlib-only (coincurve/websockets/cbor2/
-    relayfabric_sdk imported lazily inside functions) so config/event
-    helpers stay importable without those deps. Run in a subprocess so
-    modules other tests in this file already imported (e.g. coincurve, for
-    the crypto tests themselves) can't mask a leaked top-level import."""
+    """Module top level must import no third-party dependency
+    (coincurve/websockets/cbor2 imported lazily inside functions; the
+    stdlib-only relayfabric_sdk.bridge is allowed) so config/event helpers
+    stay importable without those deps. Run in a subprocess so modules other
+    tests in this file already imported (e.g. coincurve, for the crypto
+    tests themselves) can't mask a leaked top-level import."""
 
-    def test_module_top_level_is_stdlib_only(self):
+    def test_module_top_level_imports_no_third_party_deps(self):
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
         script = (
-            "import sys\n"
+            "import os, sys\n"
+            "sys.path.insert(0, os.path.join('..', '..', 'sdk', 'python'))\n"
             "import relayfabric_nostr\n"
             "leaked = [m for m in "
-            "('coincurve', 'websockets', 'cbor2', 'relayfabric_sdk') "
+            "('coincurve', 'websockets', 'cbor2') "
             "if m in sys.modules]\n"
             "assert not leaked, leaked\n"
         )

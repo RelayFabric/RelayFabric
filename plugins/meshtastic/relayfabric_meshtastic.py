@@ -1,11 +1,11 @@
 """RelayFabric Meshtastic plugin: bridges Meshtastic MQTT text uplinks over Plugin Protocol v1.
 
-Module top level is stdlib-only (json/logging/os/queue/socket/sys/threading) so
-config/parser/loop-guard helpers stay importable without cbor2, paho-mqtt, or
-meshtastic/protobuf packages (GPL). relayfabric_sdk (ipc and SentCache) and
-paho.mqtt.client are imported lazily inside the methods that need them (see
-MqttJsonBackend.__init__ and main()).
-Text bytes are never logged, only names/types.
+Module top level imports only stdlib plus the stdlib-only
+relayfabric_sdk.bridge, so config/parser/loop-guard helpers stay importable
+without cbor2, paho-mqtt, or meshtastic/protobuf packages (GPL). The rest of
+relayfabric_sdk (ipc and SentCache) and paho.mqtt.client are imported lazily
+inside the methods that need them (see MqttJsonBackend.__init__ and
+_make_bridge). Text bytes are never logged, only names/types.
 """
 
 import json
@@ -13,10 +13,11 @@ import logging
 import math
 import os
 import queue
-import socket
-import sys
 import threading
 import time
+import urllib.parse
+
+from relayfabric_sdk.bridge import FrameWriter, capped_text_send
 
 log = logging.getLogger(__name__)
 
@@ -162,17 +163,10 @@ def parse_broker_url(url):
     Mirrors plugins/mqtt's Rust parse_broker rule: requires an "mqtt://"
     scheme, and defaults the port to 1883 when omitted.
     """
-    if not url.startswith("mqtt://"):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "mqtt" or not parsed.hostname:
         raise ValueError("broker must be mqtt://host[:port]")
-    rest = url[len("mqtt://"):]
-    if ":" in rest:
-        host, port_str = rest.split(":", 1)
-        try:
-            port = int(port_str)
-        except ValueError as e:
-            raise ValueError(f"bad port in broker url: {port_str!r}") from e
-        return host, port
-    return rest, 1883
+    return parsed.hostname, parsed.port or 1883
 
 
 class MqttJsonBackend:
@@ -265,7 +259,7 @@ class MqttJsonBackend:
             raise RuntimeError(f"mqtt publish to {self._pub_topic!r} timed out")
 
 
-class Bridge:
+class Bridge(FrameWriter):
     """Bridges parsed Meshtastic MQTT JSON events <-> Plugin Protocol frames.
 
     Mirrors plugins/signal's Bridge exactly (write lock, _send_frame).
@@ -281,10 +275,9 @@ class Bridge:
     def __init__(self, cfg, backend, sock_file):
         from relayfabric_sdk import SentCache
 
+        super().__init__(sock_file)
         self.cfg = cfg
         self.backend = backend
-        self.sock_file = sock_file
-        self.write_lock = threading.Lock()
         # 1h, not SentCache's 86400s default: a Meshtastic radio echo (our
         # downlink re-uplinked by the node) arrives fast, so this only needs
         # to bound how long a lost echo can leave a stale entry able to
@@ -296,11 +289,16 @@ class Bridge:
         # _maybe_emit_gauges), only after GAUGES_INTERVAL_SECS has elapsed.
         self._last_gauges_at = time.monotonic()
 
-    def _send_frame(self, obj):
-        from relayfabric_sdk import ipc as relay_ipc
+    def start(self):
+        self.backend.start()
+        threading.Thread(target=self._reader_loop, daemon=True).start()
 
-        with self.write_lock:
-            relay_ipc.write_frame(self.sock_file, obj)
+    def _reader_loop(self):
+        for topic, event in self.backend.events():
+            try:
+                self.handle_event(topic, event)
+            except Exception as e:  # noqa: BLE001 - one bad event must not kill the reader
+                log.error(f"Meshtastic event handler error: {e}")
 
     def _maybe_emit_gauges(self, event):
         """Best-effort gauge snapshot (design §3), rate-limited to at most
@@ -354,42 +352,13 @@ class Bridge:
     # ----- egress (daemon -> Meshtastic); called from the main thread -----
 
     def handle_send(self, frame):
-        from relayfabric_sdk import ipc as relay_ipc
-
-        corr = frame["corr"]
-        endpoint = frame["endpoint"]
-        body = frame["body"]
-        channel_spec = self.cfg["channels"].get(endpoint)
-        if channel_spec is None:
-            log.warning(f"Meshtastic send to unknown endpoint {endpoint!r}")
-            self._send_frame(relay_ipc.delivery_result(corr, False, "unknown endpoint"))
-            return
-
-        body_bytes = len(body.encode("utf-8"))
-        max_bytes = self.cfg["max_text_bytes"]
-        if body_bytes > max_bytes:
-            # defensive: the daemon should have already truncated to our
-            # advertised capabilities.max_payload before it ever sends us
-            # this frame.
-            detail = f"body {body_bytes} B exceeds max_text_bytes {max_bytes} B"
-            log.warning(f"Meshtastic send to '{endpoint}' dropped: {detail}")
-            self._send_frame(relay_ipc.delivery_result(corr, False, detail))
-            return
-
-        try:
-            self.backend.publish_downlink({
-                "from": 0,
-                "channel": channel_spec["index"],
-                "type": "sendtext",
-                "payload": body,
-            })
-        except Exception as e:  # noqa: BLE001 - report the failure, don't crash
-            log.warning(f"Meshtastic send to '{endpoint}' failed: {e}")
-            self._send_frame(relay_ipc.delivery_result(corr, False, str(e)))
-            return
-        self.sent_cache.record(endpoint, body)
-        self._send_frame(relay_ipc.delivery_result(corr, True))
-        log.info(f"Sent Meshtastic message to '{endpoint}' ({body_bytes} B)")
+        capped_text_send(self, frame, "Meshtastic", "Meshtastic message",
+                         lambda spec, endpoint, body: self.backend.publish_downlink({
+                             "from": 0,
+                             "channel": spec["index"],
+                             "type": "sendtext",
+                             "payload": body,
+                         }))
 
 
 def hello_max_payload(cfg):
@@ -406,62 +375,23 @@ def hello_max_payload(cfg):
     return min(MESHTASTIC_MAX_PAYLOAD, cfg["max_text_bytes"])
 
 
+def _caps(raw_cfg):
+    from relayfabric_sdk import ipc as relay_ipc
+
+    return relay_ipc.capabilities(groups=True,
+                                  max_payload=hello_max_payload(load_config(raw_cfg)))
+
+
+def _make_bridge(raw_cfg, sock):
+    cfg = load_config(raw_cfg)
+    return Bridge(cfg, MqttJsonBackend(cfg["broker"], cfg["topic_root"]), sock)
+
+
 def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
 
-    sock_path = os.environ["RELAYFABRIC_SOCKET"]
-    plugin_name = os.environ.get("RELAYFABRIC_PLUGIN_NAME", "meshtastic")
-    raw_cfg = json.loads(os.environ.get("RELAYFABRIC_PLUGIN_CONFIG", "{}"))
-    # Scrub the resolved config (may carry secrets substituted by the daemon
-    # from a ${env:}/${file:} reference) out of our own environment so any
-    # child process this plugin spawns doesn't inherit it.
-    os.environ.pop("RELAYFABRIC_PLUGIN_CONFIG", None)
-    try:
-        cfg = load_config(raw_cfg)
-    except (ValueError, TypeError) as e:
-        print(f"relayfabric-meshtastic: invalid config: {e}", file=sys.stderr)
-        sys.exit(1)
+    from relayfabric_sdk import run_plugin
 
-    from relayfabric_sdk import ipc as relay_ipc
-
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(sock_path)
-    rfile = sock.makefile("rb")
-    wfile = sock.makefile("wb")
-
-    caps = relay_ipc.capabilities(groups=True, max_payload=hello_max_payload(cfg))
-    relay_ipc.write_frame(wfile, relay_ipc.hello(plugin_name, PLUGIN_VERSION, caps))
-    ack = relay_ipc.read_frame(rfile)
-    if ack.get("t") != "hello_ack" or ack.get("error"):
-        print(f"relayfabric-meshtastic: hello rejected: {ack.get('error')}",
-             file=sys.stderr)
-        sys.exit(1)
-
-    backend = MqttJsonBackend(cfg["broker"], cfg["topic_root"])
-    bridge = Bridge(cfg, backend, wfile)
-    backend.start()
-
-    def reader_loop():
-        for topic, event in backend.events():
-            try:
-                bridge.handle_event(topic, event)
-            except Exception as e:  # noqa: BLE001 - one bad event must not kill the reader
-                log.error(f"Meshtastic event handler error: {e}")
-
-    threading.Thread(target=reader_loop, daemon=True).start()
-
-    while True:
-        try:
-            frame = relay_ipc.read_frame(rfile)
-        except (EOFError, OSError, ValueError) as e:
-            # ValueError: oversize/corrupt frame (relay_ipc.read_frame's own
-            # MAX_FRAME check). The stream is desynced at that point, so exit
-            # rather than continue -- there is no way to resume mid-frame.
-            log.error(f"Daemon connection lost, exiting: {e}")
-            sys.exit(1)
-        kind = frame.get("t")
-        if kind == "send":
-            bridge.handle_send(frame)
-        elif kind == "shutdown":
-            sys.exit(0)
+    run_plugin(os.environ.get("RELAYFABRIC_PLUGIN_NAME", "meshtastic"),
+               PLUGIN_VERSION, _make_bridge, _caps)

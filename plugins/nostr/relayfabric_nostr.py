@@ -1,16 +1,16 @@
 """RelayFabric Nostr plugin: bridges Nostr relays (NIP-01 kind-1 notes) over
 Plugin Protocol v1 (relayfabric_sdk).
 
-Module top level is stdlib-only (asyncio/copy/json/logging/os/queue/socket/
-sys/threading/time) so config helpers stay importable without coincurve,
-websockets, cbor2, or relayfabric_sdk. Those are imported lazily inside the
-functions/methods that need them: the NIP-01 event primitives (event id,
-schnorr sign/verify, identity load/generate) live in relayfabric_sdk.nip01
-(promoted there in cycle J so the bitchat plugin can share the same tested
-crypto) and are imported where normalize_event/NostrBackend.publish/main()
-call them; NostrBackend.start() imports websockets; Bridge and main() import
-the rest of relayfabric_sdk -- the same lazy-import shape meshcore/signal
-use. Note bytes/content are never logged, only pubkeys/kinds/channel names.
+Module top level imports only stdlib plus the stdlib-only
+relayfabric_sdk.bridge, so config helpers stay importable without coincurve,
+websockets, or cbor2. Those are imported lazily inside the functions/methods
+that need them: the NIP-01 event primitives (event id, schnorr sign/verify,
+identity load/generate) live in relayfabric_sdk.nip01 (promoted there in
+cycle J so the bitchat plugin can share the same tested crypto) and are
+imported where normalize_event/NostrBackend.publish/_make_bridge call them;
+NostrBackend.start() imports websockets -- the same lazy-import shape
+meshcore/signal use. Note bytes/content are never logged, only
+pubkeys/kinds/channel names.
 """
 
 import asyncio
@@ -19,10 +19,10 @@ import json
 import logging
 import os
 import queue
-import socket
-import sys
 import threading
 import time
+
+from relayfabric_sdk.bridge import FrameWriter, capped_text_send
 
 log = logging.getLogger(__name__)
 
@@ -193,7 +193,7 @@ class NostrBackend:
     def __init__(self, relays, channels, identity):
         self.relays = list(relays)
         self.channels = channels
-        self.privkey_hex, self.pubkey_hex = identity
+        self.privkey_hex, _ = identity
         self._queue = queue.Queue(maxsize=256)
         self._loop = None
         # relay url -> live websocket connection; populated/cleared only
@@ -330,7 +330,7 @@ class NostrBackend:
         return any_ok
 
 
-class Bridge:
+class Bridge(FrameWriter):
     """Bridges normalized Nostr events <-> Plugin Protocol frames. Mirrors
     plugins/meshcore's Bridge shape (write lock, _send_frame, SentCache loop
     guard, deny-by-default, oversize defensive drop) with one difference:
@@ -348,20 +348,24 @@ class Bridge:
     def __init__(self, cfg, backend, sock_file):
         from relayfabric_sdk import SentCache
 
+        super().__init__(sock_file)
         self.cfg = cfg
         self.backend = backend
-        self.sock_file = sock_file
-        self.write_lock = threading.Lock()
         # 1h, not SentCache's 86400s default: mirrors meshcore/meshtastic's
         # echo loop-guard window (bounds how long a lost echo/ack can leave
         # a stale entry able to swallow one genuine identical-text message).
         self.sent_cache = SentCache(ttl_secs=3600)
 
-    def _send_frame(self, obj):
-        from relayfabric_sdk import ipc as relay_ipc
+    def start(self):
+        self.backend.start()
+        threading.Thread(target=self._reader_loop, daemon=True).start()
 
-        with self.write_lock:
-            relay_ipc.write_frame(self.sock_file, obj)
+    def _reader_loop(self):
+        for ev in self.backend.events():
+            try:
+                self.handle_event(ev)
+            except Exception as e:  # noqa: BLE001 - one bad event must not kill the reader
+                log.error(f"Nostr event handler error: {e}")
 
     # ----- inbound (Nostr -> daemon); called from the backend's reader thread -----
 
@@ -380,100 +384,30 @@ class Bridge:
     # ----- egress (daemon -> Nostr); called from the main thread -----
 
     def handle_send(self, frame):
-        from relayfabric_sdk import ipc as relay_ipc
+        capped_text_send(self, frame, "Nostr", "Nostr event",
+                         lambda spec, endpoint, body: self.backend.publish(endpoint, body))
 
-        corr = frame["corr"]
-        endpoint = frame["endpoint"]
-        body = frame["body"]
-        channel_spec = self.cfg["channels"].get(endpoint)
-        if channel_spec is None:
-            log.warning(f"Nostr send to unknown endpoint {endpoint!r}")
-            self._send_frame(relay_ipc.delivery_result(corr, False, "unknown endpoint"))
-            return
 
-        body_bytes = len(body.encode("utf-8"))
-        max_bytes = self.cfg["max_text_bytes"]
-        if body_bytes > max_bytes:
-            # defensive: the daemon should have already truncated to our
-            # advertised capabilities.max_payload before it ever sends us
-            # this frame.
-            detail = f"body {body_bytes} B exceeds max_text_bytes {max_bytes} B"
-            log.warning(f"Nostr send to '{endpoint}' dropped: {detail}")
-            self._send_frame(relay_ipc.delivery_result(corr, False, detail))
-            return
+def _caps(raw_cfg):
+    from relayfabric_sdk import ipc as relay_ipc
 
-        try:
-            self.backend.publish(endpoint, body)
-        except Exception as e:  # noqa: BLE001 - report the failure, don't crash
-            log.warning(f"Nostr send to '{endpoint}' failed: {e}")
-            self._send_frame(relay_ipc.delivery_result(corr, False, str(e)))
-            return
-        # delivered = send accepted by the backend (spec Sec70), not a
-        # relay-level OK acknowledgement.
-        self.sent_cache.record(endpoint, body)
-        self._send_frame(relay_ipc.delivery_result(corr, True))
-        log.info(f"Sent Nostr event to '{endpoint}' ({body_bytes} B)")
+    return relay_ipc.capabilities(text=True,
+                                  max_payload=hello_max_payload(load_config(raw_cfg)))
+
+
+def _make_bridge(raw_cfg, sock):
+    from relayfabric_sdk.nip01 import load_or_create_identity
+
+    cfg = load_config(raw_cfg)
+    identity = load_or_create_identity(cfg["identity_file"])
+    return Bridge(cfg, NostrBackend(cfg["relays"], cfg["channels"], identity), sock)
 
 
 def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
 
-    sock_path = os.environ["RELAYFABRIC_SOCKET"]
-    plugin_name = os.environ.get("RELAYFABRIC_PLUGIN_NAME", "nostr")
-    raw_cfg = json.loads(os.environ.get("RELAYFABRIC_PLUGIN_CONFIG", "{}"))
-    # Scrub the resolved config (may carry secrets substituted by the daemon
-    # from a ${env:}/${file:} reference) out of our own environment so any
-    # child process this plugin spawns doesn't inherit it.
-    os.environ.pop("RELAYFABRIC_PLUGIN_CONFIG", None)
-    try:
-        cfg = load_config(raw_cfg)
-    except (ValueError, TypeError) as e:
-        print(f"relayfabric-nostr: invalid config: {e}", file=sys.stderr)
-        sys.exit(1)
+    from relayfabric_sdk import run_plugin
 
-    from relayfabric_sdk import ipc as relay_ipc
-
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(sock_path)
-    rfile = sock.makefile("rb")
-    wfile = sock.makefile("wb")
-
-    caps = relay_ipc.capabilities(text=True, max_payload=hello_max_payload(cfg))
-    relay_ipc.write_frame(wfile, relay_ipc.hello(plugin_name, PLUGIN_VERSION, caps))
-    ack = relay_ipc.read_frame(rfile)
-    if ack.get("t") != "hello_ack" or ack.get("error"):
-        print(f"relayfabric-nostr: hello rejected: {ack.get('error')}",
-             file=sys.stderr)
-        sys.exit(1)
-
-    from relayfabric_sdk.nip01 import load_or_create_identity
-
-    identity = load_or_create_identity(cfg["identity_file"])
-    backend = NostrBackend(cfg["relays"], cfg["channels"], identity)
-    bridge = Bridge(cfg, backend, wfile)
-    backend.start()
-
-    def reader_loop():
-        for ev in backend.events():
-            try:
-                bridge.handle_event(ev)
-            except Exception as e:  # noqa: BLE001 - one bad event must not kill the reader
-                log.error(f"Nostr event handler error: {e}")
-
-    threading.Thread(target=reader_loop, daemon=True).start()
-
-    while True:
-        try:
-            frame = relay_ipc.read_frame(rfile)
-        except (EOFError, OSError, ValueError) as e:
-            # ValueError: oversize/corrupt frame (relay_ipc.read_frame's own
-            # MAX_FRAME check). The stream is desynced at that point, so exit
-            # rather than continue -- there is no way to resume mid-frame.
-            log.error(f"Daemon connection lost, exiting: {e}")
-            sys.exit(1)
-        kind = frame.get("t")
-        if kind == "send":
-            bridge.handle_send(frame)
-        elif kind == "shutdown":
-            sys.exit(0)
+    run_plugin(os.environ.get("RELAYFABRIC_PLUGIN_NAME", "nostr"),
+               PLUGIN_VERSION, _make_bridge, _caps)

@@ -406,13 +406,14 @@ class ImportCleanlinessTests(unittest.TestCase):
     import -- mirrors plugins/nostr/test_relayfabric_nostr.py's precedent.
     """
 
-    def test_module_top_level_is_stdlib_only(self):
+    def test_module_top_level_imports_no_third_party_deps(self):
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
         script = (
-            "import sys\n"
+            "import os, sys\n"
+            "sys.path.insert(0, os.path.join('..', '..', 'sdk', 'python'))\n"
             "import relayfabric_bitchat\n"
             "leaked = [m for m in "
-            "('coincurve', 'websockets', 'cbor2', 'relayfabric_sdk') "
+            "('coincurve', 'websockets', 'cbor2') "
             "if m in sys.modules]\n"
             "assert not leaked, leaked\n"
         )
