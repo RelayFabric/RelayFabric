@@ -36,8 +36,16 @@ use std::sync::Arc;
 /// here fails startup loudly rather than silently continuing with a
 /// world-accessible socket.
 fn harden_socket(path: &Path) -> std::io::Result<()> {
+    set_socket_mode(path, 0o600)
+}
+
+/// v0.4 cycle B: a plugin socket with a configured `peer_uid` must be
+/// connectable by that foreign uid, so it opens to 0666 -- the
+/// `SO_PEERCRED` check in `plugins::handle_conn` is the gate there, not
+/// the file mode. Without `peer_uid` the socket stays 0600.
+fn set_socket_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 fn main() {
@@ -79,22 +87,42 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async move {
         let daemon = Arc::new(engine::Daemon::new(cfg, &data_dir).expect("daemon init"));
-        let plugin_sock = data_dir.join("plugins.sock");
-        let _ = std::fs::remove_file(&plugin_sock);
-        let listener = tokio::net::UnixListener::bind(&plugin_sock).expect("bind plugin socket");
-        harden_socket(&plugin_sock).expect("harden plugin socket permissions");
-        tokio::spawn(plugins::listen(daemon.clone(), listener));
+        // Per-plugin sockets (v0.4 cycle B): every enabled plugin gets its
+        // own listener at <data_dir>/plugins.d/<name>.sock, bound to its
+        // name -- a connection can only become the plugin its socket is
+        // for, and each socket carries its own peer-uid policy.
+        let plugin_sock_dir = data_dir.join("plugins.d");
+        engine::create_data_dir(&plugin_sock_dir).expect("create plugin socket dir");
         let plugin_configs = daemon.cfg_snapshot(|c| c.plugins.clone());
+        // Isolation deployments (any peer_uid configured) need the foreign
+        // plugin uid to TRAVERSE into the socket dir: 0711 grants search
+        // only -- non-owner processes still can't list it, and each socket
+        // keeps its own mode + the SO_PEERCRED gate. The data_dir itself
+        // must then also be traversable (0711); see
+        // deploy/systemd/switchyardd.service.
+        if plugin_configs
+            .values()
+            .any(|p| p.enabled && p.peer_uid.is_some())
+        {
+            set_socket_mode(&plugin_sock_dir, 0o711).expect("open plugin socket dir for traversal");
+        }
         for (name, pc) in &plugin_configs {
-            if pc.enabled {
-                if let Some(cmd) = &pc.command {
-                    tokio::spawn(plugins::supervise(
-                        daemon.clone(),
-                        name.clone(),
-                        cmd.clone(),
-                        plugin_sock.clone(),
-                    ));
-                }
+            if !pc.enabled {
+                continue;
+            }
+            let sock = plugin_sock_dir.join(format!("{name}.sock"));
+            let _ = std::fs::remove_file(&sock);
+            let listener = tokio::net::UnixListener::bind(&sock).expect("bind plugin socket");
+            let mode = if pc.peer_uid.is_some() { 0o666 } else { 0o600 };
+            set_socket_mode(&sock, mode).expect("harden plugin socket permissions");
+            tokio::spawn(plugins::listen(daemon.clone(), listener, name.clone()));
+            if let Some(cmd) = &pc.command {
+                tokio::spawn(plugins::supervise(
+                    daemon.clone(),
+                    name.clone(),
+                    cmd.clone(),
+                    sock.clone(),
+                ));
             }
         }
         tokio::spawn(engine::pump(daemon.clone()));

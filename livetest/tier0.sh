@@ -34,8 +34,8 @@ if [ -z "$MQTT_PORT" ]; then
   exit 1
 fi
 
-if [ ! -S "$DATA_DIR/admin.sock" ] || [ ! -S "$DATA_DIR/plugins.sock" ]; then
-  echo "tier0.sh: switchyardd is not up (no admin.sock/plugins.sock under $DATA_DIR)." >&2
+if [ ! -S "$DATA_DIR/admin.sock" ] || [ ! -d "$DATA_DIR/plugins.d" ]; then
+  echo "tier0.sh: switchyardd is not up (no admin.sock/plugins.d under $DATA_DIR)." >&2
   echo "          run up.sh first." >&2
   exit 1
 fi

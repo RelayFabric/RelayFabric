@@ -34,7 +34,10 @@ inside it:
 - `admin.sock` — the admin API, bound fresh on every start (any stale
   socket file from a previous run is removed first) and hardened to `0600`
   immediately after `bind()`.
-- `plugins.sock` — the CBOR-over-Unix-socket plugin IPC endpoint, bound and
+- `plugins.d/<name>.sock` — one CBOR-over-Unix-socket plugin IPC endpoint
+  per enabled plugin (v0.4: a connection can only become the plugin its
+  socket is bound to, and each socket carries its own `peer_uid` policy),
+  bound and
   hardened the same way. Plugins `switchyardd` spawns itself connect to it
   automatically; a plugin run out-of-process instead is pointed at it via
   the `RELAYFABRIC_SOCKET` environment variable.
@@ -278,3 +281,21 @@ delayed bursts.
 - [Security & Sealed Routing](security.md) — the access-control model
   behind the admin socket, and sealed-routing security modes
 </content>
+
+## Hardened systemd deployment
+
+`deploy/systemd/` ships two units (v0.4 cycle B):
+
+- `switchyardd.service` — the daemon as its own `relayfabric` user with
+  full sandboxing (`ProtectSystem=strict`, seccomp `@system-service`, empty
+  capability set, `MemoryDenyWriteExecute`).
+- `relayfabric-plugin@.service` — one instance per plugin, each under its
+  own `relayfabric-plugin-<name>` user. Pair each instance with the
+  plugin's `peer_uid` in `relayfabric.yaml`; the daemon then accepts only
+  that UID on the plugin's socket. Radio/serial plugins loosen
+  `PrivateDevices` per-instance via a drop-in (`DeviceAllow=/dev/ttyUSB0`),
+  and radio plugins drop `AF_INET` entirely.
+
+Under this layout a compromised plugin parser cannot read the daemon's
+identity/sealed keys, open `admin.sock`, impersonate another plugin, or
+reach devices and networks outside its allowlist.

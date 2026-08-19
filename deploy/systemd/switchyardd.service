@@ -1,0 +1,51 @@
+# RelayFabric daemon — the privileged trust zone (routing, policy, identity
+# keys, queue, federation). Runs as its own user; plugins run under
+# relayfabric-plugin@.service as DIFFERENT users, so a compromised plugin
+# cannot read the daemon's keys, open admin.sock, or impersonate another
+# plugin (v0.4 cycle B).
+#
+# Setup:
+#   useradd --system --home /var/lib/relayfabric --shell /usr/sbin/nologin relayfabric
+#   # 0711 (not 0700): per-plugin users must be able to TRAVERSE into
+#   # plugins.d/ to reach their sockets; everything sensitive inside
+#   # (identity/, storage, admin.sock) keeps its own 0700/0600 modes.
+#   install -d -o relayfabric -g relayfabric -m 0711 /var/lib/relayfabric
+
+[Unit]
+Description=RelayFabric switchyardd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=relayfabric
+Group=relayfabric
+ExecStart=/usr/local/bin/switchyardd --config /etc/relayfabric/relayfabric.yaml
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/relayfabric
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -9,13 +9,17 @@ use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-pub async fn listen(d: Arc<Daemon>, listener: UnixListener) {
+/// One listener per enabled plugin (v0.4 cycle B): the daemon binds
+/// `<data_dir>/plugins.d/<name>.sock` for each and passes the name down, so
+/// a connection can only ever become the plugin its socket is bound to.
+pub async fn listen(d: Arc<Daemon>, listener: UnixListener, plugin_name: String) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let d = d.clone();
+                let name = plugin_name.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(d, stream).await {
+                    if let Err(e) = handle_conn(d, stream, name).await {
                         warn!(error = %e, "plugin connection ended");
                     }
                 });
@@ -28,7 +32,31 @@ pub async fn listen(d: Arc<Daemon>, listener: UnixListener) {
     }
 }
 
-async fn handle_conn(d: Arc<Daemon>, stream: tokio::net::UnixStream) -> std::io::Result<()> {
+async fn handle_conn(
+    d: Arc<Daemon>,
+    stream: tokio::net::UnixStream,
+    bound_plugin: String,
+) -> std::io::Result<()> {
+    // Peer-credential gate (v0.4 cycle B), BEFORE any frame is parsed: an
+    // unauthorized peer's bytes never reach the codec. With `peer_uid`
+    // configured, EXACTLY that uid may attach (fail closed -- the daemon's
+    // own uid is deliberately not grandfathered in, so a misconfigured
+    // same-user process can't slip past an explicit isolation policy);
+    // without it, only the daemon's own euid may (the pre-v0.4 same-user
+    // posture, now enforced rather than implied by file modes).
+    let cred = stream.peer_cred()?;
+    let expected_uid = d.cfg_snapshot(|c| c.plugins.get(&bound_plugin).and_then(|p| p.peer_uid));
+    let uid_ok = match expected_uid {
+        Some(uid) => cred.uid() == uid,
+        None => cred.uid() == unsafe { libc::geteuid() },
+    };
+    if !uid_ok {
+        return Err(std::io::Error::other(format!(
+            "refused peer uid {} on socket for plugin '{bound_plugin}'",
+            cred.uid()
+        )));
+    }
+
     let (mut r, mut w) = stream.into_split();
     let hello: PluginToDaemon = read_frame(&mut r).await?;
     let PluginToDaemon::Hello {
@@ -40,13 +68,18 @@ async fn handle_conn(d: Arc<Daemon>, stream: tokio::net::UnixStream) -> std::io:
     else {
         return Err(std::io::Error::other("first frame must be Hello"));
     };
-    // trust boundary: only configured+enabled plugin names may attach
-    let allowed = d.cfg_snapshot(|c| c.plugins.get(&plugin).map(|p| p.enabled).unwrap_or(false));
+    // trust boundary: the hello must claim the name this socket is bound
+    // to, and that name must still be a configured+enabled plugin.
+    let name_ok = plugin == bound_plugin;
+    let allowed =
+        name_ok && d.cfg_snapshot(|c| c.plugins.get(&plugin).map(|p| p.enabled).unwrap_or(false));
     if !allowed || protocol_version != PROTOCOL_VERSION {
-        let err = if allowed {
-            "unsupported protocol version"
-        } else {
+        let err = if !name_ok {
+            "plugin name does not match socket"
+        } else if !allowed {
             "unknown plugin"
+        } else {
+            "unsupported protocol version"
         };
         write_frame(
             &mut w,
@@ -205,7 +238,7 @@ mod tests {
         let d = Arc::new(test_daemon(dir.path()));
         let (plugin_side, daemon_side) = UnixStream::pair().unwrap();
 
-        let conn = tokio::spawn(handle_conn(d.clone(), daemon_side));
+        let conn = tokio::spawn(handle_conn(d.clone(), daemon_side, "mocka".into()));
 
         let (mut r, mut w) = plugin_side.into_split();
         write_frame(
@@ -258,7 +291,7 @@ mod tests {
         let mut rx = d.events.subscribe();
         let (plugin_side, daemon_side) = UnixStream::pair().unwrap();
 
-        let conn = tokio::spawn(handle_conn(d.clone(), daemon_side));
+        let conn = tokio::spawn(handle_conn(d.clone(), daemon_side, "mocka".into()));
 
         let (mut r, mut w) = plugin_side.into_split();
         write_frame(
@@ -310,13 +343,48 @@ mod tests {
         }
     }
 
+    /// A Hello claiming a name other than the one this socket is bound to
+    /// is impersonation and must be rejected before any state is touched --
+    /// per-plugin sockets make the daemon, not the connector, the authority
+    /// on which plugin a connection can be.
+    #[tokio::test]
+    async fn hello_name_must_match_the_socket_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let (plugin_side, daemon_side) = UnixStream::pair().unwrap();
+
+        let conn = tokio::spawn(handle_conn(d.clone(), daemon_side, "mocka".into()));
+
+        let (mut r, mut w) = plugin_side.into_split();
+        write_frame(
+            &mut w,
+            &PluginToDaemon::Hello {
+                plugin: "mockb".into(),
+                version: "0.1.0".into(),
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: Capabilities::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let ack: DaemonToPlugin = read_frame(&mut r).await.unwrap();
+        assert!(
+            matches!(&ack, DaemonToPlugin::HelloAck { error: Some(e), .. }
+                     if e == "plugin name does not match socket"),
+            "a cross-name hello must be rejected: {ack:?}"
+        );
+        let _ = conn.await;
+    }
+
+    /// A socket bound to a name that is no longer an enabled configured
+    /// plugin (live config change after bind) still refuses the hello.
     #[tokio::test]
     async fn hello_from_unknown_plugin_is_rejected_before_any_gauges_handling() {
         let dir = tempfile::tempdir().unwrap();
         let d = Arc::new(test_daemon(dir.path()));
         let (plugin_side, daemon_side) = UnixStream::pair().unwrap();
 
-        let conn = tokio::spawn(handle_conn(d.clone(), daemon_side));
+        let conn = tokio::spawn(handle_conn(d.clone(), daemon_side, "not-configured".into()));
 
         let (mut r, mut w) = plugin_side.into_split();
         write_frame(
@@ -335,6 +403,77 @@ mod tests {
             matches!(&ack, DaemonToPlugin::HelloAck { error: Some(e), .. } if e == "unknown plugin"),
             "an unconfigured plugin name must be rejected: {ack:?}"
         );
+        let _ = conn.await;
+    }
+
+    /// With `peer_uid` configured to a uid that is NOT the connecting
+    /// process's, the connection is refused before a single frame is read
+    /// (no HelloAck, just EOF) -- unauthorized peers don't get their bytes
+    /// parsed.
+    #[tokio::test]
+    async fn mismatched_peer_uid_is_refused_before_reading_any_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let self_uid = unsafe { libc::geteuid() };
+        if let Some(p) = d.cfg.write().unwrap().plugins.get_mut("mocka") {
+            p.peer_uid = Some(self_uid + 1);
+        }
+        let (plugin_side, daemon_side) = UnixStream::pair().unwrap();
+
+        let conn = tokio::spawn(handle_conn(d.clone(), daemon_side, "mocka".into()));
+
+        let (mut r, mut w) = plugin_side.into_split();
+        // The refusal may close the connection before this write lands --
+        // a BrokenPipe here IS the refusal, so the write result is ignored.
+        let _ = write_frame(
+            &mut w,
+            &PluginToDaemon::Hello {
+                plugin: "mocka".into(),
+                version: "0.1.0".into(),
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: Capabilities::default(),
+            },
+        )
+        .await;
+        let refused = read_frame::<_, DaemonToPlugin>(&mut r).await;
+        assert!(refused.is_err(), "must close without an ack: {refused:?}");
+        let res = conn.await.unwrap();
+        assert!(res.is_err(), "handle_conn must report the refusal");
+    }
+
+    /// A configured `peer_uid` that matches the connecting process is
+    /// accepted (and the daemon's own uid always is).
+    #[tokio::test]
+    async fn matching_peer_uid_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let self_uid = unsafe { libc::geteuid() };
+        if let Some(p) = d.cfg.write().unwrap().plugins.get_mut("mocka") {
+            p.peer_uid = Some(self_uid);
+        }
+        let (plugin_side, daemon_side) = UnixStream::pair().unwrap();
+
+        let conn = tokio::spawn(handle_conn(d.clone(), daemon_side, "mocka".into()));
+
+        let (mut r, mut w) = plugin_side.into_split();
+        write_frame(
+            &mut w,
+            &PluginToDaemon::Hello {
+                plugin: "mocka".into(),
+                version: "0.1.0".into(),
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: Capabilities::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let ack: DaemonToPlugin = read_frame(&mut r).await.unwrap();
+        assert!(
+            matches!(ack, DaemonToPlugin::HelloAck { error: None, .. }),
+            "matching peer_uid must be accepted: {ack:?}"
+        );
+        drop(w);
+        drop(r);
         let _ = conn.await;
     }
 }

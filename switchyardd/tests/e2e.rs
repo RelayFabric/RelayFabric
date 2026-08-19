@@ -16,8 +16,8 @@ struct TestDaemon {
 }
 
 impl TestDaemon {
-    fn plugin_sock(&self) -> PathBuf {
-        self.dir.path().join("data/plugins.sock")
+    fn plugin_sock(&self, name: &str) -> PathBuf {
+        self.dir.path().join(format!("data/plugins.d/{name}.sock"))
     }
     fn admin_sock(&self) -> PathBuf {
         self.dir.path().join("data/admin.sock")
@@ -440,9 +440,9 @@ async fn poll_stream_until_count(
 #[tokio::test]
 async fn bridges_dedups_and_suppresses_echo() {
     let d = start_daemon(tempfile::tempdir().unwrap());
-    wait_for(&d.plugin_sock()).await;
-    let (mut ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
-    let (mut rb, mut wb) = connect_plugin(&d.plugin_sock(), "mockb").await;
+    wait_for(&d.plugin_sock("mocka")).await;
+    let (mut ra, mut wa) = connect_plugin(&d.plugin_sock("mocka"), "mocka").await;
+    let (mut rb, mut wb) = connect_plugin(&d.plugin_sock("mockb"), "mockb").await;
 
     // A → B with pseudonymized origin tag
     let sent_at = chrono::Utc::now();
@@ -507,8 +507,8 @@ async fn bridges_dedups_and_suppresses_echo() {
 #[tokio::test]
 async fn queues_for_offline_plugin_and_survives_restart() {
     let mut d = start_daemon(tempfile::tempdir().unwrap());
-    wait_for(&d.plugin_sock()).await;
-    let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
+    wait_for(&d.plugin_sock("mocka")).await;
+    let (_ra, mut wa) = connect_plugin(&d.plugin_sock("mocka"), "mocka").await;
 
     // B is not connected: delivery must queue
     inbound(
@@ -550,10 +550,10 @@ async fn queues_for_offline_plugin_and_survives_restart() {
     d.child.kill().unwrap();
     d.child.wait().unwrap();
     // remove the stale socket file so wait_for sees the NEW daemon's bind
-    let _ = std::fs::remove_file(d.plugin_sock());
+    let _ = std::fs::remove_file(d.plugin_sock("mocka"));
     let cfg_path = d.dir.path().join("relayfabric.yaml");
     d.child = spawn_daemon(&cfg_path);
-    wait_for(&d.plugin_sock()).await;
+    wait_for(&d.plugin_sock("mocka")).await;
 
     assert!(
         cas_path.exists(),
@@ -564,7 +564,7 @@ async fn queues_for_offline_plugin_and_survives_restart() {
     // queued attachment actually rides along) and receives both parked
     // messages in order (spec §68).
     let (mut rb, mut wb) = connect_plugin_with_caps(
-        &d.plugin_sock(),
+        &d.plugin_sock("mockb"),
         "mockb",
         Capabilities {
             max_payload: Some(200),
@@ -621,8 +621,8 @@ async fn queues_for_offline_plugin_and_survives_restart() {
 #[tokio::test]
 async fn emergency_priority_overtakes_bulk_priority_for_an_offline_plugin() {
     let d = start_daemon(tempfile::tempdir().unwrap());
-    wait_for(&d.plugin_sock()).await;
-    let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
+    wait_for(&d.plugin_sock("mocka")).await;
+    let (_ra, mut wa) = connect_plugin(&d.plugin_sock("mocka"), "mocka").await;
 
     // B is not connected: three bulk-priority messages queue first...
     for body in ["bulk one", "bulk two", "bulk three"] {
@@ -654,7 +654,7 @@ async fn emergency_priority_overtakes_bulk_priority_for_an_offline_plugin() {
 
     // B connects: despite arriving last, the emergency message must be the
     // FIRST Send delivered.
-    let (mut rb, mut wb) = connect_plugin(&d.plugin_sock(), "mockb").await;
+    let (mut rb, mut wb) = connect_plugin(&d.plugin_sock("mockb"), "mockb").await;
     let (corr, _, body, _) = expect_send(&mut rb).await;
     assert!(
         body.contains("emergency evacuation notice"),
@@ -700,10 +700,10 @@ async fn emergency_priority_overtakes_bulk_priority_for_an_offline_plugin() {
 #[tokio::test]
 async fn attachment_egress_is_capability_aware() {
     let d = start_daemon(tempfile::tempdir().unwrap());
-    wait_for(&d.plugin_sock()).await;
-    let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
+    wait_for(&d.plugin_sock("mocka")).await;
+    let (_ra, mut wa) = connect_plugin(&d.plugin_sock("mocka"), "mocka").await;
     let (mut rb, mut wb) = connect_plugin_with_caps(
-        &d.plugin_sock(),
+        &d.plugin_sock("mockb"),
         "mockb",
         Capabilities {
             max_payload: Some(200),
@@ -713,7 +713,7 @@ async fn attachment_egress_is_capability_aware() {
     )
     .await;
     let (mut rc, mut wc) = connect_plugin_with_caps(
-        &d.plugin_sock(),
+        &d.plugin_sock("mockc"),
         "mockc",
         Capabilities {
             max_payload: Some(200),
@@ -820,10 +820,10 @@ async fn attachment_egress_is_capability_aware() {
 #[tokio::test]
 async fn transport_class_constrained_route_demotes_media() {
     let d = start_daemon_with_config(tempfile::tempdir().unwrap(), TRANSPORT_CLASS_CONFIG);
-    wait_for(&d.plugin_sock()).await;
-    let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
+    wait_for(&d.plugin_sock("mocka")).await;
+    let (_ra, mut wa) = connect_plugin(&d.plugin_sock("mocka"), "mocka").await;
     let (mut rb, mut wb) = connect_plugin_with_caps(
-        &d.plugin_sock(),
+        &d.plugin_sock("mockb"),
         "mockb",
         Capabilities {
             attachments: true,
@@ -832,7 +832,7 @@ async fn transport_class_constrained_route_demotes_media() {
     )
     .await;
     let (mut rc, mut wc) = connect_plugin_with_caps(
-        &d.plugin_sock(),
+        &d.plugin_sock("mockc"),
         "mockc",
         Capabilities {
             attachments: true,
@@ -997,8 +997,11 @@ async fn transport_class_constrained_route_demotes_media() {
 #[tokio::test]
 async fn rejects_unknown_plugin_name() {
     let d = start_daemon(tempfile::tempdir().unwrap());
-    wait_for(&d.plugin_sock()).await;
-    let stream = UnixStream::connect(&d.plugin_sock()).await.unwrap();
+    wait_for(&d.plugin_sock("mocka")).await;
+    // Per-plugin sockets (v0.4 cycle B): an unconfigured plugin has no
+    // socket at all; the closest attack is claiming a foreign name on a
+    // real plugin's socket, which the name binding rejects.
+    let stream = UnixStream::connect(&d.plugin_sock("mocka")).await.unwrap();
     let (mut r, mut w) = stream.into_split();
     write_frame(
         &mut w,
@@ -1138,9 +1141,9 @@ routes:
 #[tokio::test]
 async fn sender_rate_limit_drops_the_second_inbound_from_the_same_sender() {
     let d = start_daemon_with_config(tempfile::tempdir().unwrap(), RATE_LIMITED_CONFIG);
-    wait_for(&d.plugin_sock()).await;
-    let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
-    let (mut rb, _wb) = connect_plugin(&d.plugin_sock(), "mockb").await;
+    wait_for(&d.plugin_sock("mocka")).await;
+    let (_ra, mut wa) = connect_plugin(&d.plugin_sock("mocka"), "mocka").await;
+    let (mut rb, _wb) = connect_plugin(&d.plugin_sock("mockb"), "mockb").await;
 
     inbound(&mut wa, "chan", "!abcd1234", "first", chrono::Utc::now()).await;
     let (_, _, body, _) = expect_send(&mut rb).await;
@@ -1170,12 +1173,12 @@ async fn sender_rate_limit_drops_the_second_inbound_from_the_same_sender() {
 #[tokio::test]
 async fn identity_linking_full_flow_initiate_confirm_link_render_and_unlink() {
     let d = start_daemon_with_config(tempfile::tempdir().unwrap(), IDENTITY_CONFIG);
-    wait_for(&d.plugin_sock()).await;
+    wait_for(&d.plugin_sock("mocka")).await;
 
     // Plugin A ("mocka"): direct-capable — this is who the challenge targets
     // and who confirms it.
     let (mut ra, mut wa) = connect_plugin_with_caps(
-        &d.plugin_sock(),
+        &d.plugin_sock("mocka"),
         "mocka",
         Capabilities {
             max_payload: Some(200),
@@ -1186,7 +1189,7 @@ async fn identity_linking_full_flow_initiate_confirm_link_render_and_unlink() {
     .await;
     // Plugin B ("mockb"): an ordinary destination on the "general" route,
     // used only to observe the rendered tag.
-    let (mut rb, mut wb) = connect_plugin(&d.plugin_sock(), "mockb").await;
+    let (mut rb, mut wb) = connect_plugin(&d.plugin_sock("mockb"), "mockb").await;
 
     // ---- 1. Initiate via the admin socket -------------------------------
     let link_req = serde_json::json!({
@@ -1540,9 +1543,9 @@ async fn events_stream_over_http_1_0_flushes_incrementally_not_buffered_to_eof()
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let d = start_daemon(tempfile::tempdir().unwrap());
-    wait_for(&d.plugin_sock()).await;
+    wait_for(&d.plugin_sock("mocka")).await;
     wait_for(&d.admin_sock()).await;
-    let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
+    let (_ra, mut wa) = connect_plugin(&d.plugin_sock("mocka"), "mocka").await;
 
     let mut s = UnixStream::connect(&d.admin_sock()).await.unwrap();
     s.write_all(b"GET /v1/events HTTP/1.0\r\nhost: x\r\n\r\n")
@@ -1609,10 +1612,10 @@ async fn events_stream_over_http_1_0_flushes_incrementally_not_buffered_to_eof()
 async fn config_apply_reload_and_events_full_workflow() {
     let dir = tempfile::tempdir().unwrap();
     let d = start_daemon_with_config(dir, WEBUI_WORKFLOW_CONFIG);
-    wait_for(&d.plugin_sock()).await;
+    wait_for(&d.plugin_sock("mocka")).await;
     wait_for(&d.admin_sock()).await;
-    let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
-    let (mut rb, mut wb) = connect_plugin(&d.plugin_sock(), "mockb").await;
+    let (_ra, mut wa) = connect_plugin(&d.plugin_sock("mocka"), "mocka").await;
+    let (mut rb, mut wb) = connect_plugin(&d.plugin_sock("mockb"), "mockb").await;
 
     // ---- 1. GET /v1/config byte-equals the file on disk -------------------
     let cfg_path = d.dir.path().join("relayfabric.yaml");
@@ -1968,9 +1971,9 @@ federation:
 "#
     );
     let d_a = start_daemon_with_config(dir_a, &config_a);
-    wait_for(&d_a.plugin_sock()).await;
+    wait_for(&d_a.plugin_sock("mocka")).await;
     wait_for(&d_a.admin_sock()).await;
-    let (mut ra, mut wa) = connect_plugin(&d_a.plugin_sock(), "mocka").await;
+    let (mut ra, mut wa) = connect_plugin(&d_a.plugin_sock("mocka"), "mocka").await;
 
     // Open A's SSE stream BEFORE B ever connects, so the "federation up"
     // event for peer b lands in the buffer this test polls below.
@@ -2005,9 +2008,9 @@ federation:
 "#
     );
     let d_b = start_daemon_with_config(dir_b, &config_b);
-    wait_for(&d_b.plugin_sock()).await;
+    wait_for(&d_b.plugin_sock("mockb")).await;
     wait_for(&d_b.admin_sock()).await;
-    let (mut rb, mut wb) = connect_plugin(&d_b.plugin_sock(), "mockb").await;
+    let (mut rb, mut wb) = connect_plugin(&d_b.plugin_sock("mockb"), "mockb").await;
 
     // B's outbound dialer connects to A on its first (zero-delay) attempt;
     // wait for A to see it live before driving any federated traffic.
@@ -2131,8 +2134,8 @@ federation:
 "#
     );
     let d_c = start_daemon_with_config(dir_c, &config_c);
-    wait_for(&d_c.plugin_sock()).await;
-    let (_rc, mut wc) = connect_plugin(&d_c.plugin_sock(), "mockc").await;
+    wait_for(&d_c.plugin_sock("mockc")).await;
+    let (_rc, mut wc) = connect_plugin(&d_c.plugin_sock("mockc"), "mockc").await;
 
     inbound(
         &mut wc,
@@ -2280,9 +2283,9 @@ federation:
 "#
     );
     let d_a = start_daemon_with_config(dir_a, &config_a);
-    wait_for(&d_a.plugin_sock()).await;
+    wait_for(&d_a.plugin_sock("mocka")).await;
     wait_for(&d_a.admin_sock()).await;
-    let (_ra, mut wa) = connect_plugin(&d_a.plugin_sock(), "mocka").await;
+    let (_ra, mut wa) = connect_plugin(&d_a.plugin_sock("mocka"), "mocka").await;
 
     let config_b = format!(
         r#"
@@ -2305,7 +2308,7 @@ federation:
 "#
     );
     let mut d_b = start_daemon_with_config(dir_b, &config_b);
-    wait_for(&d_b.plugin_sock()).await;
+    wait_for(&d_b.plugin_sock("mockb")).await;
 
     // ---- 1. healthy: confirm the connection is up before killing anything -
     poll_until_contains(&d_a.admin_sock(), "/v1/federation", "\"connected\":true").await;
@@ -2339,11 +2342,11 @@ federation:
     // ---- 4. respawn B on the SAME data_dir (same identity/config/port) ----
     // -- see this test's doc comment for why there's no backoff to time
     // around here.
-    let _ = std::fs::remove_file(d_b.plugin_sock());
+    let _ = std::fs::remove_file(d_b.plugin_sock("mockb"));
     let cfg_path_b = d_b.dir.path().join("relayfabric.yaml");
     d_b.child = spawn_daemon(&cfg_path_b);
-    wait_for(&d_b.plugin_sock()).await;
-    let (mut rb, mut wb) = connect_plugin(&d_b.plugin_sock(), "mockb").await;
+    wait_for(&d_b.plugin_sock("mockb")).await;
+    let (mut rb, mut wb) = connect_plugin(&d_b.plugin_sock("mockb"), "mockb").await;
 
     // ---- 5. bounded settle: the parked message reaches B's mock plugin ----
     // (rendered, pseudonymous) and A's own delivery row is marked delivered
@@ -2603,9 +2606,9 @@ federation:
 "#
     );
     let d_a = start_daemon_with_config(dir_a, &config_a);
-    wait_for(&d_a.plugin_sock()).await;
+    wait_for(&d_a.plugin_sock("mocka")).await;
     wait_for(&d_a.admin_sock()).await;
-    let (_ra, mut wa) = connect_plugin(&d_a.plugin_sock(), "mocka").await;
+    let (_ra, mut wa) = connect_plugin(&d_a.plugin_sock("mocka"), "mocka").await;
 
     let config_b = format!(
         r#"
@@ -2628,8 +2631,8 @@ federation:
 "#
     );
     let d_b = start_daemon_with_config(dir_b, &config_b);
-    wait_for(&d_b.plugin_sock()).await;
-    let (mut rb, _wb) = connect_plugin(&d_b.plugin_sock(), "mockb").await;
+    wait_for(&d_b.plugin_sock("mockb")).await;
+    let (mut rb, _wb) = connect_plugin(&d_b.plugin_sock("mockb"), "mockb").await;
 
     poll_until_contains(&d_a.admin_sock(), "/v1/federation", "\"connected\":true").await;
 
@@ -2785,9 +2788,9 @@ federation:
 "#
     );
     let d_a = start_daemon_with_config(dir_a, &config_a);
-    wait_for(&d_a.plugin_sock()).await;
+    wait_for(&d_a.plugin_sock("mocka")).await;
     wait_for(&d_a.admin_sock()).await;
-    let (_ra, mut wa) = connect_plugin(&d_a.plugin_sock(), "mocka").await;
+    let (_ra, mut wa) = connect_plugin(&d_a.plugin_sock("mocka"), "mocka").await;
 
     // ---- 2. daemon B: dials A, ingress route with the DEFAULT (true) ------
     // allow_gateway_decryption -- the normal sealed-termination case.
@@ -2812,9 +2815,9 @@ federation:
 "#
     );
     let d_b = start_daemon_with_config(dir_b, &config_b);
-    wait_for(&d_b.plugin_sock()).await;
+    wait_for(&d_b.plugin_sock("mockb")).await;
     wait_for(&d_b.admin_sock()).await;
-    let (mut rb, mut wb) = connect_plugin(&d_b.plugin_sock(), "mockb").await;
+    let (mut rb, mut wb) = connect_plugin(&d_b.plugin_sock("mockb"), "mockb").await;
 
     // ---- 3. daemon C: dials A, ingress route REFUSES gateway decryption ---
     let config_c = format!(
@@ -2839,9 +2842,9 @@ federation:
 "#
     );
     let d_c = start_daemon_with_config(dir_c, &config_c);
-    wait_for(&d_c.plugin_sock()).await;
+    wait_for(&d_c.plugin_sock("mockc")).await;
     wait_for(&d_c.admin_sock()).await;
-    let (mut rc, _wc) = connect_plugin(&d_c.plugin_sock(), "mockc").await;
+    let (mut rc, _wc) = connect_plugin(&d_c.plugin_sock("mockc"), "mockc").await;
 
     // both B and C dial out to A; wait for both live connections (named
     // specifically -- see `wait_for_fed_peer_connected`'s doc comment) so

@@ -33,7 +33,8 @@ used in route endpoints (`mqtt:chat/a`, `lxmf:pasadena`, ...).
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | bool | *required* | Whether the daemon treats this plugin as active. Routes referencing a disabled or unknown plugin fail `--check-config`. |
-| `command` | string \| null | `null` | Shell command `switchyardd` spawns (via `sh -c`) and supervises. Omit to run the plugin yourself — it connects to `<data_dir>/plugins.sock` using the `RELAYFABRIC_SOCKET` env var. |
+| `command` | string \| null | `null` | Shell command `switchyardd` spawns (via `sh -c`) and supervises. Omit to run the plugin yourself (e.g. under the hardened systemd template) — it connects to `<data_dir>/plugins.d/<name>.sock` using the `RELAYFABRIC_SOCKET` env var. |
+| `peer_uid` | int \| null | `null` | Plugin isolation (v0.4): when set, **exactly** this UID may connect to the plugin's socket, verified via `SO_PEERCRED` before any frame is parsed; the socket file opens to 0666 so the foreign UID can reach it (the credential check is the gate). When unset, only the daemon's own UID may connect. Pair with `deploy/systemd/relayfabric-plugin@.service`. |
 | `config` | map | `{}` | Arbitrary per-plugin settings, forwarded to the plugin process over `RELAYFABRIC_PLUGIN_CONFIG` at spawn. Any string value may be a [secret reference](#secret-references). |
 
 Python plugins run under a venv and need an absolute interpreter path

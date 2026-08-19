@@ -1,0 +1,73 @@
+# RelayFabric plugin template — one instance per plugin, each under its OWN
+# dedicated user so plugin compromise stays inside that plugin's sandbox
+# (v0.4 cycle B). The daemon enforces the pairing: set the plugin's
+# `peer_uid` in relayfabric.yaml to this instance's uid, and the daemon
+# accepts ONLY that uid on the plugin's socket (SO_PEERCRED, checked before
+# any frame is parsed).
+#
+# Setup per plugin (example: lxmf):
+#   useradd --system --shell /usr/sbin/nologin relayfabric-plugin-lxmf
+#   systemctl enable --now relayfabric-plugin@lxmf
+#   # relayfabric.yaml:
+#   #   plugins:
+#   #     lxmf:
+#   #       enabled: true
+#   #       # no `command:` — systemd runs it, not the daemon
+#   #       peer_uid: <uid of relayfabric-plugin-lxmf>
+#
+# Per-plugin overrides go in a drop-in
+# (/etc/systemd/system/relayfabric-plugin@lxmf.service.d/override.conf):
+#   - internet-facing plugins (signal, nostr, bitchat, mqtt, meshtastic,
+#     potatomesh): keep the defaults below.
+#   - radio/serial plugins (meshcore): add
+#       [Service]
+#       PrivateDevices=no
+#       DeviceAllow=/dev/ttyUSB0 rw
+#       SupplementaryGroups=dialout
+#       RestrictAddressFamilies=AF_UNIX
+#   - the ExecStart below assumes the repo's venv layout; adjust paths.
+
+[Unit]
+Description=RelayFabric plugin %i
+After=switchyardd.service
+BindsTo=switchyardd.service
+
+[Service]
+User=relayfabric-plugin-%i
+Environment=RELAYFABRIC_SOCKET=/var/lib/relayfabric/plugins.d/%i.sock
+Environment=RELAYFABRIC_PLUGIN_NAME=%i
+ExecStart=/opt/relayfabric/venv/bin/python /opt/relayfabric/plugins/%i/relayfabric-%i
+Restart=on-failure
+RestartSec=5
+
+# Hardening — plugins parse untrusted network input; assume compromise.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+# The plugin may read the shared install and reach its socket dir; it gets
+# NO write access to the daemon's data dir (its own state, if any, goes in
+# StateDirectory).
+StateDirectory=relayfabric-plugin-%i
+ReadOnlyPaths=/opt/relayfabric
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# MemoryDenyWriteExecute is left off: CPython (ctypes/cffi, e.g. coincurve)
+# needs W^X exceptions. Rust plugins may enable it in a drop-in.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

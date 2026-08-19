@@ -11,7 +11,9 @@ plugins:
   mqtt:
     enabled: true
     # Managed by switchyardd; omit `command` to run the plugin yourself
-    # (it connects to <data_dir>/plugins.sock using RELAYFABRIC_SOCKET).
+    # (it connects to <data_dir>/plugins.d/<name>.sock using RELAYFABRIC_SOCKET;
+    # for per-UID plugin isolation set peer_uid and use
+    # deploy/systemd/relayfabric-plugin@.service).
     command: relayfabric-mqtt
     config:
       broker: mqtt://127.0.0.1:1883

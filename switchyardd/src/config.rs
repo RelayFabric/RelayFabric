@@ -272,6 +272,16 @@ pub struct PluginConfig {
     pub command: Option<String>,
     #[serde(default)]
     pub config: serde_yaml::Value,
+    /// Expected peer UID on this plugin's socket (v0.4 cycle B, plugin
+    /// isolation): when set, EXACTLY that UID may attach (the daemon's own
+    /// UID is not grandfathered in -- fail closed), checked via
+    /// `SO_PEERCRED` before any frame is read; the socket file opens to
+    /// mode 0666 so the foreign UID can connect (the credential check is
+    /// the gate, not the file mode). When unset (default), only the
+    /// daemon's own UID may attach and the socket stays 0600 -- the
+    /// pre-v0.4 filesystem posture, now actually enforced.
+    #[serde(default)]
+    pub peer_uid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

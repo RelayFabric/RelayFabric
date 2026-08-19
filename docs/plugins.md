@@ -19,10 +19,19 @@ the wire protocol. The daemon restarts a plugin that dies unexpectedly with
 bounded backoff (1s, 5s, 30s, 2m, ...); a plugin that keeps crashing is
 marked unhealthy rather than restarted forever.
 
-**CBOR-over-Unix-socket IPC.** The daemon spawns each plugin with
-`RELAYFABRIC_SOCKET` (the Unix domain socket path), `RELAYFABRIC_PLUGIN_NAME`,
+**CBOR-over-Unix-socket IPC.** Every enabled plugin gets its own socket at
+`<data_dir>/plugins.d/<name>.sock` (v0.4): a connection can only become the
+plugin its socket is bound to (a Hello claiming another name is rejected),
+and each socket carries its own peer-credential policy — with `peer_uid`
+configured, exactly that UID may attach, checked via `SO_PEERCRED` before a
+single frame is parsed. The daemon spawns each plugin with
+`RELAYFABRIC_SOCKET` (its socket path), `RELAYFABRIC_PLUGIN_NAME`,
 and `RELAYFABRIC_PLUGIN_CONFIG` (the plugin's `config:` block as JSON) in its
-environment. Every frame on the socket is a 4-byte big-endian length prefix
+environment; alternatively the hardened
+[`deploy/systemd/relayfabric-plugin@.service`](https://github.com/RelayFabric/RelayFabric/blob/main/deploy/systemd/relayfabric-plugin@.service)
+template runs each plugin as a dedicated user with seccomp/namespace
+sandboxing, device and address-family allowlists, and no access to the
+daemon's keys or admin socket. Every frame on the socket is a 4-byte big-endian length prefix
 followed by a CBOR body, with a `t` tag identifying the frame
 (`hello`, `hello_ack`, `inbound`, `send`, `send_direct`, `delivery_result`,
 `shutdown`). Wire bytes are golden-locked across implementations, so a Rust

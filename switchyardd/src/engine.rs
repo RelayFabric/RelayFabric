@@ -2916,6 +2916,7 @@ pub mod tests_support {
                     enabled: true,
                     command: None,
                     config: serde_yaml::Value::Null,
+                    peer_uid: None,
                 },
             );
         }
@@ -6212,6 +6213,7 @@ mod tests {
                 enabled: true,
                 command: None,
                 config: serde_yaml::Value::Null,
+                peer_uid: None,
             },
         );
         let outcome = d.apply_config(new_cfg);
@@ -6431,6 +6433,7 @@ mod tests {
                 enabled: true,
                 command: None,
                 config: serde_yaml::Value::Null,
+                peer_uid: None,
             },
         );
         let outcome = d.apply_config(new_cfg);

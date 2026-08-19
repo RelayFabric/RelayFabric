@@ -27,6 +27,7 @@ tracing-subscriber.workspace = true
 snow.workspace = true
 ciborium.workspace = true
 curve25519-dalek.workspace = true
+libc.workspace = true
 # Task 2 (design §2) license+offline gate, PASSED: `utoipa-swagger-ui` and
 # every one of its ~53 newly-locked transitive deps (rust-embed, zip,
 # walkdir, url/idna/ICU, mime_guess, ...) are MIT / Apache-2.0 / 0BSD /

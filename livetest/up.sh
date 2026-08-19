@@ -214,20 +214,21 @@ echo "== starting switchyardd =="
 # leaves run/data intact) would otherwise make the socket-wait loop below
 # report "up" before the new process has actually bound them. Clear them
 # first so the loop only succeeds once switchyardd has truly rebound both.
-rm -f "$DATA_DIR/admin.sock" "$DATA_DIR/plugins.sock"
+rm -f "$DATA_DIR/admin.sock"
+rm -rf "$DATA_DIR/plugins.d"
 nohup "$SWITCHYARDD_BIN" --config "$CONFIG" >"$SWITCHYARDD_LOG" 2>&1 &
 echo $! > "$SWITCHYARDD_PID_FILE"
 
 waited=0
-until { [ -S "$DATA_DIR/admin.sock" ] && [ -S "$DATA_DIR/plugins.sock" ]; } || [ "$waited" -ge 10 ]; do
+until { [ -S "$DATA_DIR/admin.sock" ] && [ -d "$DATA_DIR/plugins.d" ]; } || [ "$waited" -ge 10 ]; do
   sleep 1
   waited=$((waited + 1))
 done
-if ! { [ -S "$DATA_DIR/admin.sock" ] && [ -S "$DATA_DIR/plugins.sock" ]; }; then
+if ! { [ -S "$DATA_DIR/admin.sock" ] && [ -d "$DATA_DIR/plugins.d" ]; }; then
   echo "up.sh: switchyardd did not open its sockets within 10s, see $SWITCHYARDD_LOG" >&2
   exit 1
 fi
-echo "  switchyardd pid $(cat "$SWITCHYARDD_PID_FILE"); admin.sock and plugins.sock up under $DATA_DIR"
+echo "  switchyardd pid $(cat "$SWITCHYARDD_PID_FILE"); admin.sock and plugins.d up under $DATA_DIR"
 
 # --- status -------------------------------------------------
 echo

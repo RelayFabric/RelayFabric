@@ -103,7 +103,7 @@ plainly rather than implying a protection that doesn't exist:
   and `root` always does, regardless of UID.** There is no per-route, no
   per-user, and no read-only tier: reaching the socket at all is
   equivalent to full admin. As a second belt on top of the `0700`
-  directory, both `admin.sock` and `plugins.sock` are themselves
+  directory, `admin.sock` and the per-plugin `plugins.d/*.sock` are themselves
   explicitly locked to mode `0600` right after `bind()` (`bind()` alone
   leaves a socket file's mode umask-derived, not tightened) — so even if
   the parent directory's permissions were ever loosened by mistake, the
