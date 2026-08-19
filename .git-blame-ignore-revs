@@ -1,0 +1,3 @@
+# One-time wholesale formatting commits, ignored by git blame via
+# `git config blame.ignoreRevsFile .git-blame-ignore-revs`.
+966126e8f0495f74f2da9494672b605e74ce1dca
