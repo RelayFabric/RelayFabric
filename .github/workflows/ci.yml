@@ -1,0 +1,72 @@
+name: CI
+
+# The mandatory merge gate (v0.4 cycle A): formatting, clippy with warnings
+# denied, the full Rust workspace test suite (which includes the golden IPC
+# wire vectors), every Python plugin suite plus the SDK suite, and the
+# dependency policy/vulnerability audit. The container build lives in
+# docker.yml.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: tests (includes golden IPC vectors)
+        run: cargo test --workspace
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: install plugin + sdk dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install cbor2 paho-mqtt coincurve meshcore rns lxmf
+      - name: sdk suite
+        working-directory: sdk/python
+        run: PYTHONPATH=. python -m unittest discover -s tests -v
+      - name: plugin suites
+        run: |
+          for t in plugins/*/test_*.py; do
+            echo "== $t"
+            python "$t"
+          done
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-deny and cargo-audit
+        run: cargo install cargo-deny cargo-audit --locked
+      - name: license + source policy, security advisories
+        run: cargo deny check licenses sources advisories
+      - name: cargo audit (advisory, non-blocking)
+        # Advisory-only for now: an upstream CVE in a transitive dep must
+        # not wedge unrelated PRs. Flip to blocking once triage habits
+        # exist (v0.4 roadmap, cycle A note).
+        run: cargo audit || true

@@ -1,0 +1,32 @@
+# cargo-deny policy (v0.4 cycle A). License posture: permissive only —
+# copyleft (GPL/AGPL/LGPL/EPL) is rejected outright, matching the project's
+# standing dependency policy. MPL-2.0 is deliberately NOT allowed either;
+# add it here only with an explicit decision.
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "0BSD",
+  "Unlicense",
+  "Unicode-3.0",
+  "BSL-1.0",
+]
+confidence-threshold = 0.9
+
+[advisories]
+# unmaintained/yanked warnings surface in the report but do not fail the
+# gate; security vulnerabilities do.
+yanked = "warn"
+
+[bans]
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -30,7 +30,7 @@ axum = "0.8"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rumqttc = "0.24"
+rumqttc = { version = "0.25", default-features = false }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
