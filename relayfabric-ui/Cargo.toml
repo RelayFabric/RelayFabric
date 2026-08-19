@@ -9,9 +9,21 @@ name = "relayfabric-ui"
 path = "src/main.rs"
 
 [dependencies]
+p256.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
+ed25519-dalek.workspace = true
+ciborium.workspace = true
 tokio.workspace = true
 axum.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

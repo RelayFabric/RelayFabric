@@ -126,10 +126,11 @@ plainly rather than implying a protection that doesn't exist:
   (`docs/webui-notes.md` §78, since correlation data is more sensitive than
   routing config) — is explicitly the job of the separate `relayfabric-ui`
   service described in `docs/webui-notes.md`, fronting this socket.
-  **`relayfabric-ui` exists (v0.2) but has no authentication yet** —
-  WebAuthn/passkeys + scoped roles land in v0.4 (cycle E of the
-  [roadmap](proposals/v0.4-roadmap.md)). Until then, do not expose this API
-  or the UI's TCP listener to anyone you wouldn't give a shell on this host.
+  **As of v0.4, `relayfabric-ui` provides it: passkey (WebAuthn)
+  authentication with scoped roles**, enforced on every proxied request
+  (first-run bootstrap via a one-time console setup token). The socket
+  itself stays filesystem-guarded; expose only the authenticated UI, and
+  only behind TLS for non-localhost use.
 
 The OpenAPI document's `info.description` states this same boundary, and
 deliberately declares no `securityScheme` — inventing a bearer/OAuth scheme

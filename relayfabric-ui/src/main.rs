@@ -6,9 +6,12 @@
 //! transparently reverse-proxies `/v1/*`, `/metrics`, and `/docs/*` to the
 //! admin socket, preserving streaming so the `/v1/events` SSE feed works.
 //!
-//! It adds NO authentication of its own yet — bind it to loopback (the
-//! default) or place it behind an authenticating reverse proxy. This is the
-//! seam where the deferred RBAC/auth layer will live.
+//! Authentication (v0.4 cycle E): passkeys (WebAuthn) with scoped roles —
+//! see `auth.rs`. On first start the console prints a one-time setup token;
+//! open the UI and register the first passkey with it (it becomes
+//! `administrator`). Remote (non-localhost) use REQUIRES fronting TLS: the
+//! browser only offers WebAuthn in a secure context. `--no-auth` disables
+//! the gate for loopback development, loudly.
 //!
 //! Because it fronts an unauthenticated admin API, it defends against the
 //! browser-borne attacks that reach even a loopback listener:
@@ -21,6 +24,8 @@
 //!   relayfabric-ui --socket /run/relayfabric/admin.sock \
 //!                  --listen 127.0.0.1:8087 --web-dir relayfabric-ui/web \
 //!                  [--allowed-host relayfabric.internal]
+
+mod auth;
 
 use std::path::{Path, PathBuf};
 
@@ -40,6 +45,8 @@ struct AppState {
     /// headers. Anything else is rejected — this is the DNS-rebinding and
     /// CSRF boundary in front of an unauthenticated admin API.
     allowed_hosts: Vec<String>,
+    /// Passkey auth + roles (v0.4 cycle E). `None` only with `--no-auth`.
+    auth: Option<std::sync::Arc<auth::Auth>>,
 }
 
 /// Headers that must not be forwarded to the upstream (RFC 7230 §6.1) plus
@@ -70,12 +77,18 @@ async fn main() {
     let mut listen = "127.0.0.1:8087".to_string();
     let mut web_dir = PathBuf::from("relayfabric-ui/web");
     let mut extra_hosts: Vec<String> = Vec::new();
+    let mut state_dir = PathBuf::from("relayfabric-ui-state");
+    let mut rp_id: Option<String> = None;
+    let mut no_auth = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--socket" => socket = args.next().map(PathBuf::from),
             "--listen" => listen = args.next().unwrap_or(listen),
             "--web-dir" => web_dir = args.next().map(PathBuf::from).unwrap_or(web_dir),
+            "--state-dir" => state_dir = args.next().map(PathBuf::from).unwrap_or(state_dir),
+            "--rp-id" => rp_id = args.next(),
+            "--no-auth" => no_auth = true,
             "--allowed-host" => {
                 if let Some(h) = args.next() {
                     extra_hosts.push(h.to_ascii_lowercase());
@@ -84,7 +97,8 @@ async fn main() {
             "-h" | "--help" => {
                 eprintln!(
                     "relayfabric-ui --socket <admin.sock> [--listen 127.0.0.1:8087] \
-                     [--web-dir DIR] [--allowed-host NAME]..."
+                     [--web-dir DIR] [--state-dir DIR] [--rp-id NAME] [--no-auth] \
+                     [--allowed-host NAME]..."
                 );
                 return;
             }
@@ -113,13 +127,45 @@ async fn main() {
     allowed_hosts.sort();
     allowed_hosts.dedup();
 
+    let auth_state = if no_auth {
+        tracing::warn!(
+            "--no-auth: the admin API is exposed WITHOUT authentication; \
+             loopback development only"
+        );
+        None
+    } else {
+        // The RP id defaults to the first non-IP allowed host, else
+        // "localhost" — WebAuthn RP ids are DNS names, not IPs.
+        let rp = rp_id.unwrap_or_else(|| {
+            allowed_hosts
+                .iter()
+                .find(|h| h.chars().any(|c| c.is_ascii_alphabetic()) && *h != "localhost")
+                .cloned()
+                .unwrap_or_else(|| "localhost".to_string())
+        });
+        let a = auth::Auth::open(state_dir, rp, allowed_hosts.clone()).unwrap_or_else(|e| {
+            eprintln!("relayfabric-ui: cannot open auth state: {e}");
+            std::process::exit(1);
+        });
+        if !a.has_credentials() {
+            tracing::warn!(
+                setup_token = %a.setup_token,
+                "no passkeys registered yet — open the UI and register the \
+                 first (administrator) passkey with this one-time setup token"
+            );
+        }
+        Some(std::sync::Arc::new(a))
+    };
+
     let state = AppState {
         socket,
         web_dir,
         allowed_hosts,
+        auth: auth_state,
     };
 
     let app = Router::new()
+        .route("/auth/{*rest}", any(auth_endpoint))
         .route("/v1/{*rest}", any(proxy))
         .route("/metrics", any(proxy))
         // Swagger UI's HTML uses relative asset refs (./swagger-ui.css), which
@@ -167,8 +213,192 @@ async fn security_headers(req: Request, next: axum::middleware::Next) -> Respons
     resp
 }
 
+/// The `/auth/*` surface (v0.4 cycle E). Registration is authorized either
+/// by an administrator session (adding credentials) or — only while the
+/// store is EMPTY — by the one-time setup token the console printed at
+/// startup (bootstrap; the first credential is always administrator).
+async fn auth_endpoint(State(st): State<AppState>, req: Request) -> Response {
+    if !host_allowed(req.headers(), &st.allowed_hosts) {
+        return (StatusCode::FORBIDDEN, "host not allowed").into_response();
+    }
+    if is_state_changing(req.method()) && !origin_allowed(req.headers(), &st.allowed_hosts) {
+        return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+    }
+    let Some(a) = st.auth.clone() else {
+        return axum::Json(serde_json::json!({
+            "authenticated": true, "no_auth": true, "role": "administrator"
+        }))
+        .into_response();
+    };
+
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let session = session_token(req.headers()).and_then(|t| a.session_info(&t).map(|i| (t, i)));
+    let is_admin = matches!(&session, Some((_, (_, auth::Role::Administrator))));
+    let setup_header = req
+        .headers()
+        .get("x-setup-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let token = session_token(req.headers());
+
+    let body = match axum::body::to_bytes(req.into_body(), 1 << 20).await {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response(),
+    };
+
+    match (method.as_str(), path.as_str()) {
+        ("GET", "/auth/session") => {
+            let resp = match &session {
+                Some((_, (cred_id, role))) => serde_json::json!({
+                    "authenticated": true, "role": role, "credential": cred_id,
+                    "setup_required": false,
+                }),
+                None => serde_json::json!({
+                    "authenticated": false, "setup_required": !a.has_credentials(),
+                }),
+            };
+            axum::Json(resp).into_response()
+        }
+        ("POST", "/auth/login/options") => {
+            let (tok, challenge) = a.new_challenge(auth::Purpose::Login);
+            axum::Json(serde_json::json!({
+                "challenge_token": tok, "challenge": challenge, "rp_id": a.rp_id,
+            }))
+            .into_response()
+        }
+        ("POST", "/auth/login") => {
+            #[derive(serde::Deserialize)]
+            struct Login {
+                challenge_token: String,
+                id: String,
+                client_data_json: String,
+                authenticator_data: String,
+                signature: String,
+            }
+            let Ok(l) = serde_json::from_slice::<Login>(&body) else {
+                return (StatusCode::BAD_REQUEST, "malformed login body").into_response();
+            };
+            let (Some(cdj), Some(ad), Some(sig)) = (
+                auth::b64url_decode(&l.client_data_json),
+                auth::b64url_decode(&l.authenticator_data),
+                auth::b64url_decode(&l.signature),
+            ) else {
+                return (StatusCode::BAD_REQUEST, "malformed base64url field").into_response();
+            };
+            match a.login(&l.challenge_token, &l.id, &cdj, &ad, &sig) {
+                Ok((token, role)) => {
+                    let cookie = format!(
+                        "{}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200",
+                        auth::SESSION_COOKIE
+                    );
+                    (
+                        [(header::SET_COOKIE, cookie)],
+                        axum::Json(serde_json::json!({ "role": role })),
+                    )
+                        .into_response()
+                }
+                Err(e) => (StatusCode::UNAUTHORIZED, e).into_response(),
+            }
+        }
+        ("POST", "/auth/register/options") => {
+            let bootstrap =
+                !a.has_credentials() && setup_header.as_deref() == Some(a.setup_token.as_str());
+            if !is_admin && !bootstrap {
+                return (StatusCode::FORBIDDEN, "registration requires administrator")
+                    .into_response();
+            }
+            let (tok, challenge) = a.new_challenge(auth::Purpose::Register);
+            axum::Json(serde_json::json!({
+                "challenge_token": tok, "challenge": challenge, "rp_id": a.rp_id,
+            }))
+            .into_response()
+        }
+        ("POST", "/auth/register") => {
+            let bootstrap =
+                !a.has_credentials() && setup_header.as_deref() == Some(a.setup_token.as_str());
+            if !is_admin && !bootstrap {
+                return (StatusCode::FORBIDDEN, "registration requires administrator")
+                    .into_response();
+            }
+            #[derive(serde::Deserialize)]
+            struct Register {
+                challenge_token: String,
+                client_data_json: String,
+                attestation_object: String,
+                #[serde(default)]
+                role: Option<auth::Role>,
+                #[serde(default)]
+                label: String,
+            }
+            let Ok(r) = serde_json::from_slice::<Register>(&body) else {
+                return (StatusCode::BAD_REQUEST, "malformed register body").into_response();
+            };
+            let (Some(cdj), Some(ao)) = (
+                auth::b64url_decode(&r.client_data_json),
+                auth::b64url_decode(&r.attestation_object),
+            ) else {
+                return (StatusCode::BAD_REQUEST, "malformed base64url field").into_response();
+            };
+            // bootstrap credential is ALWAYS administrator; later ones take
+            // the admin-chosen role (default viewer).
+            let role = if bootstrap {
+                auth::Role::Administrator
+            } else {
+                r.role.unwrap_or(auth::Role::Viewer)
+            };
+            match a.register(&r.challenge_token, &cdj, &ao, role, r.label) {
+                Ok(id) => axum::Json(serde_json::json!({ "id": id, "role": role })).into_response(),
+                Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+            }
+        }
+        ("POST", "/auth/logout") => {
+            if let Some(t) = token {
+                a.logout(&t);
+            }
+            let clear = format!(
+                "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+                auth::SESSION_COOKIE
+            );
+            ([(header::SET_COOKIE, clear)], StatusCode::NO_CONTENT).into_response()
+        }
+        ("GET", "/auth/credentials") => {
+            if !is_admin {
+                return (StatusCode::FORBIDDEN, "administrator only").into_response();
+            }
+            let list: Vec<_> = a
+                .credentials()
+                .into_iter()
+                .map(|c| serde_json::json!({ "id": c.id, "role": c.role, "label": c.label }))
+                .collect();
+            axum::Json(serde_json::json!({ "credentials": list })).into_response()
+        }
+        ("DELETE", p2) if p2.starts_with("/auth/credentials/") => {
+            if !is_admin {
+                return (StatusCode::FORBIDDEN, "administrator only").into_response();
+            }
+            let id = p2.trim_start_matches("/auth/credentials/");
+            if a.remove_credential(id) {
+                StatusCode::NO_CONTENT.into_response()
+            } else {
+                StatusCode::NOT_FOUND.into_response()
+            }
+        }
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// The session cookie's value, if present.
+fn session_token(headers: &HeaderMap) -> Option<String> {
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookies.split(';').find_map(|c| {
+        let (k, v) = c.trim().split_once('=')?;
+        (k == auth::SESSION_COOKIE).then(|| v.to_string())
+    })
+}
+
 /// Reverse-proxy one request to the admin Unix socket over HTTP/1, after the
-/// Host/Origin guards, streaming the response body straight back.
+/// Host/Origin guards and the role gate, streaming the response body back.
 async fn proxy(State(st): State<AppState>, req: Request) -> Response {
     if !host_allowed(req.headers(), &st.allowed_hosts) {
         return (StatusCode::FORBIDDEN, "host not allowed").into_response();
@@ -176,6 +406,17 @@ async fn proxy(State(st): State<AppState>, req: Request) -> Response {
     // CSRF: a state-changing request carrying a cross-site Origin is refused.
     if is_state_changing(req.method()) && !origin_allowed(req.headers(), &st.allowed_hosts) {
         return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+    }
+    // Role gate (v0.4 cycle E): every proxied admin request needs a live
+    // session whose role permits (method, path).
+    if let Some(a) = &st.auth {
+        let role = session_token(req.headers()).and_then(|t| a.session_role(&t));
+        let Some(role) = role else {
+            return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+        };
+        if !role.permits(req.method().as_str(), req.uri().path()) {
+            return (StatusCode::FORBIDDEN, "role does not permit this action").into_response();
+        }
     }
     match forward(&st.socket, req).await {
         Ok(resp) => resp,

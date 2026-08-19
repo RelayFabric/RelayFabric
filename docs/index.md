@@ -27,7 +27,7 @@ Per-plugin interop coverage (inbound/outbound/replies/attachments/reconnect/dedu
 | Sealed routing — user-to-user (X3DH/ratchet), MLS groups | not built | planned v0.5+ | — |
 | Transport-class egress (phase 1, static classes) | shipped | v0.3 | SHA-locked regression e2e |
 | Transport-class phase 2 (core extraction, Android) | not built | [proposed](proposals/transport-class-phase2.md) | — |
-| Web admin UI (`relayfabric-ui`) | shipped | v0.2 | manual; **no authentication yet** (v0.4 cycle E) |
+| Web admin UI (`relayfabric-ui`) | shipped | v0.2 | passkey (WebAuthn) auth + scoped roles since v0.4-dev; ceremony suite in `auth.rs` |
 | Plugin privilege isolation (per-plugin sockets, `SO_PEERCRED`, systemd sandboxing) | shipped | v0.4-dev | unit + e2e; hardened units in `deploy/systemd/` |
 | Packaged releases (tarballs, .deb, GHCR semver images, provenance attestations) | shipped | v0.4-dev | release.yml on version tags; first artifacts at the v0.4.0 tag |
 | Federation over Tor/I2P | not built | [proposed](proposals/federation-over-tor.md) | — |

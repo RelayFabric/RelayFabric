@@ -6,6 +6,65 @@ import { html, render, Component } from './vendor/preact-htm.js';
 
 // ---- helpers ---------------------------------------------------------------
 
+// ---- passkey auth (v0.4 cycle E) -------------------------------------------
+
+const b64u = {
+  enc: (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''),
+  dec: (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0)),
+};
+
+async function passkeyLogin() {
+  const opts = await api('/auth/login/options', { method: 'POST' });
+  const cred = await navigator.credentials.get({
+    publicKey: {
+      challenge: b64u.dec(opts.challenge),
+      rpId: opts.rp_id,
+      userVerification: 'preferred',
+    },
+  });
+  return api('/auth/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      challenge_token: opts.challenge_token,
+      id: cred.id,
+      client_data_json: b64u.enc(cred.response.clientDataJSON),
+      authenticator_data: b64u.enc(cred.response.authenticatorData),
+      signature: b64u.enc(cred.response.signature),
+    }),
+  });
+}
+
+async function passkeyRegister(setupToken, role, label) {
+  const headers = setupToken ? { 'x-setup-token': setupToken } : {};
+  const opts = await api('/auth/register/options', { method: 'POST', headers });
+  const cred = await navigator.credentials.create({
+    publicKey: {
+      challenge: b64u.dec(opts.challenge),
+      rp: { id: opts.rp_id, name: 'RelayFabric' },
+      user: {
+        id: crypto.getRandomValues(new Uint8Array(16)),
+        name: label || 'relayfabric-admin',
+        displayName: label || 'RelayFabric admin',
+      },
+      pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -8 }],
+      attestation: 'none',
+    },
+  });
+  return api('/auth/register', {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      challenge_token: opts.challenge_token,
+      client_data_json: b64u.enc(cred.response.clientDataJSON),
+      attestation_object: b64u.enc(cred.response.attestationObject),
+      role, label,
+    }),
+  });
+}
+
+
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -123,6 +182,14 @@ class App extends Component {
   };
 
   async componentDidMount() {
+    try {
+      const sess = await api('/auth/session');
+      if (!sess.authenticated) {
+        this.setState({ ready: true, authRequired: true, setupRequired: sess.setup_required });
+        return;
+      }
+      this.setState({ authRole: sess.role || null });
+    } catch (_e) { /* /auth unreachable: fall through to the API probe */ }
     try {
       const status = await api('/v1/status');
       this.setState({ live: true, status, ready: true });
@@ -323,7 +390,50 @@ class App extends Component {
   };
 
   // ---- render ----
+  doLogin = async () => {
+    try {
+      const r = await passkeyLogin();
+      this.setState({ authRequired: false, authRole: r.role });
+      this.componentDidMount();
+    } catch (e) { this.setState({ authError: String(e.message || e) }); }
+  };
+
+  doSetup = async () => {
+    try {
+      await passkeyRegister(this.state.setupToken, 'administrator', 'first-admin');
+      await this.doLogin();
+    } catch (e) { this.setState({ authError: String(e.message || e) }); }
+  };
+
+  doLogout = async () => {
+    try { await api('/auth/logout', { method: 'POST' }); } catch (_) {}
+    this.setState({ authRequired: true, authRole: null });
+  };
+
+  renderAuth() {
+    const s = this.state;
+    return html`<div class="rf-root" style="display:flex;align-items:center;justify-content:center;min-height:100vh">
+      <div class="card elev-md" style="max-width:380px;padding:28px;gap:14px">
+        <div class="card-kicker">RelayFabric</div>
+        <div class="card-title">${s.setupRequired ? 'First-run setup' : 'Sign in'}</div>
+        ${s.setupRequired ? html`
+          <p style="font-size:13px;opacity:.8">No passkeys are registered. Paste the one-time
+          setup token printed on the relayfabric-ui console, then register this device's
+          passkey — it becomes the administrator credential.</p>
+          <input class="input" placeholder="setup token" value=${s.setupToken || ''}
+                 onInput=${(e) => this.setState({ setupToken: e.target.value })} />
+          <button class="btn btn-primary" onClick=${this.doSetup}>Register passkey</button>
+        ` : html`
+          <p style="font-size:13px;opacity:.8">Authenticate with a registered passkey.</p>
+          <button class="btn btn-primary" onClick=${this.doLogin}>Sign in with passkey</button>
+        `}
+        ${s.authError && html`<div style="color:var(--color-danger,#d66);font-size:12px">${s.authError}</div>`}
+      </div>
+    </div>`;
+  }
+
   render() {
+    if (this.state.authRequired) return this.renderAuth();
     const s = this.state;
     if (!s.ready) return html`<div style="display:grid;place-items:center;height:100vh;color:var(--color-text)">Connecting…</div>`;
     const rootClass = 'rf-root' + (s.theme === 'light' ? ' rf-light' : '');
@@ -367,7 +477,8 @@ class App extends Component {
       </nav>
       <div style="flex:1"></div>
       <div style="display:flex;flex-direction:column;gap:8px;padding:12px 10px 0;border-top:1px solid var(--color-divider)">
-        <div class="text-muted" style="font-size:10.5px;font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">admin.sock ${s.live ? '· connected' : '· offline'}</div>
+        <div class="text-muted" style="font-size:10.5px;font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">admin.sock ${s.live ? '· connected' : '· offline'}${s.authRole ? ' · ' + s.authRole : ''}</div>
+          ${s.authRole && html`<button class="btn btn-ghost" style="font-size:11px;padding:2px 6px" onClick=${this.doLogout}>Sign out</button>`}
         <div class="text-muted" style="font-size:10.5px;font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${shortNode(nodeId)}</div>
         <div style="display:flex;gap:10px;font-size:11px">
           <a href="/docs" target="_blank" style="text-decoration:none">/docs</a>

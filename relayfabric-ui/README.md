@@ -36,6 +36,21 @@ backed by the matching `/v1/...` endpoint.
 When the admin socket is unreachable it drops into an offline demo with
 sample data so the interface stays browsable.
 
+## Authentication (v0.4)
+
+Passkeys (WebAuthn) with scoped roles. On first start with no registered
+credentials, the console logs a one-time `setup_token`; open the UI, paste
+it, and register the first passkey — it becomes the `administrator`
+credential. Further credentials are added by an administrator
+(`/auth/credentials`), each with a role: `viewer`, `operator`,
+`route-admin`, `identity-admin`, `security-admin`, or `administrator`.
+Every proxied admin request is gated per method + path; identity-link data
+requires identity-admin. Sessions are HttpOnly `SameSite=Strict` cookies
+(12 h). Flags: `--state-dir` (credential store, 0600), `--rp-id` (WebAuthn
+RP id, defaults to the first DNS-name allowed host or `localhost`),
+`--no-auth` (loopback development only; logged loudly). Remote use
+requires fronting TLS — browsers only offer WebAuthn in a secure context.
+
 ## Security
 
 !!! this proxy adds NO authentication of its own yet.
