@@ -1,5 +1,10 @@
+# Published as `relayfabric-core` (the bare `relay-core` name is taken on
+# crates.io); in-tree consumers keep `use relay_core::` via Cargo dependency
+# renaming in the workspace manifest.
 [package]
-name = "relay-core"
+name = "relayfabric-core"
+description = "RelayFabric core model: envelopes, capabilities, transport classes and policies"
+repository = "https://github.com/RelayFabric/RelayFabric"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

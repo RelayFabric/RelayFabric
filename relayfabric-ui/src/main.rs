@@ -288,8 +288,11 @@ async fn auth_endpoint(State(st): State<AppState>, req: Request) -> Response {
             };
             match a.login(&l.challenge_token, &l.id, &cdj, &ad, &sig) {
                 Ok((token, role)) => {
+                    // Secure: browsers exempt localhost from the TLS
+                    // requirement, so the loopback dev flow still works;
+                    // everywhere else the cookie only rides HTTPS.
                     let cookie = format!(
-                        "{}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200",
+                        "{}={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200",
                         auth::SESSION_COOKIE
                     );
                     (
@@ -357,7 +360,7 @@ async fn auth_endpoint(State(st): State<AppState>, req: Request) -> Response {
                 a.logout(&t);
             }
             let clear = format!(
-                "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+                "{}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0",
                 auth::SESSION_COOKIE
             );
             ([(header::SET_COOKIE, clear)], StatusCode::NO_CONTENT).into_response()

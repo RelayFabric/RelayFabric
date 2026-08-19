@@ -1426,7 +1426,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "relay-core"
+name = "relayfabric-core"
 version = "0.4.0"
 dependencies = [
  "chrono",
@@ -1437,12 +1437,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "relay-ipc"
+name = "relayfabric-ipc"
 version = "0.4.0"
 dependencies = [
  "chrono",
  "ciborium",
- "relay-core",
+ "relayfabric-core",
  "serde",
  "serde_bytes",
  "tokio",
@@ -1453,8 +1453,8 @@ name = "relayfabric-mqtt"
 version = "0.4.0"
 dependencies = [
  "chrono",
- "relay-core",
- "relay-ipc",
+ "relayfabric-core",
+ "relayfabric-ipc",
  "rumqttc",
  "serde",
  "serde_json",
@@ -1870,6 +1870,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "switchyardctl"
 version = "0.4.0"
 dependencies = [
+ "ciborium",
  "serde_json",
  "tempfile",
 ]
@@ -1889,8 +1890,8 @@ dependencies = [
  "http-body-util",
  "libc",
  "rand",
- "relay-core",
- "relay-ipc",
+ "relayfabric-core",
+ "relayfabric-ipc",
  "rusqlite",
  "serde",
  "serde_bytes",

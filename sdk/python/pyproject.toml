@@ -1,9 +1,15 @@
 [project]
 name = "relayfabric-sdk"
-version = "0.2.0"
-description = "RelayFabric Python plugin SDK: frame codec, sent-cache, and test harness shared by the plugin fleet."
+version = "0.4.0"
+description = "RelayFabric Python plugin SDK: Plugin Protocol v1 frame codec, main-loop scaffold, bridge plumbing, sent-cache, and test harness."
+readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = ["cbor2"]
+
+[project.urls]
+Homepage = "https://docs.relayfabric.org"
+Repository = "https://github.com/RelayFabric/RelayFabric"
 
 # Not pip-installed by anything in-repo: plugins and their tests consume
 # this package via a sys.path insert to ../../sdk/python. `pip install -e

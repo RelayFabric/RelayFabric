@@ -42,5 +42,5 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 snow = "0.10.0"
 curve25519-dalek = { version = "4.1.3", default-features = false }
-relay-core = { path = "crates/relay-core" }
-relay-ipc = { path = "crates/relay-ipc" }
+relay-core = { path = "crates/relay-core", package = "relayfabric-core", version = "0.4.0" }
+relay-ipc = { path = "crates/relay-ipc", package = "relayfabric-ipc", version = "0.4.0" }

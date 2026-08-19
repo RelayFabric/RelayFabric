@@ -104,10 +104,40 @@ on config (e.g. a `max_payload` derived from a validated config field). A
 `relayfabric_sdk.bridge` additionally provides the shared `FrameWriter`
 write-lock base and the `capped_text_send` egress dance.
 
+## The 30-line plugin, and proving it
+
+`sdk/python/examples/echo_plugin.py` is a complete plugin — a `FrameWriter`
+subclass with one `handle_send`, run by `run_plugin`. Prove any plugin
+(any language) against the daemon-side contract with the conformance
+runner:
+
+```text
+switchyardctl plugin test [--config '<json>'] [--endpoint NAME] "<command>"
+PASS HELLO
+PASS SEND
+PASS SHUTDOWN
+conformant: Plugin Protocol v1
+```
+
+It plays the daemon's side on a scratch socket: Hello shape + protocol
+version + name binding, a routed `send` answered by a `delivery_result`
+with the right corr, and clean exit 0 on `shutdown`.
+
+## Published packages
+
+- **Python:** `pip install relayfabric-sdk` (PyPI) — the codec,
+  `run_plugin`, `bridge`, cache, and `FakeSock` harness.
+- **Rust:** `relayfabric-ipc` on crates.io (with `relayfabric-core` for the
+  model types). The bare `relay-core` crate name on crates.io is an
+  unrelated project — RelayFabric publishes under `relayfabric-*` only.
+
 ## Golden frames, for new-language authors
 
 The wire format is locked byte-for-byte across implementations. Before
 trusting a new codec, reproduce these exact hex vectors:
+
+See [Golden Wire Vectors](golden-vectors.md) for the full byte-exact
+vectors inline. In-repo sources:
 
 - Rust: `crates/relay-ipc/src/lib.rs` —
   `canonical_hello_frame_bytes_are_stable`,

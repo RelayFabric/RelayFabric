@@ -22,6 +22,7 @@ nav = [
   {"Live & Field Testing" = "live-testing.md"},
   {"Interop Matrix" = "interop-matrix.md"},
   {"Plugin Authoring" = "plugin-authors.md"},
+  {"Golden Wire Vectors" = "golden-vectors.md"},
   {"API Reference" = "api-reference.md"},
   {"Specification" = "SPEC.md"},
 ]

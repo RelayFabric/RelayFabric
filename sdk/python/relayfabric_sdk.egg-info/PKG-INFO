@@ -1,0 +1,25 @@
+Metadata-Version: 2.4
+Name: relayfabric-sdk
+Version: 0.4.0
+Summary: RelayFabric Python plugin SDK: Plugin Protocol v1 frame codec, main-loop scaffold, bridge plumbing, sent-cache, and test harness.
+License-Expression: Apache-2.0
+Project-URL: Homepage, https://docs.relayfabric.org
+Project-URL: Repository, https://github.com/RelayFabric/RelayFabric
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: cbor2
+
+# relayfabric-sdk
+
+The Python side of RelayFabric's Plugin Protocol v1: the CBOR frame codec
+(`relayfabric_sdk.ipc`, golden-locked byte-for-byte against the Rust
+implementation), the `run_plugin` main-loop scaffold, shared Bridge plumbing
+(`relayfabric_sdk.bridge`), the sent-message loop-guard cache, and the
+`FakeSock` test harness.
+
+A complete plugin is ~30 lines — see `examples/echo_plugin.py`. Prove any
+plugin against the daemon-side contract with:
+
+    switchyardctl plugin test "python my_plugin.py"
+
+Docs: https://docs.relayfabric.org/plugin-authors/

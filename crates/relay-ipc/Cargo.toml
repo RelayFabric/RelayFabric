@@ -1,5 +1,8 @@
+# Published as `relayfabric-ipc` (kept consistent with relayfabric-core).
 [package]
-name = "relay-ipc"
+name = "relayfabric-ipc"
+description = "RelayFabric Plugin Protocol v1: the CBOR-over-Unix-socket frame codec, golden-locked across implementations"
+repository = "https://github.com/RelayFabric/RelayFabric"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

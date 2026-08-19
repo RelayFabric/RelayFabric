@@ -240,6 +240,8 @@ fn docs_message(socket: &str) -> String {
     .join("\n")
 }
 
+mod conformance;
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut socket = String::from("/var/lib/relayfabric/admin.sock");
@@ -266,6 +268,36 @@ fn main() {
     // `docs` (Task 2, design §2) is a pure local print -- no request over
     // the socket at all -- so it's special-cased ahead of `request_for`
     // the same way `events` is, rather than round-tripping through `fetch`.
+    // `plugin test <command...>` (v0.4 cycle F): the Plugin Protocol v1
+    // conformance runner -- plays the daemon side against a plugin the
+    // author supplies as a shell command. Optional: --config '<json>'
+    // (plugin config), --endpoint NAME (the routed send's endpoint).
+    if args.first().map(String::as_str) == Some("plugin")
+        && args.get(1).map(String::as_str) == Some("test")
+    {
+        let mut rest = args[2..].to_vec();
+        let mut config = String::from("{}");
+        let mut endpoint = String::from("test");
+        if let Some(i) = rest.iter().position(|a| a == "--config") {
+            rest.remove(i);
+            if i < rest.len() {
+                config = rest.remove(i);
+            }
+        }
+        if let Some(i) = rest.iter().position(|a| a == "--endpoint") {
+            rest.remove(i);
+            if i < rest.len() {
+                endpoint = rest.remove(i);
+            }
+        }
+        if rest.is_empty() {
+            eprintln!(
+                "usage: switchyardctl plugin test [--config JSON] [--endpoint NAME] <command...>"
+            );
+            std::process::exit(2);
+        }
+        std::process::exit(conformance::run(&rest.join(" "), &config, &endpoint));
+    }
     if args.first().map(String::as_str) == Some("docs") {
         println!("{}", docs_message(&socket));
         return;
