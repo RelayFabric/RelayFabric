@@ -8,6 +8,7 @@ members = ["crates/relay-core", "crates/relay-ipc", "switchyardd", "switchyardct
 default-members = ["crates/relay-core", "crates/relay-ipc", "switchyardd", "switchyardctl", "plugins/mqtt"]
 
 [workspace.package]
+version = "0.4.0"
 edition = "2021"
 license = "Apache-2.0"
 

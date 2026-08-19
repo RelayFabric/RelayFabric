@@ -2,6 +2,14 @@
 
 This walks you from a fresh checkout to a message routed end-to-end through `switchyardd`. The quickest path — an MQTT loopback — needs only the Rust toolchain and a local broker; the protocol plugins add a Python virtualenv.
 
+!!! tip "Packaged releases (v0.4+)"
+    Version tags publish x86-64/aarch64 tarballs, a `.deb` (daemon + CLI +
+    MQTT plugin + hardened systemd units), sha256 checksums, and GitHub
+    build-provenance attestations to the
+    [releases page](https://github.com/RelayFabric/RelayFabric/releases),
+    plus semver-tagged images at `ghcr.io/relayfabric/relayfabric`.
+    Building from source (below) is only needed for development.
+
 ## Prerequisites
 
 | Component | Needed for | Notes |

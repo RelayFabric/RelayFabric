@@ -1,0 +1,84 @@
+name: Release
+
+# Packaged releases (v0.4 cycle D): on a version tag, build the Rust
+# binaries for x86-64 and aarch64, package tarballs + a .deb, generate
+# checksums and GitHub build-provenance attestations, and attach everything
+# to the GitHub release for that tag. Operators deploy without compiling.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }} -p relayfabric-ui
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG="relayfabric-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$PKG"
+          for bin in switchyardd switchyardctl relayfabric-mqtt relayfabric-ui; do
+            cp "target/${{ matrix.target }}/release/$bin" "dist/$PKG/"
+          done
+          cp LICENSE README.md docs/relayfabric.example.yaml "dist/$PKG/"
+          cp -r deploy "dist/$PKG/deploy"
+          tar -C dist -czf "dist/$PKG.tar.gz" "$PKG"
+          rm -r "dist/$PKG"
+
+      - name: Build .deb
+        run: |
+          set -euo pipefail
+          cargo install cargo-deb --locked
+          # The deb metadata's asset paths point at target/release/; both
+          # matrix runners are native (x86-64 and arm), so the host arch is
+          # the package arch and no --target indirection is needed.
+          mkdir -p target/release
+          for bin in switchyardd switchyardctl relayfabric-mqtt; do
+            cp "target/${{ matrix.target }}/release/$bin" target/release/
+          done
+          cargo deb -p switchyardd --no-build --no-strip --output dist/
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > "sha256sums-${{ matrix.target }}.txt"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*"
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber

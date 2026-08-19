@@ -1,6 +1,7 @@
 [package]
 name = "switchyardd"
-version = "0.1.0"
+version.workspace = true
+description = "RelayFabric daemon: policy-controlled routing fabric bridging mesh, radio, and Internet messaging networks"
 edition.workspace = true
 license.workspace = true
 
@@ -73,3 +74,20 @@ http-body-util.workspace = true
 # kinds for a shared package), so it only ever applies to test builds,
 # never a production `cargo build`, and pulls in no new crate.
 tokio = { version = "1", features = ["test-util"] }
+
+# `cargo deb -p switchyardd --no-build` after a workspace release build
+# (v0.4 cycle D): one .deb carrying the daemon, the CLI, the Rust MQTT
+# plugin, and the hardened systemd units.
+[package.metadata.deb]
+name = "relayfabric"
+maintainer = "RelayFabric contributors"
+copyright = "RelayFabric contributors, Apache-2.0"
+extended-description = "Privacy-first, protocol-pluggable gateway for bridging decentralized networks (Reticulum/LXMF, Meshtastic, MeshCore, Signal, Nostr, Bitchat, MQTT)."
+assets = [
+  ["target/release/switchyardd", "usr/bin/", "755"],
+  ["target/release/switchyardctl", "usr/bin/", "755"],
+  ["target/release/relayfabric-mqtt", "usr/bin/", "755"],
+  ["../deploy/systemd/switchyardd.service", "lib/systemd/system/", "644"],
+  ["../deploy/systemd/relayfabric-plugin@.service", "lib/systemd/system/", "644"],
+  ["../docs/relayfabric.example.yaml", "etc/relayfabric/relayfabric.yaml.example", "644"],
+]

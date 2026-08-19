@@ -29,7 +29,7 @@ Per-plugin interop coverage (inbound/outbound/replies/attachments/reconnect/dedu
 | Transport-class phase 2 (core extraction, Android) | not built | [proposed](proposals/transport-class-phase2.md) | — |
 | Web admin UI (`relayfabric-ui`) | shipped | v0.2 | manual; **no authentication yet** (v0.4 cycle E) |
 | Plugin privilege isolation (per-plugin sockets, `SO_PEERCRED`, systemd sandboxing) | shipped | v0.4-dev | unit + e2e; hardened units in `deploy/systemd/` |
-| Packaged releases (binaries, .deb) | in progress | v0.4 cycle D | — |
+| Packaged releases (tarballs, .deb, GHCR semver images, provenance attestations) | shipped | v0.4-dev | release.yml on version tags; first artifacts at the v0.4.0 tag |
 | Federation over Tor/I2P | not built | [proposed](proposals/federation-over-tor.md) | — |
 
 ## The idea
