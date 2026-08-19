@@ -46,7 +46,9 @@ impl SealedKey {
     /// load_or_create`.
     pub fn load_or_create(path: &Path) -> io::Result<SealedKey> {
         let bytes = crate::keyfile::load_or_create_key32(path, "sealed key")?;
-        Ok(SealedKey { secret: SecretKey::from_bytes(bytes) })
+        Ok(SealedKey {
+            secret: SecretKey::from_bytes(bytes),
+        })
     }
 
     /// The raw 32-byte X25519 public key -- what `fed::advert::
@@ -114,7 +116,9 @@ mod tests {
         SealedKey::load_or_create(&path).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert_eq!(raw.len(), 64);
-        assert!(raw.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(raw
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -128,7 +132,9 @@ mod tests {
         let key = SealedKey::load_or_create(&path).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         let bytes: [u8; 32] = hex::decode(raw.trim()).unwrap().try_into().unwrap();
-        let expected = crypto_box::SecretKey::from_bytes(bytes).public_key().to_bytes();
+        let expected = crypto_box::SecretKey::from_bytes(bytes)
+            .public_key()
+            .to_bytes();
         assert_eq!(key.public(), expected);
     }
 
@@ -148,7 +154,9 @@ mod tests {
         let recipient_pub = crypto_box::PublicKey::from(recipient.public());
         let sender_box = ChaChaBox::new(&recipient_pub, &ephemeral);
         let nonce = ChaChaBox::generate_nonce(&mut rand::rngs::OsRng);
-        let ct = sender_box.encrypt(&nonce, b"hello sealed routing".as_ref()).unwrap();
+        let ct = sender_box
+            .encrypt(&nonce, b"hello sealed routing".as_ref())
+            .unwrap();
 
         let recipient_box = ChaChaBox::new(&ephemeral.public_key(), recipient.secret());
         let pt = recipient_box.decrypt(&nonce, ct.as_ref()).unwrap();

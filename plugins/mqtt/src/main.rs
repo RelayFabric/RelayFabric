@@ -26,9 +26,14 @@ fn default_client_id() -> String {
 }
 
 fn parse_broker(url: &str) -> Result<(String, u16), String> {
-    let rest = url.strip_prefix("mqtt://").ok_or("broker must be mqtt://host[:port]")?;
+    let rest = url
+        .strip_prefix("mqtt://")
+        .ok_or("broker must be mqtt://host[:port]")?;
     match rest.split_once(':') {
-        Some((host, port)) => Ok((host.into(), port.parse().map_err(|_| "bad port".to_string())?)),
+        Some((host, port)) => Ok((
+            host.into(),
+            port.parse().map_err(|_| "bad port".to_string())?,
+        )),
         None => Ok((rest.into(), 1883)),
     }
 }
@@ -59,7 +64,10 @@ struct DeliveryTracker {
 
 impl DeliveryTracker {
     fn new() -> Self {
-        Self { pending_pkid: VecDeque::new(), awaiting_ack: HashMap::new() }
+        Self {
+            pending_pkid: VecDeque::new(),
+            awaiting_ack: HashMap::new(),
+        }
     }
 
     /// `client.publish(..)` returned `Ok`: the corr is now waiting for
@@ -92,7 +100,9 @@ impl DeliveryTracker {
     /// to avoid dropping entries that are still live; the size cap is
     /// simpler and doesn't depend on that.
     fn on_outgoing_publish(&mut self, pkid: u16) {
-        let Some(corr) = self.pending_pkid.pop_front() else { return };
+        let Some(corr) = self.pending_pkid.pop_front() else {
+            return;
+        };
         self.awaiting_ack.insert(pkid, corr);
         if self.awaiting_ack.len() > 1024 {
             if let Some(stale) = self.awaiting_ack.keys().next().copied() {
@@ -127,7 +137,9 @@ async fn main() {
     opts.set_keep_alive(Duration::from_secs(30));
     let (client, mut eventloop) = AsyncClient::new(opts, 64);
 
-    let stream = tokio::net::UnixStream::connect(&socket).await.expect("daemon socket");
+    let stream = tokio::net::UnixStream::connect(&socket)
+        .await
+        .expect("daemon socket");
     let (mut r, mut w) = stream.into_split();
     write_frame(
         &mut w,
@@ -135,12 +147,19 @@ async fn main() {
             plugin: name.clone(),
             version: env!("CARGO_PKG_VERSION").into(),
             protocol_version: PROTOCOL_VERSION,
-            capabilities: Capabilities { groups: true, max_payload: Some(64_000), ..Default::default() },
+            capabilities: Capabilities {
+                groups: true,
+                max_payload: Some(64_000),
+                ..Default::default()
+            },
         },
     )
     .await
     .expect("hello");
-    match read_frame::<_, DaemonToPlugin>(&mut r).await.expect("hello ack") {
+    match read_frame::<_, DaemonToPlugin>(&mut r)
+        .await
+        .expect("hello ack")
+    {
         DaemonToPlugin::HelloAck { error: None, .. } => info!("registered with switchyardd"),
         DaemonToPlugin::HelloAck { error: Some(e), .. } => panic!("daemon refused us: {e}"),
         other => panic!("unexpected ack: {other:?}"),
@@ -201,12 +220,20 @@ async fn main() {
                 Ok(Event::Incoming(Incoming::Publish(p))) => {
                     let topic = String::from_utf8_lossy(&p.topic).into_owned();
                     let body = String::from_utf8_lossy(&p.payload).into_owned();
-                    if mqtt_tx.send(MqttEvent::Inbound { topic, body }).await.is_err() {
+                    if mqtt_tx
+                        .send(MqttEvent::Inbound { topic, body })
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
                 Ok(Event::Outgoing(Outgoing::Publish(pkid))) => {
-                    if mqtt_tx.send(MqttEvent::OutgoingPublish(pkid)).await.is_err() {
+                    if mqtt_tx
+                        .send(MqttEvent::OutgoingPublish(pkid))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -297,15 +324,21 @@ mod tests {
 
     #[test]
     fn parses_broker_url() {
-        assert_eq!(parse_broker("mqtt://10.0.0.5:1883").unwrap(), ("10.0.0.5".into(), 1883));
-        assert_eq!(parse_broker("mqtt://broker.local").unwrap(), ("broker.local".into(), 1883));
+        assert_eq!(
+            parse_broker("mqtt://10.0.0.5:1883").unwrap(),
+            ("10.0.0.5".into(), 1883)
+        );
+        assert_eq!(
+            parse_broker("mqtt://broker.local").unwrap(),
+            ("broker.local".into(), 1883)
+        );
         assert!(parse_broker("http://x").is_err());
     }
 
     #[test]
     fn config_defaults() {
-        let cfg: PluginCfg = serde_json::from_str(
-            r#"{"broker":"mqtt://127.0.0.1:1883","topics":["a/b"]}"#).unwrap();
+        let cfg: PluginCfg =
+            serde_json::from_str(r#"{"broker":"mqtt://127.0.0.1:1883","topics":["a/b"]}"#).unwrap();
         assert_eq!(cfg.client_id, "relayfabric");
         assert_eq!(cfg.topics, vec!["a/b"]);
     }
@@ -345,7 +378,11 @@ mod tests {
             t.on_enqueued(i64::from(pkid));
             t.on_outgoing_publish(pkid);
         }
-        assert!(t.awaiting_count() <= 1024, "awaiting_ack grew unbounded: {}", t.awaiting_count());
+        assert!(
+            t.awaiting_count() <= 1024,
+            "awaiting_ack grew unbounded: {}",
+            t.awaiting_count()
+        );
     }
 
     /// Live check against a local broker; run with: cargo test -j2 -p relayfabric-mqtt -- --ignored

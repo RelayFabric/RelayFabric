@@ -72,7 +72,14 @@ pub fn canonical_bytes(env: &Envelope) -> Vec<u8> {
     let mut attachments: Vec<(&str, &str, &str, u64)> = env
         .attachments
         .iter()
-        .map(|a| (a.sha256.as_str(), a.filename.as_str(), a.mime.as_str(), a.size))
+        .map(|a| {
+            (
+                a.sha256.as_str(),
+                a.filename.as_str(),
+                a.mime.as_str(),
+                a.size,
+            )
+        })
         .collect();
     attachments.sort_unstable_by(|a, b| a.0.cmp(b.0));
 
@@ -170,7 +177,12 @@ pub fn append_attestation(
     let digest = digest_canonical(env);
     let prev_sig: Vec<u8> = match env.attestations.last() {
         Some(a) => a.sig.clone(),
-        None => env.origin.as_ref().ok_or(SigError::MissingOrigin)?.sig.clone(),
+        None => env
+            .origin
+            .as_ref()
+            .ok_or(SigError::MissingOrigin)?
+            .sig
+            .clone(),
     };
     let sig = identity.sign(&attestation_bytes(&digest, &prev_sig, now));
     env.attestations.push(Attestation {
@@ -224,8 +236,13 @@ mod tests {
     fn fixed_envelope() -> Envelope {
         let created_at: DateTime<Utc> = "2026-08-16T00:00:00Z".parse().unwrap();
         let mut env = Envelope::new(
-            Endpoint { protocol: "mock".into(), endpoint: "chan".into() },
-            Sender { native_ref: "!abcd1234".into() },
+            Endpoint {
+                protocol: "mock".into(),
+                endpoint: "chan".into(),
+            },
+            Sender {
+                native_ref: "!abcd1234".into(),
+            },
             "text".into(),
             "hello federation".into(),
             created_at,
@@ -241,7 +258,10 @@ mod tests {
     #[test]
     fn canonical_bytes_golden_vector_is_locked() {
         let env = fixed_envelope();
-        let hex: String = canonical_bytes(&env).iter().map(|b| format!("{b:02x}")).collect();
+        let hex: String = canonical_bytes(&env)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         // Cross-version stability lock (design §2): if this ever changes,
         // that's a breaking wire-format event for federation signing, not
         // a test to casually update.
@@ -431,22 +451,30 @@ mod tests {
     fn canonical_bytes_is_order_independent_for_multiple_attachments() {
         let mut env_a = fixed_envelope();
         env_a.attachments.push(AttachmentMeta {
-            filename: "b.bin".into(), mime: "application/octet-stream".into(),
-            size: 2, sha256: "bbbb".into(),
+            filename: "b.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 2,
+            sha256: "bbbb".into(),
         });
         env_a.attachments.push(AttachmentMeta {
-            filename: "a.bin".into(), mime: "application/octet-stream".into(),
-            size: 1, sha256: "aaaa".into(),
+            filename: "a.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 1,
+            sha256: "aaaa".into(),
         });
 
         let mut env_b = fixed_envelope();
         env_b.attachments.push(AttachmentMeta {
-            filename: "a.bin".into(), mime: "application/octet-stream".into(),
-            size: 1, sha256: "aaaa".into(),
+            filename: "a.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 1,
+            sha256: "aaaa".into(),
         });
         env_b.attachments.push(AttachmentMeta {
-            filename: "b.bin".into(), mime: "application/octet-stream".into(),
-            size: 2, sha256: "bbbb".into(),
+            filename: "b.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 2,
+            sha256: "bbbb".into(),
         });
 
         // Same attachments, inserted in opposite order: canonical bytes
@@ -466,12 +494,16 @@ mod tests {
         // somewhere in the tuple).
         let mut env_c = fixed_envelope();
         env_c.attachments.push(AttachmentMeta {
-            filename: "a.bin".into(), mime: "application/octet-stream".into(),
-            size: 1, sha256: "bbbb".into(), // mismatched: a.bin's metadata under bbbb's sha
+            filename: "a.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 1,
+            sha256: "bbbb".into(), // mismatched: a.bin's metadata under bbbb's sha
         });
         env_c.attachments.push(AttachmentMeta {
-            filename: "b.bin".into(), mime: "application/octet-stream".into(),
-            size: 2, sha256: "aaaa".into(), // mismatched: b.bin's metadata under aaaa's sha
+            filename: "b.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 2,
+            sha256: "aaaa".into(), // mismatched: b.bin's metadata under aaaa's sha
         });
         assert_ne!(canonical_bytes(&env_a), canonical_bytes(&env_c));
     }
@@ -488,7 +520,10 @@ mod tests {
         let id = identity(dir.path(), "origin");
         let mut env = fixed_envelope();
         let raw_sig = id.sign(&canonical_bytes(&env)); // no domain prefix
-        env.origin = Some(OriginSig { node_id: id.node_id(), sig: raw_sig });
+        env.origin = Some(OriginSig {
+            node_id: id.node_id(),
+            sig: raw_sig,
+        });
         assert_eq!(verify_origin(&env), Err(SigError::BadSignature));
     }
 
@@ -509,7 +544,11 @@ mod tests {
         raw_msg.extend_from_slice(&prev_sig);
         raw_msg.extend_from_slice(now.to_rfc3339().as_bytes());
         let raw_sig = hop1.sign(&raw_msg);
-        env.attestations.push(Attestation { node_id: hop1.node_id(), ts: now, sig: raw_sig });
+        env.attestations.push(Attestation {
+            node_id: hop1.node_id(),
+            ts: now,
+            sig: raw_sig,
+        });
 
         assert_eq!(verify_chain(&env), Err(SigError::BadSignature));
     }
@@ -527,6 +566,10 @@ mod tests {
         let sig = id.sign(&domain_separated(domains::ENVELOPE_V1, &[&canonical]));
 
         let msg_under_noise_domain = domain_separated(domains::NOISE_STATIC_V1, &[&canonical]);
-        assert!(!node_identity::verify(&id.node_id(), &msg_under_noise_domain, &sig));
+        assert!(!node_identity::verify(
+            &id.node_id(),
+            &msg_under_noise_domain,
+            &sig
+        ));
     }
 }

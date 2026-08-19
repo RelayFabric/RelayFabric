@@ -32,8 +32,8 @@ use crate::engine::{self, Daemon};
 use crate::events::Event;
 use crate::fed::advert::{self, Advert};
 use crate::fed::noise::{self, FedChannel, StaticKey};
-use crate::fed::wire::Fed;
 use crate::fed::short_node_id;
+use crate::fed::wire::Fed;
 use crate::metrics;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -82,7 +82,12 @@ impl PeerConn {
         /// not cross-thread ordering, is all the guard needs).
         static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let instance = NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self { tx, node_id, connected_at, instance }
+        Self {
+            tx,
+            node_id,
+            connected_at,
+            instance,
+        }
     }
 }
 
@@ -162,7 +167,9 @@ pub fn spawn_federation(d: Arc<Daemon>, fcfg: FederationConfig) {
     if let Err(e) = d.store.lock().unwrap().seed_federation_trust(&fcfg, now) {
         warn!(error = %e, "failed to seed federation trust store");
     }
-    let key_path = d.cfg_snapshot(|c| c.node.data_dir.clone()).join("fed_static.key");
+    let key_path = d
+        .cfg_snapshot(|c| c.node.data_dir.clone())
+        .join("fed_static.key");
     let static_key = match StaticKey::load_or_create(&key_path) {
         Ok(k) => Arc::new(k),
         Err(e) => {
@@ -214,14 +221,20 @@ async fn accept_loop(d: Arc<Daemon>, listener: TcpListener, static_key: Arc<Stat
 /// attempted -- an attacker at the cap doesn't get to spend this daemon's
 /// CPU on a handshake it was always going to refuse.
 async fn accept_loop_with_cap(
-    d: Arc<Daemon>, listener: TcpListener, static_key: Arc<StaticKey>, max_inbound: usize,
+    d: Arc<Daemon>,
+    listener: TcpListener,
+    static_key: Arc<StaticKey>,
+    max_inbound: usize,
 ) {
     let permits = Arc::new(Semaphore::new(max_inbound));
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
-                    warn!(cap = max_inbound, "federation inbound connection cap reached, dropping");
+                    warn!(
+                        cap = max_inbound,
+                        "federation inbound connection cap reached, dropping"
+                    );
                     drop(stream);
                     continue;
                 };
@@ -240,8 +253,8 @@ async fn accept_loop_with_cap(
                             // OUTBOUND connection to the same peer would use)
                             // -- see `deliveries_for_fed_ack`'s doc comment
                             // for why this matters.
-                            let peer_key =
-                                configured_peer_name(&d, &node_id).unwrap_or_else(|| node_id.clone());
+                            let peer_key = configured_peer_name(&d, &node_id)
+                                .unwrap_or_else(|| node_id.clone());
                             admit_and_run(d, channel, peer_key, node_id).await;
                         }
                         Err(e) => warn!(error = %e, "federation inbound handshake failed"),
@@ -261,9 +274,12 @@ async fn accept_loop_with_cap(
 /// an await or another lock).
 fn configured_peer_name(d: &Daemon, node_id: &str) -> Option<String> {
     d.cfg_snapshot(|c| {
-        c.federation
-            .as_ref()
-            .and_then(|f| f.peers.iter().find(|p| p.node_id == node_id).map(|p| p.name.clone()))
+        c.federation.as_ref().and_then(|f| {
+            f.peers
+                .iter()
+                .find(|p| p.node_id == node_id)
+                .map(|p| p.name.clone())
+        })
     })
 }
 
@@ -276,7 +292,9 @@ fn configured_peer_name(d: &Daemon, node_id: &str) -> Option<String> {
 /// other. Checked per-attempt rather than once, so the dialer resumes
 /// within one recheck interval of the live connection ending.
 fn has_live_conn(d: &Daemon, peer_key: &str) -> bool {
-    d.fed.as_ref().is_some_and(|fed| fed.conns.lock().unwrap().contains_key(peer_key))
+    d.fed
+        .as_ref()
+        .is_some_and(|fed| fed.conns.lock().unwrap().contains_key(peer_key))
 }
 
 /// How often `spawn_outbound` rechecks a peer it's NOT dialing because a
@@ -306,8 +324,13 @@ async fn spawn_outbound(d: Arc<Daemon>, peer: PeerConfig, static_key: Arc<Static
         }
         let handshake_ok = match TcpStream::connect(&peer.addr).await {
             Ok(stream) => {
-                match noise::handshake_initiator(stream, &static_key, &d.identity, Some(&peer.node_id))
-                    .await
+                match noise::handshake_initiator(
+                    stream,
+                    &static_key,
+                    &d.identity,
+                    Some(&peer.node_id),
+                )
+                .await
                 {
                     Ok(channel) => {
                         admit_and_run(d.clone(), channel, peer.name.clone(), peer.node_id.clone())
@@ -325,7 +348,11 @@ async fn spawn_outbound(d: Arc<Daemon>, peer: PeerConfig, static_key: Arc<Static
                 false
             }
         };
-        backoff = if handshake_ok { Duration::from_secs(1) } else { (backoff * 2).min(Duration::from_secs(60)) };
+        backoff = if handshake_ok {
+            Duration::from_secs(1)
+        } else {
+            (backoff * 2).min(Duration::from_secs(60))
+        };
         tokio::time::sleep(backoff).await;
     }
 }
@@ -345,8 +372,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let now = Utc::now();
-    let blocked =
-        d.store.lock().unwrap().trust_level(&node_id).unwrap_or(None).as_deref() == Some("blocked");
+    let blocked = d
+        .store
+        .lock()
+        .unwrap()
+        .trust_level(&node_id)
+        .unwrap_or(None)
+        .as_deref()
+        == Some("blocked");
     if blocked {
         warn!(node = %display_peer_key(&node_id), "blocked federation peer dropped at handshake");
         return;
@@ -397,7 +430,11 @@ fn display_peer_key(peer_key: &str) -> String {
 /// `register_down` so teardown is provably scoped to THIS registration.
 #[must_use]
 fn register_up(
-    d: &Daemon, peer_key: &str, node_id: &str, now: DateTime<Utc>, tx: mpsc::Sender<Fed>,
+    d: &Daemon,
+    peer_key: &str,
+    node_id: &str,
+    now: DateTime<Utc>,
+    tx: mpsc::Sender<Fed>,
 ) -> Option<u64> {
     let fed = d.fed.as_ref()?;
     let conn = PeerConn::new(tx, node_id.to_string(), now);
@@ -412,7 +449,11 @@ fn register_up(
     }
     let label = display_peer_key(peer_key);
     metrics::set_federation_peer_up(&label, true);
-    d.emit_event(|| Event::Federation { peer: label.clone(), up: true, ts: now });
+    d.emit_event(|| Event::Federation {
+        peer: label.clone(),
+        up: true,
+        ts: now,
+    });
     info!(peer = %label, "federation connection up");
     Some(instance)
 }
@@ -439,7 +480,11 @@ fn register_down(d: &Daemon, peer_key: &str, instance: u64) {
     }
     let label = display_peer_key(peer_key);
     metrics::set_federation_peer_up(&label, false);
-    d.emit_event(|| Event::Federation { peer: label.clone(), up: false, ts: Utc::now() });
+    d.emit_event(|| Event::Federation {
+        peer: label.clone(),
+        up: false,
+        ts: Utc::now(),
+    });
     info!(peer = %label, "federation connection down");
 }
 
@@ -575,13 +620,17 @@ async fn run_conn<S>(
 /// like any other write failure, so every caller's existing
 /// `.is_err() { break }` handling already covers it without change.
 async fn send_fed<S: AsyncRead + AsyncWrite + Unpin>(
-    channel: &mut FedChannel<S>, f: &Fed,
+    channel: &mut FedChannel<S>,
+    f: &Fed,
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
     ciborium::into_writer(f, &mut buf).map_err(std::io::Error::other)?;
     match tokio::time::timeout(SEND_TIMEOUT, channel.send_frame(&buf)).await {
         Ok(result) => result,
-        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "federation send timed out")),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "federation send timed out",
+        )),
     }
 }
 
@@ -626,12 +675,13 @@ fn handle_frame(d: &Daemon, peer_node_id: &str, peer_key: &str, frame: Fed) -> O
             receive_advert(d, peer_node_id, advert);
             None
         }
-        Fed::Sealed { sealed, target_route } => {
-            match engine::fed_sealed_ingress(d, peer_node_id, sealed, target_route) {
-                engine::FedIngressOutcome::Accepted(id) => Some(Fed::Ack { id: id.to_string() }),
-                engine::FedIngressOutcome::Rejected(_) => None,
-            }
-        }
+        Fed::Sealed {
+            sealed,
+            target_route,
+        } => match engine::fed_sealed_ingress(d, peer_node_id, sealed, target_route) {
+            engine::FedIngressOutcome::Accepted(id) => Some(Fed::Ack { id: id.to_string() }),
+            engine::FedIngressOutcome::Rejected(_) => None,
+        },
         Fed::Unknown => None,
     }
 }
@@ -663,7 +713,12 @@ fn advert_scope_allows(d: &Daemon, peer_node_id: &str) -> bool {
                 // analogous case (fail closed, never open).
                 return false;
             };
-            let level = d.store.lock().unwrap().trust_level(peer_node_id).unwrap_or(None);
+            let level = d
+                .store
+                .lock()
+                .unwrap()
+                .trust_level(peer_node_id)
+                .unwrap_or(None);
             let level_str = level.as_deref().unwrap_or("unknown");
             engine::trust_rank(level_str) >= engine::trust_rank(&accept_from)
         }
@@ -686,9 +741,8 @@ fn advert_scope_allows(d: &Daemon, peer_node_id: &str) -> bool {
 /// sends peers over the wire.
 pub(crate) fn build_signed_advert(d: &Daemon) -> Option<Advert> {
     let sealed_key_hex = hex::encode(d.sealed_key.public());
-    let unsigned = d.cfg_snapshot(|c| {
-        advert::build_from_config(c, &d.node_id, &sealed_key_hex, Utc::now())
-    })?;
+    let unsigned =
+        d.cfg_snapshot(|c| advert::build_from_config(c, &d.node_id, &sealed_key_hex, Utc::now()))?;
     Some(advert::sign(unsigned, &d.identity))
 }
 
@@ -702,9 +756,11 @@ fn advert_keys_sane(advert: &Advert) -> bool {
     fn ok(k: &str) -> bool {
         !k.is_empty()
             && k.len() <= 32
-            && k.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+            && k.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
     }
-    advert.services.keys().all(|k| ok(k.as_str())) && advert.protocols.keys().all(|k| ok(k.as_str()))
+    advert.services.keys().all(|k| ok(k.as_str()))
+        && advert.protocols.keys().all(|k| ok(k.as_str()))
 }
 
 /// Unicode display-spoofing codepoints NOT covered by `char::is_control()`
@@ -765,8 +821,9 @@ pub(crate) fn sanitize_advert_name(name: &str) -> String {
 /// Per-peer throttle map for `reject_advert`'s warn log line (mirrors
 /// `engine::warn_pre_trust_rejection`'s shape, kept separate -- see
 /// `ADVERT_REJECT_WARN_INTERVAL`'s doc comment for why).
-static ADVERT_REJECT_WARN_THROTTLE: std::sync::LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static ADVERT_REJECT_WARN_THROTTLE: std::sync::LazyLock<
+    Mutex<HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Bumps `ADVERT_REJECTED` and, at most once per peer per minute, warns
 /// with `reason` -- called for every receive-path validation failure
@@ -777,8 +834,11 @@ static ADVERT_REJECT_WARN_THROTTLE: std::sync::LazyLock<Mutex<HashMap<String, st
 /// Noise handshake).
 fn reject_advert(peer_node_id: &str, reason: &str) {
     metrics::inc(&metrics::ADVERT_REJECTED);
-    if super::warn_throttle_due(&ADVERT_REJECT_WARN_THROTTLE, peer_node_id,
-                                ADVERT_REJECT_WARN_INTERVAL) {
+    if super::warn_throttle_due(
+        &ADVERT_REJECT_WARN_THROTTLE,
+        peer_node_id,
+        ADVERT_REJECT_WARN_INTERVAL,
+    ) {
         warn!(peer = %short_node_id(peer_node_id), reason,
             "federation advert rejected (not persisted; further repeats from this peer are \
              throttled to 1/min)");
@@ -830,12 +890,19 @@ fn receive_advert(d: &Daemon, peer_node_id: &str, advert: Advert) {
     let sanitized_name = sanitize_advert_name(&advert.name);
 
     let result = d.store.lock().unwrap().upsert_peer_advert(
-        &advert.node_id, &raw, &sanitized_name, expires_dt, now);
+        &advert.node_id,
+        &raw,
+        &sanitized_name,
+        expires_dt,
+        now,
+    );
     match result {
         Ok(()) => {
             metrics::inc(&metrics::ADVERT_RX);
             d.emit_event(|| Event::Advert {
-                node_id: advert.node_id.clone(), name: sanitized_name.clone(), ts: now,
+                node_id: advert.node_id.clone(),
+                name: sanitized_name.clone(),
+                ts: now,
             });
         }
         Err(e) => warn!(error = %e, "failed to persist peer advert"),
@@ -868,7 +935,9 @@ pub(crate) fn handle_fed_ack(d: &Daemon, peer_key: &str, id: &str) {
         return;
     };
     let store = d.store.lock().unwrap();
-    let rows = store.deliveries_for_fed_ack(message_id, peer_key).unwrap_or_default();
+    let rows = store
+        .deliveries_for_fed_ack(message_id, peer_key)
+        .unwrap_or_default();
     let mut delivered: Vec<(uuid::Uuid, String)> = Vec::new();
     for row in &rows {
         if row.state != "attempting" {
@@ -876,7 +945,9 @@ pub(crate) fn handle_fed_ack(d: &Daemon, peer_key: &str, id: &str) {
         }
         match store.mark_delivered(row.id) {
             Ok(()) => delivered.push((row.message_id, row.route.clone())),
-            Err(e) => warn!(delivery = row.id, error = %e, "failed to persist federation delivery ack"),
+            Err(e) => {
+                warn!(delivery = row.id, error = %e, "failed to persist federation delivery ack")
+            }
         }
     }
     drop(store);
@@ -899,9 +970,10 @@ mod tests {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let key = StaticKey::load_or_create(&dir.join(format!("peer-static-{n}.key"))).unwrap();
-        let identity =
-            crate::node_identity::NodeIdentity::load_or_create(&dir.join(format!("peer-identity-{n}")))
-                .unwrap();
+        let identity = crate::node_identity::NodeIdentity::load_or_create(
+            &dir.join(format!("peer-identity-{n}")),
+        )
+        .unwrap();
         (key, identity)
     }
 
@@ -927,9 +999,9 @@ mod tests {
         let (peer_key, peer_id) = keypair(dir.path());
         let node_id = peer_id.node_id();
         let cfg = fed_cfg(vec![], vec![node_id.clone()]); // blocked
-        // test_daemon_with_federation seeds the trust store from `cfg`
-        // itself (mirroring spawn_federation's boot-time seeding), so the
-        // blocked list above is already in effect once this returns.
+                                                          // test_daemon_with_federation seeds the trust store from `cfg`
+                                                          // itself (mirroring spawn_federation's boot-time seeding), so the
+                                                          // blocked list above is already in effect once this returns.
         let d = Arc::new(test_daemon_with_federation(dir.path(), cfg));
 
         let (a, b) = tokio::io::duplex(1 << 16);
@@ -938,7 +1010,9 @@ mod tests {
             noise::handshake_responder(b, &daemon_static, &daemon_identity).await
         });
         let (client_channel, _server_node_id) = {
-            let client = handshake_initiator(a, &peer_key, &peer_id, None).await.unwrap();
+            let client = handshake_initiator(a, &peer_key, &peer_id, None)
+                .await
+                .unwrap();
             let (server_channel, server_node_id) = responder.await.unwrap().unwrap();
             let d2 = d.clone();
             tokio::spawn(async move {
@@ -947,17 +1021,25 @@ mod tests {
             (client, server_node_id)
         };
 
-        assert!(d.fed.as_ref().unwrap().conns.lock().unwrap().is_empty(),
-            "a blocked peer must never be registered");
+        assert!(
+            d.fed.as_ref().unwrap().conns.lock().unwrap().is_empty(),
+            "a blocked peer must never be registered"
+        );
 
         // The blocked side returns immediately without entering run_conn,
         // dropping the stream -- the client's next read must therefore
         // fail (EOF/reset), a deterministic completion signal.
         let mut client_channel = client_channel;
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(2), client_channel.recv_frame()).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_channel.recv_frame(),
+        )
+        .await;
         assert!(result.is_ok(), "must not hang");
-        assert!(result.unwrap().is_err(), "blocked peer's connection must be closed, not idle");
+        assert!(
+            result.unwrap().is_err(),
+            "blocked peer's connection must be closed, not idle"
+        );
     }
 
     // ---- SEEN recorded on successful handshake -----------------------------
@@ -968,7 +1050,10 @@ mod tests {
         let (peer_key, peer_id) = keypair(dir.path());
         let node_id = peer_id.node_id();
         // No peers/trusted/blocked entry at all for this node_id.
-        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![])));
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_cfg(vec![], vec![]),
+        ));
         assert_eq!(d.store.lock().unwrap().trust_level(&node_id).unwrap(), None);
 
         let mut rx = d.events.subscribe();
@@ -977,23 +1062,36 @@ mod tests {
         let responder = tokio::spawn(async move {
             noise::handshake_responder(b, &daemon_static, &daemon_identity).await
         });
-        let mut client_channel = handshake_initiator(a, &peer_key, &peer_id, None).await.unwrap();
+        let mut client_channel = handshake_initiator(a, &peer_key, &peer_id, None)
+            .await
+            .unwrap();
         let (server_channel, server_node_id) = responder.await.unwrap().unwrap();
         assert_eq!(server_node_id, node_id);
 
         let d2 = d.clone();
-        let conn_task =
-            tokio::spawn(async move { admit_and_run(d2, server_channel, node_id.clone(), node_id).await });
+        let conn_task = tokio::spawn(async move {
+            admit_and_run(d2, server_channel, node_id.clone(), node_id).await
+        });
 
         let up = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await.expect("timed out waiting for the up event").unwrap();
+            .await
+            .expect("timed out waiting for the up event")
+            .unwrap();
         match up {
             Event::Federation { up, .. } => assert!(up),
             other => panic!("expected Federation, got {other:?}"),
         }
 
-        assert_eq!(d.store.lock().unwrap().trust_level(&peer_id.node_id()).unwrap().as_deref(),
-            Some("seen"), "a successful handshake from an unconfigured node must record 'seen'");
+        assert_eq!(
+            d.store
+                .lock()
+                .unwrap()
+                .trust_level(&peer_id.node_id())
+                .unwrap()
+                .as_deref(),
+            Some("seen"),
+            "a successful handshake from an unconfigured node must record 'seen'"
+        );
 
         // Close the client side so the server's run_conn sees EOF and ends.
         let _ = client_channel.send_frame(b"").await; // best-effort, don't care if it errors
@@ -1001,7 +1099,9 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), conn_task).await;
 
         let down = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await.expect("timed out waiting for the down event").unwrap();
+            .await
+            .expect("timed out waiting for the down event")
+            .unwrap();
         match down {
             Event::Federation { up, .. } => assert!(!up),
             other => panic!("expected Federation, got {other:?}"),
@@ -1024,18 +1124,29 @@ mod tests {
 
         let (tx1, mut rx1) = mpsc::channel::<Fed>(4);
         let (tx2, mut rx2) = mpsc::channel::<Fed>(4);
-        assert!(register_up(&d, "phoenix", &node_id, now, tx1).is_some(),
-            "first registration must succeed");
-        assert!(register_up(&d, "phoenix", &node_id, now, tx2).is_none(),
-            "second registration for a live key must be refused");
+        assert!(
+            register_up(&d, "phoenix", &node_id, now, tx1).is_some(),
+            "first registration must succeed"
+        );
+        assert!(
+            register_up(&d, "phoenix", &node_id, now, tx2).is_none(),
+            "second registration for a live key must be refused"
+        );
 
         let conns = d.fed.as_ref().unwrap().conns.lock().unwrap();
         assert_eq!(conns.len(), 1);
-        conns.get("phoenix").unwrap().tx.try_send(Fed::Ping {}).unwrap();
+        conns
+            .get("phoenix")
+            .unwrap()
+            .tx
+            .try_send(Fed::Ping {})
+            .unwrap();
         drop(conns);
-        assert!(rx1.try_recv().is_ok(),
+        assert!(
+            rx1.try_recv().is_ok(),
             "the registered connection must still be the FIRST one -- \
-             a crossed second registration must not displace a live conn");
+             a crossed second registration must not displace a live conn"
+        );
         assert!(rx2.try_recv().is_err());
     }
 
@@ -1057,23 +1168,47 @@ mod tests {
         // Simulate the first conn's entry being replaced by a successor
         // out from under it (the interleaving the instance guard defends
         // against): remove + re-register.
-        d.fed.as_ref().unwrap().conns.lock().unwrap().remove("phoenix");
+        d.fed
+            .as_ref()
+            .unwrap()
+            .conns
+            .lock()
+            .unwrap()
+            .remove("phoenix");
         let (tx2, _rx2) = mpsc::channel::<Fed>(4);
         let live = register_up(&d, "phoenix", &node_id, now, tx2)
             .expect("successor registration must succeed once the key is free");
-        assert_ne!(stale, live, "each registration must get its own instance token");
+        assert_ne!(
+            stale, live,
+            "each registration must get its own instance token"
+        );
 
         let mut events = d.events.subscribe();
         register_down(&d, "phoenix", stale);
-        assert!(d.fed.as_ref().unwrap().conns.lock().unwrap().contains_key("phoenix"),
-            "a stale teardown must not evict the live successor");
-        assert!(events.try_recv().is_err(),
-            "a stale teardown must not emit a Federation down event");
+        assert!(
+            d.fed
+                .as_ref()
+                .unwrap()
+                .conns
+                .lock()
+                .unwrap()
+                .contains_key("phoenix"),
+            "a stale teardown must not evict the live successor"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "a stale teardown must not emit a Federation down event"
+        );
 
         register_down(&d, "phoenix", live);
-        assert!(d.fed.as_ref().unwrap().conns.lock().unwrap().is_empty(),
-            "the live instance's own teardown must still remove the entry");
-        match events.try_recv().expect("the live teardown must emit the down event") {
+        assert!(
+            d.fed.as_ref().unwrap().conns.lock().unwrap().is_empty(),
+            "the live instance's own teardown must still remove the entry"
+        );
+        match events
+            .try_recv()
+            .expect("the live teardown must emit the down event")
+        {
             Event::Federation { up, .. } => assert!(!up),
             other => panic!("expected Federation, got {other:?}"),
         }
@@ -1108,7 +1243,10 @@ mod tests {
     #[tokio::test]
     async fn crossed_admit_and_run_drops_the_second_connection_and_keeps_the_first() {
         let dir = tempfile::tempdir().unwrap();
-        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![])));
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_cfg(vec![], vec![]),
+        ));
 
         // First connection: full handshake, then parked in run_conn.
         let (peer1_key, peer1_id) = keypair(dir.path());
@@ -1116,17 +1254,36 @@ mod tests {
         let (ds1, di1) = keypair(dir.path());
         let responder =
             tokio::spawn(async move { noise::handshake_responder(b1, &ds1, &di1).await });
-        let _client1 = handshake_initiator(a1, &peer1_key, &peer1_id, None).await.unwrap();
+        let _client1 = handshake_initiator(a1, &peer1_key, &peer1_id, None)
+            .await
+            .unwrap();
         let (server1, node1) = responder.await.unwrap().unwrap();
         let d2 = d.clone();
         tokio::spawn(async move { admit_and_run(d2, server1, "phoenix".to_string(), node1).await });
         // Wait until the first connection is actually registered.
         for _ in 0..100 {
-            if d.fed.as_ref().unwrap().conns.lock().unwrap().contains_key("phoenix") { break; }
+            if d.fed
+                .as_ref()
+                .unwrap()
+                .conns
+                .lock()
+                .unwrap()
+                .contains_key("phoenix")
+            {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let first_instance =
-            d.fed.as_ref().unwrap().conns.lock().unwrap().get("phoenix").unwrap().instance;
+        let first_instance = d
+            .fed
+            .as_ref()
+            .unwrap()
+            .conns
+            .lock()
+            .unwrap()
+            .get("phoenix")
+            .unwrap()
+            .instance;
 
         // Second connection, same peer key (the crossed dial).
         let mut events = d.events.subscribe();
@@ -1135,47 +1292,70 @@ mod tests {
         let (ds2, di2) = keypair(dir.path());
         let responder =
             tokio::spawn(async move { noise::handshake_responder(b2, &ds2, &di2).await });
-        let mut client2 = handshake_initiator(a2, &peer2_key, &peer2_id, None).await.unwrap();
+        let mut client2 = handshake_initiator(a2, &peer2_key, &peer2_id, None)
+            .await
+            .unwrap();
         let (server2, node2) = responder.await.unwrap().unwrap();
         let d3 = d.clone();
-        let second = tokio::spawn(async move {
-            admit_and_run(d3, server2, "phoenix".to_string(), node2).await
-        });
+        let second =
+            tokio::spawn(
+                async move { admit_and_run(d3, server2, "phoenix".to_string(), node2).await },
+            );
 
         // The second admit_and_run must return promptly (refused, not run) --
         // its client sees the channel closed rather than a live idle conn.
         tokio::time::timeout(std::time::Duration::from_secs(2), second)
-            .await.expect("the crossed second connection must be dropped promptly, not kept running")
+            .await
+            .expect("the crossed second connection must be dropped promptly, not kept running")
             .unwrap();
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(2), client2.recv_frame()).await;
         assert!(result.is_ok(), "must not hang");
-        assert!(result.unwrap().is_err(), "the second connection must be closed, not idle");
+        assert!(
+            result.unwrap().is_err(),
+            "the second connection must be closed, not idle"
+        );
 
         let conns = d.fed.as_ref().unwrap().conns.lock().unwrap();
-        assert_eq!(conns.get("phoenix").map(|c| c.instance), Some(first_instance),
-            "the FIRST connection must still be the registered one");
+        assert_eq!(
+            conns.get("phoenix").map(|c| c.instance),
+            Some(first_instance),
+            "the FIRST connection must still be the registered one"
+        );
         drop(conns);
-        assert!(events.try_recv().is_err(),
-            "dropping the refused second connection must not emit any Federation down event");
+        assert!(
+            events.try_recv().is_err(),
+            "dropping the refused second connection must not emit any Federation down event"
+        );
     }
 
     // ---- ack exactly-once (state-guard replay) -----------------------------
 
     fn dest() -> Endpoint {
-        Endpoint { protocol: "fed".into(), endpoint: "phoenix/general".into() }
+        Endpoint {
+            protocol: "fed".into(),
+            endpoint: "phoenix/general".into(),
+        }
     }
 
     fn seed_attempting_fed_delivery(d: &Daemon) -> (uuid::Uuid, i64) {
         let now = Utc::now();
         let env = relay_core::Envelope::new(
-            "mock:chan".parse().unwrap(), Sender { native_ref: "!a".into() },
-            "text".into(), "hello".into(), now, now + chrono::Duration::hours(1), 8,
+            "mock:chan".parse().unwrap(),
+            Sender {
+                native_ref: "!a".into(),
+            },
+            "text".into(),
+            "hello".into(),
+            now,
+            now + chrono::Duration::hours(1),
+            8,
         );
         let store = d.store.lock().unwrap();
         store.insert_message(&env).unwrap();
-        let delivery_id =
-            store.insert_delivery(env.id, "general", &dest(), now, env.expires_at, 2).unwrap();
+        let delivery_id = store
+            .insert_delivery(env.id, "general", &dest(), now, env.expires_at, 2)
+            .unwrap();
         store.mark_attempting(delivery_id).unwrap();
         (env.id, delivery_id)
     }
@@ -1189,9 +1369,16 @@ mod tests {
         let mut rx = d.events.subscribe();
         handle_fed_ack(&d, "phoenix", &message_id.to_string());
 
-        let after_first = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let after_first = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         assert_eq!(after_first.state, "delivered");
-        let ev = rx.try_recv().expect("first Ack must emit a Delivery(delivered) event");
+        let ev = rx
+            .try_recv()
+            .expect("first Ack must emit a Delivery(delivered) event");
         match ev {
             Event::Delivery { state, .. } => assert_eq!(state, "delivered"),
             other => panic!("expected Delivery, got {other:?}"),
@@ -1201,11 +1388,21 @@ mod tests {
         // updated_at/state again, and must not emit a second event.
         let before_replay = after_first.updated_at;
         handle_fed_ack(&d, "phoenix", &message_id.to_string());
-        let after_replay = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let after_replay = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         assert_eq!(after_replay.state, "delivered");
-        assert_eq!(after_replay.updated_at, before_replay,
-            "a replayed Ack must not touch an already-delivered row");
-        assert!(rx.try_recv().is_err(), "a replayed Ack must not emit a second Delivery event");
+        assert_eq!(
+            after_replay.updated_at, before_replay,
+            "a replayed Ack must not touch an already-delivered row"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a replayed Ack must not emit a second Delivery event"
+        );
     }
 
     #[test]
@@ -1223,8 +1420,16 @@ mod tests {
 
         handle_fed_ack(&d, "seattle", &message_id.to_string()); // wrong peer
 
-        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
-        assert_eq!(after.state, "attempting", "an Ack from the wrong peer must not resolve the row");
+        let after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
+        assert_eq!(
+            after.state, "attempting",
+            "an Ack from the wrong peer must not resolve the row"
+        );
     }
 
     // ---- full wire round-trip: Fed::Envelope in, Fed::Ack out (duplex) ----
@@ -1236,9 +1441,12 @@ mod tests {
         let node_id = peer_id.node_id();
         let mut cfg = fed_cfg(vec![], vec![]);
         cfg.peers = vec![PeerConfig {
-            name: "phoenix".into(), node_id: node_id.clone(),
-            addr: "10.0.0.2:47000".into(), trust: "verified".into(),
-            messages_per_minute: 0, sealed_key: None,
+            name: "phoenix".into(),
+            node_id: node_id.clone(),
+            addr: "10.0.0.2:47000".into(),
+            trust: "verified".into(),
+            messages_per_minute: 0,
+            sealed_key: None,
         }];
         let d = Arc::new(test_daemon_with_federation(dir.path(), cfg));
 
@@ -1247,29 +1455,45 @@ mod tests {
         let responder = tokio::spawn(async move {
             noise::handshake_responder(b, &daemon_static, &daemon_identity).await
         });
-        let mut client_channel = handshake_initiator(a, &peer_key, &peer_id, None).await.unwrap();
+        let mut client_channel = handshake_initiator(a, &peer_key, &peer_id, None)
+            .await
+            .unwrap();
         let (server_channel, server_node_id) = responder.await.unwrap().unwrap();
 
         let d2 = d.clone();
-        tokio::spawn(
-            async move { admit_and_run(d2, server_channel, "phoenix".to_string(), server_node_id).await },
-        );
+        tokio::spawn(async move {
+            admit_and_run(d2, server_channel, "phoenix".to_string(), server_node_id).await
+        });
 
         let now = Utc::now();
         let mut env = relay_core::Envelope::new(
-            "mock:origin".parse().unwrap(), Sender { native_ref: "!remote".into() },
-            "text".into(), "hi from phoenix".into(), now, now + chrono::Duration::hours(1), 8,
+            "mock:origin".parse().unwrap(),
+            Sender {
+                native_ref: "!remote".into(),
+            },
+            "text".into(),
+            "hi from phoenix".into(),
+            now,
+            now + chrono::Duration::hours(1),
+            8,
         );
         env.origin = Some(crate::fed::sign::sign_origin(&env, &peer_id));
         let env_id = env.id;
-        let frame = Fed::Envelope { env: Box::new(env), target_route: "general".into() };
+        let frame = Fed::Envelope {
+            env: Box::new(env),
+            target_route: "general".into(),
+        };
         let mut buf = Vec::new();
         ciborium::into_writer(&frame, &mut buf).unwrap();
         client_channel.send_frame(&buf).await.unwrap();
 
-        let reply_bytes =
-            tokio::time::timeout(std::time::Duration::from_secs(2), client_channel.recv_frame())
-                .await.expect("timed out waiting for an Ack").unwrap();
+        let reply_bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_channel.recv_frame(),
+        )
+        .await
+        .expect("timed out waiting for an Ack")
+        .unwrap();
         let reply: Fed = ciborium::from_reader(reply_bytes.as_slice()).unwrap();
         match reply {
             Fed::Ack { id } => assert_eq!(id, env_id.to_string()),
@@ -1277,7 +1501,10 @@ mod tests {
         }
 
         let store = d.store.lock().unwrap();
-        assert_eq!(store.queue_counts().unwrap(), vec![("pending".to_string(), 2)]);
+        assert_eq!(
+            store.queue_counts().unwrap(),
+            vec![("pending".to_string(), 2)]
+        );
     }
 
     // ---- TCP listener smoke test (design says: not exhaustive timing,
@@ -1288,7 +1515,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (peer_key, peer_id) = keypair(dir.path());
         let node_id = peer_id.node_id();
-        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![])));
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_cfg(vec![], vec![]),
+        ));
         let mut rx = d.events.subscribe();
 
         let (daemon_static, _daemon_identity) = keypair(dir.path());
@@ -1299,10 +1529,14 @@ mod tests {
         tokio::spawn(async move { accept_loop(d2, listener, daemon_static).await });
 
         let stream = TcpStream::connect(addr).await.unwrap();
-        let _client_channel = handshake_initiator(stream, &peer_key, &peer_id, None).await.unwrap();
+        let _client_channel = handshake_initiator(stream, &peer_key, &peer_id, None)
+            .await
+            .unwrap();
 
         let up = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await.expect("timed out waiting for the up event over real TCP").unwrap();
+            .await
+            .expect("timed out waiting for the up event over real TCP")
+            .unwrap();
         match up {
             Event::Federation { peer, up, .. } => {
                 assert!(up);
@@ -1320,7 +1554,10 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![])));
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_cfg(vec![], vec![]),
+        ));
         let (daemon_static, _daemon_identity) = keypair(dir.path());
         let daemon_static = Arc::new(daemon_static);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1347,7 +1584,10 @@ mod tests {
         let mut buf = [0u8; 1];
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(2), over_cap.read(&mut buf)).await;
-        assert!(result.is_ok(), "an over-cap connection must be closed promptly, not left hanging");
+        assert!(
+            result.is_ok(),
+            "an over-cap connection must be closed promptly, not left hanging"
+        );
         assert_eq!(result.unwrap().unwrap(), 0,
             "an over-cap connection must be closed with EOF and zero bytes (no handshake attempted)");
     }
@@ -1369,7 +1609,8 @@ mod tests {
 
     impl<S: AsyncRead + Unpin> AsyncRead for StallWritesAfterHandshake<S> {
         fn poll_read(
-            self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
             buf: &mut tokio::io::ReadBuf<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
             std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
@@ -1378,7 +1619,9 @@ mod tests {
 
     impl<S: AsyncWrite + Unpin> AsyncWrite for StallWritesAfterHandshake<S> {
         fn poll_write(
-            self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8],
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
         ) -> std::task::Poll<std::io::Result<usize>> {
             let this = self.get_mut();
             if this.stall_writes.load(Ordering::Relaxed) {
@@ -1387,7 +1630,8 @@ mod tests {
             std::pin::Pin::new(&mut this.inner).poll_write(cx, buf)
         }
         fn poll_flush(
-            self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
             let this = self.get_mut();
             if this.stall_writes.load(Ordering::Relaxed) {
@@ -1396,7 +1640,8 @@ mod tests {
             std::pin::Pin::new(&mut this.inner).poll_flush(cx)
         }
         fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
             std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
         }
@@ -1420,16 +1665,24 @@ mod tests {
         let (peer_key, peer_id) = keypair(dir.path());
         let node_id = peer_id.node_id();
         let (daemon_static, daemon_identity) = keypair(dir.path());
-        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![])));
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_cfg(vec![], vec![]),
+        ));
 
         let (a, b) = tokio::io::duplex(1 << 16);
         let stall = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let wrapped_b = StallWritesAfterHandshake { inner: b, stall_writes: stall.clone() };
+        let wrapped_b = StallWritesAfterHandshake {
+            inner: b,
+            stall_writes: stall.clone(),
+        };
 
         let responder = tokio::spawn(async move {
             noise::handshake_responder(wrapped_b, &daemon_static, &daemon_identity).await
         });
-        let client_channel = handshake_initiator(a, &peer_key, &peer_id, None).await.unwrap();
+        let client_channel = handshake_initiator(a, &peer_key, &peer_id, None)
+            .await
+            .unwrap();
         let (server_channel, server_node_id) = responder.await.unwrap().unwrap();
         assert_eq!(server_node_id, node_id);
 
@@ -1462,9 +1715,14 @@ mod tests {
         tokio::time::advance(SEND_TIMEOUT + Duration::from_secs(1)).await;
 
         let result = tokio::time::timeout(Duration::from_secs(5), conn_task).await;
-        assert!(result.is_ok(), "the connection must be torn down, not wedged forever on a stalled write");
-        assert!(d.fed.as_ref().unwrap().conns.lock().unwrap().is_empty(),
-            "a send-timed-out connection must deregister, exactly like any other closed connection");
+        assert!(
+            result.is_ok(),
+            "the connection must be torn down, not wedged forever on a stalled write"
+        );
+        assert!(
+            d.fed.as_ref().unwrap().conns.lock().unwrap().is_empty(),
+            "a send-timed-out connection must deregister, exactly like any other closed connection"
+        );
     }
 
     // ---- RFDP discovery (design §2/§3, cycle G) ---------------------------
@@ -1479,8 +1737,10 @@ mod tests {
     /// directly here rather than adding another `test_daemon_with_*`
     /// constructor for one field.
     fn set_discovery(d: &Daemon, mode: &str, advert_ttl_secs: u64) {
-        d.cfg.write().unwrap().discovery =
-            crate::config::DiscoveryConfig { mode: mode.to_string(), advert_ttl_secs };
+        d.cfg.write().unwrap().discovery = crate::config::DiscoveryConfig {
+            mode: mode.to_string(),
+            advert_ttl_secs,
+        };
     }
 
     fn test_advert(node_id: &str, name: &str, expires: i64) -> Advert {
@@ -1491,7 +1751,10 @@ mod tests {
             services: BTreeMap::from([("federation".to_string(), true)]),
             protocols: BTreeMap::new(),
             security: advert::SecurityCaps {
-                translate: true, signed: true, sealed: true, sealed_key: Some("22".repeat(32)),
+                translate: true,
+                signed: true,
+                sealed: true,
+                sealed_key: Some("22".repeat(32)),
             },
             expires,
             sig: Vec::new(),
@@ -1506,21 +1769,26 @@ mod tests {
     /// `peer_key_str` and hands back the CLIENT-held channel the test
     /// drives by hand.
     async fn connect_for_advert_test(
-        d: &Arc<Daemon>, dir: &std::path::Path, peer_key_str: &str,
-        peer_key: &StaticKey, peer_id: &crate::node_identity::NodeIdentity,
+        d: &Arc<Daemon>,
+        dir: &std::path::Path,
+        peer_key_str: &str,
+        peer_key: &StaticKey,
+        peer_id: &crate::node_identity::NodeIdentity,
     ) -> FedChannel<tokio::io::DuplexStream> {
         let (a, b) = tokio::io::duplex(1 << 16);
         let (daemon_static, daemon_identity) = keypair(dir);
         let responder = tokio::spawn(async move {
             noise::handshake_responder(b, &daemon_static, &daemon_identity).await
         });
-        let client_channel = handshake_initiator(a, peer_key, peer_id, None).await.unwrap();
+        let client_channel = handshake_initiator(a, peer_key, peer_id, None)
+            .await
+            .unwrap();
         let (server_channel, server_node_id) = responder.await.unwrap().unwrap();
         let d2 = d.clone();
         let peer_key_owned = peer_key_str.to_string();
-        tokio::spawn(
-            async move { admit_and_run(d2, server_channel, peer_key_owned, server_node_id).await },
-        );
+        tokio::spawn(async move {
+            admit_and_run(d2, server_channel, peer_key_owned, server_node_id).await
+        });
         client_channel
     }
 
@@ -1528,13 +1796,21 @@ mod tests {
     /// single configured peer, `federation` discovery, generous TTL.
     fn advert_test_daemon_and_peer(
         dir: &std::path::Path,
-    ) -> (Arc<Daemon>, StaticKey, crate::node_identity::NodeIdentity, String) {
+    ) -> (
+        Arc<Daemon>,
+        StaticKey,
+        crate::node_identity::NodeIdentity,
+        String,
+    ) {
         let (peer_key, peer_id) = keypair(dir);
         let node_id = peer_id.node_id();
         let mut cfg = fed_cfg(vec![], vec![]);
         cfg.peers = vec![PeerConfig {
-            name: "phoenix".into(), node_id: node_id.clone(),
-            addr: "10.0.0.2:47000".into(), trust: "verified".into(), messages_per_minute: 0,
+            name: "phoenix".into(),
+            node_id: node_id.clone(),
+            addr: "10.0.0.2:47000".into(),
+            trust: "verified".into(),
+            messages_per_minute: 0,
             sealed_key: None,
         }];
         let d = Arc::new(test_daemon_with_federation(dir, cfg));
@@ -1552,7 +1828,10 @@ mod tests {
         assert_eq!(sanitize_advert_name("\x1b[31mred\x1b[0m"), "[31mred[0m");
         assert_eq!(sanitize_advert_name("line1\nline2\r\n"), "line1line2");
         assert_eq!(sanitize_advert_name("null\x00byte"), "nullbyte");
-        assert_eq!(sanitize_advert_name(&"x".repeat(100)).chars().count(), ADVERT_MAX_NAME_CHARS);
+        assert_eq!(
+            sanitize_advert_name(&"x".repeat(100)).chars().count(),
+            ADVERT_MAX_NAME_CHARS
+        );
     }
 
     /// Task 2 review fix round 1 (Important): `char::is_control()` alone
@@ -1578,7 +1857,11 @@ mod tests {
             '\u{2060}',
         ] {
             let name = format!("a{spoof}b");
-            assert_eq!(sanitize_advert_name(&name), "ab", "spoofing char {spoof:?} was not stripped");
+            assert_eq!(
+                sanitize_advert_name(&name),
+                "ab",
+                "spoofing char {spoof:?} was not stripped"
+            );
         }
     }
 
@@ -1588,7 +1871,13 @@ mod tests {
         a.services.insert("store_forward".to_string(), true);
         a.protocols.insert(
             "lxmf".to_string(),
-            advert::ProtoCaps { rx: true, tx: true, text: true, files: false, max_payload: None },
+            advert::ProtoCaps {
+                rx: true,
+                tx: true,
+                text: true,
+                files: false,
+                max_payload: None,
+            },
         );
         assert!(advert_keys_sane(&a));
     }
@@ -1615,9 +1904,15 @@ mod tests {
         let d = test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![]));
         set_discovery(&d, "disabled", 3600);
         let node_id = format!("rf:{}", "44".repeat(32));
-        d.store.lock().unwrap().seed_trust(&node_id, "trusted", Utc::now()).unwrap();
-        assert!(!advert_scope_allows(&d, &node_id),
-            "disabled discovery must never allow advert exchange, even with a fully trusted peer");
+        d.store
+            .lock()
+            .unwrap()
+            .seed_trust(&node_id, "trusted", Utc::now())
+            .unwrap();
+        assert!(
+            !advert_scope_allows(&d, &node_id),
+            "disabled discovery must never allow advert exchange, even with a fully trusted peer"
+        );
     }
 
     #[test]
@@ -1626,9 +1921,15 @@ mod tests {
         let d = test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![])); // accept_from: verified
         set_discovery(&d, "federation", 3600);
         let seen_node = format!("rf:{}", "55".repeat(32));
-        d.store.lock().unwrap().record_seen(&seen_node, Utc::now()).unwrap();
-        assert!(!advert_scope_allows(&d, &seen_node),
-            "a merely-seen peer must not pass federation-mode's accept_from gate");
+        d.store
+            .lock()
+            .unwrap()
+            .record_seen(&seen_node, Utc::now())
+            .unwrap();
+        assert!(
+            !advert_scope_allows(&d, &seen_node),
+            "a merely-seen peer must not pass federation-mode's accept_from gate"
+        );
     }
 
     #[test]
@@ -1637,7 +1938,11 @@ mod tests {
         let d = test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![]));
         set_discovery(&d, "federation", 3600);
         let verified_node = format!("rf:{}", "66".repeat(32));
-        d.store.lock().unwrap().seed_trust(&verified_node, "verified", Utc::now()).unwrap();
+        d.store
+            .lock()
+            .unwrap()
+            .seed_trust(&verified_node, "verified", Utc::now())
+            .unwrap();
         assert!(advert_scope_allows(&d, &verified_node));
     }
 
@@ -1647,9 +1952,15 @@ mod tests {
         let d = test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![]));
         set_discovery(&d, "public", 3600);
         let seen_node = format!("rf:{}", "77".repeat(32));
-        d.store.lock().unwrap().record_seen(&seen_node, Utc::now()).unwrap();
-        assert!(advert_scope_allows(&d, &seen_node),
-            "public scope must allow any authenticated peer, regardless of trust level");
+        d.store
+            .lock()
+            .unwrap()
+            .record_seen(&seen_node, Utc::now())
+            .unwrap();
+        assert!(
+            advert_scope_allows(&d, &seen_node),
+            "public scope must allow any authenticated peer, regardless of trust level"
+        );
     }
 
     // ---- duplex wire-level exchange ----------------------------------------
@@ -1664,19 +1975,33 @@ mod tests {
         // The server must proactively ask the client for its advert at
         // connect (design §2: each side sends AdvertReq).
         let first = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
-            .await.expect("timed out waiting for the server's AdvertReq").unwrap();
-        assert!(
-            matches!(ciborium::from_reader::<Fed, _>(first.as_slice()).unwrap(), Fed::AdvertReq {}));
+            .await
+            .expect("timed out waiting for the server's AdvertReq")
+            .unwrap();
+        assert!(matches!(
+            ciborium::from_reader::<Fed, _>(first.as_slice()).unwrap(),
+            Fed::AdvertReq {}
+        ));
 
         // Client answers with its OWN signed advert (node_id bound to this
         // connection's authenticated identity) -- the server must verify,
         // accept, and store it.
         let client_advert = advert::sign(
-            test_advert(&node_id, "client-node", (Utc::now() + ChronoDuration::hours(1)).timestamp()),
+            test_advert(
+                &node_id,
+                "client-node",
+                (Utc::now() + ChronoDuration::hours(1)).timestamp(),
+            ),
             &peer_id,
         );
         let mut buf = Vec::new();
-        ciborium::into_writer(&Fed::Advert { advert: client_advert }, &mut buf).unwrap();
+        ciborium::into_writer(
+            &Fed::Advert {
+                advert: client_advert,
+            },
+            &mut buf,
+        )
+        .unwrap();
         client_channel.send_frame(&buf).await.unwrap();
 
         // Client also sends its own AdvertReq -- the server must answer
@@ -1686,7 +2011,9 @@ mod tests {
         client_channel.send_frame(&req).await.unwrap();
 
         let reply = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
-            .await.expect("timed out waiting for the server's advert reply").unwrap();
+            .await
+            .expect("timed out waiting for the server's advert reply")
+            .unwrap();
         match ciborium::from_reader::<Fed, _>(reply.as_slice()).unwrap() {
             Fed::Advert { advert } => {
                 assert_eq!(advert.node_id, d.node_id);
@@ -1697,7 +2024,10 @@ mod tests {
                 // fixture, the actual `d.sealed_key.public()` this daemon
                 // loaded/created at construction.
                 assert!(advert.security.sealed);
-                assert_eq!(advert.security.sealed_key, Some(hex::encode(d.sealed_key.public())));
+                assert_eq!(
+                    advert.security.sealed_key,
+                    Some(hex::encode(d.sealed_key.public()))
+                );
             }
             other => panic!("expected Advert, got {other:?}"),
         }
@@ -1706,11 +2036,22 @@ mod tests {
         // briefly for the client's advert to land.
         let mut stored = Vec::new();
         for _ in 0..100 {
-            stored = d.store.lock().unwrap().list_peer_adverts(Utc::now()).unwrap();
-            if !stored.is_empty() { break; }
+            stored = d
+                .store
+                .lock()
+                .unwrap()
+                .list_peer_adverts(Utc::now())
+                .unwrap();
+            if !stored.is_empty() {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(stored.len(), 1, "the client's advert must be stored on the server side");
+        assert_eq!(
+            stored.len(),
+            1,
+            "the client's advert must be stored on the server side"
+        );
         assert_eq!(stored[0].0, node_id);
     }
 
@@ -1721,28 +2062,51 @@ mod tests {
         let mut client_channel =
             connect_for_advert_test(&d, dir.path(), "phoenix", &peer_key, &peer_id).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
-            .await.unwrap().unwrap(); // the server's own initial AdvertReq
+            .await
+            .unwrap()
+            .unwrap(); // the server's own initial AdvertReq
 
         // A DIFFERENT identity signs a perfectly valid advert for ITSELF,
         // but it arrives over a connection authenticated as `peer_id` --
         // an advert relayed for a third party.
         let (_third_key, third_party) = keypair(dir.path());
         let third_advert = advert::sign(
-            test_advert(&third_party.node_id(), "impersonator",
-                (Utc::now() + ChronoDuration::hours(1)).timestamp()),
+            test_advert(
+                &third_party.node_id(),
+                "impersonator",
+                (Utc::now() + ChronoDuration::hours(1)).timestamp(),
+            ),
             &third_party,
         );
         let before = metrics::ADVERT_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
         let mut buf = Vec::new();
-        ciborium::into_writer(&Fed::Advert { advert: third_advert }, &mut buf).unwrap();
+        ciborium::into_writer(
+            &Fed::Advert {
+                advert: third_advert,
+            },
+            &mut buf,
+        )
+        .unwrap();
         client_channel.send_frame(&buf).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let after = metrics::ADVERT_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(after > before, "ADVERT_REJECTED must bump for a third-party node_id");
-        let stored = d.store.lock().unwrap().list_peer_adverts(Utc::now()).unwrap();
-        assert!(stored.iter().all(|(nid, _, _)| nid != &third_party.node_id()),
-            "a third-party advert must never be stored: {stored:?}");
+        assert!(
+            after > before,
+            "ADVERT_REJECTED must bump for a third-party node_id"
+        );
+        let stored = d
+            .store
+            .lock()
+            .unwrap()
+            .list_peer_adverts(Utc::now())
+            .unwrap();
+        assert!(
+            stored
+                .iter()
+                .all(|(nid, _, _)| nid != &third_party.node_id()),
+            "a third-party advert must never be stored: {stored:?}"
+        );
     }
 
     #[tokio::test]
@@ -1752,12 +2116,18 @@ mod tests {
         let mut client_channel =
             connect_for_advert_test(&d, dir.path(), "phoenix", &peer_key, &peer_id).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
 
         let mut events_rx = d.events.subscribe();
         let malicious_name = "\x1b[31mRED\x1b[0m\nline2\x00null";
         let advert = advert::sign(
-            test_advert(&node_id, malicious_name, (Utc::now() + ChronoDuration::hours(1)).timestamp()),
+            test_advert(
+                &node_id,
+                malicious_name,
+                (Utc::now() + ChronoDuration::hours(1)).timestamp(),
+            ),
             &peer_id,
         );
         let mut buf = Vec::new();
@@ -1769,13 +2139,21 @@ mod tests {
         // newline, no NUL, matching `sanitize_advert_name`'s output
         // exactly.
         let ev = tokio::time::timeout(Duration::from_secs(2), events_rx.recv())
-            .await.expect("timed out waiting for the Advert SSE event").unwrap();
+            .await
+            .expect("timed out waiting for the Advert SSE event")
+            .unwrap();
         match ev {
-            Event::Advert { node_id: got_node, name, .. } => {
+            Event::Advert {
+                node_id: got_node,
+                name,
+                ..
+            } => {
                 assert_eq!(got_node, node_id);
                 assert_eq!(name, sanitize_advert_name(malicious_name));
-                assert!(!name.contains('\x1b') && !name.contains('\n') && !name.contains('\0'),
-                    "sanitized name must carry no control characters: {name:?}");
+                assert!(
+                    !name.contains('\x1b') && !name.contains('\n') && !name.contains('\0'),
+                    "sanitized name must carry no control characters: {name:?}"
+                );
             }
             other => panic!("expected Advert, got {other:?}"),
         }
@@ -1786,13 +2164,22 @@ mod tests {
         // signature covers canonical_bytes(advert), not this particular
         // CBOR encoding. Proving Task 3's planned "verify on serve"
         // re-check will succeed against it.
-        let stored = d.store.lock().unwrap().list_peer_adverts(Utc::now()).unwrap();
+        let stored = d
+            .store
+            .lock()
+            .unwrap()
+            .list_peer_adverts(Utc::now())
+            .unwrap();
         assert_eq!(stored.len(), 1);
         let decoded: Advert = ciborium::from_reader(stored[0].1.as_slice()).unwrap();
-        assert_eq!(decoded.name, malicious_name,
-            "advert_cbor's re-encode must preserve the original (unsanitized) name content");
-        assert!(advert::verify(&decoded).is_ok(),
-            "stored advert_cbor must remain independently re-verifiable");
+        assert_eq!(
+            decoded.name, malicious_name,
+            "advert_cbor's re-encode must preserve the original (unsanitized) name content"
+        );
+        assert!(
+            advert::verify(&decoded).is_ok(),
+            "stored advert_cbor must remain independently re-verifiable"
+        );
     }
 
     #[tokio::test]
@@ -1802,11 +2189,17 @@ mod tests {
         let mut client_channel =
             connect_for_advert_test(&d, dir.path(), "phoenix", &peer_key, &peer_id).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
 
         let huge_name = "x".repeat(20_000); // well over ADVERT_MAX_BYTES once CBOR-encoded
         let advert = advert::sign(
-            test_advert(&node_id, &huge_name, (Utc::now() + ChronoDuration::hours(1)).timestamp()),
+            test_advert(
+                &node_id,
+                &huge_name,
+                (Utc::now() + ChronoDuration::hours(1)).timestamp(),
+            ),
             &peer_id,
         );
         let before = metrics::ADVERT_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
@@ -1816,8 +2209,17 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let after = metrics::ADVERT_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(after > before, "ADVERT_REJECTED must bump for an oversized advert");
-        assert!(d.store.lock().unwrap().list_peer_adverts(Utc::now()).unwrap().is_empty());
+        assert!(
+            after > before,
+            "ADVERT_REJECTED must bump for an oversized advert"
+        );
+        assert!(d
+            .store
+            .lock()
+            .unwrap()
+            .list_peer_adverts(Utc::now())
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1827,10 +2229,16 @@ mod tests {
         let mut client_channel =
             connect_for_advert_test(&d, dir.path(), "phoenix", &peer_key, &peer_id).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
 
         let advert = advert::sign(
-            test_advert(&node_id, "stale", (Utc::now() - ChronoDuration::seconds(10)).timestamp()),
+            test_advert(
+                &node_id,
+                "stale",
+                (Utc::now() - ChronoDuration::seconds(10)).timestamp(),
+            ),
             &peer_id,
         );
         let before = metrics::ADVERT_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
@@ -1840,8 +2248,17 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let after = metrics::ADVERT_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(after > before, "ADVERT_REJECTED must bump for an already-expired advert");
-        assert!(d.store.lock().unwrap().list_peer_adverts(Utc::now()).unwrap().is_empty());
+        assert!(
+            after > before,
+            "ADVERT_REJECTED must bump for an already-expired advert"
+        );
+        assert!(d
+            .store
+            .lock()
+            .unwrap()
+            .list_peer_adverts(Utc::now())
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1851,10 +2268,16 @@ mod tests {
         let mut client_channel =
             connect_for_advert_test(&d, dir.path(), "phoenix", &peer_key, &peer_id).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
 
         let advert = advert::sign(
-            test_advert(&node_id, "far-future", (Utc::now() + ChronoDuration::days(30)).timestamp()),
+            test_advert(
+                &node_id,
+                "far-future",
+                (Utc::now() + ChronoDuration::days(30)).timestamp(),
+            ),
             &peer_id,
         );
         let mut buf = Vec::new();
@@ -1863,25 +2286,47 @@ mod tests {
 
         let mut found = false;
         for _ in 0..100 {
-            if !d.store.lock().unwrap().list_peer_adverts(Utc::now()).unwrap().is_empty() {
+            if !d
+                .store
+                .lock()
+                .unwrap()
+                .list_peer_adverts(Utc::now())
+                .unwrap()
+                .is_empty()
+            {
                 found = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(found, "a far-future-expiring advert must be accepted (clamped), not rejected");
+        assert!(
+            found,
+            "a far-future-expiring advert must be accepted (clamped), not rejected"
+        );
 
         // Clamped to now + 24h: still present just under that horizon,
         // gone just past it -- proving the real 30-day claim was NOT
         // honored verbatim.
         assert_eq!(
-            d.store.lock().unwrap()
-                .list_peer_adverts(Utc::now() + ChronoDuration::hours(23)).unwrap().len(),
-            1, "must still be unexpired just under the 24h clamp");
+            d.store
+                .lock()
+                .unwrap()
+                .list_peer_adverts(Utc::now() + ChronoDuration::hours(23))
+                .unwrap()
+                .len(),
+            1,
+            "must still be unexpired just under the 24h clamp"
+        );
         assert_eq!(
-            d.store.lock().unwrap()
-                .list_peer_adverts(Utc::now() + ChronoDuration::hours(25)).unwrap().len(),
-            0, "must be expired just past the 24h clamp -- the 30-day claim was not honored");
+            d.store
+                .lock()
+                .unwrap()
+                .list_peer_adverts(Utc::now() + ChronoDuration::hours(25))
+                .unwrap()
+                .len(),
+            0,
+            "must be expired just past the 24h clamp -- the 30-day claim was not honored"
+        );
     }
 
     // ---- refresh timer, fake-clock (design §2: advert_ttl_secs / 2) -------
@@ -1912,8 +2357,11 @@ mod tests {
         let node_id = peer_id.node_id();
         let mut cfg = fed_cfg(vec![], vec![]);
         cfg.peers = vec![PeerConfig {
-            name: "phoenix".into(), node_id: node_id.clone(),
-            addr: "10.0.0.2:47000".into(), trust: "verified".into(), messages_per_minute: 0,
+            name: "phoenix".into(),
+            node_id: node_id.clone(),
+            addr: "10.0.0.2:47000".into(),
+            trust: "verified".into(),
+            messages_per_minute: 0,
             sealed_key: None,
         }];
         let d = Arc::new(test_daemon_with_federation(dir.path(), cfg));
@@ -1923,9 +2371,13 @@ mod tests {
             connect_for_advert_test(&d, dir.path(), "phoenix", &peer_key, &peer_id).await;
 
         let first = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
-            .await.unwrap().unwrap();
-        assert!(
-            matches!(ciborium::from_reader::<Fed, _>(first.as_slice()).unwrap(), Fed::AdvertReq {}));
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            ciborium::from_reader::<Fed, _>(first.as_slice()).unwrap(),
+            Fed::AdvertReq {}
+        ));
 
         // Advance in PING_INTERVAL-sized steps (< DEAD_AFTER) toward the
         // 150s refresh point, replying to each server Ping with a Pong --
@@ -1936,9 +2388,14 @@ mod tests {
         for _ in 0..10 {
             advance_in_ticks(PING_INTERVAL).await;
             let frame = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
-                .await.expect("timed out waiting for a frame").unwrap();
+                .await
+                .expect("timed out waiting for a frame")
+                .unwrap();
             match ciborium::from_reader::<Fed, _>(frame.as_slice()).unwrap() {
-                Fed::Advert { advert } => { refreshed = Some(advert); break; }
+                Fed::Advert { advert } => {
+                    refreshed = Some(advert);
+                    break;
+                }
                 Fed::Ping {} => {
                     let mut pong = Vec::new();
                     ciborium::into_writer(&Fed::Pong {}, &mut pong).unwrap();
@@ -1967,7 +2424,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (peer_key, peer_id) = keypair(dir.path());
         let node_id = peer_id.node_id();
-        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![])));
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_cfg(vec![], vec![]),
+        ));
         let mut events = d.events.subscribe();
 
         let (a, b) = tokio::io::duplex(1 << 16);
@@ -1975,7 +2435,9 @@ mod tests {
         let responder = tokio::spawn(async move {
             noise::handshake_responder(b, &daemon_static, &daemon_identity).await
         });
-        let mut client_channel = handshake_initiator(a, &peer_key, &peer_id, None).await.unwrap();
+        let mut client_channel = handshake_initiator(a, &peer_key, &peer_id, None)
+            .await
+            .unwrap();
         let (server_channel, server_node_id) = responder.await.unwrap().unwrap();
         assert_eq!(server_node_id, node_id);
 
@@ -1986,13 +2448,24 @@ mod tests {
         });
 
         let up = tokio::time::timeout(Duration::from_secs(2), events.recv())
-            .await.expect("timed out waiting for the up event").unwrap();
-        assert!(matches!(up, Event::Federation { up: true, .. }), "expected Federation up, got {up:?}");
+            .await
+            .expect("timed out waiting for the up event")
+            .unwrap();
+        assert!(
+            matches!(up, Event::Federation { up: true, .. }),
+            "expected Federation up, got {up:?}"
+        );
         for _ in 0..100 {
-            if d.fed.as_ref().unwrap().conns.lock().unwrap().len() == 1 { break; }
+            if d.fed.as_ref().unwrap().conns.lock().unwrap().len() == 1 {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(d.fed.as_ref().unwrap().conns.lock().unwrap().len(), 1, "must be registered first");
+        assert_eq!(
+            d.fed.as_ref().unwrap().conns.lock().unwrap().len(),
+            1,
+            "must be registered first"
+        );
 
         // The client sends NOTHING from here on -- only the housekeeping
         // tick (which never itself counts as recv activity) drives virtual
@@ -2001,12 +2474,19 @@ mod tests {
         advance_in_ticks(DEAD_AFTER + TICK + Duration::from_secs(1)).await;
 
         let result = tokio::time::timeout(Duration::from_secs(5), conn_task).await;
-        assert!(result.is_ok(), "a silent peer must be torn down, not held forever");
-        assert!(d.fed.as_ref().unwrap().conns.lock().unwrap().is_empty(),
-            "a dead-timed-out connection must deregister");
+        assert!(
+            result.is_ok(),
+            "a silent peer must be torn down, not held forever"
+        );
+        assert!(
+            d.fed.as_ref().unwrap().conns.lock().unwrap().is_empty(),
+            "a dead-timed-out connection must deregister"
+        );
 
         let down = tokio::time::timeout(Duration::from_secs(2), events.recv())
-            .await.expect("timed out waiting for the down event").unwrap();
+            .await
+            .expect("timed out waiting for the down event")
+            .unwrap();
         match down {
             Event::Federation { up, .. } => assert!(!up),
             other => panic!("expected Federation down event, got {other:?}"),
@@ -2017,12 +2497,18 @@ mod tests {
         let mut observed_close = false;
         for _ in 0..20 {
             match tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame()).await {
-                Ok(Err(_)) => { observed_close = true; break; }
+                Ok(Err(_)) => {
+                    observed_close = true;
+                    break;
+                }
                 Ok(Ok(_)) => continue,
                 Err(_) => panic!("timed out waiting to observe the connection close"),
             }
         }
-        assert!(observed_close, "the client side must observe the connection close");
+        assert!(
+            observed_close,
+            "the client side must observe the connection close"
+        );
     }
 
     /// The counterpart to the silent-peer test above: a peer that sends
@@ -2036,14 +2522,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (peer_key, peer_id) = keypair(dir.path());
         let node_id = peer_id.node_id();
-        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![])));
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_cfg(vec![], vec![]),
+        ));
 
         let (a, b) = tokio::io::duplex(1 << 16);
         let (daemon_static, daemon_identity) = keypair(dir.path());
         let responder = tokio::spawn(async move {
             noise::handshake_responder(b, &daemon_static, &daemon_identity).await
         });
-        let mut client_channel = handshake_initiator(a, &peer_key, &peer_id, None).await.unwrap();
+        let mut client_channel = handshake_initiator(a, &peer_key, &peer_id, None)
+            .await
+            .unwrap();
         let (server_channel, server_node_id) = responder.await.unwrap().unwrap();
         assert_eq!(server_node_id, node_id);
 
@@ -2053,7 +2544,9 @@ mod tests {
             admit_and_run(d2, server_channel, conn_registration_key, node_id).await;
         });
         for _ in 0..100 {
-            if d.fed.as_ref().unwrap().conns.lock().unwrap().len() == 1 { break; }
+            if d.fed.as_ref().unwrap().conns.lock().unwrap().len() == 1 {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
@@ -2073,15 +2566,22 @@ mod tests {
             // produces output), not a guess at how many scheduler passes
             // are enough.
             let frame = tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame())
-                .await.unwrap_or_else(|_| panic!("timed out waiting for a server reply in round {round}"))
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for a server reply in round {round}"))
                 .unwrap();
             ciborium::from_reader::<Fed, _>(frame.as_slice())
                 .unwrap_or_else(|_| panic!("undecodable frame in round {round}"));
         }
 
-        assert!(!conn_task.is_finished(), "an active peer must not be torn down by the dead timer");
-        assert_eq!(d.fed.as_ref().unwrap().conns.lock().unwrap().len(), 1,
-            "an active peer's connection must remain registered");
+        assert!(
+            !conn_task.is_finished(),
+            "an active peer must not be torn down by the dead timer"
+        );
+        assert_eq!(
+            d.fed.as_ref().unwrap().conns.lock().unwrap().len(),
+            1,
+            "an active peer's connection must remain registered"
+        );
     }
 
     // ---- 8h rekey, fake-clock (carried from cycle F) -----------------------
@@ -2100,14 +2600,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (peer_key, peer_id) = keypair(dir.path());
         let node_id = peer_id.node_id();
-        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![])));
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_cfg(vec![], vec![]),
+        ));
 
         let (a, b) = tokio::io::duplex(1 << 16);
         let (daemon_static, daemon_identity) = keypair(dir.path());
         let responder = tokio::spawn(async move {
             noise::handshake_responder(b, &daemon_static, &daemon_identity).await
         });
-        let mut client_channel = handshake_initiator(a, &peer_key, &peer_id, None).await.unwrap();
+        let mut client_channel = handshake_initiator(a, &peer_key, &peer_id, None)
+            .await
+            .unwrap();
         let (server_channel, server_node_id) = responder.await.unwrap().unwrap();
         assert_eq!(server_node_id, node_id);
 
@@ -2118,10 +2623,16 @@ mod tests {
         });
 
         for _ in 0..100 {
-            if d.fed.as_ref().unwrap().conns.lock().unwrap().len() == 1 { break; }
+            if d.fed.as_ref().unwrap().conns.lock().unwrap().len() == 1 {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(d.fed.as_ref().unwrap().conns.lock().unwrap().len(), 1, "must be registered first");
+        assert_eq!(
+            d.fed.as_ref().unwrap().conns.lock().unwrap().len(),
+            1,
+            "must be registered first"
+        );
 
         // Stay ACTIVE throughout (reply Pong to every server Ping) so the
         // dead timer (DEAD_AFTER = 90s, Task 2 review fix round 1) never
@@ -2134,15 +2645,26 @@ mod tests {
         for _ in 0..rounds {
             advance_in_ticks(PING_INTERVAL).await;
             match tokio::time::timeout(Duration::from_secs(2), client_channel.recv_frame()).await {
-                Ok(Ok(_)) => { let _ = client_channel.send_frame(&pong).await; }
-                Ok(Err(_)) => { torn_down = true; break; } // EOF: rekey teardown reached
+                Ok(Ok(_)) => {
+                    let _ = client_channel.send_frame(&pong).await;
+                }
+                Ok(Err(_)) => {
+                    torn_down = true;
+                    break;
+                } // EOF: rekey teardown reached
                 Err(_) => panic!("timed out waiting for a frame or the connection to close"),
             }
         }
-        assert!(torn_down, "the connection must be torn down at the 8h rekey deadline, not wedged");
+        assert!(
+            torn_down,
+            "the connection must be torn down at the 8h rekey deadline, not wedged"
+        );
 
         let result = tokio::time::timeout(Duration::from_secs(5), conn_task).await;
-        assert!(result.is_ok(), "the connection task must complete once torn down");
+        assert!(
+            result.is_ok(),
+            "the connection task must complete once torn down"
+        );
         assert!(d.fed.as_ref().unwrap().conns.lock().unwrap().is_empty(),
             "a rekeyed connection must deregister, so spawn_outbound's redial loop can re-handshake");
     }

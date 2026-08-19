@@ -65,7 +65,10 @@ pub enum PluginToDaemon {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum DaemonToPlugin {
-    HelloAck { protocol_version: u32, error: Option<String> },
+    HelloAck {
+        protocol_version: u32,
+        error: Option<String>,
+    },
     Send {
         corr: i64,
         endpoint: String,
@@ -102,9 +105,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
     w.flush().await
 }
 
-pub async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
-    r: &mut R,
-) -> io::Result<T> {
+pub async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> io::Result<T> {
     let mut hdr = [0u8; 4];
     r.read_exact(&mut hdr).await?;
     let len = u32::from_be_bytes(hdr);
@@ -133,7 +134,11 @@ mod tests {
         write_frame(&mut a, &msg).await.unwrap();
         let got: PluginToDaemon = read_frame(&mut b).await.unwrap();
         match got {
-            PluginToDaemon::Hello { plugin, protocol_version, .. } => {
+            PluginToDaemon::Hello {
+                plugin,
+                protocol_version,
+                ..
+            } => {
                 assert_eq!(plugin, "mqtt");
                 assert_eq!(protocol_version, 1);
             }
@@ -177,10 +182,18 @@ mod tests {
     #[tokio::test]
     async fn corr_survives_send_result_roundtrip() {
         let (mut a, mut b) = tokio::io::duplex(1024);
-        write_frame(&mut a, &DaemonToPlugin::Send {
-            corr: 42, endpoint: "chan".into(), kind: "text".into(), body: "hi".into(),
-            attachments: vec![],
-        }).await.unwrap();
+        write_frame(
+            &mut a,
+            &DaemonToPlugin::Send {
+                corr: 42,
+                endpoint: "chan".into(),
+                kind: "text".into(),
+                body: "hi".into(),
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
         let DaemonToPlugin::Send { corr, .. } = read_frame(&mut b).await.unwrap() else {
             panic!("wrong variant");
         };
@@ -235,12 +248,22 @@ mod tests {
     #[tokio::test]
     async fn send_direct_frame_roundtrips() {
         let (mut a, mut b) = tokio::io::duplex(1024);
-        write_frame(&mut a, &DaemonToPlugin::SendDirect {
-            corr: 99,
-            native_ref: "a91d00aa".into(),
-            body: "verification code".into(),
-        }).await.unwrap();
-        let DaemonToPlugin::SendDirect { corr, native_ref, body } = read_frame(&mut b).await.unwrap() else {
+        write_frame(
+            &mut a,
+            &DaemonToPlugin::SendDirect {
+                corr: 99,
+                native_ref: "a91d00aa".into(),
+                body: "verification code".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let DaemonToPlugin::SendDirect {
+            corr,
+            native_ref,
+            body,
+        } = read_frame(&mut b).await.unwrap()
+        else {
             panic!("wrong variant");
         };
         assert_eq!(corr, 99);
@@ -273,11 +296,17 @@ mod tests {
         let mut gauges = BTreeMap::new();
         gauges.insert("rssi".to_string(), -71.5);
         gauges.insert("queue_depth".to_string(), 3.0);
-        write_frame(&mut a, &PluginToDaemon::Gauges { gauges: gauges.clone() }).await.unwrap();
+        write_frame(
+            &mut a,
+            &PluginToDaemon::Gauges {
+                gauges: gauges.clone(),
+            },
+        )
+        .await
+        .unwrap();
         let PluginToDaemon::Gauges { gauges: got } = read_frame(&mut b).await.unwrap() else {
             panic!("wrong variant");
         };
         assert_eq!(got, gauges);
     }
-
 }

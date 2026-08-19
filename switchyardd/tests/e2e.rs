@@ -1,5 +1,7 @@
 use relay_core::Capabilities;
-use relay_ipc::{read_frame, write_frame, DaemonToPlugin, IpcAttachment, PluginToDaemon, PROTOCOL_VERSION};
+use relay_ipc::{
+    read_frame, write_frame, DaemonToPlugin, IpcAttachment, PluginToDaemon, PROTOCOL_VERSION,
+};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -14,8 +16,12 @@ struct TestDaemon {
 }
 
 impl TestDaemon {
-    fn plugin_sock(&self) -> PathBuf { self.dir.path().join("data/plugins.sock") }
-    fn admin_sock(&self) -> PathBuf { self.dir.path().join("data/admin.sock") }
+    fn plugin_sock(&self) -> PathBuf {
+        self.dir.path().join("data/plugins.sock")
+    }
+    fn admin_sock(&self) -> PathBuf {
+        self.dir.path().join("data/admin.sock")
+    }
 }
 
 impl Drop for TestDaemon {
@@ -143,7 +149,8 @@ transports:
 // output.
 fn spawn_daemon(cfg_path: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_switchyardd"))
-        .arg("--config").arg(cfg_path)
+        .arg("--config")
+        .arg(cfg_path)
         .env("RUST_LOG", "error")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -158,7 +165,11 @@ fn start_daemon(dir: tempfile::TempDir) -> TestDaemon {
 fn start_daemon_with_config(dir: tempfile::TempDir, config: &str) -> TestDaemon {
     let data = dir.path().join("data");
     let cfg_path = dir.path().join("relayfabric.yaml");
-    std::fs::write(&cfg_path, config.replace("DATA_DIR", data.to_str().unwrap())).unwrap();
+    std::fs::write(
+        &cfg_path,
+        config.replace("DATA_DIR", data.to_str().unwrap()),
+    )
+    .unwrap();
     let child = spawn_daemon(&cfg_path);
     TestDaemon { child, dir }
 }
@@ -180,12 +191,17 @@ async fn connect_plugin_with_caps(
 ) -> (OwnedReadHalf, OwnedWriteHalf) {
     let stream = UnixStream::connect(sock).await.unwrap();
     let (mut r, mut w) = stream.into_split();
-    write_frame(&mut w, &PluginToDaemon::Hello {
-        plugin: name.into(),
-        version: "0".into(),
-        protocol_version: PROTOCOL_VERSION,
-        capabilities,
-    }).await.unwrap();
+    write_frame(
+        &mut w,
+        &PluginToDaemon::Hello {
+            plugin: name.into(),
+            version: "0".into(),
+            protocol_version: PROTOCOL_VERSION,
+            capabilities,
+        },
+    )
+    .await
+    .unwrap();
     let ack: DaemonToPlugin = read_frame(&mut r).await.unwrap();
     match ack {
         DaemonToPlugin::HelloAck { error: None, .. } => {}
@@ -196,8 +212,14 @@ async fn connect_plugin_with_caps(
 
 async fn connect_plugin(sock: &Path, name: &str) -> (OwnedReadHalf, OwnedWriteHalf) {
     connect_plugin_with_caps(
-        sock, name, Capabilities { max_payload: Some(200), ..Default::default() },
-    ).await
+        sock,
+        name,
+        Capabilities {
+            max_payload: Some(200),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 // created_at is caller-supplied (rather than sampled fresh inside this
@@ -239,32 +261,50 @@ async fn inbound_with_priority(
     attachments: Vec<IpcAttachment>,
     priority: Option<&str>,
 ) {
-    write_frame(w, &PluginToDaemon::Inbound {
-        endpoint: endpoint.into(),
-        sender: sender.into(),
-        kind: "text".into(),
-        body: body.into(),
-        created_at: Some(created_at),
-        attachments,
-        priority: priority.map(String::from),
-    }).await.unwrap();
+    write_frame(
+        w,
+        &PluginToDaemon::Inbound {
+            endpoint: endpoint.into(),
+            sender: sender.into(),
+            kind: "text".into(),
+            body: body.into(),
+            created_at: Some(created_at),
+            attachments,
+            priority: priority.map(String::from),
+        },
+    )
+    .await
+    .unwrap();
 }
 
 async fn expect_send(r: &mut OwnedReadHalf) -> (i64, String, String, Vec<IpcAttachment>) {
     let msg: DaemonToPlugin = timeout(Duration::from_secs(10), read_frame(r))
-        .await.expect("timed out waiting for Send").unwrap();
+        .await
+        .expect("timed out waiting for Send")
+        .unwrap();
     match msg {
-        DaemonToPlugin::Send { corr, endpoint, body, attachments, .. } =>
-            (corr, endpoint, body, attachments),
+        DaemonToPlugin::Send {
+            corr,
+            endpoint,
+            body,
+            attachments,
+            ..
+        } => (corr, endpoint, body, attachments),
         other => panic!("expected Send, got {other:?}"),
     }
 }
 
 async fn expect_send_direct(r: &mut OwnedReadHalf) -> (i64, String, String) {
     let msg: DaemonToPlugin = timeout(Duration::from_secs(10), read_frame(r))
-        .await.expect("timed out waiting for SendDirect").unwrap();
+        .await
+        .expect("timed out waiting for SendDirect")
+        .unwrap();
     match msg {
-        DaemonToPlugin::SendDirect { corr, native_ref, body } => (corr, native_ref, body),
+        DaemonToPlugin::SendDirect {
+            corr,
+            native_ref,
+            body,
+        } => (corr, native_ref, body),
         other => panic!("expected SendDirect, got {other:?}"),
     }
 }
@@ -284,7 +324,8 @@ async fn admin_request(sock: &Path, method: &str, path: &str, body: Option<&str>
     let mut head = format!("{method} {path} HTTP/1.0\r\nhost: x\r\n");
     match body {
         Some(b) => head.push_str(&format!(
-            "content-type: application/json\r\ncontent-length: {}\r\n\r\n{b}", b.len(),
+            "content-type: application/json\r\ncontent-length: {}\r\n\r\n{b}",
+            b.len(),
         )),
         None => head.push_str("\r\n"),
     }
@@ -292,7 +333,12 @@ async fn admin_request(sock: &Path, method: &str, path: &str, body: Option<&str>
     let mut raw = String::new();
     s.read_to_string(&mut raw).await.unwrap();
     let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
-    let status: u16 = head.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0);
     (status, body.to_string())
 }
 
@@ -305,11 +351,18 @@ async fn admin_request(sock: &Path, method: &str, path: &str, body: Option<&str>
 async fn admin_get_with_head(sock: &Path, path: &str) -> (u16, String, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = UnixStream::connect(sock).await.unwrap();
-    s.write_all(format!("GET {path} HTTP/1.0\r\nhost: x\r\n\r\n").as_bytes()).await.unwrap();
+    s.write_all(format!("GET {path} HTTP/1.0\r\nhost: x\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
     let mut raw = String::new();
     s.read_to_string(&mut raw).await.unwrap();
     let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
-    let status: u16 = head.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0);
     (status, head.to_lowercase(), body.to_string())
 }
 
@@ -339,7 +392,9 @@ async fn poll_until_contains(sock: &Path, path: &str, needle: &str) -> String {
 async fn open_events_stream(sock: &Path) -> UnixStream {
     use tokio::io::AsyncWriteExt;
     let mut s = UnixStream::connect(sock).await.unwrap();
-    s.write_all(b"GET /v1/events HTTP/1.0\r\nhost: x\r\n\r\n").await.unwrap();
+    s.write_all(b"GET /v1/events HTTP/1.0\r\nhost: x\r\n\r\n")
+        .await
+        .unwrap();
     s
 }
 
@@ -356,7 +411,10 @@ async fn poll_stream_until_contains(s: &mut UnixStream, collected: &mut String, 
 /// at least `min_count` times -- for asserting a REPEAT of an event type the
 /// buffer already contains (e.g. rollback's second `config_applied`).
 async fn poll_stream_until_count(
-    s: &mut UnixStream, collected: &mut String, needle: &str, min_count: usize,
+    s: &mut UnixStream,
+    collected: &mut String,
+    needle: &str,
+    min_count: usize,
 ) {
     use tokio::io::AsyncReadExt;
     if collected.matches(needle).count() >= min_count {
@@ -394,27 +452,49 @@ async fn bridges_dedups_and_suppresses_echo() {
     assert!(body.starts_with("[MOCK"), "body was: {body}");
     assert!(body.contains("hello from a"));
     assert!(!body.contains("!abcd1234"), "native id leaked: {body}");
-    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
-        corr, delivered: true, detail: None,
-    }).await.unwrap();
+    write_frame(
+        &mut wb,
+        &PluginToDaemon::DeliveryResult {
+            corr,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
     // exact duplicate is dropped: no second Send on B (same created_at as
     // the original — an "exact" duplicate is identical in every dedup-key
     // field, not just body text)
     inbound(&mut wa, "chan", "!abcd1234", "hello from a", sent_at).await;
     assert!(
-        timeout(Duration::from_secs(2), read_frame::<_, DaemonToPlugin>(&mut rb))
-            .await.is_err(),
+        timeout(
+            Duration::from_secs(2),
+            read_frame::<_, DaemonToPlugin>(&mut rb)
+        )
+        .await
+        .is_err(),
         "duplicate was bridged"
     );
 
     // no echo back to A (reply direction still works)
     assert!(
-        timeout(Duration::from_millis(500), read_frame::<_, DaemonToPlugin>(&mut ra))
-            .await.is_err(),
+        timeout(
+            Duration::from_millis(500),
+            read_frame::<_, DaemonToPlugin>(&mut ra)
+        )
+        .await
+        .is_err(),
         "message echoed to its ingress endpoint"
     );
-    inbound(&mut wb, "chan", "peer-b", "reply from b", chrono::Utc::now()).await;
+    inbound(
+        &mut wb,
+        "chan",
+        "peer-b",
+        "reply from b",
+        chrono::Utc::now(),
+    )
+    .await;
     let (_, _, body, _) = expect_send(&mut ra).await;
     assert!(body.contains("reply from b"));
 
@@ -431,7 +511,14 @@ async fn queues_for_offline_plugin_and_survives_restart() {
     let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
 
     // B is not connected: delivery must queue
-    inbound(&mut wa, "chan", "!abcd1234", "parked message", chrono::Utc::now()).await;
+    inbound(
+        &mut wa,
+        "chan",
+        "!abcd1234",
+        "parked message",
+        chrono::Utc::now(),
+    )
+    .await;
     let queue = poll_until_contains(&d.admin_sock(), "/v1/queue", "\"pending\":1").await;
     assert!(queue.contains("\"pending\":1"), "queue was: {queue}");
 
@@ -440,14 +527,19 @@ async fn queues_for_offline_plugin_and_survives_restart() {
     // written to disk, not held only in memory).
     let payload = b"bytes that must survive a daemon restart".to_vec();
     let expected_sha = hex::encode(Sha256::digest(&payload));
-    inbound_with_attachments(&mut wa, "chan", "!abcd1234", "parked with attachment",
+    inbound_with_attachments(
+        &mut wa,
+        "chan",
+        "!abcd1234",
+        "parked with attachment",
         chrono::Utc::now(),
         vec![IpcAttachment {
             filename: "restart.bin".into(),
             mime: "application/octet-stream".into(),
             data: payload.clone(),
         }],
-    ).await;
+    )
+    .await;
     let cas_path = d.dir.path().join("data/attachments").join(&expected_sha);
     // handle_inbound writes the CAS blob synchronously before the delivery
     // row exists, but frame delivery + processing is still async from this
@@ -463,29 +555,60 @@ async fn queues_for_offline_plugin_and_survives_restart() {
     d.child = spawn_daemon(&cfg_path);
     wait_for(&d.plugin_sock()).await;
 
-    assert!(cas_path.exists(), "attachment blob did not survive the daemon kill+restart");
+    assert!(
+        cas_path.exists(),
+        "attachment blob did not survive the daemon kill+restart"
+    );
 
     // B connects after restart (with the attachments capability, so the
     // queued attachment actually rides along) and receives both parked
     // messages in order (spec §68).
-    let (mut rb, mut wb) = connect_plugin_with_caps(&d.plugin_sock(), "mockb",
-        Capabilities { max_payload: Some(200), attachments: true, ..Default::default() }).await;
+    let (mut rb, mut wb) = connect_plugin_with_caps(
+        &d.plugin_sock(),
+        "mockb",
+        Capabilities {
+            max_payload: Some(200),
+            attachments: true,
+            ..Default::default()
+        },
+    )
+    .await;
 
     let (corr1, _, body1, attachments1) = expect_send(&mut rb).await;
     assert!(body1.contains("parked message"));
     assert!(attachments1.is_empty());
-    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
-        corr: corr1, delivered: true, detail: None,
-    }).await.unwrap();
+    write_frame(
+        &mut wb,
+        &PluginToDaemon::DeliveryResult {
+            corr: corr1,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
     let (corr2, _, body2, attachments2) = expect_send(&mut rb).await;
     assert!(body2.contains("parked with attachment"));
     assert_eq!(attachments2.len(), 1);
-    assert_eq!(attachments2[0].data, payload, "attachment bytes were not intact after restart");
-    assert_eq!(hex::encode(Sha256::digest(&attachments2[0].data)), expected_sha);
-    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
-        corr: corr2, delivered: true, detail: None,
-    }).await.unwrap();
+    assert_eq!(
+        attachments2[0].data, payload,
+        "attachment bytes were not intact after restart"
+    );
+    assert_eq!(
+        hex::encode(Sha256::digest(&attachments2[0].data)),
+        expected_sha
+    );
+    write_frame(
+        &mut wb,
+        &PluginToDaemon::DeliveryResult {
+            corr: corr2,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 }
 
 /// Covers Task 4's priority scheduling end to end (spec §39): several
@@ -504,14 +627,27 @@ async fn emergency_priority_overtakes_bulk_priority_for_an_offline_plugin() {
     // B is not connected: three bulk-priority messages queue first...
     for body in ["bulk one", "bulk two", "bulk three"] {
         inbound_with_priority(
-            &mut wa, "chan", "!abcd1234", body, chrono::Utc::now(), vec![], Some("bulk"),
-        ).await;
+            &mut wa,
+            "chan",
+            "!abcd1234",
+            body,
+            chrono::Utc::now(),
+            vec![],
+            Some("bulk"),
+        )
+        .await;
     }
     // ...then one emergency-priority message queues last.
     inbound_with_priority(
-        &mut wa, "chan", "!abcd1234", "emergency evacuation notice", chrono::Utc::now(),
-        vec![], Some("emergency"),
-    ).await;
+        &mut wa,
+        "chan",
+        "!abcd1234",
+        "emergency evacuation notice",
+        chrono::Utc::now(),
+        vec![],
+        Some("emergency"),
+    )
+    .await;
 
     let queue = poll_until_contains(&d.admin_sock(), "/v1/queue", "\"pending\":4").await;
     assert!(queue.contains("\"pending\":4"), "queue was: {queue}");
@@ -520,19 +656,38 @@ async fn emergency_priority_overtakes_bulk_priority_for_an_offline_plugin() {
     // FIRST Send delivered.
     let (mut rb, mut wb) = connect_plugin(&d.plugin_sock(), "mockb").await;
     let (corr, _, body, _) = expect_send(&mut rb).await;
-    assert!(body.contains("emergency evacuation notice"),
-        "emergency message did not arrive first, body was: {body}");
-    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
-        corr, delivered: true, detail: None,
-    }).await.unwrap();
+    assert!(
+        body.contains("emergency evacuation notice"),
+        "emergency message did not arrive first, body was: {body}"
+    );
+    write_frame(
+        &mut wb,
+        &PluginToDaemon::DeliveryResult {
+            corr,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
     // the three bulk messages still follow, in some order, none lost.
     for _ in 0..3 {
         let (corr, _, body, _) = expect_send(&mut rb).await;
-        assert!(body.contains("bulk "), "expected a bulk message, body was: {body}");
-        write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
-            corr, delivered: true, detail: None,
-        }).await.unwrap();
+        assert!(
+            body.contains("bulk "),
+            "expected a bulk message, body was: {body}"
+        );
+        write_frame(
+            &mut wb,
+            &PluginToDaemon::DeliveryResult {
+                corr,
+                delivered: true,
+                detail: None,
+            },
+        )
+        .await
+        .unwrap();
     }
 }
 
@@ -547,41 +702,91 @@ async fn attachment_egress_is_capability_aware() {
     let d = start_daemon(tempfile::tempdir().unwrap());
     wait_for(&d.plugin_sock()).await;
     let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
-    let (mut rb, mut wb) = connect_plugin_with_caps(&d.plugin_sock(), "mockb",
-        Capabilities { max_payload: Some(200), attachments: true, ..Default::default() }).await;
-    let (mut rc, mut wc) = connect_plugin_with_caps(&d.plugin_sock(), "mockc",
-        Capabilities { max_payload: Some(200), attachments: false, ..Default::default() }).await;
+    let (mut rb, mut wb) = connect_plugin_with_caps(
+        &d.plugin_sock(),
+        "mockb",
+        Capabilities {
+            max_payload: Some(200),
+            attachments: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (mut rc, mut wc) = connect_plugin_with_caps(
+        &d.plugin_sock(),
+        "mockc",
+        Capabilities {
+            max_payload: Some(200),
+            attachments: false,
+            ..Default::default()
+        },
+    )
+    .await;
 
     let payload = b"\x89PNGfake-image-bytes-not-really-a-png".to_vec();
     let expected_sha = hex::encode(Sha256::digest(&payload));
-    inbound_with_attachments(&mut wa, "achan", "!abcd1234", "look at this",
+    inbound_with_attachments(
+        &mut wa,
+        "achan",
+        "!abcd1234",
+        "look at this",
         chrono::Utc::now(),
         vec![IpcAttachment {
             filename: "photo.png".into(),
             mime: "image/png".into(),
             data: payload.clone(),
         }],
-    ).await;
+    )
+    .await;
 
     // B: attachments capability true -> bytes ride along unchanged.
     let (corr_b, _, body_b, attachments_b) = expect_send(&mut rb).await;
     assert_eq!(attachments_b.len(), 1);
     assert_eq!(attachments_b[0].filename, "photo.png");
-    assert_eq!(attachments_b[0].data, payload, "attachment bytes were altered in transit");
-    assert_eq!(hex::encode(Sha256::digest(&attachments_b[0].data)), expected_sha);
-    assert!(!body_b.contains("[attachment omitted]"), "body was: {body_b}");
+    assert_eq!(
+        attachments_b[0].data, payload,
+        "attachment bytes were altered in transit"
+    );
+    assert_eq!(
+        hex::encode(Sha256::digest(&attachments_b[0].data)),
+        expected_sha
+    );
+    assert!(
+        !body_b.contains("[attachment omitted]"),
+        "body was: {body_b}"
+    );
 
     // C: attachments capability false -> stripped, noted, no attachment data.
     let (corr_c, _, body_c, attachments_c) = expect_send(&mut rc).await;
-    assert!(attachments_c.is_empty(), "C lacks the attachments capability");
-    assert!(body_c.contains("[attachment omitted]"), "body was: {body_c}");
+    assert!(
+        attachments_c.is_empty(),
+        "C lacks the attachments capability"
+    );
+    assert!(
+        body_c.contains("[attachment omitted]"),
+        "body was: {body_c}"
+    );
 
-    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
-        corr: corr_b, delivered: true, detail: None,
-    }).await.unwrap();
-    write_frame(&mut wc, &PluginToDaemon::DeliveryResult {
-        corr: corr_c, delivered: true, detail: None,
-    }).await.unwrap();
+    write_frame(
+        &mut wb,
+        &PluginToDaemon::DeliveryResult {
+            corr: corr_b,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut wc,
+        &PluginToDaemon::DeliveryResult {
+            corr: corr_c,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 }
 
 /// Transport-class cycle Task 4 (design §3/§113.4, e2e): the destination
@@ -617,80 +822,176 @@ async fn transport_class_constrained_route_demotes_media() {
     let d = start_daemon_with_config(tempfile::tempdir().unwrap(), TRANSPORT_CLASS_CONFIG);
     wait_for(&d.plugin_sock()).await;
     let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
-    let (mut rb, mut wb) = connect_plugin_with_caps(&d.plugin_sock(), "mockb",
-        Capabilities { attachments: true, ..Default::default() }).await;
-    let (mut rc, mut wc) = connect_plugin_with_caps(&d.plugin_sock(), "mockc",
-        Capabilities { attachments: true, ..Default::default() }).await;
+    let (mut rb, mut wb) = connect_plugin_with_caps(
+        &d.plugin_sock(),
+        "mockb",
+        Capabilities {
+            attachments: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (mut rc, mut wc) = connect_plugin_with_caps(
+        &d.plugin_sock(),
+        "mockc",
+        Capabilities {
+            attachments: true,
+            ..Default::default()
+        },
+    )
+    .await;
 
     // ---- send 1: short body + image -- proves the literal note text and
     // selective (image-only) demotion.
     let payload = b"\x89PNGfake-image-bytes-not-really-a-png".to_vec();
     let expected_sha = hex::encode(Sha256::digest(&payload));
-    inbound_with_attachments(&mut wa, "achan", "!abcd1234", "constrained link test",
+    inbound_with_attachments(
+        &mut wa,
+        "achan",
+        "!abcd1234",
+        "constrained link test",
         chrono::Utc::now(),
         vec![IpcAttachment {
             filename: "photo.png".into(),
             mime: "image/png".into(),
             data: payload.clone(),
         }],
-    ).await;
+    )
+    .await;
 
     let (corr_b1, _, body_b1, att_b1) = expect_send(&mut rb).await;
-    assert!(att_b1.is_empty(), "an image must never reach a transport that forbids images");
-    assert!(body_b1.contains("[image 'photo.png' omitted — constrained transport]"),
-        "body was: {body_b1}");
-    assert!(body_b1.len() <= 237,
-        "body must stay within the Meshtastic transport cap: {} bytes", body_b1.len());
-    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
-        corr: corr_b1, delivered: true, detail: None,
-    }).await.unwrap();
+    assert!(
+        att_b1.is_empty(),
+        "an image must never reach a transport that forbids images"
+    );
+    assert!(
+        body_b1.contains("[image 'photo.png' omitted — constrained transport]"),
+        "body was: {body_b1}"
+    );
+    assert!(
+        body_b1.len() <= 237,
+        "body must stay within the Meshtastic transport cap: {} bytes",
+        body_b1.len()
+    );
+    write_frame(
+        &mut wb,
+        &PluginToDaemon::DeliveryResult {
+            corr: corr_b1,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
     let (corr_c1, _, body_c1, att_c1) = expect_send(&mut rc).await;
-    assert_eq!(att_c1.len(), 1, "the internet-default sibling must still receive the image");
-    assert_eq!(att_c1[0].data, payload, "attachment bytes were altered in transit");
+    assert_eq!(
+        att_c1.len(),
+        1,
+        "the internet-default sibling must still receive the image"
+    );
+    assert_eq!(
+        att_c1[0].data, payload,
+        "attachment bytes were altered in transit"
+    );
     assert_eq!(hex::encode(Sha256::digest(&att_c1[0].data)), expected_sha);
-    assert!(body_c1.contains("constrained link test"), "body was: {body_c1}");
-    assert!(!body_c1.contains("omitted"),
-        "the non-constraining sibling must apply no demotion: {body_c1}");
-    write_frame(&mut wc, &PluginToDaemon::DeliveryResult {
-        corr: corr_c1, delivered: true, detail: None,
-    }).await.unwrap();
+    assert!(
+        body_c1.contains("constrained link test"),
+        "body was: {body_c1}"
+    );
+    assert!(
+        !body_c1.contains("omitted"),
+        "the non-constraining sibling must apply no demotion: {body_c1}"
+    );
+    write_frame(
+        &mut wc,
+        &PluginToDaemon::DeliveryResult {
+            corr: corr_c1,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
-    poll_until_contains(&d.admin_sock(), "/metrics", "relayfabric_transport_demoted_total 1").await;
+    poll_until_contains(
+        &d.admin_sock(),
+        "/metrics",
+        "relayfabric_transport_demoted_total 1",
+    )
+    .await;
 
     // ---- send 2: oversize body + video -- proves the payload-cap
     // composition (transport cap tighter than the plugin's own, which is
     // unset here i.e. unlimited).
     let big_body = "Y".repeat(2000);
-    inbound_with_attachments(&mut wa, "achan", "!abcd1234", &big_body,
+    inbound_with_attachments(
+        &mut wa,
+        "achan",
+        "!abcd1234",
+        &big_body,
         chrono::Utc::now(),
         vec![IpcAttachment {
             filename: "clip.mp4".into(),
             mime: "video/mp4".into(),
             data: vec![3u8; 40],
         }],
-    ).await;
+    )
+    .await;
 
     let (corr_b2, _, body_b2, att_b2) = expect_send(&mut rb).await;
-    assert!(att_b2.is_empty(), "a video must never reach a transport that forbids video");
-    assert!(body_b2.len() <= 237,
+    assert!(
+        att_b2.is_empty(),
+        "a video must never reach a transport that forbids video"
+    );
+    assert!(
+        body_b2.len() <= 237,
         "body must be capped to the tighter TRANSPORT limit, not left unbounded: {} bytes",
-        body_b2.len());
-    assert!(body_b2.ends_with('…'), "an oversize body must show visible truncation: {body_b2}");
-    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
-        corr: corr_b2, delivered: true, detail: None,
-    }).await.unwrap();
+        body_b2.len()
+    );
+    assert!(
+        body_b2.ends_with('…'),
+        "an oversize body must show visible truncation: {body_b2}"
+    );
+    write_frame(
+        &mut wb,
+        &PluginToDaemon::DeliveryResult {
+            corr: corr_b2,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
     let (corr_c2, _, body_c2, att_c2) = expect_send(&mut rc).await;
-    assert_eq!(att_c2.len(), 1, "the internet-default sibling must receive the video too");
-    assert!(body_c2.contains(&big_body),
+    assert_eq!(
+        att_c2.len(),
+        1,
+        "the internet-default sibling must receive the video too"
+    );
+    assert!(
+        body_c2.contains(&big_body),
         "the non-constraining sibling must deliver the body byte-for-byte, untruncated: len {}",
-        body_c2.len());
-    write_frame(&mut wc, &PluginToDaemon::DeliveryResult {
-        corr: corr_c2, delivered: true, detail: None,
-    }).await.unwrap();
+        body_c2.len()
+    );
+    write_frame(
+        &mut wc,
+        &PluginToDaemon::DeliveryResult {
+            corr: corr_c2,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
-    poll_until_contains(&d.admin_sock(), "/metrics", "relayfabric_transport_demoted_total 2").await;
+    poll_until_contains(
+        &d.admin_sock(),
+        "/metrics",
+        "relayfabric_transport_demoted_total 2",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -699,14 +1000,20 @@ async fn rejects_unknown_plugin_name() {
     wait_for(&d.plugin_sock()).await;
     let stream = UnixStream::connect(&d.plugin_sock()).await.unwrap();
     let (mut r, mut w) = stream.into_split();
-    write_frame(&mut w, &PluginToDaemon::Hello {
-        plugin: "intruder".into(),
-        version: "0".into(),
-        protocol_version: PROTOCOL_VERSION,
-        capabilities: Capabilities::default(),
-    }).await.unwrap();
-    let DaemonToPlugin::HelloAck { error: Some(_), .. } = read_frame(&mut r).await.unwrap()
-    else { panic!("unknown plugin was accepted") };
+    write_frame(
+        &mut w,
+        &PluginToDaemon::Hello {
+            plugin: "intruder".into(),
+            version: "0".into(),
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: Capabilities::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let DaemonToPlugin::HelloAck { error: Some(_), .. } = read_frame(&mut r).await.unwrap() else {
+        panic!("unknown plugin was accepted")
+    };
 }
 
 /// Covers spec §112.3's public-gating validation at the binary level (not
@@ -746,15 +1053,26 @@ routes:
     std::fs::write(&cfg_path, config).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_switchyardd"))
-        .arg("--config").arg(&cfg_path)
+        .arg("--config")
+        .arg(&cfg_path)
         .arg("--check-config")
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(1), "check-config must exit 1 on an uncovered route");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "check-config must exit 1 on an uncovered route"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("general"), "stderr should name the route: {stderr}");
-    assert!(stderr.contains("mockb"), "stderr should name the uncovered protocol: {stderr}");
+    assert!(
+        stderr.contains("general"),
+        "stderr should name the route: {stderr}"
+    );
+    assert!(
+        stderr.contains("mockb"),
+        "stderr should name the uncovered protocol: {stderr}"
+    );
 }
 
 /// Covers spec §112.8's "unlimited on a public node isn't silently assumed
@@ -794,17 +1112,22 @@ routes:
     std::fs::write(&cfg_path, config).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_switchyardd"))
-        .arg("--config").arg(&cfg_path)
+        .arg("--config")
+        .arg(&cfg_path)
         .arg("--check-config")
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(0),
-        "a covered public config with unset limits must still pass check-config");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a covered public config with unset limits must still pass check-config"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("node.public is true but limits are unset (unlimited); see SPEC §112.8"),
-        "stderr should carry the unlimited-public-node warning: {stderr}");
+        "stderr should carry the unlimited-public-node warning: {stderr}"
+    );
 }
 
 /// Covers spec §112.8's per-sender rate limit end to end: with
@@ -827,8 +1150,12 @@ async fn sender_rate_limit_drops_the_second_inbound_from_the_same_sender() {
     // never arrive as a Send.
     inbound(&mut wa, "chan", "!abcd1234", "second", chrono::Utc::now()).await;
     assert!(
-        timeout(Duration::from_secs(2), read_frame::<_, DaemonToPlugin>(&mut rb))
-            .await.is_err(),
+        timeout(
+            Duration::from_secs(2),
+            read_frame::<_, DaemonToPlugin>(&mut rb)
+        )
+        .await
+        .is_err(),
         "rate-limited message was bridged anyway"
     );
 }
@@ -847,8 +1174,16 @@ async fn identity_linking_full_flow_initiate_confirm_link_render_and_unlink() {
 
     // Plugin A ("mocka"): direct-capable — this is who the challenge targets
     // and who confirms it.
-    let (mut ra, mut wa) = connect_plugin_with_caps(&d.plugin_sock(), "mocka",
-        Capabilities { max_payload: Some(200), direct_messages: true, ..Default::default() }).await;
+    let (mut ra, mut wa) = connect_plugin_with_caps(
+        &d.plugin_sock(),
+        "mocka",
+        Capabilities {
+            max_payload: Some(200),
+            direct_messages: true,
+            ..Default::default()
+        },
+    )
+    .await;
     // Plugin B ("mockb"): an ordinary destination on the "general" route,
     // used only to observe the rendered tag.
     let (mut rb, mut wb) = connect_plugin(&d.plugin_sock(), "mockb").await;
@@ -858,71 +1193,156 @@ async fn identity_linking_full_flow_initiate_confirm_link_render_and_unlink() {
         "requester": "mockb:!bob-secret",
         "target": "mocka:!alice-secret",
         "display_name": "Jascha",
-    }).to_string();
-    let (status, resp_body) =
-        admin_request(&d.admin_sock(), "POST", "/v1/identities/link", Some(&link_req)).await;
+    })
+    .to_string();
+    let (status, resp_body) = admin_request(
+        &d.admin_sock(),
+        "POST",
+        "/v1/identities/link",
+        Some(&link_req),
+    )
+    .await;
     assert_eq!(status, 202, "body was: {resp_body}");
-    assert!(!resp_body.contains("!bob-secret"),
-        "the requester's full ref must never leak in the 202 response: {resp_body}");
+    assert!(
+        !resp_body.contains("!bob-secret"),
+        "the requester's full ref must never leak in the 202 response: {resp_body}"
+    );
     let challenge_id = serde_json::from_str::<serde_json::Value>(&resp_body).unwrap()
-        ["challenge_id"].as_i64().unwrap();
+        ["challenge_id"]
+        .as_i64()
+        .unwrap();
     assert!(challenge_id > 0);
 
     // ---- 2. SendDirect with the code arrives at A ------------------------
     let (corr, native_ref, sd_body) = expect_send_direct(&mut ra).await;
-    assert_eq!(native_ref, "!alice-secret", "the target's native ref must be the SendDirect destination");
-    assert!(sd_body.contains("RelayFabric verification code:"), "body was: {sd_body}");
-    assert!(!sd_body.contains("!bob-secret"),
-        "the requester's full ref must never appear in the challenge body: {sd_body}");
-    let code = sd_body.split("code: ").nth(1).unwrap().split(' ').next().unwrap().to_string();
+    assert_eq!(
+        native_ref, "!alice-secret",
+        "the target's native ref must be the SendDirect destination"
+    );
+    assert!(
+        sd_body.contains("RelayFabric verification code:"),
+        "body was: {sd_body}"
+    );
+    assert!(
+        !sd_body.contains("!bob-secret"),
+        "the requester's full ref must never appear in the challenge body: {sd_body}"
+    );
+    let code = sd_body
+        .split("code: ")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_string();
     assert_eq!(code.len(), 6);
     assert!(code.chars().all(|c| c.is_ascii_digit()));
-    write_frame(&mut wa, &PluginToDaemon::DeliveryResult {
-        corr, delivered: true, detail: None,
-    }).await.unwrap();
+    write_frame(
+        &mut wa,
+        &PluginToDaemon::DeliveryResult {
+            corr,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
     // ---- 3. A replies with the code to confirm ----------------------------
     inbound(&mut wa, "chan", "!alice-secret", &code, chrono::Utc::now()).await;
 
     // ---- 4. Poll /v1/identities until the link appears (masked, no code) --
-    let identities =
-        poll_until_contains(&d.admin_sock(), "/v1/identities", "\"display_name\":\"Jascha\"").await;
-    assert!(!identities.contains(&code), "the code must never appear in an API response: {identities}");
-    assert!(!identities.contains("!alice-secret"), "full target ref leaked: {identities}");
-    assert!(!identities.contains("!bob-secret"), "full requester ref leaked: {identities}");
-    let link_id = serde_json::from_str::<serde_json::Value>(&identities).unwrap()
-        ["links"][0]["id"].as_i64().unwrap();
+    let identities = poll_until_contains(
+        &d.admin_sock(),
+        "/v1/identities",
+        "\"display_name\":\"Jascha\"",
+    )
+    .await;
+    assert!(
+        !identities.contains(&code),
+        "the code must never appear in an API response: {identities}"
+    );
+    assert!(
+        !identities.contains("!alice-secret"),
+        "full target ref leaked: {identities}"
+    );
+    assert!(
+        !identities.contains("!bob-secret"),
+        "full requester ref leaked: {identities}"
+    );
+    let link_id = serde_json::from_str::<serde_json::Value>(&identities).unwrap()["links"][0]["id"]
+        .as_i64()
+        .unwrap();
 
     // Drain A's best-effort confirmation notice so it doesn't stray into a
     // later read (and, while here, check its body too: still no secrets).
     let (confirm_corr, _, confirm_body) = expect_send_direct(&mut ra).await;
-    assert!(!confirm_body.contains("!bob-secret"),
-        "the requester's full ref must never appear in a confirmation notice: {confirm_body}");
-    write_frame(&mut wa, &PluginToDaemon::DeliveryResult {
-        corr: confirm_corr, delivered: true, detail: None,
-    }).await.unwrap();
+    assert!(
+        !confirm_body.contains("!bob-secret"),
+        "the requester's full ref must never appear in a confirmation notice: {confirm_body}"
+    );
+    write_frame(
+        &mut wa,
+        &PluginToDaemon::DeliveryResult {
+            corr: confirm_corr,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
     // ---- 5. Linked-mode route delivery renders the display_name at B -----
-    inbound(&mut wa, "chan", "!alice-secret", "hello team", chrono::Utc::now()).await;
+    inbound(
+        &mut wa,
+        "chan",
+        "!alice-secret",
+        "hello team",
+        chrono::Utc::now(),
+    )
+    .await;
     let (corr_b, _, body_b, _) = expect_send(&mut rb).await;
     assert!(body_b.starts_with("[Jascha]\n"), "body was: {body_b}");
     assert!(body_b.contains("hello team"));
-    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
-        corr: corr_b, delivered: true, detail: None,
-    }).await.unwrap();
+    write_frame(
+        &mut wb,
+        &PluginToDaemon::DeliveryResult {
+            corr: corr_b,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
     // ---- 6. DELETE the link ------------------------------------------------
     let (status, _) = admin_request(
-        &d.admin_sock(), "DELETE", &format!("/v1/identities/link/{link_id}"), None,
-    ).await;
+        &d.admin_sock(),
+        "DELETE",
+        &format!("/v1/identities/link/{link_id}"),
+        None,
+    )
+    .await;
     assert_eq!(status, 204);
 
     // ---- 7. Next message from the same identity renders the pseudonym -----
-    inbound(&mut wa, "chan", "!alice-secret", "hello again", chrono::Utc::now()).await;
+    inbound(
+        &mut wa,
+        "chan",
+        "!alice-secret",
+        "hello again",
+        chrono::Utc::now(),
+    )
+    .await;
     let (_, _, body_after_unlink, _) = expect_send(&mut rb).await;
-    assert!(!body_after_unlink.contains("Jascha"),
-        "after unlink, rendering must revert to the pseudonym: {body_after_unlink}");
-    assert!(body_after_unlink.starts_with("[MOCK"), "body was: {body_after_unlink}");
+    assert!(
+        !body_after_unlink.contains("Jascha"),
+        "after unlink, rendering must revert to the pseudonym: {body_after_unlink}"
+    );
+    assert!(
+        body_after_unlink.starts_with("[MOCK"),
+        "body was: {body_after_unlink}"
+    );
 }
 
 // ---- config secret references (Task 3, design §2 / SPEC §51, §59) --------
@@ -960,7 +1380,8 @@ routes:
     std::fs::write(&cfg_path, config).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_switchyardd"))
-        .arg("--config").arg(&cfg_path)
+        .arg("--config")
+        .arg(&cfg_path)
         .arg("--check-config")
         // ensure the referenced var really is unset for this child, no
         // matter what's in the outer test process's own environment.
@@ -968,10 +1389,16 @@ routes:
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(1), "check-config must exit 1 on an unresolvable secret ref");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "check-config must exit 1 on an unresolvable secret ref"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("${env:RF_E2E_CHECK_CONFIG_MISSING}"),
-        "stderr should name the reference form: {stderr}");
+    assert!(
+        stderr.contains("${env:RF_E2E_CHECK_CONFIG_MISSING}"),
+        "stderr should name the reference form: {stderr}"
+    );
 }
 
 /// Covers the redaction half of the same invariant: when the reference
@@ -1005,17 +1432,28 @@ routes:
     std::fs::write(&cfg_path, config).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_switchyardd"))
-        .arg("--config").arg(&cfg_path)
+        .arg("--config")
+        .arg(&cfg_path)
         .arg("--check-config")
         .env("RF_E2E_CHECK_CONFIG_PRESENT", "sentinel-checkconfig-77ab")
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(0), "check-config must pass once the reference resolves");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "check-config must pass once the reference resolves"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stdout.contains("sentinel-checkconfig-77ab"), "resolved secret leaked on stdout: {stdout}");
-    assert!(!stderr.contains("sentinel-checkconfig-77ab"), "resolved secret leaked on stderr: {stderr}");
+    assert!(
+        !stdout.contains("sentinel-checkconfig-77ab"),
+        "resolved secret leaked on stdout: {stdout}"
+    );
+    assert!(
+        !stderr.contains("sentinel-checkconfig-77ab"),
+        "resolved secret leaked on stderr: {stderr}"
+    );
 }
 
 /// The core Task 3 invariant end to end: the RESOLVED secret value must
@@ -1049,7 +1487,8 @@ plugins:
     std::fs::write(&cfg_path, config).unwrap();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_switchyardd"))
-        .arg("--config").arg(&cfg_path)
+        .arg("--config")
+        .arg(&cfg_path)
         .env("RUST_LOG", "error")
         .env("RF_E2E_SUPERVISE_SECRET", "sentinel-supervise-e2e-9f3c")
         .stdout(Stdio::null())
@@ -1072,10 +1511,14 @@ plugins:
     let _ = child.kill();
     let _ = child.wait();
 
-    assert!(captured.contains("sentinel-supervise-e2e-9f3c"),
-        "resolved secret must reach the plugin process's env: {captured:?}");
-    assert!(!captured.contains("${env:"),
-        "the unresolved reference form must never cross into the plugin's env: {captured:?}");
+    assert!(
+        captured.contains("sentinel-supervise-e2e-9f3c"),
+        "resolved secret must reach the plugin process's env: {captured:?}"
+    );
+    assert!(
+        !captured.contains("${env:"),
+        "the unresolved reference form must never cross into the plugin's env: {captured:?}"
+    );
 }
 
 /// SSE over HTTP/1.0 (design §4's ctl transport choice): proves the core
@@ -1102,11 +1545,20 @@ async fn events_stream_over_http_1_0_flushes_incrementally_not_buffered_to_eof()
     let (_ra, mut wa) = connect_plugin(&d.plugin_sock(), "mocka").await;
 
     let mut s = UnixStream::connect(&d.admin_sock()).await.unwrap();
-    s.write_all(b"GET /v1/events HTTP/1.0\r\nhost: x\r\n\r\n").await.unwrap();
+    s.write_all(b"GET /v1/events HTTP/1.0\r\nhost: x\r\n\r\n")
+        .await
+        .unwrap();
 
     // Drive a real ingress event through the live daemon AFTER the request
     // is already on the wire.
-    inbound(&mut wa, "chan", "!e2e-sender", "hello over sse", chrono::Utc::now()).await;
+    inbound(
+        &mut wa,
+        "chan",
+        "!e2e-sender",
+        "hello over sse",
+        chrono::Utc::now(),
+    )
+    .await;
 
     // Read incrementally with a bounded timeout per attempt: this must NOT
     // hang waiting for EOF, since the connection never closes on its own
@@ -1129,9 +1581,18 @@ async fn events_stream_over_http_1_0_flushes_incrementally_not_buffered_to_eof()
     }
 
     assert!(collected.contains("event: ingress"), "stream: {collected}");
-    assert!(collected.contains("\"routes\":[\"general\"]"), "stream: {collected}");
-    assert!(!collected.contains("!e2e-sender"), "full native ref leaked: {collected}");
-    assert!(!collected.contains("hello over sse"), "message body leaked: {collected}");
+    assert!(
+        collected.contains("\"routes\":[\"general\"]"),
+        "stream: {collected}"
+    );
+    assert!(
+        !collected.contains("!e2e-sender"),
+        "full native ref leaked: {collected}"
+    );
+    assert!(
+        !collected.contains("hello over sse"),
+        "message body leaked: {collected}"
+    );
 }
 
 /// Task 5's full-workflow e2e (design §Testing): boots a daemon with one
@@ -1157,7 +1618,10 @@ async fn config_apply_reload_and_events_full_workflow() {
     let cfg_path = d.dir.path().join("relayfabric.yaml");
     let original_text = std::fs::read_to_string(&cfg_path).unwrap();
     let served = admin_get(&d.admin_sock(), "/v1/config").await;
-    assert_eq!(served, original_text, "GET /v1/config must serve the file verbatim");
+    assert_eq!(
+        served, original_text,
+        "GET /v1/config must serve the file verbatim"
+    );
 
     // ---- 2. open the SSE connection BEFORE the mutation --------------------
     let mut sse = open_events_stream(&d.admin_sock()).await;
@@ -1172,31 +1636,51 @@ async fn config_apply_reload_and_events_full_workflow() {
     let (status, body) =
         admin_request(&d.admin_sock(), "PUT", "/v1/config", Some(&mutated_text)).await;
     assert_eq!(status, 200, "body was: {body}");
-    assert_eq!(body, "{\"applied\":true,\"restart_required\":[]}",
-        "adding a route alone must never require a restart: {body}");
+    assert_eq!(
+        body, "{\"applied\":true,\"restart_required\":[]}",
+        "adding a route alone must never require a restart: {body}"
+    );
 
     // the new route is visible immediately (the PUT handler applies before
     // responding -- no poll needed for this read).
     let routes_after_put = admin_get(&d.admin_sock(), "/v1/routes").await;
-    assert!(routes_after_put.contains("\"name\":\"extra\""),
-        "new route missing from /v1/routes: {routes_after_put}");
+    assert!(
+        routes_after_put.contains("\"name\":\"extra\""),
+        "new route missing from /v1/routes: {routes_after_put}"
+    );
 
     // SSE must have already seen config_applied with an empty restart list.
     poll_stream_until_contains(&mut sse, &mut sse_buf, "event: config_applied").await;
-    assert!(sse_buf.contains("\"restart_required\":[]"), "sse: {sse_buf}");
+    assert!(
+        sse_buf.contains("\"restart_required\":[]"),
+        "sse: {sse_buf}"
+    );
 
     // ---- 4. drive a message over the NEW route -- live, no restart --------
-    inbound(&mut wa, "newchan", "!e2e-workflow-sender", "hello via the new route",
-        chrono::Utc::now()).await;
+    inbound(
+        &mut wa,
+        "newchan",
+        "!e2e-workflow-sender",
+        "hello via the new route",
+        chrono::Utc::now(),
+    )
+    .await;
     let (corr, endpoint, body, _) = expect_send(&mut rb).await;
     // `endpoint` here is the DESTINATION channel ("extra" route's
     // `mockb:chan`), not the source endpoint ("newchan") the inbound
     // arrived on -- those are independent namespaces.
     assert_eq!(endpoint, "chan");
     assert!(body.contains("hello via the new route"), "body was: {body}");
-    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
-        corr, delivered: true, detail: None,
-    }).await.unwrap();
+    write_frame(
+        &mut wb,
+        &PluginToDaemon::DeliveryResult {
+            corr,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
     // SSE must have seen the ingress (routed onto "extra") and the delivery
     // (delivered, on "extra") for this exact message.
@@ -1204,23 +1688,38 @@ async fn config_apply_reload_and_events_full_workflow() {
     assert!(sse_buf.contains("\"routes\":[\"extra\"]"), "sse: {sse_buf}");
     poll_stream_until_contains(&mut sse, &mut sse_buf, "event: delivery").await;
     assert!(sse_buf.contains("\"route\":\"extra\""), "sse: {sse_buf}");
-    assert!(sse_buf.contains("\"state\":\"delivered\""), "sse: {sse_buf}");
-    assert!(!sse_buf.contains("!e2e-workflow-sender"), "full native ref leaked: {sse_buf}");
-    assert!(!sse_buf.contains("hello via the new route"), "message body leaked: {sse_buf}");
+    assert!(
+        sse_buf.contains("\"state\":\"delivered\""),
+        "sse: {sse_buf}"
+    );
+    assert!(
+        !sse_buf.contains("!e2e-workflow-sender"),
+        "full native ref leaked: {sse_buf}"
+    );
+    assert!(
+        !sse_buf.contains("hello via the new route"),
+        "message body leaked: {sse_buf}"
+    );
 
     // ---- 5. rollback: old (one-route) config becomes live again -----------
-    let (status, body) =
-        admin_request(&d.admin_sock(), "POST", "/v1/config/rollback", None).await;
+    let (status, body) = admin_request(&d.admin_sock(), "POST", "/v1/config/rollback", None).await;
     assert_eq!(status, 200, "body was: {body}");
-    assert_eq!(body, "{\"applied\":true,\"restart_required\":[]}", "body was: {body}");
+    assert_eq!(
+        body, "{\"applied\":true,\"restart_required\":[]}",
+        "body was: {body}"
+    );
 
     let config_after_rollback = admin_get(&d.admin_sock(), "/v1/config").await;
-    assert_eq!(config_after_rollback, original_text,
-        "rollback must restore the original config text verbatim");
+    assert_eq!(
+        config_after_rollback, original_text,
+        "rollback must restore the original config text verbatim"
+    );
 
     let routes_after_rollback = admin_get(&d.admin_sock(), "/v1/routes").await;
-    assert!(!routes_after_rollback.contains("\"name\":\"extra\""),
-        "rolled-back route must no longer be listed: {routes_after_rollback}");
+    assert!(
+        !routes_after_rollback.contains("\"name\":\"extra\""),
+        "rolled-back route must no longer be listed: {routes_after_rollback}"
+    );
 
     // Rollback re-applies the previous config through the same apply_config
     // path as PUT, so the stream must carry a SECOND config_applied event.
@@ -1229,10 +1728,21 @@ async fn config_apply_reload_and_events_full_workflow() {
     // ---- 6. bounded negative: a message aimed at the now-gone route is ----
     // dropped (matches zero routes), never bridged as a Send -- NOT a dead
     // letter, since the route itself no longer exists (CONTROLLER RULING).
-    inbound(&mut wa, "newchan", "!e2e-workflow-sender", "should never arrive post-rollback",
-        chrono::Utc::now()).await;
+    inbound(
+        &mut wa,
+        "newchan",
+        "!e2e-workflow-sender",
+        "should never arrive post-rollback",
+        chrono::Utc::now(),
+    )
+    .await;
     assert!(
-        timeout(Duration::from_secs(2), read_frame::<_, DaemonToPlugin>(&mut rb)).await.is_err(),
+        timeout(
+            Duration::from_secs(2),
+            read_frame::<_, DaemonToPlugin>(&mut rb)
+        )
+        .await
+        .is_err(),
         "a message on the rolled-back route's endpoint was bridged anyway"
     );
 }
@@ -1257,8 +1767,11 @@ fn precreate_node_identity(data_dir: &Path) -> String {
     std::fs::create_dir_all(&identity_dir).unwrap();
     let seed: [u8; 32] = rand::random();
     let mut f = std::fs::OpenOptions::new()
-        .write(true).create_new(true).mode(0o600)
-        .open(identity_dir.join("node.key")).unwrap();
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(identity_dir.join("node.key"))
+        .unwrap();
     f.write_all(hex::encode(seed).as_bytes()).unwrap();
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
     format!("rf:{}", hex::encode(signing_key.verifying_key().to_bytes()))
@@ -1282,10 +1795,15 @@ fn precreate_sealed_key(data_dir: &Path) -> String {
     std::fs::create_dir_all(data_dir).unwrap();
     let secret_bytes: [u8; 32] = rand::random();
     let mut f = std::fs::OpenOptions::new()
-        .write(true).create_new(true).mode(0o600)
-        .open(data_dir.join("sealed.key")).unwrap();
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(data_dir.join("sealed.key"))
+        .unwrap();
     f.write_all(hex::encode(secret_bytes).as_bytes()).unwrap();
-    let public = crypto_box::SecretKey::from_bytes(secret_bytes).public_key().to_bytes();
+    let public = crypto_box::SecretKey::from_bytes(secret_bytes)
+        .public_key()
+        .to_bytes();
     hex::encode(public)
 }
 
@@ -1297,7 +1815,11 @@ fn precreate_sealed_key(data_dir: &Path) -> String {
 /// (another process could in principle grab the same port in between);
 /// acceptable for a test.
 fn free_tcp_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// Sums every value in the `{state: count}` aggregate `GET /v1/queue` body
@@ -1306,7 +1828,11 @@ fn free_tcp_port() -> u16 {
 /// without needing to enumerate every state name up front.
 fn total_queue_count(body: &str) -> i64 {
     let v: serde_json::Value = serde_json::from_str(body).unwrap();
-    v.as_object().unwrap().values().map(|n| n.as_i64().unwrap()).sum()
+    v.as_object()
+        .unwrap()
+        .values()
+        .map(|n| n.as_i64().unwrap())
+        .sum()
 }
 
 /// Polls `total_queue_count` on `sock` every ~200ms until it reads the SAME
@@ -1356,13 +1882,20 @@ async fn wait_for_fed_peer_connected(sock: &Path, name: &str) {
     for _ in 0..50 {
         let body = admin_get(sock, "/v1/federation").await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        if v["peers"].as_array().unwrap().iter()
-            .any(|p| p["name"] == name && p["connected"] == true) {
+        if v["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == name && p["connected"] == true)
+        {
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("peer {name:?} on {} never showed connected:true", sock.display());
+    panic!(
+        "peer {name:?} on {} never showed connected:true",
+        sock.display()
+    );
 }
 
 /// Design §Testing's two-real-daemon federation e2e. Noise identity binding
@@ -1487,34 +2020,90 @@ federation:
     // ---- 3. A -> B: rendered at B, pseudonymous, A's delivery marked -------
     // delivered by B's Fed::Ack (independent of B's own mock plugin's
     // DeliveryResult, which only settles B's LOCAL "b-in" row).
-    inbound(&mut wa, "outchan", "!a-secret", "hello from a to b via fed", chrono::Utc::now()).await;
+    inbound(
+        &mut wa,
+        "outchan",
+        "!a-secret",
+        "hello from a to b via fed",
+        chrono::Utc::now(),
+    )
+    .await;
     let (corr_b, endpoint_b, body_b, _) = expect_send(&mut rb).await;
     assert_eq!(endpoint_b, "inchan");
     assert!(body_b.starts_with("[MOCK"), "body was: {body_b}");
-    assert!(body_b.contains("hello from a to b via fed"), "body was: {body_b}");
-    assert!(!body_b.contains("!a-secret"), "native ref leaked across federation: {body_b}");
-    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
-        corr: corr_b, delivered: true, detail: None,
-    }).await.unwrap();
+    assert!(
+        body_b.contains("hello from a to b via fed"),
+        "body was: {body_b}"
+    );
+    assert!(
+        !body_b.contains("!a-secret"),
+        "native ref leaked across federation: {body_b}"
+    );
+    write_frame(
+        &mut wb,
+        &PluginToDaemon::DeliveryResult {
+            corr: corr_b,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
-    poll_until_contains(&d_a.admin_sock(), "/v1/queue?state=delivered", "\"route\":\"a-out\"").await;
+    poll_until_contains(
+        &d_a.admin_sock(),
+        "/v1/queue?state=delivered",
+        "\"route\":\"a-out\"",
+    )
+    .await;
 
     poll_stream_until_contains(&mut sse_a, &mut sse_a_buf, "event: delivery").await;
-    assert!(sse_a_buf.contains("\"route\":\"a-out\""), "sse: {sse_a_buf}");
-    assert!(sse_a_buf.contains("\"state\":\"delivered\""), "sse: {sse_a_buf}");
+    assert!(
+        sse_a_buf.contains("\"route\":\"a-out\""),
+        "sse: {sse_a_buf}"
+    );
+    assert!(
+        sse_a_buf.contains("\"state\":\"delivered\""),
+        "sse: {sse_a_buf}"
+    );
 
     // ---- 4. B -> A: the reverse direction -----------------------------------
-    inbound(&mut wb, "outchan", "!b-secret", "hello from b to a via fed", chrono::Utc::now()).await;
+    inbound(
+        &mut wb,
+        "outchan",
+        "!b-secret",
+        "hello from b to a via fed",
+        chrono::Utc::now(),
+    )
+    .await;
     let (corr_a, endpoint_a, body_a, _) = expect_send(&mut ra).await;
     assert_eq!(endpoint_a, "inchan");
     assert!(body_a.starts_with("[MOCK"), "body was: {body_a}");
-    assert!(body_a.contains("hello from b to a via fed"), "body was: {body_a}");
-    assert!(!body_a.contains("!b-secret"), "native ref leaked across federation: {body_a}");
-    write_frame(&mut wa, &PluginToDaemon::DeliveryResult {
-        corr: corr_a, delivered: true, detail: None,
-    }).await.unwrap();
+    assert!(
+        body_a.contains("hello from b to a via fed"),
+        "body was: {body_a}"
+    );
+    assert!(
+        !body_a.contains("!b-secret"),
+        "native ref leaked across federation: {body_a}"
+    );
+    write_frame(
+        &mut wa,
+        &PluginToDaemon::DeliveryResult {
+            corr: corr_a,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
-    poll_until_contains(&d_b.admin_sock(), "/v1/queue?state=delivered", "\"route\":\"b-out\"").await;
+    poll_until_contains(
+        &d_b.admin_sock(),
+        "/v1/queue?state=delivered",
+        "\"route\":\"b-out\"",
+    )
+    .await;
 
     // ---- 5. trust-denied: daemon C dials A but is never listed as A's ------
     // peer -- handshake succeeds (Noise identity binding is orthogonal to
@@ -1545,12 +2134,28 @@ federation:
     wait_for(&d_c.plugin_sock()).await;
     let (_rc, mut wc) = connect_plugin(&d_c.plugin_sock(), "mockc").await;
 
-    inbound(&mut wc, "outchan", "!c-untrusted", "this must never reach a mock plugin",
-        chrono::Utc::now()).await;
+    inbound(
+        &mut wc,
+        "outchan",
+        "!c-untrusted",
+        "this must never reach a mock plugin",
+        chrono::Utc::now(),
+    )
+    .await;
 
-    poll_until_contains(&d_a.admin_sock(), "/metrics", "relayfabric_federation_rejected_total 1").await;
+    poll_until_contains(
+        &d_a.admin_sock(),
+        "/metrics",
+        "relayfabric_federation_rejected_total 1",
+    )
+    .await;
     assert!(
-        timeout(Duration::from_secs(2), read_frame::<_, DaemonToPlugin>(&mut ra)).await.is_err(),
+        timeout(
+            Duration::from_secs(2),
+            read_frame::<_, DaemonToPlugin>(&mut ra)
+        )
+        .await
+        .is_err(),
         "a trust-denied peer's envelope was bridged anyway"
     );
 
@@ -1559,18 +2164,40 @@ federation:
     // echo must die (dedup and/or hop cap -- both already unit-proven at the
     // fed_ingress level; this proves the WIRING doesn't storm over a real
     // two-daemon round trip) rather than bouncing forever.
-    inbound(&mut wa, "loopchan", "!loop-secret", "unique-loop-body-xyz", chrono::Utc::now()).await;
+    inbound(
+        &mut wa,
+        "loopchan",
+        "!loop-secret",
+        "unique-loop-body-xyz",
+        chrono::Utc::now(),
+    )
+    .await;
     let (corr_loop, endpoint_loop, body_loop, _) = expect_send(&mut rb).await;
     assert_eq!(endpoint_loop, "loopchan");
-    assert!(body_loop.contains("unique-loop-body-xyz"), "body was: {body_loop}");
-    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
-        corr: corr_loop, delivered: true, detail: None,
-    }).await.unwrap();
+    assert!(
+        body_loop.contains("unique-loop-body-xyz"),
+        "body was: {body_loop}"
+    );
+    write_frame(
+        &mut wb,
+        &PluginToDaemon::DeliveryResult {
+            corr: corr_loop,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
     // bounded negative: no SECOND Send for the loop message reaches B's
     // mock plugin -- the echo must not re-deliver locally a second time.
     assert!(
-        timeout(Duration::from_secs(2), read_frame::<_, DaemonToPlugin>(&mut rb)).await.is_err(),
+        timeout(
+            Duration::from_secs(2),
+            read_frame::<_, DaemonToPlugin>(&mut rb)
+        )
+        .await
+        .is_err(),
         "the loop's echo was delivered to the terminal mock plugin a second time"
     );
 
@@ -1581,8 +2208,14 @@ federation:
     // to.
     let a_total = poll_until_queue_count_stable(&d_a.admin_sock(), Duration::from_secs(15)).await;
     let b_total = poll_until_queue_count_stable(&d_b.admin_sock(), Duration::from_secs(15)).await;
-    assert!(a_total <= 12, "daemon A's total delivery rows unexpectedly large: {a_total}");
-    assert!(b_total <= 12, "daemon B's total delivery rows unexpectedly large: {b_total}");
+    assert!(
+        a_total <= 12,
+        "daemon A's total delivery rows unexpectedly large: {a_total}"
+    );
+    assert!(
+        b_total <= 12,
+        "daemon B's total delivery rows unexpectedly large: {b_total}"
+    );
 }
 
 /// Design §Testing's "peer-down retry-then-recover" leg -- a SIBLING to
@@ -1688,9 +2321,20 @@ federation:
     // ---- 3. drive a message toward the now-dead peer: the delivery must ---
     // go (and stay) pending -- retried every 5s by process_due_fed's "no
     // live connection" branch -- never dead_lettered, never lost.
-    inbound(&mut wa, "outchan", "!recover-secret", "message sent while b is down",
-        chrono::Utc::now()).await;
-    poll_until_contains(&d_a.admin_sock(), "/v1/queue?state=pending", "\"route\":\"a-out\"").await;
+    inbound(
+        &mut wa,
+        "outchan",
+        "!recover-secret",
+        "message sent while b is down",
+        chrono::Utc::now(),
+    )
+    .await;
+    poll_until_contains(
+        &d_a.admin_sock(),
+        "/v1/queue?state=pending",
+        "\"route\":\"a-out\"",
+    )
+    .await;
 
     // ---- 4. respawn B on the SAME data_dir (same identity/config/port) ----
     // -- see this test's doc comment for why there's no backoff to time
@@ -1706,13 +2350,31 @@ federation:
     // by B's Fed::Ack once the connection comes back and the pump retries.
     let (corr, endpoint, body, _) = expect_send(&mut rb).await;
     assert_eq!(endpoint, "inchan");
-    assert!(body.contains("message sent while b is down"), "body was: {body}");
-    assert!(!body.contains("!recover-secret"), "native ref leaked across federation: {body}");
-    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
-        corr, delivered: true, detail: None,
-    }).await.unwrap();
+    assert!(
+        body.contains("message sent while b is down"),
+        "body was: {body}"
+    );
+    assert!(
+        !body.contains("!recover-secret"),
+        "native ref leaked across federation: {body}"
+    );
+    write_frame(
+        &mut wb,
+        &PluginToDaemon::DeliveryResult {
+            corr,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
-    poll_until_contains(&d_a.admin_sock(), "/v1/queue?state=delivered", "\"route\":\"a-out\"").await;
+    poll_until_contains(
+        &d_a.admin_sock(),
+        "/v1/queue?state=delivered",
+        "\"route\":\"a-out\"",
+    )
+    .await;
 }
 
 /// Bounded negative for admin-JSON polling (design §Testing's discovery e2e
@@ -1726,7 +2388,10 @@ async fn assert_stays_absent(sock: &Path, path: &str, needle: &str) {
     const INTERVAL: Duration = Duration::from_millis(150);
     for _ in 0..ATTEMPTS {
         let body = admin_get(sock, path).await;
-        assert!(!body.contains(needle), "{path} unexpectedly contains {needle:?}: {body}");
+        assert!(
+            !body.contains(needle),
+            "{path} unexpectedly contains {needle:?}: {body}"
+        );
         tokio::time::sleep(INTERVAL).await;
     }
 }
@@ -1826,15 +2491,29 @@ federation:
 
     // ---- A learns B's advert: node_id, name, and the published service ----
     let a_view_of_b = poll_until_contains(
-        &d_a.admin_sock(), "/v1/discovery", &format!("\"node_id\":\"{node_id_b}\"")).await;
-    assert!(a_view_of_b.contains("\"name\":\"e2e-fed-disco-b\""), "body: {a_view_of_b}");
+        &d_a.admin_sock(),
+        "/v1/discovery",
+        &format!("\"node_id\":\"{node_id_b}\""),
+    )
+    .await;
+    assert!(
+        a_view_of_b.contains("\"name\":\"e2e-fed-disco-b\""),
+        "body: {a_view_of_b}"
+    );
     assert!(a_view_of_b.contains("\"chat\":true"), "body: {a_view_of_b}");
     assert!(a_view_of_b.contains("\"mockb\":{"), "body: {a_view_of_b}");
 
     // ---- B learns A's advert: the reverse direction ------------------------
     let b_view_of_a = poll_until_contains(
-        &d_b.admin_sock(), "/v1/discovery", &format!("\"node_id\":\"{node_id_a}\"")).await;
-    assert!(b_view_of_a.contains("\"name\":\"e2e-fed-disco-a\""), "body: {b_view_of_a}");
+        &d_b.admin_sock(),
+        "/v1/discovery",
+        &format!("\"node_id\":\"{node_id_a}\""),
+    )
+    .await;
+    assert!(
+        b_view_of_a.contains("\"name\":\"e2e-fed-disco-a\""),
+        "body: {b_view_of_a}"
+    );
     assert!(b_view_of_a.contains("\"chat\":true"), "body: {b_view_of_a}");
     assert!(b_view_of_a.contains("\"mocka\":{"), "body: {b_view_of_a}");
 
@@ -1859,9 +2538,17 @@ federation:
 
     // ---- bounded negative: neither side ever learns the other's advert ----
     assert_stays_absent(
-        &d_a.admin_sock(), "/v1/discovery", &format!("\"node_id\":\"{node_id_c}\"")).await;
+        &d_a.admin_sock(),
+        "/v1/discovery",
+        &format!("\"node_id\":\"{node_id_c}\""),
+    )
+    .await;
     assert_stays_absent(
-        &d_c.admin_sock(), "/v1/discovery", &format!("\"node_id\":\"{node_id_a}\"")).await;
+        &d_c.admin_sock(),
+        "/v1/discovery",
+        &format!("\"node_id\":\"{node_id_a}\""),
+    )
+    .await;
 }
 
 /// Design §Testing's federation egress budget leg (design §5, carried from
@@ -1947,8 +2634,22 @@ federation:
     poll_until_contains(&d_a.admin_sock(), "/v1/federation", "\"connected\":true").await;
 
     // two quick messages, back-to-back -- due almost simultaneously.
-    inbound(&mut wa, "outchan", "!budget-1", "budget message one", chrono::Utc::now()).await;
-    inbound(&mut wa, "outchan", "!budget-2", "budget message two", chrono::Utc::now()).await;
+    inbound(
+        &mut wa,
+        "outchan",
+        "!budget-1",
+        "budget message one",
+        chrono::Utc::now(),
+    )
+    .await;
+    inbound(
+        &mut wa,
+        "outchan",
+        "!budget-2",
+        "budget message two",
+        chrono::Utc::now(),
+    )
+    .await;
 
     // exactly one gets through promptly...
     let (_corr, endpoint, body, _) = expect_send(&mut rb).await;
@@ -1958,12 +2659,22 @@ federation:
     // ...and no second Send follows within a couple of seconds -- the
     // other message stayed deferred by the budget, not delivered too.
     assert!(
-        timeout(Duration::from_secs(2), read_frame::<_, DaemonToPlugin>(&mut rb)).await.is_err(),
+        timeout(
+            Duration::from_secs(2),
+            read_frame::<_, DaemonToPlugin>(&mut rb)
+        )
+        .await
+        .is_err(),
         "a second message was delivered despite the peer's 1/minute budget"
     );
 
     // ...and the deferral shows up on the metric, not just as an absence.
-    poll_until_contains(&d_a.admin_sock(), "/metrics", "relayfabric_budget_deferred_total 1").await;
+    poll_until_contains(
+        &d_a.admin_sock(),
+        "/metrics",
+        "relayfabric_budget_deferred_total 1",
+    )
+    .await;
 }
 
 /// Design §Testing's two-gateway sealed-routing e2e (cycle H, Task 6, SPEC
@@ -2139,25 +2850,69 @@ federation:
     wait_for_fed_peer_connected(&d_a.admin_sock(), "c").await;
 
     // ---- 4. A -> B, sealed: delivered and DECRYPTED at B ------------------
-    inbound(&mut wa, "outchan-b", "!a-secret-b", DELIVER_SENTINEL, chrono::Utc::now()).await;
+    inbound(
+        &mut wa,
+        "outchan-b",
+        "!a-secret-b",
+        DELIVER_SENTINEL,
+        chrono::Utc::now(),
+    )
+    .await;
     let (corr_b, endpoint_b, body_b, _) = expect_send(&mut rb).await;
     assert_eq!(endpoint_b, "inchan");
     assert!(body_b.contains(DELIVER_SENTINEL), "body was: {body_b}");
-    assert!(!body_b.contains("!a-secret-b"), "native ref leaked across sealed federation: {body_b}");
-    write_frame(&mut wb, &PluginToDaemon::DeliveryResult {
-        corr: corr_b, delivered: true, detail: None,
-    }).await.unwrap();
+    assert!(
+        !body_b.contains("!a-secret-b"),
+        "native ref leaked across sealed federation: {body_b}"
+    );
+    write_frame(
+        &mut wb,
+        &PluginToDaemon::DeliveryResult {
+            corr: corr_b,
+            delivered: true,
+            detail: None,
+        },
+    )
+    .await
+    .unwrap();
 
-    poll_until_contains(&d_a.admin_sock(), "/metrics", "relayfabric_sealed_egress_total 1").await;
-    poll_until_contains(&d_b.admin_sock(), "/metrics", "relayfabric_sealed_ingress_total 1").await;
+    poll_until_contains(
+        &d_a.admin_sock(),
+        "/metrics",
+        "relayfabric_sealed_egress_total 1",
+    )
+    .await;
+    poll_until_contains(
+        &d_b.admin_sock(),
+        "/metrics",
+        "relayfabric_sealed_ingress_total 1",
+    )
+    .await;
 
     // ---- 5. A -> C, sealed: decrypts fine, then DOWNGRADE REFUSAL ---------
     // at C's policy gate -- never delivered, never persisted (NoPersist).
-    inbound(&mut wa, "outchan-c", "!a-secret-c", DOWNGRADE_SENTINEL, chrono::Utc::now()).await;
+    inbound(
+        &mut wa,
+        "outchan-c",
+        "!a-secret-c",
+        DOWNGRADE_SENTINEL,
+        chrono::Utc::now(),
+    )
+    .await;
 
-    poll_until_contains(&d_c.admin_sock(), "/metrics", "relayfabric_sealed_rejected_total 1").await;
+    poll_until_contains(
+        &d_c.admin_sock(),
+        "/metrics",
+        "relayfabric_sealed_rejected_total 1",
+    )
+    .await;
     assert!(
-        timeout(Duration::from_secs(2), read_frame::<_, DaemonToPlugin>(&mut rc)).await.is_err(),
+        timeout(
+            Duration::from_secs(2),
+            read_frame::<_, DaemonToPlugin>(&mut rc)
+        )
+        .await
+        .is_err(),
         "a security-downgrade-refused sealed message was delivered to C's mock plugin anyway"
     );
 
@@ -2165,7 +2920,12 @@ federation:
     // shows up in C's dead-letter queue either (Task 5's NoPersist posture
     // for every fed_sealed_ingress rejection -- a persisted row here would
     // make the refusal cosmetic, not real).
-    assert_stays_absent(&d_c.admin_sock(), "/v1/queue?state=dead_letter", "SECURITY_DOWNGRADE_REFUSED").await;
+    assert_stays_absent(
+        &d_c.admin_sock(),
+        "/v1/queue?state=dead_letter",
+        "SECURITY_DOWNGRADE_REFUSED",
+    )
+    .await;
 }
 
 /// Task 3 (design §3): the human-facing/machine-facing docs surfaces
@@ -2217,21 +2977,40 @@ async fn openapi_doc_and_swagger_ui_are_served() {
     let spec_body = admin_get(&d.admin_sock(), "/v1/openapi.json").await;
     let spec: serde_json::Value =
         serde_json::from_str(&spec_body).expect("/v1/openapi.json must parse as JSON");
-    let version = spec["openapi"].as_str().expect("openapi field must be a string");
-    assert!(version.starts_with("3.1"), "expected OpenAPI 3.1.x, got {version:?}");
+    let version = spec["openapi"]
+        .as_str()
+        .expect("openapi field must be a string");
+    assert!(
+        version.starts_with("3.1"),
+        "expected OpenAPI 3.1.x, got {version:?}"
+    );
     let paths = spec["paths"].as_object().expect("paths must be an object");
     for want in [
-        "/v1/status", "/v1/config", "/v1/identities/link", "/v1/federation", "/v1/discovery",
+        "/v1/status",
+        "/v1/config",
+        "/v1/identities/link",
+        "/v1/federation",
+        "/v1/discovery",
     ] {
-        assert!(paths.contains_key(want), "openapi.json paths missing {want}: {:?}", paths.keys().collect::<Vec<_>>());
+        assert!(
+            paths.contains_key(want),
+            "openapi.json paths missing {want}: {:?}",
+            paths.keys().collect::<Vec<_>>()
+        );
     }
     let direct_path_count = paths.len();
 
     // GET /docs -- direct 200 text/html, a UI marker, no external host in
     // the literal index.html bytes.
     let (status, head, docs_body) = admin_get_with_head(&d.admin_sock(), "/docs").await;
-    assert_eq!(status, 200, "GET /docs must be a direct 200, not a redirect");
-    assert!(head.contains("text/html"), "GET /docs content-type head was: {head}");
+    assert_eq!(
+        status, 200,
+        "GET /docs must be a direct 200, not a redirect"
+    );
+    assert!(
+        head.contains("text/html"),
+        "GET /docs content-type head was: {head}"
+    );
     assert!(
         docs_body.contains("swagger-ui") || docs_body.contains("Swagger UI"),
         "GET /docs body has no Swagger UI marker: {docs_body}"
@@ -2244,7 +3023,10 @@ async fn openapi_doc_and_swagger_ui_are_served() {
     // swagger-initializer.js -- the piece that actually points the UI at
     // this daemon's /v1/openapi.json, with the phone-home guard.
     let init_js = admin_get(&d.admin_sock(), "/docs/swagger-initializer.js").await;
-    assert!(init_js.contains("/v1/openapi.json"), "swagger-initializer.js: {init_js}");
+    assert!(
+        init_js.contains("/v1/openapi.json"),
+        "swagger-initializer.js: {init_js}"
+    );
     assert!(
         init_js.contains("\"validatorUrl\": \"none\""),
         "swagger-initializer.js is missing validatorUrl:\"none\" -- Swagger UI's default \
@@ -2265,9 +3047,12 @@ async fn openapi_doc_and_swagger_ui_are_served() {
     let ctl_body = admin_get(&d.admin_sock(), "/v1/openapi.json").await;
     let ctl_spec: serde_json::Value =
         serde_json::from_str(&ctl_body).expect("ctl openapi output must parse as JSON");
-    let ctl_paths = ctl_spec["paths"].as_object().expect("paths must be an object");
+    let ctl_paths = ctl_spec["paths"]
+        .as_object()
+        .expect("paths must be an object");
     assert_eq!(
-        ctl_paths.len(), direct_path_count,
+        ctl_paths.len(),
+        direct_path_count,
         "ctl openapi's path count must match the direct GET /v1/openapi.json"
     );
 }

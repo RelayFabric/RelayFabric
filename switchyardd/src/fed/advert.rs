@@ -234,7 +234,10 @@ pub fn verify(advert: &Advert) -> Result<(), AdvertError> {
 /// trusts the caller passed `SealedKey::public()`'s own hex encoding,
 /// which is 64 lowercase hex chars by construction.
 pub fn build_from_config(
-    cfg: &Config, node_id: &str, sealed_key_hex: &str, now: DateTime<Utc>,
+    cfg: &Config,
+    node_id: &str,
+    sealed_key_hex: &str,
+    now: DateTime<Utc>,
 ) -> Option<Advert> {
     if cfg.discovery.mode == "disabled" {
         return None;
@@ -300,7 +303,8 @@ mod tests {
     /// below -- these tests exercise the SOURCING logic (which cfg fields
     /// land where), not `fed::sealkey::SealedKey` itself (covered by
     /// `fed::sealkey`'s own test module), so a fixed hex string is enough.
-    const TEST_SEALED_KEY_HEX: &str = "11223344556677889900aabbccddeeff11223344556677889900aabbccddee";
+    const TEST_SEALED_KEY_HEX: &str =
+        "11223344556677889900aabbccddeeff11223344556677889900aabbccddee";
 
     fn fixed_advert() -> Advert {
         let mut services = BTreeMap::new();
@@ -310,7 +314,13 @@ mod tests {
         let mut protocols = BTreeMap::new();
         protocols.insert(
             "lxmf".to_string(),
-            ProtoCaps { rx: true, tx: true, text: true, files: false, max_payload: None },
+            ProtoCaps {
+                rx: true,
+                tx: true,
+                text: true,
+                files: false,
+                max_payload: None,
+            },
         );
 
         Advert {
@@ -335,8 +345,10 @@ mod tests {
     #[test]
     fn canonical_bytes_golden_vector_is_locked() {
         let advert = fixed_advert();
-        let hex: String =
-            canonical_bytes(&advert).iter().map(|b| format!("{b:02x}")).collect();
+        let hex: String = canonical_bytes(&advert)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         // Cross-version stability lock (design §1). RE-VERSIONED cycle H
         // (design §1/SPEC §113.3, EXPECTED -- see Task 1 report): `opaque`
         // dropped, `sealed`/`sealed_key` added to the signed security
@@ -541,7 +553,10 @@ routes:
         let yaml = format!("{}\ndiscovery:\n  mode: federation\n", base_yaml());
         let cfg = config::load_from_str(&yaml).unwrap();
         let advert = build_from_config(&cfg, "rf:whatever", TEST_SEALED_KEY_HEX, now()).unwrap();
-        assert_eq!(advert.services, BTreeMap::from([("federation".to_string(), true)]));
+        assert_eq!(
+            advert.services,
+            BTreeMap::from([("federation".to_string(), true)])
+        );
         assert!(advert.protocols.is_empty());
     }
 
@@ -569,13 +584,25 @@ routes:
         // egress list).
         assert_eq!(
             advert.protocols.get("mocka"),
-            Some(&ProtoCaps { rx: true, tx: false, text: true, files: false, max_payload: None })
+            Some(&ProtoCaps {
+                rx: true,
+                tx: false,
+                text: true,
+                files: false,
+                max_payload: None
+            })
         );
         // mockb: egress in regional-chat AND ingress in telemetry-svc --
         // union means both rx and tx end up true.
         assert_eq!(
             advert.protocols.get("mockb"),
-            Some(&ProtoCaps { rx: true, tx: true, text: true, files: false, max_payload: None })
+            Some(&ProtoCaps {
+                rx: true,
+                tx: true,
+                text: true,
+                files: false,
+                max_payload: None
+            })
         );
     }
 
@@ -604,7 +631,8 @@ discovery:
   mode: public
 "#;
         let cfg = config::load_from_str(yaml).unwrap();
-        let advert = build_from_config(&cfg, "rf:distinct-node-id", TEST_SEALED_KEY_HEX, now()).unwrap();
+        let advert =
+            build_from_config(&cfg, "rf:distinct-node-id", TEST_SEALED_KEY_HEX, now()).unwrap();
         assert_eq!(advert.name, "test-node");
         assert_eq!(advert.node_id, "rf:distinct-node-id");
     }

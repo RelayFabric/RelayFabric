@@ -9,7 +9,9 @@ pub struct Aliaser {
 
 impl Aliaser {
     pub fn load_or_create(path: &Path) -> io::Result<Aliaser> {
-        Ok(Aliaser { key: crate::keyfile::load_or_create_key32(path, "alias key")? })
+        Ok(Aliaser {
+            key: crate::keyfile::load_or_create_key32(path, "alias key")?,
+        })
     }
 
     pub fn alias(&self, protocol: &str, native_ref: &str, scope: &str) -> String {
@@ -55,7 +57,9 @@ mod tests {
         let (prefix, hexpart) = alias.split_once('-').unwrap();
         assert_eq!(prefix, "MESH");
         assert_eq!(hexpart.len(), 4);
-        assert!(hexpart.chars().all(|c| c.is_ascii_hexdigit() && !c.is_lowercase()));
+        assert!(hexpart
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_lowercase()));
         // short protocol names keep their full name
         assert!(aliaser().alias("mqtt", "x", "r").starts_with("MQTT-"));
     }

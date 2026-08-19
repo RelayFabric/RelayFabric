@@ -45,7 +45,10 @@ impl FromStr for Endpoint {
         if protocol.is_empty() || endpoint.is_empty() {
             return Err(format!("endpoint '{s}' must be 'protocol:endpoint'"));
         }
-        Ok(Endpoint { protocol: protocol.into(), endpoint: endpoint.into() })
+        Ok(Endpoint {
+            protocol: protocol.into(),
+            endpoint: endpoint.into(),
+        })
     }
 }
 
@@ -225,9 +228,18 @@ mod tests {
     fn envelope_expiry() {
         let now = Utc::now();
         let mut env = Envelope::new(
-            Endpoint { protocol: "mock".into(), endpoint: "chan".into() },
-            Sender { native_ref: "!abcd".into() },
-            "text".into(), "hi".into(), now, now + Duration::hours(24), 8,
+            Endpoint {
+                protocol: "mock".into(),
+                endpoint: "chan".into(),
+            },
+            Sender {
+                native_ref: "!abcd".into(),
+            },
+            "text".into(),
+            "hi".into(),
+            now,
+            now + Duration::hours(24),
+            8,
         );
         assert!(!env.is_expired(now));
         assert!(env.is_expired(now + Duration::hours(25)));
@@ -248,16 +260,29 @@ mod tests {
     fn priority_rank_unknown_falls_back_to_normal() {
         assert_eq!(priority_rank("urgent"), 2);
         assert_eq!(priority_rank(""), 2);
-        assert_eq!(priority_rank("EMERGENCY"), 2, "class names are case-sensitive, not fuzzy-matched");
+        assert_eq!(
+            priority_rank("EMERGENCY"),
+            2,
+            "class names are case-sensitive, not fuzzy-matched"
+        );
     }
 
     #[test]
     fn envelope_new_defaults_priority_to_normal() {
         let now = Utc::now();
         let env = Envelope::new(
-            Endpoint { protocol: "mock".into(), endpoint: "chan".into() },
-            Sender { native_ref: "!abcd".into() },
-            "text".into(), "hi".into(), now, now + Duration::hours(24), 8,
+            Endpoint {
+                protocol: "mock".into(),
+                endpoint: "chan".into(),
+            },
+            Sender {
+                native_ref: "!abcd".into(),
+            },
+            "text".into(),
+            "hi".into(),
+            now,
+            now + Duration::hours(24),
+            8,
         );
         assert_eq!(env.priority, "normal");
     }
@@ -266,9 +291,18 @@ mod tests {
     fn envelope_priority_serde_roundtrip_and_old_json_defaults_normal() {
         let now = Utc::now();
         let mut env = Envelope::new(
-            Endpoint { protocol: "mock".into(), endpoint: "chan".into() },
-            Sender { native_ref: "!abcd".into() },
-            "text".into(), "hi".into(), now, now + Duration::hours(24), 8,
+            Endpoint {
+                protocol: "mock".into(),
+                endpoint: "chan".into(),
+            },
+            Sender {
+                native_ref: "!abcd".into(),
+            },
+            "text".into(),
+            "hi".into(),
+            now,
+            now + Duration::hours(24),
+            8,
         );
         env.priority = "emergency".into();
         let json = serde_json::to_string(&env).unwrap();
@@ -298,9 +332,18 @@ mod tests {
     fn envelope_attachments_serde_roundtrip_and_old_json_defaults_empty() {
         let now = Utc::now();
         let mut env = Envelope::new(
-            Endpoint { protocol: "mock".into(), endpoint: "chan".into() },
-            Sender { native_ref: "!abcd".into() },
-            "text".into(), "hi".into(), now, now + Duration::hours(24), 8,
+            Endpoint {
+                protocol: "mock".into(),
+                endpoint: "chan".into(),
+            },
+            Sender {
+                native_ref: "!abcd".into(),
+            },
+            "text".into(),
+            "hi".into(),
+            now,
+            now + Duration::hours(24),
+            8,
         );
         assert!(env.attachments.is_empty());
         env.attachments.push(AttachmentMeta {
@@ -333,9 +376,18 @@ mod tests {
     fn envelope_federation_fields_are_absent_when_default() {
         let now = Utc::now();
         let env = Envelope::new(
-            Endpoint { protocol: "mock".into(), endpoint: "chan".into() },
-            Sender { native_ref: "!abcd".into() },
-            "text".into(), "hi".into(), now, now + Duration::hours(24), 8,
+            Endpoint {
+                protocol: "mock".into(),
+                endpoint: "chan".into(),
+            },
+            Sender {
+                native_ref: "!abcd".into(),
+            },
+            "text".into(),
+            "hi".into(),
+            now,
+            now + Duration::hours(24),
+            8,
         );
         assert!(env.origin.is_none());
         assert!(env.attestations.is_empty());
@@ -356,12 +408,28 @@ mod tests {
     fn envelope_federation_fields_roundtrip_when_present_and_old_json_defaults_absent() {
         let now = Utc::now();
         let mut env = Envelope::new(
-            Endpoint { protocol: "mock".into(), endpoint: "chan".into() },
-            Sender { native_ref: "!abcd".into() },
-            "text".into(), "hi".into(), now, now + Duration::hours(24), 8,
+            Endpoint {
+                protocol: "mock".into(),
+                endpoint: "chan".into(),
+            },
+            Sender {
+                native_ref: "!abcd".into(),
+            },
+            "text".into(),
+            "hi".into(),
+            now,
+            now + Duration::hours(24),
+            8,
         );
-        env.origin = Some(OriginSig { node_id: "rf:aa".into(), sig: vec![1, 2, 3] });
-        env.attestations.push(Attestation { node_id: "rf:bb".into(), ts: now, sig: vec![4, 5] });
+        env.origin = Some(OriginSig {
+            node_id: "rf:aa".into(),
+            sig: vec![1, 2, 3],
+        });
+        env.attestations.push(Attestation {
+            node_id: "rf:bb".into(),
+            ts: now,
+            sig: vec![4, 5],
+        });
         env.hops = 2;
 
         let json = serde_json::to_string(&env).unwrap();

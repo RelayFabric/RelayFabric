@@ -3,10 +3,7 @@ use relay_core::Endpoint;
 
 /// Deny by default: only explicitly routed (source → destinations) pairs
 /// flow, and the ingress endpoint never echoes back to itself (spec §24, §38).
-pub fn route<'a>(
-    routes: &'a [RouteConfig],
-    source: &Endpoint,
-) -> Vec<(&'a str, &'a Endpoint)> {
+pub fn route<'a>(routes: &'a [RouteConfig], source: &Endpoint) -> Vec<(&'a str, &'a Endpoint)> {
     let mut out = Vec::new();
     for r in routes {
         if !r.sources.contains(source) {
@@ -27,7 +24,9 @@ mod tests {
     use crate::config::{RenderConfig, RouteConfig};
     use relay_core::Endpoint;
 
-    fn ep(s: &str) -> Endpoint { s.parse().unwrap() }
+    fn ep(s: &str) -> Endpoint {
+        s.parse().unwrap()
+    }
 
     fn routes() -> Vec<RouteConfig> {
         vec![RouteConfig {

@@ -37,7 +37,10 @@ mod tests {
         for _ in 0..100 {
             let code = generate_code();
             assert_eq!(code.len(), 6, "code should be exactly 6 characters");
-            assert!(code.chars().all(|c| c.is_numeric()), "code should contain only digits");
+            assert!(
+                code.chars().all(|c| c.is_numeric()),
+                "code should contain only digits"
+            );
         }
     }
 

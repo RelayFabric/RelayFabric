@@ -11,7 +11,9 @@ pub fn key(
     created_at: Option<DateTime<Utc>>,
     attachment_shas: &[String],
 ) -> String {
-    let ts = created_at.map(|t| t.timestamp().to_string()).unwrap_or_default();
+    let ts = created_at
+        .map(|t| t.timestamp().to_string())
+        .unwrap_or_default();
     // sorted so the same set of attachments, resent with the shas in a
     // different order (e.g. a plugin that doesn't preserve ordering),
     // still dedups against the original.
@@ -39,7 +41,10 @@ pub struct Dedup {
 
 impl Dedup {
     pub fn new(ttl: Duration) -> Dedup {
-        Dedup { ttl, seen: HashMap::new() }
+        Dedup {
+            ttl,
+            seen: HashMap::new(),
+        }
     }
 
     /// Changes the TTL applied to entries recorded from this point on;
@@ -62,7 +67,8 @@ impl Dedup {
         // O(n) prune per call, in-memory only (restart forgets the
         // cache). Fine at gateway volumes; move to the sqlite dedup table if
         // restart-replay ever bites.
-        self.seen.retain(|_, (t, ttl)| now.duration_since(*t) < *ttl);
+        self.seen
+            .retain(|_, (t, ttl)| now.duration_since(*t) < *ttl);
         self.seen.contains_key(key)
     }
 
@@ -118,10 +124,14 @@ mod tests {
         // "old" must still be a duplicate (its own TTL never changed),
         // "new" must have already expired.
         let t1 = t0 + Duration::from_secs(6);
-        assert!(d.is_duplicate("old", t1),
-            "an entry recorded before set_ttl must keep aging out on its original TTL");
-        assert!(!d.is_duplicate("new", t1),
-            "an entry recorded after set_ttl must expire on the new, shorter TTL");
+        assert!(
+            d.is_duplicate("old", t1),
+            "an entry recorded before set_ttl must keep aging out on its original TTL"
+        );
+        assert!(
+            !d.is_duplicate("new", t1),
+            "an entry recorded after set_ttl must expire on the new, shorter TTL"
+        );
     }
 
     #[test]
@@ -164,8 +174,14 @@ mod tests {
         // after: not a duplicate, but the sender's budget is exhausted, so
         // the limiter denies it. Per the fixed ordering, engine.rs must NOT
         // call `record` for a denied message.
-        assert!(!dedup.is_duplicate(key_b, t0), "message B is new content, not a duplicate");
-        assert!(!limiter.allow(sender_key, 0, t0), "message B is denied: budget exhausted");
+        assert!(
+            !dedup.is_duplicate(key_b, t0),
+            "message B is new content, not a duplicate"
+        );
+        assert!(
+            !limiter.allow(sender_key, 0, t0),
+            "message B is denied: budget exhausted"
+        );
         // (no dedup.record(key_b, ..) here — this is the fix under test)
 
         // A full minute later (rate-limit window rolled over), the sender
@@ -174,11 +190,19 @@ mod tests {
         // fresh, and the limiter (window elapsed) must now allow it: the
         // retry is accepted end to end.
         let t1 = t0 + Duration::from_secs(61);
-        assert!(!dedup.is_duplicate(key_b, t1),
-            "message B was rate-limited, never recorded, so must not dedup-collide on retry");
-        assert!(limiter.allow(sender_key, 0, t1), "rate-limit window has rolled over");
+        assert!(
+            !dedup.is_duplicate(key_b, t1),
+            "message B was rate-limited, never recorded, so must not dedup-collide on retry"
+        );
+        assert!(
+            limiter.allow(sender_key, 0, t1),
+            "rate-limit window has rolled over"
+        );
         dedup.record(key_b, t1);
-        assert!(dedup.is_duplicate(key_b, t1), "the accepted retry is now recorded as seen");
+        assert!(
+            dedup.is_duplicate(key_b, t1),
+            "the accepted retry is now recorded as seen"
+        );
     }
 
     #[test]
@@ -195,15 +219,40 @@ mod tests {
     fn key_is_sensitive_to_attachment_shas_but_order_independent() {
         let none = key("p", "s", "e", "b", None, &[]);
         let one = key("p", "s", "e", "b", None, &["sha1".to_string()]);
-        let two = key("p", "s", "e", "b", None, &["sha1".to_string(), "sha2".to_string()]);
+        let two = key(
+            "p",
+            "s",
+            "e",
+            "b",
+            None,
+            &["sha1".to_string(), "sha2".to_string()],
+        );
         assert_ne!(none, one, "attaching a file must change the key");
-        assert_ne!(one, two, "a different set of attachments must change the key");
+        assert_ne!(
+            one, two,
+            "a different set of attachments must change the key"
+        );
 
         // same set, different order on the wire: must dedup to the same key
-        let forward = key("p", "s", "e", "b", None,
-            &["sha1".to_string(), "sha2".to_string()]);
-        let reversed = key("p", "s", "e", "b", None,
-            &["sha2".to_string(), "sha1".to_string()]);
-        assert_eq!(forward, reversed, "attachment order must not affect the key");
+        let forward = key(
+            "p",
+            "s",
+            "e",
+            "b",
+            None,
+            &["sha1".to_string(), "sha2".to_string()],
+        );
+        let reversed = key(
+            "p",
+            "s",
+            "e",
+            "b",
+            None,
+            &["sha2".to_string(), "sha1".to_string()],
+        );
+        assert_eq!(
+            forward, reversed,
+            "attachment order must not affect the key"
+        );
     }
 }

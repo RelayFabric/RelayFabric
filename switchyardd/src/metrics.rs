@@ -94,7 +94,10 @@ pub static FEDERATION_PEERS_UP: LazyLock<Mutex<HashMap<String, bool>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn set_federation_peer_up(peer: &str, up: bool) {
-    FEDERATION_PEERS_UP.lock().unwrap().insert(peer.to_string(), up);
+    FEDERATION_PEERS_UP
+        .lock()
+        .unwrap()
+        .insert(peer.to_string(), up);
 }
 
 pub fn inc(c: &AtomicU64) {
@@ -112,7 +115,11 @@ pub fn record_latency(latency: CDuration) {
 }
 
 pub fn inc_route(route: &str) {
-    *ROUTE_MESSAGES.lock().unwrap().entry(route.to_string()).or_insert(0) += 1;
+    *ROUTE_MESSAGES
+        .lock()
+        .unwrap()
+        .entry(route.to_string())
+        .or_insert(0) += 1;
 }
 
 const MAX_GAUGES_PER_PLUGIN: usize = 32;
@@ -139,7 +146,9 @@ impl Default for PluginGauges {
 
 impl PluginGauges {
     pub fn new() -> Self {
-        PluginGauges { inner: Mutex::new(HashMap::new()) }
+        PluginGauges {
+            inner: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Sanitizes gauge names to `[a-z0-9_]` (any other byte -> `_`,
@@ -163,13 +172,23 @@ impl PluginGauges {
             .map(|(name, value)| (sanitize_gauge_name(&name), value))
             .collect();
         if non_finite > 0 {
-            warn!(plugin, non_finite, "gauges frame contained non-finite value(s); dropped");
+            warn!(
+                plugin,
+                non_finite, "gauges frame contained non-finite value(s); dropped"
+            );
         }
         if total - non_finite > MAX_GAUGES_PER_PLUGIN {
-            warn!(plugin, total, cap = MAX_GAUGES_PER_PLUGIN,
-                "gauges frame exceeded per-plugin cap; excess ignored");
+            warn!(
+                plugin,
+                total,
+                cap = MAX_GAUGES_PER_PLUGIN,
+                "gauges frame exceeded per-plugin cap; excess ignored"
+            );
         }
-        self.inner.lock().unwrap().insert(plugin.to_string(), (sanitized, Instant::now()));
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(plugin.to_string(), (sanitized, Instant::now()));
     }
 
     /// Renders every gauge from every plugin whose snapshot is younger than
@@ -188,7 +207,8 @@ impl PluginGauges {
             names.sort_by(|a, b| a.0.cmp(b.0));
             for (name, value) in names {
                 out.push_str(&format!(
-                    "relayfabric_plugin_gauge{{plugin=\"{plugin}\",name=\"{name}\"}} {value}\n"));
+                    "relayfabric_plugin_gauge{{plugin=\"{plugin}\",name=\"{name}\"}} {value}\n"
+                ));
             }
         }
         out
@@ -211,7 +231,10 @@ impl PluginGauges {
         if age > GAUGE_STALE_AFTER {
             return BTreeMap::new();
         }
-        gauges.iter().map(|(name, value)| (name.clone(), (*value, age.as_secs()))).collect()
+        gauges
+            .iter()
+            .map(|(name, value)| (name.clone(), (*value, age.as_secs())))
+            .collect()
     }
 }
 
@@ -243,7 +266,9 @@ fn render_routes(routes: &HashMap<String, u64>) -> String {
     let mut entries: Vec<_> = routes.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (route, n) in entries {
-        out.push_str(&format!("relayfabric_route_messages_total{{route=\"{route}\"}} {n}\n"));
+        out.push_str(&format!(
+            "relayfabric_route_messages_total{{route=\"{route}\"}} {n}\n"
+        ));
     }
     out
 }
@@ -276,16 +301,23 @@ pub fn render(
         ("relayfabric_transport_demoted_total", &TRANSPORT_DEMOTED),
     ];
     for (name, c) in counters {
-        out.push_str(&format!("# TYPE {name} counter\n{name} {}\n", c.load(Ordering::Relaxed)));
+        out.push_str(&format!(
+            "# TYPE {name} counter\n{name} {}\n",
+            c.load(Ordering::Relaxed)
+        ));
     }
     out.push_str("# TYPE relayfabric_queue_depth gauge\n");
     for (state, n) in queue_counts {
-        out.push_str(&format!("relayfabric_queue_depth{{state=\"{state}\"}} {n}\n"));
+        out.push_str(&format!(
+            "relayfabric_queue_depth{{state=\"{state}\"}} {n}\n"
+        ));
     }
     out.push_str("# TYPE relayfabric_plugin_up gauge\n");
     for (plugin, up) in plugin_up {
         out.push_str(&format!(
-            "relayfabric_plugin_up{{plugin=\"{plugin}\"}} {}\n", u8::from(*up)));
+            "relayfabric_plugin_up{{plugin=\"{plugin}\"}} {}\n",
+            u8::from(*up)
+        ));
     }
     out.push_str("# TYPE relayfabric_federation_peer_up gauge\n");
     {
@@ -294,7 +326,9 @@ pub fn render(
         entries.sort_by(|a, b| a.0.cmp(b.0));
         for (peer, up) in entries {
             out.push_str(&format!(
-                "relayfabric_federation_peer_up{{peer=\"{peer}\"}} {}\n", u8::from(*up)));
+                "relayfabric_federation_peer_up{{peer=\"{peer}\"}} {}\n",
+                u8::from(*up)
+            ));
         }
     }
     out.push_str(&render_latency(
@@ -354,12 +388,18 @@ mod tests {
         let key = "test-only-fed-peer-unique-7c2e";
         set_federation_peer_up(key, true);
         let out = render(&[], &[], &PluginGauges::new());
-        assert!(out.contains(&format!("relayfabric_federation_peer_up{{peer=\"{key}\"}} 1")));
+        assert!(out.contains(&format!(
+            "relayfabric_federation_peer_up{{peer=\"{key}\"}} 1"
+        )));
 
         set_federation_peer_up(key, false);
         let out = render(&[], &[], &PluginGauges::new());
-        assert!(out.contains(&format!("relayfabric_federation_peer_up{{peer=\"{key}\"}} 0")),
-            "a fresh set_federation_peer_up call must replace the prior state: {out}");
+        assert!(
+            out.contains(&format!(
+                "relayfabric_federation_peer_up{{peer=\"{key}\"}} 0"
+            )),
+            "a fresh set_federation_peer_up call must replace the prior state: {out}"
+        );
     }
 
     // ---- delivery latency ------------------------------------------------
@@ -389,7 +429,10 @@ mod tests {
         // global-state-free render_latency_formats_micros_as_seconds test
         // above.
         assert!(after_count > before_count);
-        assert!(after_sum >= before_sum, "a clamped-to-zero latency must never decrease the sum");
+        assert!(
+            after_sum >= before_sum,
+            "a clamped-to-zero latency must never decrease the sum"
+        );
     }
 
     // ---- route counter -----------------------------------------------
@@ -413,9 +456,19 @@ mod tests {
         // (or concurrent production code, in the real daemon) touching the
         // same process-global ROUTE_MESSAGES map, so an exact +1 is safe.
         let key = "test-only-route-inc-route-unique-9f3a";
-        let before = ROUTE_MESSAGES.lock().unwrap().get(key).copied().unwrap_or(0);
+        let before = ROUTE_MESSAGES
+            .lock()
+            .unwrap()
+            .get(key)
+            .copied()
+            .unwrap_or(0);
         inc_route(key);
-        let after = ROUTE_MESSAGES.lock().unwrap().get(key).copied().unwrap_or(0);
+        let after = ROUTE_MESSAGES
+            .lock()
+            .unwrap()
+            .get(key)
+            .copied()
+            .unwrap_or(0);
         assert_eq!(after, before + 1);
     }
 
@@ -436,7 +489,10 @@ mod tests {
         vals.insert("RSSI".to_string(), -71.0);
         g.record("meshtastic", vals);
         let out = g.render(Instant::now());
-        assert_eq!(out, "relayfabric_plugin_gauge{plugin=\"meshtastic\",name=\"rssi\"} -71\n");
+        assert_eq!(
+            out,
+            "relayfabric_plugin_gauge{plugin=\"meshtastic\",name=\"rssi\"} -71\n"
+        );
     }
 
     #[test]
@@ -466,7 +522,10 @@ mod tests {
         g.record("mqtt", vals);
         let far_future = Instant::now() + GAUGE_STALE_AFTER + Duration::from_secs(1);
         let out = g.render(far_future);
-        assert!(!out.contains("mqtt"), "a 10min+-stale gauge must not render: {out}");
+        assert!(
+            !out.contains("mqtt"),
+            "a 10min+-stale gauge must not render: {out}"
+        );
     }
 
     #[test]
@@ -477,7 +536,10 @@ mod tests {
         g.record("mqtt", vals);
         let almost_stale = Instant::now() + GAUGE_STALE_AFTER - Duration::from_secs(1);
         let out = g.render(almost_stale);
-        assert!(out.contains("mqtt"), "a gauge just under the stale window must still render: {out}");
+        assert!(
+            out.contains("mqtt"),
+            "a gauge just under the stale window must still render: {out}"
+        );
     }
 
     #[test]
@@ -490,7 +552,10 @@ mod tests {
         g.record("chatty", vals);
         let out = g.render(Instant::now());
         let count = out.matches("plugin=\"chatty\"").count();
-        assert_eq!(count, 32, "excess gauges beyond the 32 cap must be ignored: {out}");
+        assert_eq!(
+            count, 32,
+            "excess gauges beyond the 32 cap must be ignored: {out}"
+        );
     }
 
     #[test]
@@ -510,10 +575,18 @@ mod tests {
         g.record("meshtastic", vals);
 
         let out = g.render(Instant::now());
-        assert_eq!(out, "relayfabric_plugin_gauge{plugin=\"meshtastic\",name=\"finite_gauge\"} -71\n",
-            "only the finite value may survive record(): {out}");
-        assert!(!out.to_lowercase().contains("inf"), "no inf/-inf token may reach render output: {out}");
-        assert!(!out.to_lowercase().contains("nan"), "no NaN token may reach render output: {out}");
+        assert_eq!(
+            out, "relayfabric_plugin_gauge{plugin=\"meshtastic\",name=\"finite_gauge\"} -71\n",
+            "only the finite value may survive record(): {out}"
+        );
+        assert!(
+            !out.to_lowercase().contains("inf"),
+            "no inf/-inf token may reach render output: {out}"
+        );
+        assert!(
+            !out.to_lowercase().contains("nan"),
+            "no NaN token may reach render output: {out}"
+        );
     }
 
     // ---- per-plugin gauge accessor (design §2: admin GET /v1/plugins) ----
@@ -568,7 +641,10 @@ mod tests {
         g.record("mqtt", second);
 
         let out = g.render(Instant::now());
-        assert!(!out.contains("name=\"rssi\""), "a fresh frame must fully replace the old one: {out}");
+        assert!(
+            !out.contains("name=\"rssi\""),
+            "a fresh frame must fully replace the old one: {out}"
+        );
         assert!(!out.contains("name=\"snr\""));
         assert!(out.contains("name=\"queue_depth\""));
     }

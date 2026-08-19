@@ -169,7 +169,9 @@ impl Config {
     /// lookups elsewhere in the engine.
     pub fn transport_policy(&self, plugin: &str) -> relay_core::TransportPolicy {
         let entry = self.transports.get(plugin);
-        let class = entry.map(|e| e.class).unwrap_or_else(|| default_transport_class_for(plugin));
+        let class = entry
+            .map(|e| e.class)
+            .unwrap_or_else(|| default_transport_class_for(plugin));
         let mut policy = relay_core::TransportPolicy::for_class(class);
         if let Some(e) = entry {
             if let Some(v) = e.max_payload_bytes {
@@ -192,9 +194,15 @@ impl Config {
     }
 }
 
-fn default_ttl() -> u64 { 86_400 }
-fn default_hop_limit() -> u8 { 8 }
-fn default_max_attachment_bytes() -> u64 { 8 * 1024 * 1024 }
+fn default_ttl() -> u64 {
+    86_400
+}
+fn default_hop_limit() -> u8 {
+    8
+}
+fn default_max_attachment_bytes() -> u64 {
+    8 * 1024 * 1024
+}
 
 /// Reserved route name for identity-link challenge/confirmation deliveries
 /// (design §Lifecycle, §IPC): a user route may never be named this
@@ -320,8 +328,12 @@ pub struct RouteConfig {
     pub allow_gateway_decryption: Option<bool>,
 }
 
-fn default_identity_mode() -> String { "pseudonymous".to_string() }
-fn default_security_mode() -> String { "gateway".to_string() }
+fn default_identity_mode() -> String {
+    "pseudonymous".to_string()
+}
+fn default_security_mode() -> String {
+    "gateway".to_string()
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RenderConfig {
@@ -353,11 +365,16 @@ pub struct RenderConfig {
 
 impl Default for RenderConfig {
     fn default() -> Self {
-        RenderConfig { tag: default_render_tag(), max_chars: 0 }
+        RenderConfig {
+            tag: default_render_tag(),
+            max_chars: 0,
+        }
     }
 }
 
-fn default_render_tag() -> String { "alias".to_string() }
+fn default_render_tag() -> String {
+    "alias".to_string()
+}
 
 /// Federation policy config (design §3/§4, cycle F). `PartialEq`/`Eq` power
 /// `Daemon::apply_config`'s restart-required diff (see `Config::federation`'s
@@ -479,7 +496,10 @@ pub struct DiscoveryConfig {
 
 impl Default for DiscoveryConfig {
     fn default() -> Self {
-        DiscoveryConfig { mode: default_discovery_mode(), advert_ttl_secs: default_advert_ttl_secs() }
+        DiscoveryConfig {
+            mode: default_discovery_mode(),
+            advert_ttl_secs: default_advert_ttl_secs(),
+        }
     }
 }
 
@@ -542,9 +562,15 @@ impl Default for PrivacyConfig {
     }
 }
 
-fn default_minimum_security() -> String { "gateway".to_string() }
-fn default_allow_gateway_decryption() -> bool { true }
-fn default_allow_protocol_downgrade() -> bool { true }
+fn default_minimum_security() -> String {
+    "gateway".to_string()
+}
+fn default_allow_gateway_decryption() -> bool {
+    true
+}
+fn default_allow_protocol_downgrade() -> bool {
+    true
+}
 
 /// Protocol name reserved for federation (design §4/§5): no plugin may
 /// claim it, and no route SOURCE may claim it as a source protocol -- a fed
@@ -643,7 +669,11 @@ fn resolve_secrets(cfg: &mut Config) -> Result<(), String> {
         plugin.config = resolve_value(&plugin.config, &mut errors);
     }
     cfg.raw_plugin_configs = raw;
-    if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 /// Recursively walks a `serde_yaml::Value`, replacing any string leaf that
@@ -699,11 +729,9 @@ fn resolve_value(v: &serde_yaml::Value, errors: &mut Vec<String>) -> serde_yaml:
 fn warn_if_public_with_no_limits(cfg: &Config) {
     let per_sender_unset =
         cfg.limits.per_sender.messages_per_minute == 0 && cfg.limits.per_sender.bytes_per_hour == 0;
-    let global_unset =
-        cfg.limits.global.queue_max == 0 && cfg.limits.global.cas_max_bytes == 0;
+    let global_unset = cfg.limits.global.queue_max == 0 && cfg.limits.global.cas_max_bytes == 0;
     if cfg.node.public && per_sender_unset && global_unset {
-        eprintln!(
-            "warning: node.public is true but limits are unset (unlimited); see SPEC §112.8");
+        eprintln!("warning: node.public is true but limits are unset (unlimited); see SPEC §112.8");
     }
 }
 
@@ -744,7 +772,10 @@ fn warn_if_federation_node_id_overlap(cfg: &Config) {
         eprintln!(
             "warning: federation node_id(s) appear in more than one of peers/trusted/blocked: {} \
              (blocked always wins on conflict; see seed_federation_trust)",
-            ids.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            ids.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 }
@@ -788,7 +819,12 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
              signed into this node's own RFDP advert)"
         ));
     }
-    if let Some(c) = cfg.node.name.chars().find(|&c| is_unsafe_advert_name_char(c)) {
+    if let Some(c) = cfg
+        .node
+        .name
+        .chars()
+        .find(|&c| is_unsafe_advert_name_char(c))
+    {
         return Err(format!(
             "node.name contains an unsafe character ({c:?}) -- no control characters, newlines, \
              or Unicode bidi-control/default-ignorable spoofing codepoints allowed (design §1: it \
@@ -880,8 +916,12 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
     // Validate public_services protocols are enabled plugins
     for svc in &cfg.public_services {
         for proto in svc.ingress.iter().chain(&svc.egress) {
-            require_enabled_plugin(cfg, proto, &format!("public_services '{}'", svc.name),
-                                   "; enable the plugin or remove the entry")?;
+            require_enabled_plugin(
+                cfg,
+                proto,
+                &format!("public_services '{}'", svc.name),
+                "; enable the plugin or remove the entry",
+            )?;
         }
     }
 
@@ -929,8 +969,12 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
                 "transport_budgets '{}' has messages_per_minute 0 which would block all egress; omit the entry instead",
                 proto));
         }
-        require_enabled_plugin(cfg, proto, &format!("transport_budgets entry '{proto}'"),
-                               "; enable the plugin or remove the entry")?;
+        require_enabled_plugin(
+            cfg,
+            proto,
+            &format!("transport_budgets entry '{proto}'"),
+            "; enable the plugin or remove the entry",
+        )?;
     }
 
     // Validate transports keys are enabled plugins, and any override
@@ -941,8 +985,12 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
     // relay-core and this module's own
     // `unknown_transport_class_is_a_clear_deserialize_error` test).
     for (proto, entry) in &cfg.transports {
-        require_enabled_plugin(cfg, proto, &format!("transports entry '{proto}'"),
-                               "; enable the plugin or remove the entry")?;
+        require_enabled_plugin(
+            cfg,
+            proto,
+            &format!("transports entry '{proto}'"),
+            "; enable the plugin or remove the entry",
+        )?;
         if let Some(max_payload_bytes) = entry.max_payload_bytes {
             if max_payload_bytes < TRANSPORT_MAX_PAYLOAD_BYTES_FLOOR {
                 return Err(format!(
@@ -1012,7 +1060,9 @@ fn security_rank(mode: &str) -> u8 {
 /// what `engine::fed_sealed_ingress`'s downgrade-refusal gate dead-letters
 /// `SECURITY_DOWNGRADE_REFUSED` on.
 pub(crate) fn effective_allow_gateway_decryption(cfg: &Config, route: &RouteConfig) -> bool {
-    route.allow_gateway_decryption.unwrap_or(cfg.privacy.allow_gateway_decryption)
+    route
+        .allow_gateway_decryption
+        .unwrap_or(cfg.privacy.allow_gateway_decryption)
 }
 
 /// Design §3/§113.2 validation specific to a `security_mode: sealed` route,
@@ -1053,8 +1103,10 @@ fn validate_sealed_route(cfg: &Config, r: &RouteConfig) -> Result<(), String> {
             // in the same routes-loop iteration) already rejected this.
             continue;
         };
-        let Some(peer) =
-            cfg.federation.as_ref().and_then(|fed| fed.peers.iter().find(|p| p.name == peer_name))
+        let Some(peer) = cfg
+            .federation
+            .as_ref()
+            .and_then(|fed| fed.peers.iter().find(|p| p.name == peer_name))
         else {
             // Unknown peer / absent federation block -- likewise already
             // rejected by `validate_fed_destination`.
@@ -1254,7 +1306,9 @@ fn validate_fed_destination(cfg: &Config, route_name: &str, endpoint: &str) -> R
 fn is_valid_peer_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 32
-        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Whether `c` is unsafe in a `node.name` (final cycle-G review finding --
@@ -1432,10 +1486,16 @@ routes:
         let yaml = with_secret_config("RF_CONFIG_TEST_RAW_YAML");
         let cfg = load_from_str(&yaml).unwrap();
         assert_eq!(cfg.raw_yaml, yaml);
-        assert!(cfg.raw_yaml.contains("${env:RF_CONFIG_TEST_RAW_YAML}"),
-            "raw_yaml must keep the reference form: {}", cfg.raw_yaml);
-        assert!(!cfg.raw_yaml.contains("sentinel-raw-yaml-value"),
-            "raw_yaml must never contain a resolved secret value: {}", cfg.raw_yaml);
+        assert!(
+            cfg.raw_yaml.contains("${env:RF_CONFIG_TEST_RAW_YAML}"),
+            "raw_yaml must keep the reference form: {}",
+            cfg.raw_yaml
+        );
+        assert!(
+            !cfg.raw_yaml.contains("sentinel-raw-yaml-value"),
+            "raw_yaml must never contain a resolved secret value: {}",
+            cfg.raw_yaml
+        );
         std::env::remove_var("RF_CONFIG_TEST_RAW_YAML");
     }
 
@@ -1481,7 +1541,10 @@ routes:
         );
         let err = parse(&bad).unwrap_err();
         assert!(err.contains("small"), "err should name the policy: {err}");
-        assert!(err.contains("rejct"), "err should quote the bad value: {err}");
+        assert!(
+            err.contains("rejct"),
+            "err should quote the bad value: {err}"
+        );
     }
 
     #[test]
@@ -1514,11 +1577,13 @@ routes:
 
     #[test]
     fn rejects_duplicate_route_names() {
-        let bad = format!("{GOOD}
+        let bad = format!(
+            "{GOOD}
   - name: general
     sources: [\"mocka:chan\"]
     destinations: [\"mockb:chan\"]
-");
+"
+        );
         let err = parse(&bad).unwrap_err();
         assert!(err.contains("duplicate"), "err was: {err}");
     }
@@ -1787,7 +1852,10 @@ limits:
         );
         let err = parse(&yaml).unwrap_err();
         assert!(err.contains("general"), "err should name the route: {err}");
-        assert!(err.contains("anonymous"), "err should quote the bad value: {err}");
+        assert!(
+            err.contains("anonymous"),
+            "err should quote the bad value: {err}"
+        );
     }
 
     /// The design's §IPC "@identity" sentinel is where challenge/confirmation
@@ -1830,7 +1898,8 @@ limits:
                     "    destinations: [\"mocka:chan\", \"mockb:chan\"]\n    render:\n      max_chars: {max_chars}"
                 ),
             );
-            let cfg = parse(&yaml).unwrap_or_else(|e| panic!("max_chars {max_chars} should be valid: {e}"));
+            let cfg = parse(&yaml)
+                .unwrap_or_else(|e| panic!("max_chars {max_chars} should be valid: {e}"));
             assert_eq!(cfg.routes[0].render.max_chars, max_chars);
             // tag omitted under a present `render:` block still defaults to "alias".
             assert_eq!(cfg.routes[0].render.tag, "alias");
@@ -1848,7 +1917,10 @@ limits:
         );
         let err = parse(&yaml).unwrap_err();
         assert!(err.contains("general"), "err should name the route: {err}");
-        assert!(err.contains("alais"), "err should quote the bad value: {err}");
+        assert!(
+            err.contains("alais"),
+            "err should quote the bad value: {err}"
+        );
     }
 
     /// `max_chars` below the 16 floor is rejected rather than silently
@@ -1934,10 +2006,23 @@ routes:
     fn plugin_config_secret_ref_resolves_into_runtime_config() {
         std::env::set_var("RF_CONFIG_TEST_TOKEN_RESOLVE", "sentinel-runtime-value");
         let cfg = parse_and_resolve(&with_secret_config("RF_CONFIG_TEST_TOKEN_RESOLVE")).unwrap();
-        let token = cfg.plugins["mocka"].config.get("token").unwrap().as_str().unwrap();
+        let token = cfg.plugins["mocka"]
+            .config
+            .get("token")
+            .unwrap()
+            .as_str()
+            .unwrap();
         assert_eq!(token, "sentinel-runtime-value");
         // an ordinary literal string alongside the reference is untouched.
-        assert_eq!(cfg.plugins["mocka"].config.get("plain").unwrap().as_str().unwrap(), "literal-value");
+        assert_eq!(
+            cfg.plugins["mocka"]
+                .config
+                .get("plain")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "literal-value"
+        );
         std::env::remove_var("RF_CONFIG_TEST_TOKEN_RESOLVE");
     }
 
@@ -1945,7 +2030,11 @@ routes:
     fn raw_plugin_configs_retains_unresolved_form_for_display() {
         std::env::set_var("RF_CONFIG_TEST_TOKEN_RAW", "sentinel-runtime-value");
         let cfg = parse_and_resolve(&with_secret_config("RF_CONFIG_TEST_TOKEN_RAW")).unwrap();
-        let raw_token = cfg.raw_plugin_configs["mocka"].get("token").unwrap().as_str().unwrap();
+        let raw_token = cfg.raw_plugin_configs["mocka"]
+            .get("token")
+            .unwrap()
+            .as_str()
+            .unwrap();
         assert_eq!(raw_token, "${env:RF_CONFIG_TEST_TOKEN_RAW}");
         // the resolved runtime config must never leak into the raw snapshot.
         assert!(!format!("{:?}", cfg.raw_plugin_configs).contains("sentinel-runtime-value"));
@@ -1981,7 +2070,10 @@ routes:
         let list_item = config["nested"]["list"][0].as_str().unwrap();
         assert_eq!(list_item, "sentinel-nested-value");
         assert_eq!(config["nested"]["list"][1].as_str().unwrap(), "literal");
-        assert_eq!(config["nested"]["inner"]["deep"].as_str().unwrap(), "sentinel-nested-value");
+        assert_eq!(
+            config["nested"]["inner"]["deep"].as_str().unwrap(),
+            "sentinel-nested-value"
+        );
         std::env::remove_var("RF_CONFIG_TEST_NESTED");
     }
 
@@ -2005,7 +2097,10 @@ routes:
         // from a prior manual run.
         std::env::remove_var("RF_CONFIG_TEST_TOKEN_UNSET");
         let err = parse_and_resolve(&with_secret_config("RF_CONFIG_TEST_TOKEN_UNSET")).unwrap_err();
-        assert!(err.contains("${env:RF_CONFIG_TEST_TOKEN_UNSET}"), "err should name the reference: {err}");
+        assert!(
+            err.contains("${env:RF_CONFIG_TEST_TOKEN_UNSET}"),
+            "err should name the reference: {err}"
+        );
     }
 
     #[test]
@@ -2031,8 +2126,14 @@ routes:
     destinations: ["mocka:chan", "mockb:chan"]
 "#;
         let err = parse_and_resolve(yaml).unwrap_err();
-        assert!(err.contains("${env:RF_CONFIG_TEST_MULTI_A}"), "err was: {err}");
-        assert!(err.contains("${env:RF_CONFIG_TEST_MULTI_B}"), "err was: {err}");
+        assert!(
+            err.contains("${env:RF_CONFIG_TEST_MULTI_A}"),
+            "err was: {err}"
+        );
+        assert!(
+            err.contains("${env:RF_CONFIG_TEST_MULTI_B}"),
+            "err was: {err}"
+        );
     }
 
     /// Integration-level companion to `secrets::tests::resolve_file_errors_
@@ -2058,7 +2159,10 @@ routes:
     destinations: ["mocka:chan", "mockb:chan"]
 "#;
         let err = parse_and_resolve(yaml).unwrap_err();
-        assert!(err.contains("${file:relative/token.txt}"), "err should name the reference: {err}");
+        assert!(
+            err.contains("${file:relative/token.txt}"),
+            "err should name the reference: {err}"
+        );
     }
 
     #[test]
@@ -2092,9 +2196,21 @@ routes:
         std::fs::write(&cfg_path, &yaml).unwrap();
 
         let cfg = load(&cfg_path).unwrap();
-        assert_eq!(cfg.plugins["mocka"].config.get("token").unwrap().as_str().unwrap(), "sentinel-file-token");
         assert_eq!(
-            cfg.raw_plugin_configs["mocka"].get("token").unwrap().as_str().unwrap(),
+            cfg.plugins["mocka"]
+                .config
+                .get("token")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "sentinel-file-token"
+        );
+        assert_eq!(
+            cfg.raw_plugin_configs["mocka"]
+                .get("token")
+                .unwrap()
+                .as_str()
+                .unwrap(),
             format!("${{file:{}}}", secret_path.display()),
         );
     }
@@ -2127,7 +2243,12 @@ routes:
 "#;
         let cfg = parse_and_resolve(yaml).unwrap();
         assert_eq!(
-            cfg.plugins["mocka"].config.get("token").unwrap().as_str().unwrap(),
+            cfg.plugins["mocka"]
+                .config
+                .get("token")
+                .unwrap()
+                .as_str()
+                .unwrap(),
             "${vault:x}",
         );
     }
@@ -2140,12 +2261,17 @@ routes:
     fn example_config_has_no_secret_refs_and_loads_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let raw = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/relayfabric.example.yaml"),
-        ).unwrap();
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../docs/relayfabric.example.yaml"),
+        )
+        .unwrap();
         let cfg_path = dir.path().join("relayfabric.yaml");
         std::fs::write(&cfg_path, &raw).unwrap();
         let cfg = load(&cfg_path).unwrap();
-        assert_eq!(cfg.plugins["mqtt"].config["broker"], serde_yaml::Value::String("mqtt://127.0.0.1:1883".into()));
+        assert_eq!(
+            cfg.plugins["mqtt"].config["broker"],
+            serde_yaml::Value::String("mqtt://127.0.0.1:1883".into())
+        );
     }
 
     // ---- federation (design §3/§4, cycle F) --------------------------------
@@ -2165,9 +2291,15 @@ routes:
     destinations: ["mockb:chan"]
 "#;
 
-    fn node_id_a() -> String { format!("rf:{}", "ab".repeat(32)) }
-    fn node_id_b() -> String { format!("rf:{}", "cd".repeat(32)) }
-    fn node_id_c() -> String { format!("rf:{}", "ef".repeat(32)) }
+    fn node_id_a() -> String {
+        format!("rf:{}", "ab".repeat(32))
+    }
+    fn node_id_b() -> String {
+        format!("rf:{}", "cd".repeat(32))
+    }
+    fn node_id_c() -> String {
+        format!("rf:{}", "ef".repeat(32))
+    }
 
     #[test]
     fn federation_block_absent_is_valid_and_field_is_none() {
@@ -2195,9 +2327,12 @@ federation:
   trusted: ["{b}"]
   blocked: ["{c}"]
 "#,
-            a = node_id_a(), b = node_id_b(), c = node_id_c(),
+            a = node_id_a(),
+            b = node_id_b(),
+            c = node_id_c(),
         );
-        let cfg = parse(&yaml).unwrap_or_else(|e| panic!("full federation block should be valid: {e}"));
+        let cfg =
+            parse(&yaml).unwrap_or_else(|e| panic!("full federation block should be valid: {e}"));
         let fed = cfg.federation.unwrap();
         assert_eq!(fed.listen.as_deref(), Some("127.0.0.1:47000"));
         assert_eq!(fed.accept_from, "trusted");
@@ -2224,7 +2359,10 @@ federation:
         assert_eq!(fed.max_hops, 4);
         assert_eq!(fed.max_ttl_secs, 86_400);
         assert_eq!(fed.identity_exposure, "pseudonymous");
-        assert!(fed.ingress_routes.is_empty(), "default: no route accepts fed ingress");
+        assert!(
+            fed.ingress_routes.is_empty(),
+            "default: no route accepts fed ingress"
+        );
         assert!(fed.peers.is_empty());
         assert!(fed.trusted.is_empty());
         assert!(fed.blocked.is_empty());
@@ -2388,8 +2526,12 @@ federation:
             "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{a}\"\n      addr: \"10.0.0.2:47000\"\n      sealed_key: \"{sk}\"\n",
             a = node_id_a(), sk = sealed_key,
         );
-        let cfg = parse(&yaml).unwrap_or_else(|e| panic!("valid sealed_key should be accepted: {e}"));
-        assert_eq!(cfg.federation.unwrap().peers[0].sealed_key, Some(sealed_key));
+        let cfg =
+            parse(&yaml).unwrap_or_else(|e| panic!("valid sealed_key should be accepted: {e}"));
+        assert_eq!(
+            cfg.federation.unwrap().peers[0].sealed_key,
+            Some(sealed_key)
+        );
     }
 
     #[test]
@@ -2442,7 +2584,8 @@ federation:
     fn federation_valid_trusted_and_blocked_entries_are_ok() {
         let yaml = format!(
             "{FED_BASE}\nfederation:\n  trusted: [\"{a}\"]\n  blocked: [\"{b}\"]\n",
-            a = node_id_a(), b = node_id_b(),
+            a = node_id_a(),
+            b = node_id_b(),
         );
         let cfg = parse(&yaml).unwrap();
         let fed = cfg.federation.unwrap();
@@ -2455,35 +2598,59 @@ federation:
     #[test]
     fn overlapping_federation_node_ids_is_empty_when_every_list_is_disjoint() {
         let fed = fed_cfg_for(
-            vec![peer_cfg("phoenix", &node_id_a())], vec![node_id_b()], vec![node_id_c()]);
+            vec![peer_cfg("phoenix", &node_id_a())],
+            vec![node_id_b()],
+            vec![node_id_c()],
+        );
         assert!(overlapping_federation_node_ids(&fed).is_empty());
     }
 
     #[test]
     fn overlapping_federation_node_ids_flags_a_peer_also_listed_trusted() {
         let fed = fed_cfg_for(
-            vec![peer_cfg("phoenix", &node_id_a())], vec![node_id_a()], vec![]);
-        assert_eq!(overlapping_federation_node_ids(&fed), BTreeSet::from([node_id_a()]));
+            vec![peer_cfg("phoenix", &node_id_a())],
+            vec![node_id_a()],
+            vec![],
+        );
+        assert_eq!(
+            overlapping_federation_node_ids(&fed),
+            BTreeSet::from([node_id_a()])
+        );
     }
 
     #[test]
     fn overlapping_federation_node_ids_flags_a_peer_also_listed_blocked() {
         let fed = fed_cfg_for(
-            vec![peer_cfg("phoenix", &node_id_a())], vec![], vec![node_id_a()]);
-        assert_eq!(overlapping_federation_node_ids(&fed), BTreeSet::from([node_id_a()]));
+            vec![peer_cfg("phoenix", &node_id_a())],
+            vec![],
+            vec![node_id_a()],
+        );
+        assert_eq!(
+            overlapping_federation_node_ids(&fed),
+            BTreeSet::from([node_id_a()])
+        );
     }
 
     #[test]
     fn overlapping_federation_node_ids_flags_trusted_also_listed_blocked() {
         let fed = fed_cfg_for(vec![], vec![node_id_a()], vec![node_id_a()]);
-        assert_eq!(overlapping_federation_node_ids(&fed), BTreeSet::from([node_id_a()]));
+        assert_eq!(
+            overlapping_federation_node_ids(&fed),
+            BTreeSet::from([node_id_a()])
+        );
     }
 
     #[test]
     fn overlapping_federation_node_ids_dedups_when_the_same_id_is_in_all_three() {
         let fed = fed_cfg_for(
-            vec![peer_cfg("phoenix", &node_id_a())], vec![node_id_a()], vec![node_id_a()]);
-        assert_eq!(overlapping_federation_node_ids(&fed), BTreeSet::from([node_id_a()]));
+            vec![peer_cfg("phoenix", &node_id_a())],
+            vec![node_id_a()],
+            vec![node_id_a()],
+        );
+        assert_eq!(
+            overlapping_federation_node_ids(&fed),
+            BTreeSet::from([node_id_a()])
+        );
     }
 
     #[test]
@@ -2505,19 +2672,30 @@ federation:
 
     fn peer_cfg(name: &str, node_id: &str) -> PeerConfig {
         PeerConfig {
-            name: name.into(), node_id: node_id.into(),
-            addr: "10.0.0.2:47000".into(), trust: "verified".into(),
-            messages_per_minute: 0, sealed_key: None,
+            name: name.into(),
+            node_id: node_id.into(),
+            addr: "10.0.0.2:47000".into(),
+            trust: "verified".into(),
+            messages_per_minute: 0,
+            sealed_key: None,
         }
     }
 
     fn fed_cfg_for(
-        peers: Vec<PeerConfig>, trusted: Vec<String>, blocked: Vec<String>,
+        peers: Vec<PeerConfig>,
+        trusted: Vec<String>,
+        blocked: Vec<String>,
     ) -> FederationConfig {
         FederationConfig {
-            listen: None, accept_from: "verified".into(), max_hops: 4, max_ttl_secs: 86_400,
-            identity_exposure: "pseudonymous".into(), ingress_routes: vec![],
-            peers, trusted, blocked,
+            listen: None,
+            accept_from: "verified".into(),
+            max_hops: 4,
+            max_ttl_secs: 86_400,
+            identity_exposure: "pseudonymous".into(),
+            ingress_routes: vec![],
+            peers,
+            trusted,
+            blocked,
         }
     }
 
@@ -2567,7 +2745,10 @@ federation:
         let err = parse(&yaml).unwrap_err();
         assert!(err.contains("general"), "err should name the route: {err}");
         assert!(err.contains("federation"), "err was: {err}");
-        assert!(!err.contains("unknown plugin"), "must not fall through to the generic plugin check: {err}");
+        assert!(
+            !err.contains("unknown plugin"),
+            "must not fall through to the generic plugin check: {err}"
+        );
     }
 
     /// A `fed:<peer>/<route>` destination naming a peer that's actually
@@ -2583,7 +2764,9 @@ federation:
             ),
             node_id_a(),
         );
-        parse(&yaml).unwrap_or_else(|e| panic!("a fed: destination naming a configured peer should be valid: {e}"));
+        parse(&yaml).unwrap_or_else(|e| {
+            panic!("a fed: destination naming a configured peer should be valid: {e}")
+        });
     }
 
     #[test]
@@ -2597,7 +2780,10 @@ federation:
             node_id_a(),
         );
         let err = parse(&yaml).unwrap_err();
-        assert!(err.contains("phoenix"), "err should name the unknown peer: {err}");
+        assert!(
+            err.contains("phoenix"),
+            "err should name the unknown peer: {err}"
+        );
         assert!(err.contains("unknown peer"), "err was: {err}");
     }
 
@@ -2649,8 +2835,10 @@ federation:
     #[test]
     fn example_config_has_no_federation_block_and_stays_valid() {
         let raw = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/relayfabric.example.yaml"),
-        ).unwrap();
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../docs/relayfabric.example.yaml"),
+        )
+        .unwrap();
         let cfg: Config = serde_yaml::from_str(&raw).unwrap();
         assert!(cfg.federation.is_none());
         assert!(validate(&cfg).is_ok());
@@ -2669,8 +2857,10 @@ federation:
     #[test]
     fn example_config_has_no_discovery_block_and_stays_valid() {
         let raw = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/relayfabric.example.yaml"),
-        ).unwrap();
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../docs/relayfabric.example.yaml"),
+        )
+        .unwrap();
         let cfg: Config = serde_yaml::from_str(&raw).unwrap();
         assert_eq!(cfg.discovery.mode, "disabled");
         assert!(validate(&cfg).is_ok());
@@ -2808,7 +2998,10 @@ federation:
         );
         let err = parse(&yaml).unwrap_err();
         assert!(err.contains("general"), "err should name the route: {err}");
-        assert!(err.contains("opaque"), "err should quote the bad value: {err}");
+        assert!(
+            err.contains("opaque"),
+            "err should quote the bad value: {err}"
+        );
     }
 
     /// SPEC §113.1: `native` is documented as an alias of `gateway` today,
@@ -2823,7 +3016,10 @@ federation:
         );
         let err = parse(&yaml).unwrap_err();
         assert!(err.contains("native"), "err should quote the value: {err}");
-        assert!(err.contains("alias"), "err should explain native is an alias of gateway: {err}");
+        assert!(
+            err.contains("alias"),
+            "err should explain native is an alias of gateway: {err}"
+        );
         assert!(err.contains("gateway"), "err was: {err}");
     }
 
@@ -2853,7 +3049,10 @@ federation:
     #[test]
     fn effective_allow_gateway_decryption_defers_to_node_privacy_when_route_unset() {
         let mut cfg = parse(GOOD).unwrap();
-        assert_eq!(cfg.routes[0].allow_gateway_decryption, None, "fixture sanity check");
+        assert_eq!(
+            cfg.routes[0].allow_gateway_decryption, None,
+            "fixture sanity check"
+        );
         cfg.privacy.allow_gateway_decryption = true;
         assert!(effective_allow_gateway_decryption(&cfg, &cfg.routes[0]));
         cfg.privacy.allow_gateway_decryption = false;
@@ -2865,8 +3064,10 @@ federation:
         let mut cfg = parse(GOOD).unwrap();
         cfg.privacy.allow_gateway_decryption = false;
         cfg.routes[0].allow_gateway_decryption = Some(true);
-        assert!(effective_allow_gateway_decryption(&cfg, &cfg.routes[0]),
-            "an explicit route-level true must win over the node's false floor");
+        assert!(
+            effective_allow_gateway_decryption(&cfg, &cfg.routes[0]),
+            "an explicit route-level true must win over the node's false floor"
+        );
     }
 
     #[test]
@@ -2874,8 +3075,10 @@ federation:
         let mut cfg = parse(GOOD).unwrap();
         cfg.privacy.allow_gateway_decryption = true;
         cfg.routes[0].allow_gateway_decryption = Some(false);
-        assert!(!effective_allow_gateway_decryption(&cfg, &cfg.routes[0]),
-            "an explicit route-level false must win even when the node default is true");
+        assert!(
+            !effective_allow_gateway_decryption(&cfg, &cfg.routes[0]),
+            "an explicit route-level false must win even when the node default is true"
+        );
     }
 
     // ---- privacy floor (node-level, design §3, SPEC §113.2, cycle H) ------
@@ -2923,7 +3126,10 @@ federation:
         let yaml = format!("{GOOD}\nprivacy:\n  minimum_security: sealed\n");
         let err = parse(&yaml).unwrap_err();
         assert!(err.contains("general"), "err should name the route: {err}");
-        assert!(err.contains("gateway"), "err should name the route's mode: {err}");
+        assert!(
+            err.contains("gateway"),
+            "err should name the route's mode: {err}"
+        );
         assert!(err.contains("sealed"), "err should name the floor: {err}");
         assert!(err.contains("floor"), "err should say 'floor': {err}");
     }
@@ -2943,8 +3149,9 @@ federation:
             ),
             node_id_a(), sealed_key,
         );
-        let cfg = parse(&yaml)
-            .unwrap_or_else(|e| panic!("a sealed route to a keyed peer should satisfy a sealed floor: {e}"));
+        let cfg = parse(&yaml).unwrap_or_else(|e| {
+            panic!("a sealed route to a keyed peer should satisfy a sealed floor: {e}")
+        });
         assert_eq!(cfg.privacy.minimum_security, "sealed");
         assert_eq!(cfg.routes[0].security_mode, "sealed");
     }
@@ -2964,7 +3171,10 @@ federation:
         let err = parse(&yaml).unwrap_err();
         assert!(err.contains("general"), "err should name the route: {err}");
         assert!(err.contains("sealed"), "err was: {err}");
-        assert!(err.contains("mocka:chan"), "err should name the offending destination: {err}");
+        assert!(
+            err.contains("mocka:chan"),
+            "err should name the offending destination: {err}"
+        );
     }
 
     /// Rejection (b), mixed case: one `fed:` destination and one plain
@@ -2983,7 +3193,10 @@ federation:
         );
         let err = parse(&yaml).unwrap_err();
         assert!(err.contains("sealed"), "err was: {err}");
-        assert!(err.contains("mockb:chan"), "err should name the non-fed destination: {err}");
+        assert!(
+            err.contains("mockb:chan"),
+            "err should name the non-fed destination: {err}"
+        );
     }
 
     /// Rejection (c): a `sealed` route to a `fed:` peer that has NO
@@ -3018,9 +3231,11 @@ federation:
                 "    destinations: [\"mocka:chan\", \"mockb:chan\"]",
                 "    destinations: [\"fed:phoenix/regional-chat\"]\n    security_mode: sealed",
             ),
-            node_id_a(), sealed_key,
+            node_id_a(),
+            sealed_key,
         );
-        parse(&yaml).unwrap_or_else(|e| panic!("sealed route to a keyed peer should be valid: {e}"));
+        parse(&yaml)
+            .unwrap_or_else(|e| panic!("sealed route to a keyed peer should be valid: {e}"));
     }
 
     /// Rejection (b) takes priority when `federation` is entirely absent --
@@ -3045,15 +3260,25 @@ federation:
     #[test]
     fn example_config_has_no_privacy_block_and_every_route_defaults_to_gateway() {
         let raw = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/relayfabric.example.yaml"),
-        ).unwrap();
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../docs/relayfabric.example.yaml"),
+        )
+        .unwrap();
         let cfg: Config = serde_yaml::from_str(&raw).unwrap();
         assert_eq!(cfg.privacy.minimum_security, "gateway");
         assert!(cfg.privacy.allow_gateway_decryption);
         assert!(cfg.privacy.allow_protocol_downgrade);
         for r in &cfg.routes {
-            assert_eq!(r.security_mode, "gateway", "route '{}' should default to gateway", r.name);
-            assert_eq!(r.allow_gateway_decryption, None, "route '{}' should default to None", r.name);
+            assert_eq!(
+                r.security_mode, "gateway",
+                "route '{}' should default to gateway",
+                r.name
+            );
+            assert_eq!(
+                r.allow_gateway_decryption, None,
+                "route '{}' should default to None",
+                r.name
+            );
         }
         assert!(validate(&cfg).is_ok());
     }
@@ -3103,9 +3328,18 @@ federation:
                 "{name} should default to terrestrial_internet"
             );
         }
-        assert_eq!(default_transport_class_for("meshtastic"), relay_core::TransportClass::Meshtastic);
-        assert_eq!(default_transport_class_for("meshcore"), relay_core::TransportClass::MeshCore);
-        assert_eq!(default_transport_class_for("lxmf"), relay_core::TransportClass::Reticulum);
+        assert_eq!(
+            default_transport_class_for("meshtastic"),
+            relay_core::TransportClass::Meshtastic
+        );
+        assert_eq!(
+            default_transport_class_for("meshcore"),
+            relay_core::TransportClass::MeshCore
+        );
+        assert_eq!(
+            default_transport_class_for("lxmf"),
+            relay_core::TransportClass::Reticulum
+        );
         assert_eq!(
             default_transport_class_for("some_future_plugin"),
             relay_core::TransportClass::TerrestrialInternet,
@@ -3149,7 +3383,8 @@ routes:
         );
         let cfg = parse(&yaml).unwrap();
         let policy = cfg.transport_policy("mocka");
-        let base = relay_core::TransportPolicy::for_class(relay_core::TransportClass::SatelliteInternet);
+        let base =
+            relay_core::TransportPolicy::for_class(relay_core::TransportClass::SatelliteInternet);
         // Overridden fields take the config value...
         assert_eq!(policy.max_payload_bytes, 32768);
         assert!(!policy.allow_images);
@@ -3172,8 +3407,14 @@ routes:
     fn unknown_transport_class_is_a_clear_deserialize_error() {
         let yaml = format!("{GOOD}transports:\n  mocka: {{ class: warp_drive }}\n");
         let err = parse(&yaml).unwrap_err();
-        assert!(err.contains("unknown variant"), "expected a clear unknown-variant error, got: {err}");
-        assert!(err.contains("warp_drive"), "error should name the bad value: {err}");
+        assert!(
+            err.contains("unknown variant"),
+            "expected a clear unknown-variant error, got: {err}"
+        );
+        assert!(
+            err.contains("warp_drive"),
+            "error should name the bad value: {err}"
+        );
     }
 
     #[test]
@@ -3195,7 +3436,8 @@ routes:
 
     #[test]
     fn transports_entry_max_payload_bytes_below_floor_err() {
-        let yaml = format!("{GOOD}transports:\n  mocka: {{ class: meshtastic, max_payload_bytes: 10 }}\n");
+        let yaml =
+            format!("{GOOD}transports:\n  mocka: {{ class: meshtastic, max_payload_bytes: 10 }}\n");
         let err = parse(&yaml).unwrap_err();
         assert!(err.contains("mocka"), "error should name entry: {err}");
         assert!(err.contains("max_payload_bytes"), "err was: {err}");
@@ -3204,7 +3446,8 @@ routes:
 
     #[test]
     fn transports_entry_max_payload_bytes_at_floor_ok() {
-        let yaml = format!("{GOOD}transports:\n  mocka: {{ class: meshtastic, max_payload_bytes: 64 }}\n");
+        let yaml =
+            format!("{GOOD}transports:\n  mocka: {{ class: meshtastic, max_payload_bytes: 64 }}\n");
         let cfg = parse(&yaml).unwrap();
         assert_eq!(cfg.transports["mocka"].max_payload_bytes, Some(64));
     }
@@ -3216,16 +3459,22 @@ routes:
     /// the transports feature must not change today's behavior for any
     /// config that predates it (design §2 backward-compat invariant).
     #[test]
-    fn example_config_has_no_transports_block_and_mqtt_resolves_to_non_constraining_internet_default() {
+    fn example_config_has_no_transports_block_and_mqtt_resolves_to_non_constraining_internet_default(
+    ) {
         let raw = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/relayfabric.example.yaml"),
-        ).unwrap();
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../docs/relayfabric.example.yaml"),
+        )
+        .unwrap();
         let cfg: Config = serde_yaml::from_str(&raw).unwrap();
         assert!(cfg.transports.is_empty());
         assert!(validate(&cfg).is_ok());
 
         let policy = cfg.transport_policy("mqtt");
-        assert_eq!(policy, relay_core::TransportPolicy::for_class(relay_core::TransportClass::TerrestrialInternet));
+        assert_eq!(
+            policy,
+            relay_core::TransportPolicy::for_class(relay_core::TransportClass::TerrestrialInternet)
+        );
         assert!(policy.max_payload_bytes >= 16 * 1024 * 1024);
         assert!(policy.allow_images);
         assert!(policy.allow_video);

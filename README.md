@@ -1,5 +1,8 @@
 # RelayFabric
 
+[![CI](https://github.com/RelayFabric/RelayFabric/actions/workflows/ci.yml/badge.svg)](https://github.com/RelayFabric/RelayFabric/actions/workflows/ci.yml)
+[![Docker](https://github.com/RelayFabric/RelayFabric/actions/workflows/docker.yml/badge.svg)](https://github.com/RelayFabric/RelayFabric/actions/workflows/docker.yml)
+
 RelayFabric is an open communications routing fabric for interconnecting
 otherwise incompatible messaging, mesh, radio, and Internet communications
 systems. It provides a common routing, policy, identity, security, and
@@ -8,10 +11,12 @@ plugins. MeshCore uses the native MIT Companion Radio Protocol (spec §8's
 preferred style), while Meshtastic uses MQTT (licensing favors it). Initial
 target networks: Reticulum/LXMF, Signal, Meshtastic, MeshCore, Bitchat, Nostr.
 
-**Status:** v0.3 in progress: federation, RFDP, documented API + /docs, sealed
-routing (`docs/SPEC.md` §113 — zero-knowledge routing, not traffic
-anonymity), and transport-class-aware egress (constrained links degrade
-gracefully: payload capped, media dropped to a note).
+**Status:** [v0.3.0 released](https://github.com/RelayFabric/RelayFabric/releases/tag/v0.3.0)
+— core fabric, eight plugins, federation + RFDP, sealed routing phase 1,
+transport-class-aware egress, admin API + web UI. **v0.4 in progress** — the
+hardening/proving/packaging release ([roadmap](docs/proposals/v0.4-roadmap.md)).
+The [feature-status table](https://docs.relayfabric.org/#feature-status) is
+the single source of truth for what is shipped, validated, or pending.
 
 ## Components
 
@@ -22,10 +27,11 @@ gracefully: payload capped, media dropped to a note).
   daemon's Unix-socket admin API for the browser; see
   [`relayfabric-ui/README.md`](relayfabric-ui/README.md).
 - Plugins — separate processes speaking a small CBOR-over-Unix-socket IPC
-  protocol to the daemon. MQTT, LXMF, Signal, Meshtastic, MeshCore, Nostr, and
-  Bitchat plugins available; see [LXMF](plugins/lxmf/README.md), [Signal](plugins/signal/README.md),
+  protocol to the daemon. MQTT, LXMF, Signal, Meshtastic, MeshCore, Nostr,
+  Bitchat, and PotatoMesh plugins available; see [LXMF](plugins/lxmf/README.md), [Signal](plugins/signal/README.md),
   [Meshtastic](plugins/meshtastic/README.md), [MeshCore](plugins/meshcore/README.md),
-  [Nostr](plugins/nostr/README.md), or [Bitchat](plugins/bitchat/README.md) docs.
+  [Nostr](plugins/nostr/README.md), [Bitchat](plugins/bitchat/README.md), or
+  [PotatoMesh](plugins/potatomesh/README.md) docs.
 
 ## Build
 

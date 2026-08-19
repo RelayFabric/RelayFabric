@@ -10,8 +10,8 @@ use crate::{
     transform,
 };
 use alias::Aliaser;
-use node_identity::NodeIdentity;
 use chrono::{DateTime, Duration as CDuration, Utc};
+use node_identity::NodeIdentity;
 use relay_core::{AttachmentMeta, Capabilities, Endpoint, Envelope, Sender};
 use relay_ipc::{DaemonToPlugin, IpcAttachment, MAX_FRAME};
 use sha2::{Digest, Sha256};
@@ -120,15 +120,17 @@ pub struct Daemon {
 /// to also tighten a pre-existing dir left with looser permissions (e.g.
 /// from an older install or a manual mkdir).
 pub(crate) fn create_data_dir(data_dir: &Path) -> std::io::Result<()> {
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(data_dir)?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(data_dir)?;
     std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))
 }
 
 impl Daemon {
     pub fn new(cfg: Config, data_dir: &Path) -> std::io::Result<Daemon> {
         create_data_dir(data_dir)?;
-        let store = Store::open(&data_dir.join("relayfabric.db"))
-            .map_err(std::io::Error::other)?;
+        let store = Store::open(&data_dir.join("relayfabric.db")).map_err(std::io::Error::other)?;
         let recovered = store.recover().map_err(std::io::Error::other)?;
         if recovered > 0 {
             info!(recovered, "requeued in-flight deliveries from previous run");
@@ -138,9 +140,14 @@ impl Daemon {
         let node_id = identity.node_id();
         let sealed_key = fed::sealkey::SealedKey::load_or_create(&data_dir.join("sealed.key"))?;
         let ttl = std::time::Duration::from_secs(cfg.dedup_ttl_secs);
-        let cas = Cas::new(&data_dir.join("attachments"), cfg.limits.global.cas_max_bytes)?;
+        let cas = Cas::new(
+            &data_dir.join("attachments"),
+            cfg.limits.global.cas_max_bytes,
+        )?;
         let sender_limiter = SenderLimiter::new(
-            cfg.limits.per_sender.messages_per_minute, cfg.limits.per_sender.bytes_per_hour);
+            cfg.limits.per_sender.messages_per_minute,
+            cfg.limits.per_sender.bytes_per_hour,
+        );
         // The initial `Receiver` `channel()` hands back is discarded
         // immediately: a broadcast channel works fine with zero live
         // receivers (every `send` from `emit_event` is already gated on
@@ -148,9 +155,12 @@ impl Daemon {
         // /v1/events`, `switchyardctl events`) calls `events.subscribe()`
         // fresh, later.
         let (events, _initial_events_rx) = broadcast::channel(256);
-        let fed = cfg.federation.is_some().then(|| crate::fed::conn::FedState {
-            conns: Mutex::new(HashMap::new()),
-        });
+        let fed = cfg
+            .federation
+            .is_some()
+            .then(|| crate::fed::conn::FedState {
+                conns: Mutex::new(HashMap::new()),
+            });
         Ok(Daemon {
             cfg: RwLock::new(cfg),
             store: Mutex::new(store),
@@ -193,7 +203,13 @@ impl Daemon {
     /// tying the caller to the read guard), so it's safe to hold across
     /// subsequent store/plugins lock acquisitions.
     pub fn route_cfg(&self, name: &str) -> Option<RouteConfig> {
-        self.cfg.read().unwrap().routes.iter().find(|r| r.name == name).cloned()
+        self.cfg
+            .read()
+            .unwrap()
+            .routes
+            .iter()
+            .find(|r| r.name == name)
+            .cloned()
     }
 
     /// Runs `f` against a read guard on the current config and returns
@@ -305,7 +321,10 @@ impl Daemon {
         };
         *self.sender_limiter.lock().unwrap() = SenderLimiter::new(sender_mm, sender_bph);
         *self.budget_limiter.lock().unwrap() = BudgetLimiter::new();
-        self.dedup.lock().unwrap().set_ttl(std::time::Duration::from_secs(dedup_ttl_secs));
+        self.dedup
+            .lock()
+            .unwrap()
+            .set_ttl(std::time::Duration::from_secs(dedup_ttl_secs));
         restart_required.sort();
         restart_required.dedup();
         let outcome = ApplyOutcome { restart_required };
@@ -346,10 +365,16 @@ pub fn handle_inbound(
     // .await points elsewhere in this module) -- `routes` is the one
     // non-trivial clone (a `Vec<RouteConfig>`), everything else is Copy.
     let (max_attachment_bytes, ttl_default_secs, hop_limit, routes_snapshot, route_max, global_max) =
-        d.cfg_snapshot(|c| (
-            c.max_attachment_bytes, c.ttl_default_secs, c.hop_limit, c.routes.clone(),
-            c.limits.per_route.queue_max, c.limits.global.queue_max,
-        ));
+        d.cfg_snapshot(|c| {
+            (
+                c.max_attachment_bytes,
+                c.ttl_default_secs,
+                c.hop_limit,
+                c.routes.clone(),
+                c.limits.per_route.queue_max,
+                c.limits.global.queue_max,
+            )
+        });
 
     // Hash every attachment up front — a bare in-memory digest, no CAS I/O —
     // so the dedup key can be sensitive to the *full* attachment set,
@@ -360,7 +385,11 @@ pub fn handle_inbound(
     // bytes to disk, because it never gets an `insert_attachment_refs` row,
     // which means the GC in `purge_terminal` could never find and reclaim
     // that blob again — a permanent leak, not just a stale one.
-    struct Hashed { att: IpcAttachment, sha: String, oversize: bool }
+    struct Hashed {
+        att: IpcAttachment,
+        sha: String,
+        oversize: bool,
+    }
     let hashed: Vec<Hashed> = attachments
         .into_iter()
         .map(|att| {
@@ -391,10 +420,15 @@ pub fn handle_inbound(
     // Applies to every priority class, emergency included — there is no
     // ingress bypass; the egress emergency bypass (see priority scheduling)
     // is scheduling-only and never lets a message skip this gate.
-    let sender_bytes = body.len() as u64
-        + hashed.iter().map(|h| h.att.data.len() as u64).sum::<u64>();
+    let sender_bytes =
+        body.len() as u64 + hashed.iter().map(|h| h.att.data.len() as u64).sum::<u64>();
     let sender_key = format!("{plugin}|{sender}");
-    if !d.sender_limiter.lock().unwrap().allow(&sender_key, sender_bytes, Instant::now()) {
+    if !d
+        .sender_limiter
+        .lock()
+        .unwrap()
+        .allow(&sender_key, sender_bytes, Instant::now())
+    {
         metrics::inc(&metrics::RATELIMITED);
         let prefix: String = sender.chars().take(8).collect();
         warn!(plugin, sender = %prefix, "sender rate limit exceeded, dropping message");
@@ -418,22 +452,29 @@ pub fn handle_inbound(
     // straight through to normal routing below.
     let trimmed_body = body.trim();
     if trimmed_body.len() == 6 && trimmed_body.chars().all(|c| c.is_ascii_digit()) {
-        let matched = match d.store.lock().unwrap()
-            .find_active_challenge(plugin, &sender, trimmed_body, now)
-        {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(error = %e, "failed to check identity challenge for inbound reply");
-                None
-            }
-        };
+        let matched =
+            match d
+                .store
+                .lock()
+                .unwrap()
+                .find_active_challenge(plugin, &sender, trimmed_body, now)
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "failed to check identity challenge for inbound reply");
+                    None
+                }
+            };
         if let Some(challenge) = matched {
             confirm_link(d, challenge, now);
             return;
         }
     }
 
-    let source = Endpoint { protocol: plugin.to_string(), endpoint };
+    let source = Endpoint {
+        protocol: plugin.to_string(),
+        endpoint,
+    };
     let targets: Vec<(String, Endpoint)> = routes::route(&routes_snapshot, &source)
         .into_iter()
         .map(|(r, e)| (r.to_string(), e.clone()))
@@ -462,7 +503,10 @@ pub fn handle_inbound(
             Ok(sha) => {
                 shas.push(sha.clone());
                 metas.push(AttachmentMeta {
-                    filename: h.att.filename, mime: h.att.mime, size, sha256: sha,
+                    filename: h.att.filename,
+                    mime: h.att.mime,
+                    size,
+                    sha256: sha,
                 });
             }
             Err(e) if cas::is_budget_exceeded(&e) => {
@@ -470,7 +514,10 @@ pub fn handle_inbound(
                 // no warn (mirrors the oversize-attachment branch above,
                 // which also doesn't log): the filename is message content
                 // and only ever belongs in the body note, never a log line.
-                notes.push_str(&format!("\n[dropped {}: cas budget exceeded]", h.att.filename));
+                notes.push_str(&format!(
+                    "\n[dropped {}: cas budget exceeded]",
+                    h.att.filename
+                ));
             }
             Err(e) => {
                 warn!(error = %e, size, "failed to store attachment, dropping it");
@@ -515,7 +562,15 @@ pub fn handle_inbound(
     // `drop(store)`, alongside the Ingress event this function already
     // sends post-loop.
     let queue_full_routes = fan_out_deliveries(
-        &store, env.id, env.expires_at, priority_rank, &targets, route_max, global_max, now);
+        &store,
+        env.id,
+        env.expires_at,
+        priority_rank,
+        &targets,
+        route_max,
+        global_max,
+        now,
+    );
     // Finding 3 (whole-branch review, minor): dropped explicitly BEFORE
     // either emission below, mirroring `handle_result`'s `drop(store)`
     // pattern -- emitting while this guard is still live would hold the
@@ -532,7 +587,10 @@ pub fn handle_inbound(
         id: env.id,
         protocol: env.source.protocol.clone(),
         sender_masked: format!(
-            "{}:{}", env.source.protocol, identity_links::mask_ref(&env.sender.native_ref)),
+            "{}:{}",
+            env.source.protocol,
+            identity_links::mask_ref(&env.sender.native_ref)
+        ),
         routes: targets.iter().map(|(r, _)| r.clone()).collect(),
         ts: now,
     });
@@ -679,8 +737,11 @@ static PRE_TRUST_REJECT_WARN_THROTTLE: std::sync::LazyLock<Mutex<HashMap<String,
 const PRE_TRUST_REJECT_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn warn_pre_trust_rejection(peer_node_id: &str, reason: &str) {
-    if fed::warn_throttle_due(&PRE_TRUST_REJECT_WARN_THROTTLE, peer_node_id,
-                              PRE_TRUST_REJECT_WARN_INTERVAL) {
+    if fed::warn_throttle_due(
+        &PRE_TRUST_REJECT_WARN_THROTTLE,
+        peer_node_id,
+        PRE_TRUST_REJECT_WARN_INTERVAL,
+    ) {
         warn!(peer = %fed::short_node_id(peer_node_id), reason,
               "federation ingress rejected pre-trust (not persisted; further repeats from this \
                peer are throttled to 1/min)");
@@ -715,14 +776,18 @@ fn reject(
     }
 
     let now = Utc::now();
-    let dest = Endpoint { protocol: "fed".to_string(), endpoint: crate::fed::short_node_id(peer_node_id) };
+    let dest = Endpoint {
+        protocol: "fed".to_string(),
+        endpoint: crate::fed::short_node_id(peer_node_id),
+    };
     let store = d.store.lock().unwrap();
     if let Err(e) = store.insert_message(env) {
         warn!(error = %e, reason, "failed to persist rejected federated message");
         drop(store);
         return FedIngressOutcome::Rejected(reason);
     }
-    let inserted = store.insert_dead_delivery(env.id, target_route, &dest, now, env.expires_at, reason);
+    let inserted =
+        store.insert_dead_delivery(env.id, target_route, &dest, now, env.expires_at, reason);
     drop(store);
     match &inserted {
         Ok(_) => {
@@ -738,7 +803,12 @@ fn reject(
 /// `peer_node_id`'s stored trust level ranks below the configured
 /// `accept_from` floor.
 fn fed_trust_denied(d: &Daemon, peer_node_id: &str, accept_from: &str) -> bool {
-    let level = d.store.lock().unwrap().trust_level(peer_node_id).unwrap_or(None);
+    let level = d
+        .store
+        .lock()
+        .unwrap()
+        .trust_level(peer_node_id)
+        .unwrap_or(None);
     let level_str = level.as_deref().unwrap_or("unknown");
     trust_rank(level_str) < trust_rank(accept_from)
 }
@@ -802,7 +872,15 @@ fn persist_and_fan_out(
         warn!(error = %e, "failed to persist {what} attachment refs");
     }
     let queue_full_routes = fan_out_deliveries(
-        &store, env.id, env.expires_at, priority_rank, &targets, route_max, global_max, now);
+        &store,
+        env.id,
+        env.expires_at,
+        priority_rank,
+        &targets,
+        route_max,
+        global_max,
+        now,
+    );
     drop(store);
     for route in &queue_full_routes {
         emit_delivery(d, env.id, route.clone(), "dead_letter");
@@ -864,7 +942,14 @@ pub fn fed_ingress(
     env.priority = "normal".to_string();
 
     if fed::sign::verify_chain(&env).is_err() {
-        return reject(d, &env, &target_route, peer_node_id, "BAD_SIGNATURE", Persistence::NoPersist);
+        return reject(
+            d,
+            &env,
+            &target_route,
+            peer_node_id,
+            "BAD_SIGNATURE",
+            Persistence::NoPersist,
+        );
     }
 
     let fed_cfg = d.cfg_snapshot(|c| c.federation.clone());
@@ -876,11 +961,25 @@ pub fn fed_ingress(
         // persisted (Persistence::Persist) under its own distinct reason
         // -- `ROUTE_NOT_FEDERATED` is reserved for a genuine policy
         // rejection, not this defensive branch (Task 4 review Minor).
-        return reject(d, &env, &target_route, peer_node_id, "FED_CONFIG_MISSING", Persistence::Persist);
+        return reject(
+            d,
+            &env,
+            &target_route,
+            peer_node_id,
+            "FED_CONFIG_MISSING",
+            Persistence::Persist,
+        );
     };
 
     if fed_trust_denied(d, peer_node_id, &fed_cfg.accept_from) {
-        return reject(d, &env, &target_route, peer_node_id, "TRUST_DENIED", Persistence::NoPersist);
+        return reject(
+            d,
+            &env,
+            &target_route,
+            peer_node_id,
+            "TRUST_DENIED",
+            Persistence::NoPersist,
+        );
     }
 
     // Replay-window bound + TTL clamp (see `bound_replay_and_clamp_ttl`).
@@ -893,15 +992,36 @@ pub fn fed_ingress(
     // `expires_at` AFTER its rejection check, so splitting it around the
     // hop check is unnecessary.
     if let Err(reason) = bound_replay_and_clamp_ttl(&mut env, fed_cfg.max_ttl_secs) {
-        return reject(d, &env, &target_route, peer_node_id, reason, Persistence::Persist);
+        return reject(
+            d,
+            &env,
+            &target_route,
+            peer_node_id,
+            reason,
+            Persistence::Persist,
+        );
     }
 
     if env.hops >= fed_cfg.max_hops {
-        return reject(d, &env, &target_route, peer_node_id, "HOP_LIMIT", Persistence::Persist);
+        return reject(
+            d,
+            &env,
+            &target_route,
+            peer_node_id,
+            "HOP_LIMIT",
+            Persistence::Persist,
+        );
     }
 
     if !fed_cfg.ingress_routes.contains(&target_route) {
-        return reject(d, &env, &target_route, peer_node_id, "ROUTE_NOT_FEDERATED", Persistence::Persist);
+        return reject(
+            d,
+            &env,
+            &target_route,
+            peer_node_id,
+            "ROUTE_NOT_FEDERATED",
+            Persistence::Persist,
+        );
     }
     let Some(route_cfg) = d.route_cfg(&target_route) else {
         // Defensive: config validation guarantees every `ingress_routes`
@@ -912,7 +1032,14 @@ pub fn fed_ingress(
         // check above, for the same rationale (operator config bug, not
         // an untrusted-peer-reachable path -- this point is only reached
         // after the trust gate already passed).
-        return reject(d, &env, &target_route, peer_node_id, "FED_CONFIG_MISSING", Persistence::Persist);
+        return reject(
+            d,
+            &env,
+            &target_route,
+            peer_node_id,
+            "FED_CONFIG_MISSING",
+            Persistence::Persist,
+        );
     };
 
     // Dedup peek (design §5: "envelope id preserved end-to-end" — the
@@ -923,7 +1050,11 @@ pub fn fed_ingress(
     // `handle_inbound`: a message that ends up rate-limited below must not
     // be recorded as seen yet.
     let dedup_key = env.id.to_string();
-    if d.dedup.lock().unwrap().is_duplicate(&dedup_key, Instant::now()) {
+    if d.dedup
+        .lock()
+        .unwrap()
+        .is_duplicate(&dedup_key, Instant::now())
+    {
         metrics::inc(&metrics::DUPLICATES);
         return FedIngressOutcome::Rejected("DUPLICATE");
     }
@@ -936,9 +1067,13 @@ pub fn fed_ingress(
     // different transport.
     let node_short = fed::short_node_id(peer_node_id);
     let sender_key = format!("fed|{node_short}:{}", env.sender.native_ref);
-    let sender_bytes =
-        env.body.len() as u64 + env.attachments.iter().map(|a| a.size).sum::<u64>();
-    if !d.sender_limiter.lock().unwrap().allow(&sender_key, sender_bytes, Instant::now()) {
+    let sender_bytes = env.body.len() as u64 + env.attachments.iter().map(|a| a.size).sum::<u64>();
+    if !d
+        .sender_limiter
+        .lock()
+        .unwrap()
+        .allow(&sender_key, sender_bytes, Instant::now())
+    {
         metrics::inc(&metrics::RATELIMITED);
         return FedIngressOutcome::Rejected("RATE_LIMITED");
     }
@@ -946,8 +1081,14 @@ pub fn fed_ingress(
     // `handle_inbound`'s own ordering.
     d.dedup.lock().unwrap().record(&dedup_key, Instant::now());
 
-    persist_and_fan_out(d, &env, &target_route, &route_cfg, "federated",
-                        &metrics::FED_INGRESS)
+    persist_and_fan_out(
+        d,
+        &env,
+        &target_route,
+        &route_cfg,
+        "federated",
+        &metrics::FED_INGRESS,
+    )
 }
 
 /// Per-peer throttle for `fed_sealed_ingress`'s rejection warn lines --
@@ -986,8 +1127,11 @@ static SEALED_REJECT_WARN_THROTTLE: std::sync::LazyLock<Mutex<HashMap<String, In
 /// rejection, full stop" is a single, easily-audited invariant.
 fn sealed_reject(peer_node_id: &str, reason: &'static str) -> FedIngressOutcome {
     metrics::inc(&metrics::SEALED_REJECTED);
-    if fed::warn_throttle_due(&SEALED_REJECT_WARN_THROTTLE, peer_node_id,
-                              PRE_TRUST_REJECT_WARN_INTERVAL) {
+    if fed::warn_throttle_due(
+        &SEALED_REJECT_WARN_THROTTLE,
+        peer_node_id,
+        PRE_TRUST_REJECT_WARN_INTERVAL,
+    ) {
         warn!(peer = %fed::short_node_id(peer_node_id), reason,
               "sealed federation ingress rejected (not persisted; further repeats from this \
                peer are throttled to 1/min)");
@@ -1092,7 +1236,11 @@ pub fn fed_sealed_ingress(
     // peek-before-persist split: anything rejected below must not be
     // recorded as seen yet.
     let dedup_key = format!("sealed:{}:{}", sealed.id, sealed.expires_at);
-    if d.dedup.lock().unwrap().is_duplicate(&dedup_key, Instant::now()) {
+    if d.dedup
+        .lock()
+        .unwrap()
+        .is_duplicate(&dedup_key, Instant::now())
+    {
         metrics::inc(&metrics::DUPLICATES);
         return FedIngressOutcome::Rejected("DUPLICATE");
     }
@@ -1171,8 +1319,7 @@ pub fn fed_sealed_ingress(
     // point dead-letters (NEVER delivers) rather than silently
     // downgrading -- phase 1 has no sealed relay-onward, so there is no
     // other honest option than refusal.
-    let allow_decrypt =
-        d.cfg_snapshot(|c| effective_allow_gateway_decryption(c, &route_cfg));
+    let allow_decrypt = d.cfg_snapshot(|c| effective_allow_gateway_decryption(c, &route_cfg));
     if !allow_decrypt {
         return sealed_reject(peer_node_id, "SECURITY_DOWNGRADE_REFUSED");
     }
@@ -1184,9 +1331,13 @@ pub fn fed_sealed_ingress(
     // per-origin-user, since the origin is opaque by design.
     let node_short = fed::short_node_id(peer_node_id);
     let sender_key = format!("fed-sealed|{node_short}");
-    let sender_bytes =
-        env.body.len() as u64 + env.attachments.iter().map(|a| a.size).sum::<u64>();
-    if !d.sender_limiter.lock().unwrap().allow(&sender_key, sender_bytes, Instant::now()) {
+    let sender_bytes = env.body.len() as u64 + env.attachments.iter().map(|a| a.size).sum::<u64>();
+    if !d
+        .sender_limiter
+        .lock()
+        .unwrap()
+        .allow(&sender_key, sender_bytes, Instant::now())
+    {
         metrics::inc(&metrics::RATELIMITED);
         return FedIngressOutcome::Rejected("RATE_LIMITED");
     }
@@ -1194,8 +1345,14 @@ pub fn fed_sealed_ingress(
     // `fed_ingress`'s own ordering.
     d.dedup.lock().unwrap().record(&dedup_key, Instant::now());
 
-    persist_and_fan_out(d, &env, &target_route, &route_cfg, "sealed federated",
-                        &metrics::SEALED_INGRESS)
+    persist_and_fan_out(
+        d,
+        &env,
+        &target_route,
+        &route_cfg,
+        "sealed federated",
+        &metrics::SEALED_INGRESS,
+    )
 }
 
 /// Initiates an identity-link challenge (design §Lifecycle step 1, admin API
@@ -1214,7 +1371,8 @@ pub fn initiate_link(
 ) -> Result<i64, String> {
     let direct_capable: Vec<String> = {
         let plugins = d.plugins.lock().unwrap();
-        plugins.iter()
+        plugins
+            .iter()
             .filter(|(_, h)| h.connected && h.capabilities.direct_messages)
             .map(|(name, _)| name.clone())
             .collect()
@@ -1222,12 +1380,14 @@ pub fn initiate_link(
     if !direct_capable.iter().any(|p| p == &target.protocol) {
         return Err(if direct_capable.is_empty() {
             "target plugin is not connected or does not support direct messages; \
-             no currently-connected plugins support direct messages".to_string()
+             no currently-connected plugins support direct messages"
+                .to_string()
         } else {
             format!(
                 "target plugin '{}' is not connected or does not support direct messages; \
                  currently direct-capable: {}",
-                target.protocol, direct_capable.join(", ")
+                target.protocol,
+                direct_capable.join(", ")
             )
         });
     }
@@ -1237,19 +1397,29 @@ pub fn initiate_link(
     let expires = now + CDuration::minutes(15);
     let challenge_id = {
         let store = d.store.lock().unwrap();
-        store.create_challenge(
-            &code, &target.protocol, &target.endpoint,
-            &requester.protocol, &requester.endpoint,
-            display_name, now, expires,
-        ).map_err(|e| e.to_string())?
+        store
+            .create_challenge(
+                &code,
+                &target.protocol,
+                &target.endpoint,
+                &requester.protocol,
+                &requester.endpoint,
+                display_name,
+                now,
+                expires,
+            )
+            .map_err(|e| e.to_string())?
     };
 
     // Masked per design §Lifecycle step 1's exact body wording: the target
     // sees who is asking to link, but never the requester's full ref.
     // RULING 2: protocol stays visible, only the ref is masked — "signal:****921A"
     // style, not `mask_ref` applied to the whole "proto:ref" string.
-    let masked_requester =
-        format!("{}:{}", requester.protocol, identity_links::mask_ref(&requester.endpoint));
+    let masked_requester = format!(
+        "{}:{}",
+        requester.protocol,
+        identity_links::mask_ref(&requester.endpoint)
+    );
     let body = format!(
         "RelayFabric verification code: {code} — reply with this code to link {masked_requester}. Ignore to refuse."
     );
@@ -1285,12 +1455,21 @@ pub fn initiate_link(
 /// `Err("queue full")` so `initiate_link` can surface it to its caller;
 /// `confirm_link`'s best-effort calls simply discard the `Err`.
 fn enqueue_identity_send(
-    d: &Daemon, dest: Endpoint, body: String, now: DateTime<Utc>, expires: DateTime<Utc>,
+    d: &Daemon,
+    dest: Endpoint,
+    body: String,
+    now: DateTime<Utc>,
+    expires: DateTime<Utc>,
 ) -> Result<(), String> {
     let (hop_limit, global_max) = d.cfg_snapshot(|c| (c.hop_limit, c.limits.global.queue_max));
     let env = Envelope::new(
-        Endpoint { protocol: IDENTITY_ROUTE.trim_start_matches('@').to_string(), endpoint: "system".to_string() },
-        Sender { native_ref: IDENTITY_ROUTE.to_string() },
+        Endpoint {
+            protocol: IDENTITY_ROUTE.trim_start_matches('@').to_string(),
+            endpoint: "system".to_string(),
+        },
+        Sender {
+            native_ref: IDENTITY_ROUTE.to_string(),
+        },
         "notice".to_string(),
         body,
         now,
@@ -1302,12 +1481,12 @@ fn enqueue_identity_send(
         warn!(error = %e, "failed to persist identity notice message");
         return Ok(());
     }
-    let over_global = global_max > 0
-        && store.pending_count(None).unwrap_or(0) >= i64::from(global_max);
+    let over_global =
+        global_max > 0 && store.pending_count(None).unwrap_or(0) >= i64::from(global_max);
     if over_global {
         metrics::inc(&metrics::QUEUE_REJECTED);
-        let inserted = store.insert_dead_delivery(
-            env.id, IDENTITY_ROUTE, &dest, now, expires, "QUEUE_FULL");
+        let inserted =
+            store.insert_dead_delivery(env.id, IDENTITY_ROUTE, &dest, now, expires, "QUEUE_FULL");
         if let Err(e) = &inserted {
             warn!(error = %e, "failed to record queue-full identity delivery");
         }
@@ -1323,9 +1502,14 @@ fn enqueue_identity_send(
         }
         return Err("queue full".to_string());
     }
-    if let Err(e) = store.insert_delivery(env.id, IDENTITY_ROUTE, &dest, now, expires,
-        relay_core::priority_rank(&env.priority))
-    {
+    if let Err(e) = store.insert_delivery(
+        env.id,
+        IDENTITY_ROUTE,
+        &dest,
+        now,
+        expires,
+        relay_core::priority_rank(&env.priority),
+    ) {
         warn!(error = %e, "failed to enqueue identity notice delivery");
     }
     Ok(())
@@ -1351,8 +1535,14 @@ fn confirm_link(d: &Daemon, challenge: storage::Challenge, now: DateTime<Utc>) {
         // One-link-per-identity: delete any existing link(s) touching
         // either party before inserting the new one (replace, not stack).
         for (proto, r) in [
-            (challenge.target_protocol.as_str(), challenge.target_ref.as_str()),
-            (challenge.requester_protocol.as_str(), challenge.requester_ref.as_str()),
+            (
+                challenge.target_protocol.as_str(),
+                challenge.target_ref.as_str(),
+            ),
+            (
+                challenge.requester_protocol.as_str(),
+                challenge.requester_ref.as_str(),
+            ),
         ] {
             if let Ok(Some(existing)) = store.link_for_identity(proto, r) {
                 if let Err(e) = store.delete_link(existing.id) {
@@ -1362,9 +1552,12 @@ fn confirm_link(d: &Daemon, challenge: storage::Challenge, now: DateTime<Utc>) {
         }
 
         match store.insert_link(
-            &challenge.target_protocol, &challenge.target_ref,
-            &challenge.requester_protocol, &challenge.requester_ref,
-            &challenge.display_name, now,
+            &challenge.target_protocol,
+            &challenge.target_ref,
+            &challenge.requester_protocol,
+            &challenge.requester_ref,
+            &challenge.display_name,
+            now,
         ) {
             Ok(id) => id,
             Err(e) => {
@@ -1387,10 +1580,16 @@ fn confirm_link(d: &Daemon, challenge: storage::Challenge, now: DateTime<Utc>) {
     // protocol, no ref (masked or otherwise), no display_name.
     d.emit_event(|| Event::LinkVerified { link_id, ts: now });
 
-    let masked_requester = format!("{}:{}", challenge.requester_protocol,
-        identity_links::mask_ref(&challenge.requester_ref));
-    let masked_target = format!("{}:{}", challenge.target_protocol,
-        identity_links::mask_ref(&challenge.target_ref));
+    let masked_requester = format!(
+        "{}:{}",
+        challenge.requester_protocol,
+        identity_links::mask_ref(&challenge.requester_ref)
+    );
+    let masked_target = format!(
+        "{}:{}",
+        challenge.target_protocol,
+        identity_links::mask_ref(&challenge.target_ref)
+    );
     let expires = now + CDuration::seconds(d.cfg_snapshot(|c| c.ttl_default_secs) as i64);
 
     // Best-effort (design §Lifecycle step 2): a queue-full rejection here
@@ -1398,21 +1597,29 @@ fn confirm_link(d: &Daemon, challenge: storage::Challenge, now: DateTime<Utc>) {
     // was just confirmed, so the Result is deliberately discarded.
     let _ = enqueue_identity_send(
         d,
-        Endpoint { protocol: challenge.target_protocol.clone(), endpoint: challenge.target_ref.clone() },
+        Endpoint {
+            protocol: challenge.target_protocol.clone(),
+            endpoint: challenge.target_ref.clone(),
+        },
         format!(
             "RelayFabric: identity link confirmed with {masked_requester} as \"{}\".",
             challenge.display_name
         ),
-        now, expires,
+        now,
+        expires,
     );
     let _ = enqueue_identity_send(
         d,
-        Endpoint { protocol: challenge.requester_protocol.clone(), endpoint: challenge.requester_ref.clone() },
+        Endpoint {
+            protocol: challenge.requester_protocol.clone(),
+            endpoint: challenge.requester_ref.clone(),
+        },
         format!(
             "RelayFabric: {masked_target} confirmed the identity link as \"{}\".",
             challenge.display_name
         ),
-        now, expires,
+        now,
+        expires,
     );
 }
 
@@ -1465,11 +1672,21 @@ pub fn handle_result(d: &Daemon, corr: i64, delivered: bool, detail: Option<Stri
         return;
     }
     // look up attempt count to decide retry vs dead-letter
-    let attempts = delivery.as_ref().map(|del| del.attempt_count).unwrap_or(queue::MAX_ATTEMPTS);
+    let attempts = delivery
+        .as_ref()
+        .map(|del| del.attempt_count)
+        .unwrap_or(queue::MAX_ATTEMPTS);
     let state = if attempts >= queue::MAX_ATTEMPTS {
-        warn_if_mark_failed(corr, "dead_letter",
-            store.mark_terminal(corr, "dead_letter", "RETRY_EXHAUSTED"));
-        warn!(delivery = corr, detail = detail.as_deref().unwrap_or(""), "dead-lettered");
+        warn_if_mark_failed(
+            corr,
+            "dead_letter",
+            store.mark_terminal(corr, "dead_letter", "RETRY_EXHAUSTED"),
+        );
+        warn!(
+            delivery = corr,
+            detail = detail.as_deref().unwrap_or(""),
+            "dead-lettered"
+        );
         "dead_letter"
     } else {
         let next = Utc::now()
@@ -1517,7 +1734,10 @@ fn emit_delivery_event(d: &Daemon, delivery: Option<&storage::Delivery>, state: 
 /// copy of the `Event::Delivery` construction.
 pub(crate) fn emit_delivery(d: &Daemon, id: uuid::Uuid, route: impl Into<String>, state: &str) {
     d.emit_event(|| Event::Delivery {
-        id, route: route.into(), state: state.to_string(), ts: Utc::now(),
+        id,
+        route: route.into(),
+        state: state.to_string(),
+        ts: Utc::now(),
     });
 }
 
@@ -1601,15 +1821,22 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             if let Err(e) = &other {
                 warn!(delivery = del.id, error = %e, "failed to load message for delivery");
             }
-            let result = d.store.lock().unwrap()
-                .mark_terminal(del.id, "failed", "DESTINATION_UNKNOWN");
+            let result =
+                d.store
+                    .lock()
+                    .unwrap()
+                    .mark_terminal(del.id, "failed", "DESTINATION_UNKNOWN");
             warn_if_mark_failed(del.id, "failed", result);
             emit_delivery(d, del.message_id, del.route.clone(), "failed");
             return;
         }
     };
     if env.is_expired(now) {
-        let result = d.store.lock().unwrap().mark_terminal(del.id, "expired", "TTL_EXPIRED");
+        let result = d
+            .store
+            .lock()
+            .unwrap()
+            .mark_terminal(del.id, "expired", "TTL_EXPIRED");
         warn_if_mark_failed(del.id, "expired", result);
         emit_delivery(d, del.message_id, del.route.clone(), "expired");
         return;
@@ -1631,17 +1858,27 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
     match policy::evaluate(&policies, &env, &del.destination) {
         policy::Decision::Deny { policy } => {
             metrics::inc(&metrics::POLICY_DENIALS);
-            let result = d.store.lock().unwrap()
-                .mark_terminal(del.id, "dead_letter", "POLICY_DENIED");
+            let result =
+                d.store
+                    .lock()
+                    .unwrap()
+                    .mark_terminal(del.id, "dead_letter", "POLICY_DENIED");
             warn_if_mark_failed(del.id, "dead_letter", result);
             info!(delivery = del.id, policy, "policy denied");
             emit_delivery(d, del.message_id, del.route.clone(), "dead_letter");
         }
-        policy::Decision::Allow { max_payload, attachments_allowed, max_attachment_bytes } => {
+        policy::Decision::Allow {
+            max_payload,
+            attachments_allowed,
+            max_attachment_bytes,
+        } => {
             // capability + policy limits combine to the tighter one
             let (tx, cap_limit, dest_supports_attachments) = {
                 let plugins = d.plugins.lock().unwrap();
-                match plugins.get(&del.destination.protocol).filter(|h| h.connected) {
+                match plugins
+                    .get(&del.destination.protocol)
+                    .filter(|h| h.connected)
+                {
                     Some(h) => (
                         Some(h.tx.clone()),
                         h.capabilities.max_payload.map(|v| v as usize),
@@ -1652,7 +1889,10 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             };
             let Some(tx) = tx else {
                 // plugin not connected: nudge next_attempt forward, stay pending
-                let result = d.store.lock().unwrap()
+                let result = d
+                    .store
+                    .lock()
+                    .unwrap()
                     .mark_retry(del.id, now + CDuration::seconds(5));
                 warn_if_mark_failed(del.id, "pending", result);
                 return;
@@ -1697,15 +1937,23 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             // bypass. A protocol with no configured budget always allows
             // (see `BudgetLimiter::allow`) and never checks priority.
             if del.priority > 0 {
-                let per_minute = d.cfg_snapshot(|c| c.transport_budgets
-                    .get(&del.destination.protocol)
-                    .map(|b| b.messages_per_minute)
-                    .unwrap_or(0));
-                let allowed = d.budget_limiter.lock().unwrap()
-                    .allow(&del.destination.protocol, per_minute, Instant::now());
+                let per_minute = d.cfg_snapshot(|c| {
+                    c.transport_budgets
+                        .get(&del.destination.protocol)
+                        .map(|b| b.messages_per_minute)
+                        .unwrap_or(0)
+                });
+                let allowed = d.budget_limiter.lock().unwrap().allow(
+                    &del.destination.protocol,
+                    per_minute,
+                    Instant::now(),
+                );
                 if !allowed {
                     metrics::inc(&metrics::BUDGET_DEFERRED);
-                    let result = d.store.lock().unwrap()
+                    let result = d
+                        .store
+                        .lock()
+                        .unwrap()
                         .mark_retry(del.id, now + CDuration::seconds(10));
                     warn_if_mark_failed(del.id, "pending", result);
                     return;
@@ -1726,14 +1974,18 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             // advertise (`TERRESTRIAL_MAX_PAYLOAD_BYTES`'s doc comment in
             // `relay_core::transport`) -- the backward-compat anchor.
             let cap_limit = Some(
-                cap_limit.map(|v| v as u64).unwrap_or(u64::MAX).min(tp.max_payload_bytes) as usize
+                cap_limit
+                    .map(|v| v as u64)
+                    .unwrap_or(u64::MAX)
+                    .min(tp.max_payload_bytes) as usize,
             );
             let limit = match (max_payload, cap_limit) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
-            let alias = d.aliaser.alias(
-                &env.source.protocol, &env.sender.native_ref, &del.route);
+            let alias = d
+                .aliaser
+                .alias(&env.source.protocol, &env.sender.native_ref, &del.route);
 
             // Rendering (design §Rendering): a route explicitly opted into
             // "linked" mode AND a verified link connecting this envelope's
@@ -1751,12 +2003,19 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
             // further down need it too -- an `Option<&RouteConfig>` tied to
             // a live read guard would hold that guard across all of it.
             let route_cfg = d.route_cfg(&del.route);
-            let linked_mode = route_cfg.as_ref().map(|r| r.identity_mode == "linked").unwrap_or(false);
+            let linked_mode = route_cfg
+                .as_ref()
+                .map(|r| r.identity_mode == "linked")
+                .unwrap_or(false);
             let tag = if linked_mode {
-                let link = d.store.lock().unwrap()
+                let link = d
+                    .store
+                    .lock()
+                    .unwrap()
                     .link_for_identity(&env.source.protocol, &env.sender.native_ref)
                     .unwrap_or(None);
-                link.map(|l| l.display_name).unwrap_or_else(|| alias.clone())
+                link.map(|l| l.display_name)
+                    .unwrap_or_else(|| alias.clone())
             } else {
                 alias.clone()
             };
@@ -1789,8 +2048,11 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
                 // attachments outright: strip every attachment and note it
                 // once per attachment, without naming any of them (a
                 // blanket strip must not reveal which files existed).
-                let dropped: Vec<(String, u64)> =
-                    env.attachments.iter().map(|a| (a.filename.clone(), a.size)).collect();
+                let dropped: Vec<(String, u64)> = env
+                    .attachments
+                    .iter()
+                    .map(|a| (a.filename.clone(), a.size))
+                    .collect();
                 (Vec::new(), transform::attachment_notes(&dropped, "omitted"))
             };
             // Decision: `env.body` is route-level `max_chars`-truncated
@@ -1813,8 +2075,7 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
                 Some(mc) => transform::truncate_body(&env.body, mc),
                 None => env.body.clone(),
             };
-            let body = transform::render(
-                render_tag, &format!("{truncated_body}{notes}"), limit);
+            let body = transform::render(render_tag, &format!("{truncated_body}{notes}"), limit);
             let result = d.store.lock().unwrap().mark_attempting(del.id);
             warn_if_mark_failed(del.id, "attempting", result);
             let send = DaemonToPlugin::Send {
@@ -1835,7 +2096,10 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
                     mpsc::error::TrySendError::Full(_) => "full",
                     mpsc::error::TrySendError::Closed(_) => "closed",
                 };
-                let result = d.store.lock().unwrap()
+                let result = d
+                    .store
+                    .lock()
+                    .unwrap()
                     .mark_retry(del.id, now + CDuration::seconds(5));
                 warn_if_mark_failed(del.id, "pending", result);
                 warn!(delivery = del.id, plugin = %del.destination.protocol,
@@ -1872,7 +2136,10 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
 /// disconnected plugin MAY reconnect before the TTL, so that case keeps the
 /// existing retry posture.
 async fn process_due_identity(
-    d: &Arc<Daemon>, del: storage::Delivery, env: Envelope, now: DateTime<Utc>,
+    d: &Arc<Daemon>,
+    del: storage::Delivery,
+    env: Envelope,
+    now: DateTime<Utc>,
 ) {
     enum Readiness {
         Ready(mpsc::Sender<DaemonToPlugin>),
@@ -1882,7 +2149,9 @@ async fn process_due_identity(
     let readiness = {
         let plugins = d.plugins.lock().unwrap();
         match plugins.get(&del.destination.protocol) {
-            Some(h) if h.connected && h.capabilities.direct_messages => Readiness::Ready(h.tx.clone()),
+            Some(h) if h.connected && h.capabilities.direct_messages => {
+                Readiness::Ready(h.tx.clone())
+            }
             Some(h) if h.connected => Readiness::NotDirectCapable,
             _ => Readiness::Disconnected,
         }
@@ -1890,8 +2159,11 @@ async fn process_due_identity(
     let tx = match readiness {
         Readiness::Ready(tx) => tx,
         Readiness::NotDirectCapable => {
-            let result = d.store.lock().unwrap()
-                .mark_terminal(del.id, "dead_letter", "NOT_DIRECT_CAPABLE");
+            let result =
+                d.store
+                    .lock()
+                    .unwrap()
+                    .mark_terminal(del.id, "dead_letter", "NOT_DIRECT_CAPABLE");
             warn_if_mark_failed(del.id, "dead_letter", result);
             warn!(delivery = del.id, plugin = %del.destination.protocol,
                   "identity delivery dead-lettered: plugin connected but not direct-capable");
@@ -1899,7 +2171,10 @@ async fn process_due_identity(
             return;
         }
         Readiness::Disconnected => {
-            let result = d.store.lock().unwrap()
+            let result = d
+                .store
+                .lock()
+                .unwrap()
                 .mark_retry(del.id, now + CDuration::seconds(5));
             warn_if_mark_failed(del.id, "pending", result);
             return;
@@ -1907,15 +2182,23 @@ async fn process_due_identity(
     };
 
     if del.priority > 0 {
-        let per_minute = d.cfg_snapshot(|c| c.transport_budgets
-            .get(&del.destination.protocol)
-            .map(|b| b.messages_per_minute)
-            .unwrap_or(0));
-        let allowed = d.budget_limiter.lock().unwrap()
-            .allow(&del.destination.protocol, per_minute, Instant::now());
+        let per_minute = d.cfg_snapshot(|c| {
+            c.transport_budgets
+                .get(&del.destination.protocol)
+                .map(|b| b.messages_per_minute)
+                .unwrap_or(0)
+        });
+        let allowed = d.budget_limiter.lock().unwrap().allow(
+            &del.destination.protocol,
+            per_minute,
+            Instant::now(),
+        );
         if !allowed {
             metrics::inc(&metrics::BUDGET_DEFERRED);
-            let result = d.store.lock().unwrap()
+            let result = d
+                .store
+                .lock()
+                .unwrap()
                 .mark_retry(del.id, now + CDuration::seconds(10));
             warn_if_mark_failed(del.id, "pending", result);
             return;
@@ -1936,7 +2219,10 @@ async fn process_due_identity(
             mpsc::error::TrySendError::Full(_) => "full",
             mpsc::error::TrySendError::Closed(_) => "closed",
         };
-        let result = d.store.lock().unwrap()
+        let result = d
+            .store
+            .lock()
+            .unwrap()
             .mark_retry(del.id, now + CDuration::seconds(5));
         warn_if_mark_failed(del.id, "pending", result);
         warn!(delivery = del.id, plugin = %del.destination.protocol,
@@ -1983,14 +2269,22 @@ async fn process_due_identity(
 /// attestation and incrementing `hops` happen unconditionally, on BOTH
 /// paths -- that's this hop's actual provenance record regardless of
 /// whether it originated the message or is merely forwarding it.
-async fn process_due_fed(d: &Arc<Daemon>, del: storage::Delivery, env: Envelope, now: DateTime<Utc>) {
+async fn process_due_fed(
+    d: &Arc<Daemon>,
+    del: storage::Delivery,
+    env: Envelope,
+    now: DateTime<Utc>,
+) {
     let Some((peer_name, remote_route)) = del.destination.endpoint.split_once('/') else {
         // Unreachable in practice: `config::validate_fed_destination`
         // enforces this shape at config-load time, so every `fed:` delivery
         // row's `dest_endpoint` already has the separator. Defensive only
         // (e.g. a hand-built row in a test) -- failed outright rather than
         // retried forever against a shape that can never become valid.
-        let result = d.store.lock().unwrap()
+        let result = d
+            .store
+            .lock()
+            .unwrap()
             .mark_terminal(del.id, "failed", "FED_DEST_MALFORMED");
         warn_if_mark_failed(del.id, "failed", result);
         emit_delivery(d, del.message_id, del.route.clone(), "failed");
@@ -1998,13 +2292,20 @@ async fn process_due_fed(d: &Arc<Daemon>, del: storage::Delivery, env: Envelope,
     };
 
     let tx = d.fed.as_ref().and_then(|fed| {
-        fed.conns.lock().unwrap().get(peer_name).map(|c| c.tx.clone())
+        fed.conns
+            .lock()
+            .unwrap()
+            .get(peer_name)
+            .map(|c| c.tx.clone())
     });
     let Some(tx) = tx else {
         // No live connection to this peer (never connected, or currently
         // down between reconnect attempts) -- same posture as a
         // disconnected plugin: nudge next_attempt forward, stay pending.
-        let result = d.store.lock().unwrap()
+        let result = d
+            .store
+            .lock()
+            .unwrap()
             .mark_retry(del.id, now + CDuration::seconds(5));
         warn_if_mark_failed(del.id, "pending", result);
         return;
@@ -2037,24 +2338,31 @@ async fn process_due_fed(d: &Arc<Daemon>, del: storage::Delivery, env: Envelope,
     // separate reset plumbing needed here (verified directly,
     // `fed_egress_budget_resets_on_apply_config` below).
     let per_minute = d.cfg_snapshot(|c| {
-        c.federation.as_ref()
+        c.federation
+            .as_ref()
             .and_then(|f| f.peers.iter().find(|p| p.name == peer_name))
             .map(|p| p.messages_per_minute)
             .unwrap_or(0)
     });
-    let allowed = d.budget_limiter.lock().unwrap()
-        .allow(&format!("fed/{peer_name}"), per_minute, Instant::now());
+    let allowed = d.budget_limiter.lock().unwrap().allow(
+        &format!("fed/{peer_name}"),
+        per_minute,
+        Instant::now(),
+    );
     if !allowed {
         metrics::inc(&metrics::BUDGET_DEFERRED);
-        let result = d.store.lock().unwrap()
+        let result = d
+            .store
+            .lock()
+            .unwrap()
             .mark_retry(del.id, now + CDuration::seconds(5));
         warn_if_mark_failed(del.id, "pending", result);
         return;
     }
 
-    let identity_exposure = d.cfg_snapshot(|c| {
-        c.federation.as_ref().map(|f| f.identity_exposure.clone())
-    }).unwrap_or_else(|| "pseudonymous".to_string());
+    let identity_exposure = d
+        .cfg_snapshot(|c| c.federation.as_ref().map(|f| f.identity_exposure.clone()))
+        .unwrap_or_else(|| "pseudonymous".to_string());
 
     let mut out_env = env.clone();
     if out_env.origin.is_none() {
@@ -2064,7 +2372,8 @@ async fn process_due_fed(d: &Arc<Daemon>, del: storage::Delivery, env: Envelope,
         if identity_exposure == "pseudonymous" {
             let scope = format!("fed:{peer_name}/{remote_route}");
             out_env.sender.native_ref =
-                d.aliaser.alias(&out_env.source.protocol, &out_env.sender.native_ref, &scope);
+                d.aliaser
+                    .alias(&out_env.source.protocol, &out_env.sender.native_ref, &scope);
         }
         out_env.origin = Some(fed::sign::sign_origin(&out_env, &d.identity));
     }
@@ -2074,7 +2383,10 @@ async fn process_due_fed(d: &Arc<Daemon>, del: storage::Delivery, env: Envelope,
         // real runtime path. Retried rather than dropped: a transient bug
         // here shouldn't silently lose the message.
         warn!(delivery = del.id, error = %e, "failed to append federation attestation");
-        let result = d.store.lock().unwrap()
+        let result = d
+            .store
+            .lock()
+            .unwrap()
             .mark_retry(del.id, now + CDuration::seconds(5));
         warn_if_mark_failed(del.id, "pending", result);
         return;
@@ -2109,8 +2421,11 @@ async fn process_due_fed(d: &Arc<Daemon>, del: storage::Delivery, env: Envelope,
     // so this never guesses either way (a gateway-mode delivery whose
     // route vanished ALSO dead-letters here, not just a sealed one).
     let Some(route_cfg) = d.route_cfg(&del.route) else {
-        let result = d.store.lock().unwrap()
-            .mark_terminal(del.id, "dead_letter", "ROUTE_CONFIG_MISSING");
+        let result =
+            d.store
+                .lock()
+                .unwrap()
+                .mark_terminal(del.id, "dead_letter", "ROUTE_CONFIG_MISSING");
         warn_if_mark_failed(del.id, "dead_letter", result);
         warn!(delivery = del.id, route = %del.route, peer = peer_name,
               "fed egress dead-lettered: route config not found (renamed/removed since this \
@@ -2141,11 +2456,18 @@ async fn process_due_fed(d: &Arc<Daemon>, del: storage::Delivery, env: Envelope,
                 mpsc::error::TrySendError::Full(_) => "full",
                 mpsc::error::TrySendError::Closed(_) => "closed",
             };
-            let result = d.store.lock().unwrap()
+            let result = d
+                .store
+                .lock()
+                .unwrap()
                 .mark_retry(del.id, now + CDuration::seconds(5));
             warn_if_mark_failed(del.id, "pending", result);
-            warn!(delivery = del.id, peer = peer_name, reason = closed_or_full,
-                  "federation connection unavailable, requeued");
+            warn!(
+                delivery = del.id,
+                peer = peer_name,
+                reason = closed_or_full,
+                "federation connection unavailable, requeued"
+            );
         }
     }
 }
@@ -2208,7 +2530,8 @@ const SEALED_MAX_BYTES: u64 = fed::noise::MAX_FRAME as u64 - SEALED_OVERHEAD_MAR
 /// proceed anyway".
 fn resolve_sealed_key(d: &Daemon, peer_name: &str) -> Option<crypto_box::PublicKey> {
     let (config_pin, node_id) = d.cfg_snapshot(|c| {
-        c.federation.as_ref()
+        c.federation
+            .as_ref()
             .and_then(|f| f.peers.iter().find(|p| p.name == peer_name))
             .map(|p| (p.sealed_key.clone(), p.node_id.clone()))
     })?;
@@ -2223,7 +2546,10 @@ fn resolve_sealed_key(d: &Daemon, peer_name: &str) -> Option<crypto_box::PublicK
     // forward-compat defense-in-depth (design §1: advert-learned keys are
     // real API surface, e.g. once a future phase relaxes the config-pin
     // requirement), not dead code to delete.
-    let advert_key = d.store.lock().unwrap()
+    let advert_key = d
+        .store
+        .lock()
+        .unwrap()
         .list_peer_adverts(Utc::now())
         .unwrap_or_default()
         .into_iter()
@@ -2238,8 +2564,10 @@ fn resolve_sealed_key(d: &Daemon, peer_name: &str) -> Option<crypto_box::PublicK
     let chosen_hex = match (&config_pin, &advert_key) {
         (Some(cfg), Some(adv)) => {
             if cfg != adv {
-                warn!(peer = peer_name,
-                      "sealed_key config pin disagrees with advert-learned key; config wins");
+                warn!(
+                    peer = peer_name,
+                    "sealed_key config pin disagrees with advert-learned key; config wins"
+                );
             }
             cfg.clone()
         }
@@ -2283,11 +2611,19 @@ fn resolve_sealed_key(d: &Daemon, peer_name: &str) -> Option<crypto_box::PublicK
 /// deliveries_for_fed_ack`'s `(message_id, peer_key)` lookup matches it
 /// the same way it already matches a gateway-mode `Fed::Envelope`'s id.
 async fn process_due_fed_sealed(
-    d: &Arc<Daemon>, del: &storage::Delivery, out_env: Envelope,
-    peer_name: &str, remote_route: &str, tx: mpsc::Sender<fed::wire::Fed>, now: DateTime<Utc>,
+    d: &Arc<Daemon>,
+    del: &storage::Delivery,
+    out_env: Envelope,
+    peer_name: &str,
+    remote_route: &str,
+    tx: mpsc::Sender<fed::wire::Fed>,
+    now: DateTime<Utc>,
 ) {
     let Some(recipient_pub) = resolve_sealed_key(d, peer_name) else {
-        let result = d.store.lock().unwrap()
+        let result = d
+            .store
+            .lock()
+            .unwrap()
             .mark_terminal(del.id, "dead_letter", "NO_SEALED_KEY");
         warn_if_mark_failed(del.id, "dead_letter", result);
         warn!(delivery = del.id, peer = peer_name,
@@ -2300,8 +2636,11 @@ async fn process_due_fed_sealed(
     ciborium::into_writer(&out_env, &mut canonical_env_cbor)
         .expect("Envelope always serializes to CBOR");
     if canonical_env_cbor.len() as u64 > SEALED_MAX_BYTES {
-        let result = d.store.lock().unwrap()
-            .mark_terminal(del.id, "dead_letter", "SEALED_OVERSIZE");
+        let result =
+            d.store
+                .lock()
+                .unwrap()
+                .mark_terminal(del.id, "dead_letter", "SEALED_OVERSIZE");
         warn_if_mark_failed(del.id, "dead_letter", result);
         warn!(delivery = del.id, peer = peer_name, size = canonical_env_cbor.len(),
               "sealed egress dead-lettered: envelope exceeds the sealed size ceiling, rejected at origin");
@@ -2309,16 +2648,24 @@ async fn process_due_fed_sealed(
         return;
     }
 
-    let max_ttl_secs = d.cfg_snapshot(|c| c.federation.as_ref().map(|f| f.max_ttl_secs))
+    let max_ttl_secs = d
+        .cfg_snapshot(|c| c.federation.as_ref().map(|f| f.max_ttl_secs))
         .unwrap_or(86_400);
     let expires_at = (out_env.created_at + CDuration::seconds(max_ttl_secs as i64)).timestamp();
-    let sealed =
-        fed::seal::seal(&canonical_env_cbor, &out_env.id.to_string(), expires_at, &recipient_pub);
+    let sealed = fed::seal::seal(
+        &canonical_env_cbor,
+        &out_env.id.to_string(),
+        expires_at,
+        &recipient_pub,
+    );
 
     let result = d.store.lock().unwrap().mark_attempting(del.id);
     warn_if_mark_failed(del.id, "attempting", result);
 
-    let frame = fed::wire::Fed::Sealed { sealed, target_route: remote_route.to_string() };
+    let frame = fed::wire::Fed::Sealed {
+        sealed,
+        target_route: remote_route.to_string(),
+    };
     // try_send, not send().await -- same rationale as the gateway path.
     match tx.try_send(frame) {
         Ok(()) => metrics::inc(&metrics::SEALED_EGRESS),
@@ -2327,11 +2674,18 @@ async fn process_due_fed_sealed(
                 mpsc::error::TrySendError::Full(_) => "full",
                 mpsc::error::TrySendError::Closed(_) => "closed",
             };
-            let result = d.store.lock().unwrap()
+            let result = d
+                .store
+                .lock()
+                .unwrap()
                 .mark_retry(del.id, now + CDuration::seconds(5));
             warn_if_mark_failed(del.id, "pending", result);
-            warn!(delivery = del.id, peer = peer_name, reason = closed_or_full,
-                  "federation connection unavailable, requeued (sealed)");
+            warn!(
+                delivery = del.id,
+                peer = peer_name,
+                reason = closed_or_full,
+                "federation connection unavailable, requeued (sealed)"
+            );
         }
     }
 }
@@ -2456,9 +2810,17 @@ pub mod tests_support {
     /// config at construction) — this only exists so budget tests don't have
     /// to spell out the full `Config` literal.
     pub fn test_daemon_with_budgets(
-        dir: &std::path::Path, transport_budgets: BTreeMap<String, Budget>,
+        dir: &std::path::Path,
+        transport_budgets: BTreeMap<String, Budget>,
     ) -> Daemon {
-        test_daemon_full(dir, Limits::default(), transport_budgets, false, vec![], None)
+        test_daemon_full(
+            dir,
+            Limits::default(),
+            transport_budgets,
+            false,
+            vec![],
+            None,
+        )
     }
 
     /// Like `test_daemon`, but with caller-supplied `node.public` and
@@ -2468,9 +2830,18 @@ pub mod tests_support {
     /// from disk, `public: true` with services that don't actually cover
     /// the fixture's `general` route is accepted at construction time.
     pub fn test_daemon_with_public(
-        dir: &std::path::Path, public: bool, services: Vec<PublicService>,
+        dir: &std::path::Path,
+        public: bool,
+        services: Vec<PublicService>,
     ) -> Daemon {
-        test_daemon_full(dir, Limits::default(), BTreeMap::new(), public, services, None)
+        test_daemon_full(
+            dir,
+            Limits::default(),
+            BTreeMap::new(),
+            public,
+            services,
+            None,
+        )
     }
 
     /// Like `test_daemon`, but with a caller-supplied `federation` block --
@@ -2484,9 +2855,23 @@ pub mod tests_support {
     /// itself does NOT do this (only `spawn_federation` owns that call
     /// site in production), so a test driving `fed_ingress` directly
     /// (bypassing `spawn_federation` entirely) needs it done here instead.
-    pub fn test_daemon_with_federation(dir: &std::path::Path, federation: FederationConfig) -> Daemon {
-        let d = test_daemon_full(dir, Limits::default(), BTreeMap::new(), false, vec![], Some(federation.clone()));
-        d.store.lock().unwrap().seed_federation_trust(&federation, Utc::now()).unwrap();
+    pub fn test_daemon_with_federation(
+        dir: &std::path::Path,
+        federation: FederationConfig,
+    ) -> Daemon {
+        let d = test_daemon_full(
+            dir,
+            Limits::default(),
+            BTreeMap::new(),
+            false,
+            vec![],
+            Some(federation.clone()),
+        );
+        d.store
+            .lock()
+            .unwrap()
+            .seed_federation_trust(&federation, Utc::now())
+            .unwrap();
         d
     }
 
@@ -2495,25 +2880,51 @@ pub mod tests_support {
     /// as `test_daemon_with_limits`: `sender_limiter` bakes in its numbers
     /// at construction).
     pub fn test_daemon_with_federation_and_limits(
-        dir: &std::path::Path, federation: FederationConfig, limits: Limits,
+        dir: &std::path::Path,
+        federation: FederationConfig,
+        limits: Limits,
     ) -> Daemon {
-        let d = test_daemon_full(dir, limits, BTreeMap::new(), false, vec![], Some(federation.clone()));
-        d.store.lock().unwrap().seed_federation_trust(&federation, Utc::now()).unwrap();
+        let d = test_daemon_full(
+            dir,
+            limits,
+            BTreeMap::new(),
+            false,
+            vec![],
+            Some(federation.clone()),
+        );
+        d.store
+            .lock()
+            .unwrap()
+            .seed_federation_trust(&federation, Utc::now())
+            .unwrap();
         d
     }
 
     fn test_daemon_full(
-        dir: &std::path::Path, limits: Limits, transport_budgets: BTreeMap<String, Budget>,
-        public: bool, public_services: Vec<PublicService>, federation: Option<FederationConfig>,
+        dir: &std::path::Path,
+        limits: Limits,
+        transport_budgets: BTreeMap<String, Budget>,
+        public: bool,
+        public_services: Vec<PublicService>,
+        federation: Option<FederationConfig>,
     ) -> Daemon {
         let mut plugins = BTreeMap::new();
         for name in ["mocka", "mockb"] {
-            plugins.insert(name.to_string(), PluginConfig {
-                enabled: true, command: None, config: serde_yaml::Value::Null,
-            });
+            plugins.insert(
+                name.to_string(),
+                PluginConfig {
+                    enabled: true,
+                    command: None,
+                    config: serde_yaml::Value::Null,
+                },
+            );
         }
         let cfg = Config {
-            node: NodeConfig { name: "t".into(), data_dir: dir.to_path_buf(), public },
+            node: NodeConfig {
+                name: "t".into(),
+                data_dir: dir.to_path_buf(),
+                public,
+            },
             plugins,
             raw_plugin_configs: BTreeMap::new(),
             raw_yaml: String::new(),
@@ -2561,8 +2972,13 @@ pub mod tests_support {
     pub fn signed_test_envelope(identity: &NodeIdentity, body: &str, hops: u32) -> Envelope {
         let now = Utc::now();
         let mut env = Envelope::new(
-            Endpoint { protocol: "mock".into(), endpoint: "origin-chan".into() },
-            Sender { native_ref: "!origin-sender".into() },
+            Endpoint {
+                protocol: "mock".into(),
+                endpoint: "origin-chan".into(),
+            },
+            Sender {
+                native_ref: "!origin-sender".into(),
+            },
             "text".into(),
             body.to_string(),
             now,
@@ -2578,13 +2994,23 @@ pub mod tests_support {
     /// capability — shared by engine's own tests and admin.rs's Tower-oneshot
     /// tests (identity-link admin endpoints need a way to stand up a
     /// non-direct-capable plugin for the 409 rejection path).
-    pub fn register_plugin(d: &Daemon, name: &str, attachments: bool) -> mpsc::Receiver<DaemonToPlugin> {
+    pub fn register_plugin(
+        d: &Daemon,
+        name: &str,
+        attachments: bool,
+    ) -> mpsc::Receiver<DaemonToPlugin> {
         let (tx, rx) = mpsc::channel(8);
-        d.plugins.lock().unwrap().insert(name.to_string(), PluginHandle {
-            tx,
-            capabilities: Capabilities { attachments, ..Capabilities::default() },
-            connected: true,
-        });
+        d.plugins.lock().unwrap().insert(
+            name.to_string(),
+            PluginHandle {
+                tx,
+                capabilities: Capabilities {
+                    attachments,
+                    ..Capabilities::default()
+                },
+                connected: true,
+            },
+        );
         rx
     }
 
@@ -2593,11 +3019,17 @@ pub mod tests_support {
     /// admin.rs's Tower-oneshot tests for `POST /v1/identities/link`.
     pub fn register_direct_plugin(d: &Daemon, name: &str) -> mpsc::Receiver<DaemonToPlugin> {
         let (tx, rx) = mpsc::channel(8);
-        d.plugins.lock().unwrap().insert(name.to_string(), PluginHandle {
-            tx,
-            capabilities: Capabilities { direct_messages: true, ..Capabilities::default() },
-            connected: true,
-        });
+        d.plugins.lock().unwrap().insert(
+            name.to_string(),
+            PluginHandle {
+                tx,
+                capabilities: Capabilities {
+                    direct_messages: true,
+                    ..Capabilities::default()
+                },
+                connected: true,
+            },
+        );
         rx
     }
 }
@@ -2607,16 +3039,25 @@ mod tests {
     use super::*;
     use tests_support::{
         register_direct_plugin, register_plugin, signed_test_envelope, test_daemon,
-        test_daemon_with_budgets, test_daemon_with_federation, test_daemon_with_federation_and_limits,
-        test_daemon_with_limits, test_peer_identity,
+        test_daemon_with_budgets, test_daemon_with_federation,
+        test_daemon_with_federation_and_limits, test_daemon_with_limits, test_peer_identity,
     };
 
     #[test]
     fn inbound_routes_to_other_endpoint_and_dedups() {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
         // one delivery row, to mockb, none echoed to mocka
         let store = d.store.lock().unwrap();
         let counts = store.queue_counts().unwrap();
@@ -2625,15 +3066,37 @@ mod tests {
         assert_eq!(due[0].destination.protocol, "mockb");
         drop(store);
         // duplicate is dropped
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
-        assert_eq!(d.store.lock().unwrap().queue_counts().unwrap(),
-                   vec![("pending".to_string(), 1)]);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
+        assert_eq!(
+            d.store.lock().unwrap().queue_counts().unwrap(),
+            vec![("pending".to_string(), 1)]
+        );
         // unrouted endpoint is dropped (deny by default)
-        handle_inbound(&d, "mocka", "elsewhere".into(), "!a".into(), "text".into(),
-                       "hi".into(), None, vec![], None);
-        assert_eq!(d.store.lock().unwrap().queue_counts().unwrap(),
-                   vec![("pending".to_string(), 1)]);
+        handle_inbound(
+            &d,
+            "mocka",
+            "elsewhere".into(),
+            "!a".into(),
+            "text".into(),
+            "hi".into(),
+            None,
+            vec![],
+            None,
+        );
+        assert_eq!(
+            d.store.lock().unwrap().queue_counts().unwrap(),
+            vec![("pending".to_string(), 1)]
+        );
     }
 
     /// A missing priority defaults the envelope's stored class to "normal";
@@ -2645,24 +3108,49 @@ mod tests {
     fn inbound_priority_missing_or_unrecognized_both_schedule_at_the_normal_rank() {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "no priority sent".into(), None, vec![], None);
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "typo'd priority".into(), None, vec![], Some("urgent".into()));
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "no priority sent".into(),
+            None,
+            vec![],
+            None,
+        );
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "typo'd priority".into(),
+            None,
+            vec![],
+            Some("urgent".into()),
+        );
 
         let store = d.store.lock().unwrap();
         let due = store.due_deliveries(chrono::Utc::now(), 10).unwrap();
         assert_eq!(due.len(), 2);
-        assert!(due.iter().all(|d| d.priority == 2),
-            "both a missing and an unrecognized priority must schedule at the normal rank");
+        assert!(
+            due.iter().all(|d| d.priority == 2),
+            "both a missing and an unrecognized priority must schedule at the normal rank"
+        );
 
-        let envs: Vec<_> = due.iter()
+        let envs: Vec<_> = due
+            .iter()
             .map(|d| store.get_message(d.message_id).unwrap().unwrap())
             .collect();
-        assert!(envs.iter().any(|e| e.priority == "normal"),
-            "a missing priority must default the stored class to \"normal\"");
-        assert!(envs.iter().any(|e| e.priority == "urgent"),
-            "an unrecognized class name must be stored verbatim, not silently rewritten");
+        assert!(
+            envs.iter().any(|e| e.priority == "normal"),
+            "a missing priority must default the stored class to \"normal\""
+        );
+        assert!(
+            envs.iter().any(|e| e.priority == "urgent"),
+            "an unrecognized class name must be stored verbatim, not silently rewritten"
+        );
     }
 
     #[tokio::test]
@@ -2685,12 +3173,20 @@ mod tests {
             raw.execute(
                 "INSERT INTO messages (id, envelope, created_at) VALUES (?1, ?2, ?3)",
                 rusqlite::params![ghost_id.to_string(), "not valid json", now.to_rfc3339()],
-            ).unwrap();
+            )
+            .unwrap();
         }
         let delivery_id = {
             let store = d.store.lock().unwrap();
             store
-                .insert_delivery(ghost_id, "general", &dest, now, now + CDuration::hours(1), 2)
+                .insert_delivery(
+                    ghost_id,
+                    "general",
+                    &dest,
+                    now,
+                    now + CDuration::hours(1),
+                    2,
+                )
                 .unwrap()
         };
         let del = {
@@ -2705,7 +3201,12 @@ mod tests {
             .await
             .expect("process_due hung instead of completing (self-deadlock)");
 
-        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         assert_eq!(after.state, "failed");
         assert_eq!(after.reason.as_deref(), Some("DESTINATION_UNKNOWN"));
     }
@@ -2728,7 +3229,10 @@ mod tests {
         std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
         create_data_dir(&loose).unwrap();
         let mode = std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "pre-existing loose-permission data dir must be tightened");
+        assert_eq!(
+            mode, 0o700,
+            "pre-existing loose-permission data dir must be tightened"
+        );
     }
 
     #[tokio::test]
@@ -2736,8 +3240,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = Arc::new(test_daemon(dir.path()));
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
         // sample `now` after handle_inbound (which stamps next_attempt with
         // its own, slightly later, internal Utc::now()) so due_deliveries
         // actually finds the row.
@@ -2751,21 +3264,33 @@ mod tests {
         // slot, so any further try_send hits backpressure.
         let (tx, _rx) = mpsc::channel(1);
         tx.try_send(DaemonToPlugin::Shutdown).unwrap();
-        d.plugins.lock().unwrap().insert("mockb".to_string(), PluginHandle {
-            tx, capabilities: Capabilities::default(), connected: true,
-        });
+        d.plugins.lock().unwrap().insert(
+            "mockb".to_string(),
+            PluginHandle {
+                tx,
+                capabilities: Capabilities::default(),
+                connected: true,
+            },
+        );
 
-        let del = { let store = d.store.lock().unwrap(); store.deliveries_for_id(delivery_id).unwrap() };
+        let del = {
+            let store = d.store.lock().unwrap();
+            store.deliveries_for_id(delivery_id).unwrap()
+        };
 
         // Regression guard: process_due used to `.await` a send on this
         // channel, which would hang forever with the slot held. It must
         // return promptly and leave the delivery pending for the next tick.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2), process_due(&d, del, now))
+        tokio::time::timeout(std::time::Duration::from_secs(2), process_due(&d, del, now))
             .await
             .expect("process_due hung on a full plugin channel");
 
-        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         assert_eq!(after.state, "pending");
     }
 
@@ -2787,22 +3312,36 @@ mod tests {
         };
         let expected_sha = hex::encode(Sha256::digest(&small.data));
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![small, big], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![small, big],
+            None,
+        );
 
         let store = d.store.lock().unwrap();
         let due = store.due_deliveries(chrono::Utc::now(), 10).unwrap();
         assert_eq!(due.len(), 1);
         let env = store.get_message(due[0].message_id).unwrap().unwrap();
 
-        assert_eq!(env.attachments.len(), 1, "only the in-cap attachment gets a meta");
+        assert_eq!(
+            env.attachments.len(),
+            1,
+            "only the in-cap attachment gets a meta"
+        );
         assert_eq!(env.attachments[0].sha256, expected_sha);
         assert_eq!(env.attachments[0].filename, "small.txt");
         assert_eq!(env.attachments[0].size, 4);
 
         assert!(
             env.body.contains("[dropped big.bin: 64 B over 16 B limit]"),
-            "body did not carry the drop note: {}", env.body
+            "body did not carry the drop note: {}",
+            env.body
         );
 
         // the accepted attachment's bytes actually landed in the CAS
@@ -2825,15 +3364,29 @@ mod tests {
         let sha = hex::encode(Sha256::digest(&att.data));
 
         // "elsewhere" is not a configured route source for test_daemon.
-        handle_inbound(&d, "mocka", "elsewhere".into(), "!a".into(), "text".into(),
-                       "hi".into(), None, vec![att], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "elsewhere".into(),
+            "!a".into(),
+            "text".into(),
+            "hi".into(),
+            None,
+            vec![att],
+            None,
+        );
 
-        assert!(d.cas.get(&sha).is_err(),
-            "unrouted message must not write attachment bytes to the CAS");
+        assert!(
+            d.cas.get(&sha).is_err(),
+            "unrouted message must not write attachment bytes to the CAS"
+        );
         let entries: Vec<_> = std::fs::read_dir(dir.path().join("attachments"))
-            .unwrap().collect();
-        assert!(entries.is_empty(),
-            "CAS dir must contain no files for a dropped/unrouted message");
+            .unwrap()
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "CAS dir must contain no files for a dropped/unrouted message"
+        );
     }
 
     /// Companion to storage.rs's
@@ -2855,10 +3408,28 @@ mod tests {
 
         // two independent messages (different bodies, so dedup doesn't
         // collapse them) carrying an attachment with identical bytes.
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "first".into(), None, vec![shared.clone()], None);
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "second".into(), None, vec![shared], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "first".into(),
+            None,
+            vec![shared.clone()],
+            None,
+        );
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "second".into(),
+            None,
+            vec![shared],
+            None,
+        );
         assert_eq!(d.cas.get(&sha).unwrap(), b"shared bytes");
 
         let now = Utc::now();
@@ -2876,16 +3447,25 @@ mod tests {
             store.mark_attempting(id1).unwrap();
             store.mark_delivered(id1).unwrap();
         }
-        let (purged1, orphans1) =
-            d.store.lock().unwrap().purge_terminal(now + CDuration::hours(1)).unwrap();
+        let (purged1, orphans1) = d
+            .store
+            .lock()
+            .unwrap()
+            .purge_terminal(now + CDuration::hours(1))
+            .unwrap();
         assert_eq!(purged1, 1);
-        assert!(orphans1.is_empty(),
-            "sha still referenced by the second (pending) message must survive: {orphans1:?}");
+        assert!(
+            orphans1.is_empty(),
+            "sha still referenced by the second (pending) message must survive: {orphans1:?}"
+        );
         for s in &orphans1 {
             d.cas.remove(s).unwrap();
         }
-        assert_eq!(d.cas.get(&sha).unwrap(), b"shared bytes",
-            "CAS blob must survive: a live message still references it");
+        assert_eq!(
+            d.cas.get(&sha).unwrap(),
+            b"shared bytes",
+            "CAS blob must survive: a live message still references it"
+        );
 
         // now finish off the second message too and purge again: nothing
         // references the sha anymore, so it must come back as orphaned and
@@ -2895,14 +3475,21 @@ mod tests {
             store.mark_attempting(id2).unwrap();
             store.mark_delivered(id2).unwrap();
         }
-        let (purged2, orphans2) =
-            d.store.lock().unwrap().purge_terminal(now + CDuration::hours(1)).unwrap();
+        let (purged2, orphans2) = d
+            .store
+            .lock()
+            .unwrap()
+            .purge_terminal(now + CDuration::hours(1))
+            .unwrap();
         assert_eq!(purged2, 1);
         assert_eq!(orphans2, vec![sha.clone()]);
         for s in &orphans2 {
             d.cas.remove(s).unwrap();
         }
-        assert!(d.cas.get(&sha).is_err(), "now-truly-orphaned blob must be removable");
+        assert!(
+            d.cas.get(&sha).is_err(),
+            "now-truly-orphaned blob must be removable"
+        );
     }
 
     // register_plugin/register_direct_plugin moved to tests_support (shared
@@ -2923,19 +3510,37 @@ mod tests {
         let mut rx = register_plugin(&d, "mockb", true);
 
         let att = IpcAttachment {
-            filename: "photo.jpg".into(), mime: "image/jpeg".into(),
+            filename: "photo.jpg".into(),
+            mime: "image/jpeg".into(),
             data: b"just some bytes".to_vec(),
         };
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "look at this".into(), None, vec![att.clone()], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "look at this".into(),
+            None,
+            vec![att.clone()],
+            None,
+        );
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
-            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
         };
         process_due(&d, del, now).await;
 
-        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+        let DaemonToPlugin::Send {
+            body, attachments, ..
+        } = recv_send(&mut rx).await
+        else {
             panic!("expected Send");
         };
         assert_eq!(attachments.len(), 1);
@@ -2951,24 +3556,45 @@ mod tests {
         let mut rx = register_plugin(&d, "mockb", false); // no attachments capability
 
         let att = IpcAttachment {
-            filename: "photo.jpg".into(), mime: "image/jpeg".into(), data: b"bytes".to_vec(),
+            filename: "photo.jpg".into(),
+            mime: "image/jpeg".into(),
+            data: b"bytes".to_vec(),
         };
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "look at this".into(), None, vec![att], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "look at this".into(),
+            None,
+            vec![att],
+            None,
+        );
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
-            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
         };
         process_due(&d, del, now).await;
 
-        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+        let DaemonToPlugin::Send {
+            body, attachments, ..
+        } = recv_send(&mut rx).await
+        else {
             panic!("expected Send");
         };
         assert!(attachments.is_empty());
         assert!(body.contains("[attachment omitted]"), "body was: {body}");
-        assert!(!body.contains("photo.jpg"),
-            "a blanket capability strip must not name the dropped file: {body}");
+        assert!(
+            !body.contains("photo.jpg"),
+            "a blanket capability strip must not name the dropped file: {body}"
+        );
     }
 
     #[tokio::test]
@@ -2977,30 +3603,55 @@ mod tests {
         let d = test_daemon(dir.path());
         d.cfg.write().unwrap().policies = vec![crate::config::Policy {
             name: "no-attachments-for-b".into(),
-            r#match: crate::config::PolicyMatch { destination_protocol: vec!["mockb".into()] },
+            r#match: crate::config::PolicyMatch {
+                destination_protocol: vec!["mockb".into()],
+            },
             rules: crate::config::PolicyRules {
-                attachments: Some("reject".into()), ..Default::default()
+                attachments: Some("reject".into()),
+                ..Default::default()
             },
         }];
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", true); // capability says yes...
 
         let att = IpcAttachment {
-            filename: "photo.jpg".into(), mime: "image/jpeg".into(), data: b"bytes".to_vec(),
+            filename: "photo.jpg".into(),
+            mime: "image/jpeg".into(),
+            data: b"bytes".to_vec(),
         };
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "look at this".into(), None, vec![att], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "look at this".into(),
+            None,
+            vec![att],
+            None,
+        );
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
-            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
         };
         process_due(&d, del, now).await;
 
-        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+        let DaemonToPlugin::Send {
+            body, attachments, ..
+        } = recv_send(&mut rx).await
+        else {
             panic!("expected Send");
         };
-        assert!(attachments.is_empty(), "...but policy says no, and policy wins");
+        assert!(
+            attachments.is_empty(),
+            "...but policy says no, and policy wins"
+        );
         assert!(body.contains("[attachment omitted]"), "body was: {body}");
     }
 
@@ -3010,28 +3661,49 @@ mod tests {
         let d = test_daemon(dir.path());
         d.cfg.write().unwrap().policies = vec![crate::config::Policy {
             name: "small-attachments-for-b".into(),
-            r#match: crate::config::PolicyMatch { destination_protocol: vec!["mockb".into()] },
+            r#match: crate::config::PolicyMatch {
+                destination_protocol: vec!["mockb".into()],
+            },
             rules: crate::config::PolicyRules {
-                max_attachment_bytes: Some(10), ..Default::default()
+                max_attachment_bytes: Some(10),
+                ..Default::default()
             },
         }];
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", true);
 
         let att = IpcAttachment {
-            filename: "toobig.bin".into(), mime: "application/octet-stream".into(),
+            filename: "toobig.bin".into(),
+            mime: "application/octet-stream".into(),
             data: vec![0u8; 20], // over the 10 B policy cap, under the ingress cap
         };
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "look at this".into(), None, vec![att], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "look at this".into(),
+            None,
+            vec![att],
+            None,
+        );
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
-            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
         };
         process_due(&d, del, now).await;
 
-        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+        let DaemonToPlugin::Send {
+            body, attachments, ..
+        } = recv_send(&mut rx).await
+        else {
             panic!("expected Send");
         };
         assert!(attachments.is_empty());
@@ -3048,27 +3720,54 @@ mod tests {
         let mut rx = register_plugin(&d, "mockb", true);
 
         let att = IpcAttachment {
-            filename: "gone.bin".into(), mime: "application/octet-stream".into(),
+            filename: "gone.bin".into(),
+            mime: "application/octet-stream".into(),
             data: b"will vanish".to_vec(),
         };
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "look at this".into(), None, vec![att], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "look at this".into(),
+            None,
+            vec![att],
+            None,
+        );
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
-            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
         };
-        let env = d.store.lock().unwrap().get_message(del.message_id).unwrap().unwrap();
+        let env = d
+            .store
+            .lock()
+            .unwrap()
+            .get_message(del.message_id)
+            .unwrap()
+            .unwrap();
         let sha = env.attachments[0].sha256.clone();
         d.cas.remove(&sha).unwrap(); // simulate the blob having gone missing
 
         process_due(&d, del, now).await;
 
-        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+        let DaemonToPlugin::Send {
+            body, attachments, ..
+        } = recv_send(&mut rx).await
+        else {
             panic!("expected Send");
         };
         assert!(attachments.is_empty());
-        assert!(body.contains("[attachment gone.bin unavailable]"), "body was: {body}");
+        assert!(
+            body.contains("[attachment gone.bin unavailable]"),
+            "body was: {body}"
+        );
     }
 
     // ---- transport-class policy (design §3, spec §17/§113.4): egress -----
@@ -3081,38 +3780,68 @@ mod tests {
     async fn process_due_constrained_transport_demotes_image_to_a_note_and_bumps_the_metric() {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
-        d.cfg.write().unwrap().transports.insert("mockb".to_string(), crate::config::TransportEntry {
-            class: relay_core::TransportClass::Meshtastic,
-            max_payload_bytes: None,
-            allow_images: None,
-            allow_video: None,
-            compress: None,
-            batch_telemetry: None,
-        });
+        d.cfg.write().unwrap().transports.insert(
+            "mockb".to_string(),
+            crate::config::TransportEntry {
+                class: relay_core::TransportClass::Meshtastic,
+                max_payload_bytes: None,
+                allow_images: None,
+                allow_video: None,
+                compress: None,
+                batch_telemetry: None,
+            },
+        );
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", true);
         let before = metrics::TRANSPORT_DEMOTED.load(std::sync::atomic::Ordering::Relaxed);
 
         let att = IpcAttachment {
-            filename: "photo.jpg".into(), mime: "image/jpeg".into(), data: vec![7u8; 32],
+            filename: "photo.jpg".into(),
+            mime: "image/jpeg".into(),
+            data: vec![7u8; 32],
         };
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hi".into(), None, vec![att], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hi".into(),
+            None,
+            vec![att],
+            None,
+        );
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
-            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
         };
         process_due(&d, del, now).await;
 
-        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+        let DaemonToPlugin::Send {
+            body, attachments, ..
+        } = recv_send(&mut rx).await
+        else {
             panic!("expected Send");
         };
-        assert!(attachments.is_empty(),
-            "an image must never reach a transport that forbids images");
-        assert!(body.contains("[image 'photo.jpg' omitted — constrained transport]"), "body was: {body}");
+        assert!(
+            attachments.is_empty(),
+            "an image must never reach a transport that forbids images"
+        );
+        assert!(
+            body.contains("[image 'photo.jpg' omitted — constrained transport]"),
+            "body was: {body}"
+        );
         let after = metrics::TRANSPORT_DEMOTED.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(after > before, "TRANSPORT_DEMOTED must increment on a media demotion");
+        assert!(
+            after > before,
+            "TRANSPORT_DEMOTED must increment on a media demotion"
+        );
     }
 
     /// `allow_images`/`allow_video` are independent knobs (design §1): a
@@ -3123,39 +3852,70 @@ mod tests {
     async fn process_due_transport_policy_demotes_video_but_keeps_a_non_media_attachment() {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
-        d.cfg.write().unwrap().transports.insert("mockb".to_string(), crate::config::TransportEntry {
-            class: relay_core::TransportClass::TerrestrialInternet,
-            max_payload_bytes: None,
-            allow_images: None,       // stays true (internet default)
-            allow_video: Some(false), // explicitly forbidden for this route
-            compress: None,
-            batch_telemetry: None,
-        });
+        d.cfg.write().unwrap().transports.insert(
+            "mockb".to_string(),
+            crate::config::TransportEntry {
+                class: relay_core::TransportClass::TerrestrialInternet,
+                max_payload_bytes: None,
+                allow_images: None,       // stays true (internet default)
+                allow_video: Some(false), // explicitly forbidden for this route
+                compress: None,
+                batch_telemetry: None,
+            },
+        );
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", true);
         let before = metrics::TRANSPORT_DEMOTED.load(std::sync::atomic::Ordering::Relaxed);
 
         let clip = IpcAttachment {
-            filename: "clip.mp4".into(), mime: "video/mp4".into(), data: vec![1u8; 32],
+            filename: "clip.mp4".into(),
+            mime: "video/mp4".into(),
+            data: vec![1u8; 32],
         };
         let doc = IpcAttachment {
-            filename: "notes.pdf".into(), mime: "application/pdf".into(), data: vec![2u8; 32],
+            filename: "notes.pdf".into(),
+            mime: "application/pdf".into(),
+            data: vec![2u8; 32],
         };
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hi".into(), None, vec![clip, doc], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hi".into(),
+            None,
+            vec![clip, doc],
+            None,
+        );
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
-            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
         };
         process_due(&d, del, now).await;
 
-        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+        let DaemonToPlugin::Send {
+            body, attachments, ..
+        } = recv_send(&mut rx).await
+        else {
             panic!("expected Send");
         };
-        assert_eq!(attachments.len(), 1, "only the video should be demoted, the PDF must pass through");
+        assert_eq!(
+            attachments.len(),
+            1,
+            "only the video should be demoted, the PDF must pass through"
+        );
         assert_eq!(attachments[0].filename, "notes.pdf");
-        assert!(body.contains("[video 'clip.mp4' omitted — constrained transport]"), "body was: {body}");
+        assert!(
+            body.contains("[video 'clip.mp4' omitted — constrained transport]"),
+            "body was: {body}"
+        );
         let after = metrics::TRANSPORT_DEMOTED.load(std::sync::atomic::Ordering::Relaxed);
         assert!(after > before);
     }
@@ -3167,28 +3927,51 @@ mod tests {
     async fn process_due_constrained_transport_caps_payload_to_the_tighter_transport_limit() {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
-        d.cfg.write().unwrap().transports.insert("mockb".to_string(), crate::config::TransportEntry {
-            class: relay_core::TransportClass::Meshtastic, // 237 B cap
-            max_payload_bytes: None,
-            allow_images: None,
-            allow_video: None,
-            compress: None,
-            batch_telemetry: None,
-        });
+        d.cfg.write().unwrap().transports.insert(
+            "mockb".to_string(),
+            crate::config::TransportEntry {
+                class: relay_core::TransportClass::Meshtastic, // 237 B cap
+                max_payload_bytes: None,
+                allow_images: None,
+                allow_video: None,
+                compress: None,
+                batch_telemetry: None,
+            },
+        );
         let d = Arc::new(d);
         let (tx, mut rx) = mpsc::channel(8);
-        d.plugins.lock().unwrap().insert("mockb".to_string(), PluginHandle {
-            tx,
-            capabilities: Capabilities { max_payload: Some(5000), ..Capabilities::default() },
-            connected: true,
-        });
+        d.plugins.lock().unwrap().insert(
+            "mockb".to_string(),
+            PluginHandle {
+                tx,
+                capabilities: Capabilities {
+                    max_payload: Some(5000),
+                    ..Capabilities::default()
+                },
+                connected: true,
+            },
+        );
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "x".repeat(1000), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "x".repeat(1000),
+            None,
+            vec![],
+            None,
+        );
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
-            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
         };
         process_due(&d, del, now).await;
 
@@ -3209,18 +3992,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = Arc::new(test_daemon(dir.path())); // no transports: block configured
         let (tx, mut rx) = mpsc::channel(8);
-        d.plugins.lock().unwrap().insert("mockb".to_string(), PluginHandle {
-            tx,
-            capabilities: Capabilities { max_payload: Some(20), ..Capabilities::default() },
-            connected: true,
-        });
+        d.plugins.lock().unwrap().insert(
+            "mockb".to_string(),
+            PluginHandle {
+                tx,
+                capabilities: Capabilities {
+                    max_payload: Some(20),
+                    ..Capabilities::default()
+                },
+                connected: true,
+            },
+        );
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "this body is much longer than twenty bytes".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "this body is much longer than twenty bytes".into(),
+            None,
+            vec![],
+            None,
+        );
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
-            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
         };
         process_due(&d, del, now).await;
 
@@ -3243,25 +4046,53 @@ mod tests {
         let mut rx = register_plugin(&d, "mockb", true);
 
         let att = IpcAttachment {
-            filename: "photo.jpg".into(), mime: "image/jpeg".into(), data: vec![9u8; 64],
+            filename: "photo.jpg".into(),
+            mime: "image/jpeg".into(),
+            data: vec![9u8; 64],
         };
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "ordinary message".into(), None, vec![att], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "ordinary message".into(),
+            None,
+            vec![att],
+            None,
+        );
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
-            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
         };
         process_due(&d, del, now).await;
 
-        let DaemonToPlugin::Send { body, attachments, .. } = recv_send(&mut rx).await else {
+        let DaemonToPlugin::Send {
+            body, attachments, ..
+        } = recv_send(&mut rx).await
+        else {
             panic!("expected Send");
         };
-        assert_eq!(attachments.len(), 1,
-            "the internet-default transport must never demote media: backward compat");
+        assert_eq!(
+            attachments.len(),
+            1,
+            "the internet-default transport must never demote media: backward compat"
+        );
         assert_eq!(attachments[0].filename, "photo.jpg");
-        assert!(body.ends_with("ordinary message"), "body must be delivered untruncated: {body}");
-        assert!(!body.contains("omitted"), "no demotion note may appear on the non-constraining default: {body}");
+        assert!(
+            body.ends_with("ordinary message"),
+            "body must be delivered untruncated: {body}"
+        );
+        assert!(
+            !body.contains("omitted"),
+            "no demotion note may appear on the non-constraining default: {body}"
+        );
     }
 
     /// SEALED EXEMPTION (design §3, SPEC §113.4, CRITICAL): sealed egress
@@ -3281,7 +4112,8 @@ mod tests {
     /// legitimately bumps it; the body/attachments equality checks below
     /// are the load-bearing proof of the exemption.)
     #[tokio::test]
-    async fn process_due_fed_sealed_egress_ignores_transport_policy_even_when_misconfigured_for_fed() {
+    async fn process_due_fed_sealed_egress_ignores_transport_policy_even_when_misconfigured_for_fed(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let recipient_secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
         let recipient_pub = recipient_secret.public_key();
@@ -3295,14 +4127,17 @@ mod tests {
             let mut cfg = d.cfg.read().unwrap().clone();
             let route = cfg.routes.iter_mut().find(|r| r.name == "general").unwrap();
             route.security_mode = "sealed".to_string();
-            cfg.transports.insert(FED_PROTOCOL.to_string(), crate::config::TransportEntry {
-                class: relay_core::TransportClass::Meshtastic,
-                max_payload_bytes: Some(64),
-                allow_images: Some(false),
-                allow_video: Some(false),
-                compress: None,
-                batch_telemetry: None,
-            });
+            cfg.transports.insert(
+                FED_PROTOCOL.to_string(),
+                crate::config::TransportEntry {
+                    class: relay_core::TransportClass::Meshtastic,
+                    max_payload_bytes: Some(64),
+                    allow_images: Some(false),
+                    allow_video: Some(false),
+                    compress: None,
+                    batch_telemetry: None,
+                },
+            );
             d.apply_config(cfg);
         }
         let mut rx = register_fed_conn(&d, "phoenix", &node_id);
@@ -3312,18 +4147,32 @@ mod tests {
         assert!(long_body.len() > 64, "fixture sanity check");
         let mut env = local_env("!ref", long_body);
         env.attachments = vec![AttachmentMeta {
-            filename: "photo.jpg".into(), mime: "image/jpeg".into(),
-            size: 32, sha256: "deadbeef".repeat(8),
+            filename: "photo.jpg".into(),
+            mime: "image/jpeg".into(),
+            size: 32,
+            sha256: "deadbeef".repeat(8),
         }];
         let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         process_due(&d, del, Utc::now()).await;
 
         let (sealed, _) = unwrap_sealed_frame(rx.try_recv().unwrap());
         let opened = fed::seal::unseal(&sealed, &recipient_secret).unwrap();
         let decoded: Envelope = ciborium::from_reader(opened.as_slice()).unwrap();
-        assert_eq!(decoded.body, long_body, "sealed egress must never truncate to a transport cap");
-        assert_eq!(decoded.attachments.len(), 1, "sealed egress must never demote media to a note");
+        assert_eq!(
+            decoded.body, long_body,
+            "sealed egress must never truncate to a transport cap"
+        );
+        assert_eq!(
+            decoded.attachments.len(),
+            1,
+            "sealed egress must never demote media to a note"
+        );
         assert_eq!(decoded.attachments[0].filename, "photo.jpg");
     }
 
@@ -3336,20 +4185,29 @@ mod tests {
         let sha_b = d.cas.put(&[2u8; 10]).unwrap();
         let metas = vec![
             AttachmentMeta {
-                filename: "a.bin".into(), mime: "application/octet-stream".into(),
-                size: 10, sha256: sha_a,
+                filename: "a.bin".into(),
+                mime: "application/octet-stream".into(),
+                size: 10,
+                sha256: sha_a,
             },
             AttachmentMeta {
-                filename: "b.bin".into(), mime: "application/octet-stream".into(),
-                size: 10, sha256: sha_b,
+                filename: "b.bin".into(),
+                mime: "application/octet-stream".into(),
+                size: 10,
+                sha256: sha_b,
             },
         ];
 
         // budget only has room for the first attachment's 10 bytes.
-        let tp = relay_core::TransportPolicy::for_class(relay_core::TransportClass::TerrestrialInternet);
+        let tp =
+            relay_core::TransportPolicy::for_class(relay_core::TransportClass::TerrestrialInternet);
         let (attachments, notes) = load_attachments(&d, &metas, None, 15, tp);
 
-        assert_eq!(attachments.len(), 1, "only the first fits under the frame budget");
+        assert_eq!(
+            attachments.len(),
+            1,
+            "only the first fits under the frame budget"
+        );
         assert_eq!(attachments[0].filename, "a.bin");
         assert!(
             notes.contains("[dropped b.bin: 10 B over 15 B limit]"),
@@ -3368,39 +4226,83 @@ mod tests {
         d.cfg.write().unwrap().max_attachment_bytes = 16;
 
         let a = IpcAttachment {
-            filename: "a.bin".into(), mime: "application/octet-stream".into(),
+            filename: "a.bin".into(),
+            mime: "application/octet-stream".into(),
             data: vec![0u8; 64], // oversize -> dropped
         };
         let b = IpcAttachment {
-            filename: "b.bin".into(), mime: "application/octet-stream".into(),
+            filename: "b.bin".into(),
+            mime: "application/octet-stream".into(),
             data: vec![1u8; 64], // different bytes, also oversize -> dropped
         };
         let same_created_at = Utc::now();
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), Some(same_created_at), vec![a], None);
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), Some(same_created_at), vec![b], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            Some(same_created_at),
+            vec![a],
+            None,
+        );
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            Some(same_created_at),
+            vec![b],
+            None,
+        );
 
         let counts = d.store.lock().unwrap().queue_counts().unwrap();
-        assert_eq!(counts, vec![("pending".to_string(), 2)],
-            "differing dropped attachments must not dedup-collide: {counts:?}");
+        assert_eq!(
+            counts,
+            vec![("pending".to_string(), 2)],
+            "differing dropped attachments must not dedup-collide: {counts:?}"
+        );
     }
 
     #[test]
     fn inbound_over_per_route_queue_max_dead_letters_with_queue_full_reason() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("relayfabric.db");
-        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
-            per_route: crate::config::PerRoute { queue_max: 1 },
-            ..Default::default()
-        });
+        let d = test_daemon_with_limits(
+            dir.path(),
+            crate::config::Limits {
+                per_route: crate::config::PerRoute { queue_max: 1 },
+                ..Default::default()
+            },
+        );
         let before = metrics::QUEUE_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "first".into(), None, vec![], None);
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "second".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "first".into(),
+            None,
+            vec![],
+            None,
+        );
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "second".into(),
+            None,
+            vec![],
+            None,
+        );
 
         let after = metrics::QUEUE_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
         // QUEUE_REJECTED is a process-global counter shared by every test in
@@ -3410,10 +4312,16 @@ mod tests {
         // this test's rejection happened is the dead_letter row + QUEUE_FULL
         // reason asserted below, which only this test's own over-quota
         // delivery could have produced.
-        assert!(after > before, "the second delivery must bump QUEUE_REJECTED");
+        assert!(
+            after > before,
+            "the second delivery must bump QUEUE_REJECTED"
+        );
 
         let counts = d.store.lock().unwrap().queue_counts().unwrap();
-        assert!(counts.contains(&("pending".to_string(), 1)), "counts was {counts:?}");
+        assert!(
+            counts.contains(&("pending".to_string(), 1)),
+            "counts was {counts:?}"
+        );
         assert!(counts.contains(&("dead_letter".to_string(), 1)),
             "over-quota delivery must land dead_letter and stay visible in queue_counts: {counts:?}");
 
@@ -3421,8 +4329,11 @@ mod tests {
         // any dead_letter reason.
         let raw = rusqlite::Connection::open(&db_path).unwrap();
         let reason: String = raw
-            .query_row("SELECT reason FROM deliveries WHERE state = 'dead_letter'", [],
-                       |r| r.get(0))
+            .query_row(
+                "SELECT reason FROM deliveries WHERE state = 'dead_letter'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(reason, "QUEUE_FULL");
     }
@@ -3443,17 +4354,37 @@ mod tests {
         // tracked created_at again, this test's contribution to the sum
         // would be >= 2s instead of near-zero.
         let created_at = Utc::now() - CDuration::seconds(2);
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), Some(created_at), vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            Some(created_at),
+            vec![],
+            None,
+        );
 
-        let due = { let store = d.store.lock().unwrap(); store.due_deliveries(Utc::now(), 10).unwrap() };
+        let due = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(Utc::now(), 10).unwrap()
+        };
         assert_eq!(due.len(), 1);
         let delivery_id = due[0].id;
         assert_eq!(due[0].route, "general");
-        d.store.lock().unwrap().mark_attempting(delivery_id).unwrap();
+        d.store
+            .lock()
+            .unwrap()
+            .mark_attempting(delivery_id)
+            .unwrap();
 
-        let route_before =
-            metrics::ROUTE_MESSAGES.lock().unwrap().get("general").copied().unwrap_or(0);
+        let route_before = metrics::ROUTE_MESSAGES
+            .lock()
+            .unwrap()
+            .get("general")
+            .copied()
+            .unwrap_or(0);
         let latency_count_before =
             metrics::DELIVERY_LATENCY_COUNT.load(std::sync::atomic::Ordering::Relaxed);
         let latency_sum_before =
@@ -3461,8 +4392,12 @@ mod tests {
 
         handle_result(&d, delivery_id, true, None);
 
-        let route_after =
-            metrics::ROUTE_MESSAGES.lock().unwrap().get("general").copied().unwrap_or(0);
+        let route_after = metrics::ROUTE_MESSAGES
+            .lock()
+            .unwrap()
+            .get("general")
+            .copied()
+            .unwrap_or(0);
         let latency_count_after =
             metrics::DELIVERY_LATENCY_COUNT.load(std::sync::atomic::Ordering::Relaxed);
         let latency_sum_after =
@@ -3477,13 +4412,24 @@ mod tests {
         // planted in created_at: 1 minute is orders of magnitude more than
         // this in-process round trip takes, and orders of magnitude less
         // than the fake 2s would have contributed had created_at leaked in.
-        assert!(route_after > route_before, "a delivered message must bump its route's counter");
+        assert!(
+            route_after > route_before,
+            "a delivered message must bump its route's counter"
+        );
         assert!(latency_count_after > latency_count_before);
-        assert!(latency_sum_after < latency_sum_before + 60_000_000,
+        assert!(
+            latency_sum_after < latency_sum_before + 60_000_000,
             "recorded latency must track received_at, not the lied-about \
-             created_at: before={latency_sum_before} after={latency_sum_after}");
+             created_at: before={latency_sum_before} after={latency_sum_after}"
+        );
 
-        let state = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap().state;
+        let state = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap()
+            .state;
         assert_eq!(state, "delivered");
     }
 
@@ -3500,13 +4446,29 @@ mod tests {
         let d = test_daemon(dir.path());
 
         let epoch_zero = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), Some(epoch_zero), vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            Some(epoch_zero),
+            vec![],
+            None,
+        );
 
-        let due = { let store = d.store.lock().unwrap(); store.due_deliveries(Utc::now(), 10).unwrap() };
+        let due = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(Utc::now(), 10).unwrap()
+        };
         assert_eq!(due.len(), 1);
         let delivery_id = due[0].id;
-        d.store.lock().unwrap().mark_attempting(delivery_id).unwrap();
+        d.store
+            .lock()
+            .unwrap()
+            .mark_attempting(delivery_id)
+            .unwrap();
 
         let latency_sum_before =
             metrics::DELIVERY_LATENCY_MICROS_SUM.load(std::sync::atomic::Ordering::Relaxed);
@@ -3521,24 +4483,50 @@ mod tests {
         // this shared counter) and comfortably smaller than the ~56 years
         // an epoch-0 created_at would have contributed.
         const ONE_HOUR_MICROS: u64 = 3_600_000_000;
-        assert!(latency_sum_after < latency_sum_before + ONE_HOUR_MICROS,
+        assert!(
+            latency_sum_after < latency_sum_before + ONE_HOUR_MICROS,
             "an epoch-0 created_at must not poison the latency metric: \
-             before={latency_sum_before} after={latency_sum_after}");
+             before={latency_sum_before} after={latency_sum_after}"
+        );
     }
 
     #[test]
     fn inbound_over_sender_per_minute_limit_drops_second_message_and_bumps_metric() {
         let dir = tempfile::tempdir().unwrap();
-        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
-            per_sender: crate::config::PerSender { messages_per_minute: 1, bytes_per_hour: 0 },
-            ..Default::default()
-        });
+        let d = test_daemon_with_limits(
+            dir.path(),
+            crate::config::Limits {
+                per_sender: crate::config::PerSender {
+                    messages_per_minute: 1,
+                    bytes_per_hour: 0,
+                },
+                ..Default::default()
+            },
+        );
         let before = metrics::RATELIMITED.load(std::sync::atomic::Ordering::Relaxed);
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "first".into(), None, vec![], None);
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "second".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "first".into(),
+            None,
+            vec![],
+            None,
+        );
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "second".into(),
+            None,
+            vec![],
+            None,
+        );
 
         let after = metrics::RATELIMITED.load(std::sync::atomic::Ordering::Relaxed);
         // ">" not an exact +1 delta: RATELIMITED is a process-global counter
@@ -3547,11 +4535,17 @@ mod tests {
         // a real increment from this test's own action still guarantees
         // after > before regardless of what else the counter is doing
         // concurrently, so this stays a precise, non-flaky assertion.
-        assert!(after > before, "the second message from the same sender must bump RATELIMITED");
+        assert!(
+            after > before,
+            "the second message from the same sender must bump RATELIMITED"
+        );
 
         let counts = d.store.lock().unwrap().queue_counts().unwrap();
-        assert_eq!(counts, vec![("pending".to_string(), 1)],
-            "a rate-limited message must vanish entirely, not enqueue or dead-letter: {counts:?}");
+        assert_eq!(
+            counts,
+            vec![("pending".to_string(), 1)],
+            "a rate-limited message must vanish entirely, not enqueue or dead-letter: {counts:?}"
+        );
     }
 
     /// A different sender on the same plugin must not share the rate-limited
@@ -3560,45 +4554,96 @@ mod tests {
     #[test]
     fn sender_rate_limit_does_not_bleed_across_senders() {
         let dir = tempfile::tempdir().unwrap();
-        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
-            per_sender: crate::config::PerSender { messages_per_minute: 1, bytes_per_hour: 0 },
-            ..Default::default()
-        });
+        let d = test_daemon_with_limits(
+            dir.path(),
+            crate::config::Limits {
+                per_sender: crate::config::PerSender {
+                    messages_per_minute: 1,
+                    bytes_per_hour: 0,
+                },
+                ..Default::default()
+            },
+        );
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "from a".into(), None, vec![], None);
-        handle_inbound(&d, "mocka", "chan".into(), "!b".into(), "text".into(),
-                       "from b".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "from a".into(),
+            None,
+            vec![],
+            None,
+        );
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!b".into(),
+            "text".into(),
+            "from b".into(),
+            None,
+            vec![],
+            None,
+        );
 
         let counts = d.store.lock().unwrap().queue_counts().unwrap();
-        assert_eq!(counts, vec![("pending".to_string(), 2)],
-            "a different sender must get its own budget: {counts:?}");
+        assert_eq!(
+            counts,
+            vec![("pending".to_string(), 2)],
+            "a different sender must get its own budget: {counts:?}"
+        );
     }
 
     #[test]
     fn inbound_drops_attachment_over_cas_budget_and_notes_it_but_message_still_flows() {
         let dir = tempfile::tempdir().unwrap();
-        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
-            global: crate::config::GlobalLimits { queue_max: 0, cas_max_bytes: 5 },
-            ..Default::default()
-        });
+        let d = test_daemon_with_limits(
+            dir.path(),
+            crate::config::Limits {
+                global: crate::config::GlobalLimits {
+                    queue_max: 0,
+                    cas_max_bytes: 5,
+                },
+                ..Default::default()
+            },
+        );
 
         let att = IpcAttachment {
             filename: "over-budget.bin".into(),
             mime: "application/octet-stream".into(),
             data: vec![0u8; 20], // over the 5-byte CAS budget, under the ingress size cap
         };
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![att], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![att],
+            None,
+        );
 
         let store = d.store.lock().unwrap();
         let due = store.due_deliveries(chrono::Utc::now(), 10).unwrap();
-        assert_eq!(due.len(), 1, "message must still flow despite the dropped attachment");
+        assert_eq!(
+            due.len(),
+            1,
+            "message must still flow despite the dropped attachment"
+        );
         let env = store.get_message(due[0].message_id).unwrap().unwrap();
-        assert!(env.attachments.is_empty(), "the over-budget attachment must not get a meta");
         assert!(
-            env.body.contains("[dropped over-budget.bin: cas budget exceeded]"),
-            "body was: {}", env.body
+            env.attachments.is_empty(),
+            "the over-budget attachment must not get a meta"
+        );
+        assert!(
+            env.body
+                .contains("[dropped over-budget.bin: cas budget exceeded]"),
+            "body was: {}",
+            env.body
         );
     }
 
@@ -3606,19 +4651,39 @@ mod tests {
     async fn transport_budget_defers_the_send_over_it_and_emergency_bypasses() {
         let dir = tempfile::tempdir().unwrap();
         let mut budgets = std::collections::BTreeMap::new();
-        budgets.insert("mockb".to_string(), crate::config::Budget { messages_per_minute: 2 });
+        budgets.insert(
+            "mockb".to_string(),
+            crate::config::Budget {
+                messages_per_minute: 2,
+            },
+        );
         let d = Arc::new(test_daemon_with_budgets(dir.path(), budgets));
         let mut rx = register_plugin(&d, "mockb", false);
 
         // three normal-priority messages queued for mockb, a 2/minute budget.
         for body in ["one", "two", "three"] {
-            handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                           body.into(), None, vec![], None);
+            handle_inbound(
+                &d,
+                "mocka",
+                "chan".into(),
+                "!a".into(),
+                "text".into(),
+                body.into(),
+                None,
+                vec![],
+                None,
+            );
         }
         let now = Utc::now();
-        let dues = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 10).unwrap() };
+        let dues = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now, 10).unwrap()
+        };
         assert_eq!(dues.len(), 3);
-        assert!(dues.iter().all(|d| d.priority == 2), "these are all normal priority");
+        assert!(
+            dues.iter().all(|d| d.priority == 2),
+            "these are all normal priority"
+        );
         let ids: Vec<i64> = dues.iter().map(|d| d.id).collect();
 
         let before = metrics::BUDGET_DEFERRED.load(std::sync::atomic::Ordering::Relaxed);
@@ -3632,14 +4697,19 @@ mod tests {
         // counter concurrently) -- the real, race-free proof that exactly
         // one of these three deliveries was deferred is the Send-count
         // assertion below (exactly two Sends, then an empty channel).
-        assert!(after > before, "only the third send within the minute must be deferred");
+        assert!(
+            after > before,
+            "only the third send within the minute must be deferred"
+        );
 
         // the first two budget slots went out as real Sends...
         recv_send(&mut rx).await;
         recv_send(&mut rx).await;
         // ...and nothing else: the third never called try_send at all.
-        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
-            "the budget-deferred delivery must not have produced a Send");
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "the budget-deferred delivery must not have produced a Send"
+        );
 
         // the deferred delivery (whichever of the three it was) must still be
         // 'pending' with its next_attempt pushed ~10s out, not immediately
@@ -3647,22 +4717,44 @@ mod tests {
         let deferred_id = ids[2];
         {
             let store = d.store.lock().unwrap();
-            assert!(store.due_deliveries(now + CDuration::seconds(9), 10).unwrap()
-                .iter().all(|d| d.id != deferred_id),
-                "must not be due again before the ~10s budget backoff elapses");
-            assert!(store.due_deliveries(now + CDuration::seconds(11), 10).unwrap()
-                .iter().any(|d| d.id == deferred_id),
-                "must be due again once the ~10s budget backoff has elapsed");
+            assert!(
+                store
+                    .due_deliveries(now + CDuration::seconds(9), 10)
+                    .unwrap()
+                    .iter()
+                    .all(|d| d.id != deferred_id),
+                "must not be due again before the ~10s budget backoff elapses"
+            );
+            assert!(
+                store
+                    .due_deliveries(now + CDuration::seconds(11), 10)
+                    .unwrap()
+                    .iter()
+                    .any(|d| d.id == deferred_id),
+                "must be due again once the ~10s budget backoff has elapsed"
+            );
         }
 
         // an emergency send for the same over-budget destination must
         // bypass the check entirely and go out immediately.
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "urgent".into(), None, vec![], Some("emergency".into()));
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "urgent".into(),
+            None,
+            vec![],
+            Some("emergency".into()),
+        );
         let now2 = Utc::now();
         let emergency_del = {
             let store = d.store.lock().unwrap();
-            store.due_deliveries(now2, 10).unwrap().into_iter()
+            store
+                .due_deliveries(now2, 10)
+                .unwrap()
+                .into_iter()
                 .find(|d| d.priority == 0)
                 .expect("the emergency delivery must be immediately due")
         };
@@ -3688,8 +4780,14 @@ mod tests {
         let target: Endpoint = "mockb:!target-secret".parse().unwrap();
         let err = initiate_link(&d, requester, target, "Jascha").unwrap_err();
 
-        assert!(err.contains("mocka"), "err must name the direct-capable plugin: {err}");
-        assert!(!err.contains("!target-secret"), "err must never leak the target ref: {err}");
+        assert!(
+            err.contains("mocka"),
+            "err must name the direct-capable plugin: {err}"
+        );
+        assert!(
+            !err.contains("!target-secret"),
+            "err must never leak the target ref: {err}"
+        );
     }
 
     #[test]
@@ -3713,7 +4811,10 @@ mod tests {
         let requester: Endpoint = "mocka:!req".parse().unwrap();
         let target: Endpoint = "ghost:!target".parse().unwrap();
         let err = initiate_link(&d, requester, target, "Jascha").unwrap_err();
-        assert!(err.contains("mocka"), "err must still name the direct-capable plugins that ARE connected: {err}");
+        assert!(
+            err.contains("mocka"),
+            "err must still name the direct-capable plugins that ARE connected: {err}"
+        );
     }
 
     #[test]
@@ -3724,9 +4825,16 @@ mod tests {
         let target: Endpoint = "mockb:!target".parse().unwrap();
         assert!(initiate_link(&d, requester, target, "Jascha").is_err());
 
-        let due = d.store.lock().unwrap().due_deliveries(Utc::now(), 10).unwrap();
-        assert!(due.iter().all(|de| de.route != IDENTITY_ROUTE),
-            "a rejected initiate_link must not enqueue an @identity delivery");
+        let due = d
+            .store
+            .lock()
+            .unwrap()
+            .due_deliveries(Utc::now(), 10)
+            .unwrap();
+        assert!(
+            due.iter().all(|de| de.route != IDENTITY_ROUTE),
+            "a rejected initiate_link must not enqueue an @identity delivery"
+        );
     }
 
     #[tokio::test]
@@ -3743,29 +4851,55 @@ mod tests {
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
-            store.due_deliveries(now, 10).unwrap().into_iter()
+            store
+                .due_deliveries(now, 10)
+                .unwrap()
+                .into_iter()
                 .find(|de| de.route == IDENTITY_ROUTE)
                 .expect("challenge delivery must be queued on the @identity route")
         };
         assert_eq!(del.destination.protocol, "mockb");
-        assert_eq!(del.destination.endpoint, "+15559876543",
-            "the target's native_ref must be stored in dest_endpoint");
+        assert_eq!(
+            del.destination.endpoint, "+15559876543",
+            "the target's native_ref must be stored in dest_endpoint"
+        );
 
         process_due(&d, del, now).await;
-        let DaemonToPlugin::SendDirect { native_ref, body, .. } = recv_send(&mut rx).await else {
+        let DaemonToPlugin::SendDirect {
+            native_ref, body, ..
+        } = recv_send(&mut rx).await
+        else {
             panic!("expected SendDirect");
         };
         assert_eq!(native_ref, "+15559876543");
-        assert!(body.contains("RelayFabric verification code:"), "body was: {body}");
-        assert!(!body.contains("+15551234567"),
-            "the requester's full ref must never appear in the challenge body: {body}");
+        assert!(
+            body.contains("RelayFabric verification code:"),
+            "body was: {body}"
+        );
+        assert!(
+            !body.contains("+15551234567"),
+            "the requester's full ref must never appear in the challenge body: {body}"
+        );
 
-        let code = body.split("code: ").nth(1).unwrap().split(' ').next().unwrap();
+        let code = body
+            .split("code: ")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
         assert_eq!(code.len(), 6);
         assert!(code.chars().all(|c| c.is_ascii_digit()));
-        let found = d.store.lock().unwrap()
-            .find_active_challenge("mockb", "+15559876543", code, now).unwrap();
-        assert!(found.is_some(), "the code in the SendDirect body must match the stored challenge");
+        let found = d
+            .store
+            .lock()
+            .unwrap()
+            .find_active_challenge("mockb", "+15559876543", code, now)
+            .unwrap();
+        assert!(
+            found.is_some(),
+            "the code in the SendDirect body must match the stored challenge"
+        );
     }
 
     /// RULING 1 (Task 3 review): `enqueue_identity_send` must respect the
@@ -3779,17 +4913,34 @@ mod tests {
     fn initiate_link_over_global_queue_cap_dead_letters_and_returns_queue_full() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("relayfabric.db");
-        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
-            global: crate::config::GlobalLimits { queue_max: 1, ..Default::default() },
-            ..Default::default()
-        });
+        let d = test_daemon_with_limits(
+            dir.path(),
+            crate::config::Limits {
+                global: crate::config::GlobalLimits {
+                    queue_max: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
         let _rx = register_direct_plugin(&d, "mockb");
 
         // fill the global queue to its cap of 1 with an ordinary routed message
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
-        assert_eq!(d.store.lock().unwrap().queue_counts().unwrap(),
-            vec![("pending".to_string(), 1)]);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
+        assert_eq!(
+            d.store.lock().unwrap().queue_counts().unwrap(),
+            vec![("pending".to_string(), 1)]
+        );
 
         let requester: Endpoint = "mocka:!req".parse().unwrap();
         let target: Endpoint = "mockb:!target".parse().unwrap();
@@ -3799,10 +4950,13 @@ mod tests {
         // the @identity delivery landed dead_letter with QUEUE_FULL, not
         // silently dropped (same visibility contract as the per-route case).
         let raw = rusqlite::Connection::open(&db_path).unwrap();
-        let reason: String = raw.query_row(
-            "SELECT reason FROM deliveries WHERE route = '@identity' AND state = 'dead_letter'",
-            [], |r| r.get(0),
-        ).unwrap();
+        let reason: String = raw
+            .query_row(
+                "SELECT reason FROM deliveries WHERE route = '@identity' AND state = 'dead_letter'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(reason, "QUEUE_FULL");
     }
 
@@ -3812,39 +4966,95 @@ mod tests {
     #[test]
     fn confirm_link_over_global_queue_cap_dead_letters_notices_but_still_confirms_link() {
         let dir = tempfile::tempdir().unwrap();
-        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
-            global: crate::config::GlobalLimits { queue_max: 1, ..Default::default() },
-            ..Default::default()
-        });
+        let d = test_daemon_with_limits(
+            dir.path(),
+            crate::config::Limits {
+                global: crate::config::GlobalLimits {
+                    queue_max: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
         let now = Utc::now();
-        seed_challenge(&d, ("mockb", "!target"), ("mocka", "!req"), "424242", "Jascha", now, 15);
+        seed_challenge(
+            &d,
+            ("mockb", "!target"),
+            ("mocka", "!req"),
+            "424242",
+            "Jascha",
+            now,
+            15,
+        );
 
         // fill the global queue to its cap of 1
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
 
-        handle_inbound(&d, "mockb", "chan".into(), "!target".into(), "text".into(),
-                       "424242".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mockb",
+            "chan".into(),
+            "!target".into(),
+            "text".into(),
+            "424242".into(),
+            None,
+            vec![],
+            None,
+        );
 
-        let link = d.store.lock().unwrap().link_for_identity("mockb", "!target").unwrap();
-        assert!(link.is_some(),
-            "the link must still be confirmed even when both notices are queue-capped");
+        let link = d
+            .store
+            .lock()
+            .unwrap()
+            .link_for_identity("mockb", "!target")
+            .unwrap();
+        assert!(
+            link.is_some(),
+            "the link must still be confirmed even when both notices are queue-capped"
+        );
 
         let counts = d.store.lock().unwrap().queue_counts().unwrap();
-        assert!(counts.contains(&("dead_letter".to_string(), 2)),
-            "both best-effort confirmation notices must dead-letter with QUEUE_FULL: {counts:?}");
+        assert!(
+            counts.contains(&("dead_letter".to_string(), 2)),
+            "both best-effort confirmation notices must dead-letter with QUEUE_FULL: {counts:?}"
+        );
     }
 
     // ---- identity linking: confirm interception ----------------------------
 
     fn seed_challenge(
-        d: &Daemon, target: (&str, &str), requester: (&str, &str),
-        code: &str, display_name: &str, now: DateTime<Utc>, ttl_minutes: i64,
+        d: &Daemon,
+        target: (&str, &str),
+        requester: (&str, &str),
+        code: &str,
+        display_name: &str,
+        now: DateTime<Utc>,
+        ttl_minutes: i64,
     ) -> i64 {
-        d.store.lock().unwrap().create_challenge(
-            code, target.0, target.1, requester.0, requester.1,
-            display_name, now, now + CDuration::minutes(ttl_minutes),
-        ).unwrap()
+        d.store
+            .lock()
+            .unwrap()
+            .create_challenge(
+                code,
+                target.0,
+                target.1,
+                requester.0,
+                requester.1,
+                display_name,
+                now,
+                now + CDuration::minutes(ttl_minutes),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -3852,7 +5062,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
         let now = Utc::now();
-        seed_challenge(&d, ("mockb", "!target"), ("mocka", "!req"), "424242", "Jascha", now, 15);
+        seed_challenge(
+            &d,
+            ("mockb", "!target"),
+            ("mocka", "!req"),
+            "424242",
+            "Jascha",
+            now,
+            15,
+        );
 
         // LINKS_VERIFIED is a process-global counter shared by every test in
         // this binary's parallel run, so only a monotonic ">" check is safe
@@ -3862,20 +5080,41 @@ mod tests {
         // count assertion below (confirm_link enqueues a fresh, non-dedup'd
         // row per call, so a double-fire would show up as 4 rows, not 2).
         let before = metrics::LINKS_VERIFIED.load(std::sync::atomic::Ordering::Relaxed);
-        handle_inbound(&d, "mockb", "chan".into(), "!target".into(), "text".into(),
-                       "424242".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mockb",
+            "chan".into(),
+            "!target".into(),
+            "text".into(),
+            "424242".into(),
+            None,
+            vec![],
+            None,
+        );
         let after = metrics::LINKS_VERIFIED.load(std::sync::atomic::Ordering::Relaxed);
         assert!(after > before, "LINKS_VERIFIED must bump");
 
-        let link = d.store.lock().unwrap().link_for_identity("mockb", "!target").unwrap();
+        let link = d
+            .store
+            .lock()
+            .unwrap()
+            .link_for_identity("mockb", "!target")
+            .unwrap();
         assert_eq!(link.unwrap().display_name, "Jascha");
 
         // Not routed: the "general" route (mockb:chan -> mocka:chan) would
         // otherwise have produced a delivery for this exact inbound. Only
         // the two best-effort @identity confirmation notices are queued.
-        let due = d.store.lock().unwrap().due_deliveries(Utc::now(), 10).unwrap();
-        assert!(due.iter().all(|de| de.route == IDENTITY_ROUTE),
-            "the confirming message itself must never be routed: {due:?}");
+        let due = d
+            .store
+            .lock()
+            .unwrap()
+            .due_deliveries(Utc::now(), 10)
+            .unwrap();
+        assert!(
+            due.iter().all(|de| de.route == IDENTITY_ROUTE),
+            "the confirming message itself must never be routed: {due:?}"
+        );
         assert_eq!(due.len(), 2, "one confirmation notice per party: {due:?}");
     }
 
@@ -3884,17 +5123,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
         let now = Utc::now();
-        seed_challenge(&d, ("mockb", "!target"), ("mocka", "!req"), "424242", "Jascha", now, 15);
+        seed_challenge(
+            &d,
+            ("mockb", "!target"),
+            ("mocka", "!req"),
+            "424242",
+            "Jascha",
+            now,
+            15,
+        );
 
         // same protocol, same code, but a DIFFERENT native ref replying.
-        handle_inbound(&d, "mockb", "chan".into(), "!someone-else".into(), "text".into(),
-                       "424242".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mockb",
+            "chan".into(),
+            "!someone-else".into(),
+            "text".into(),
+            "424242".into(),
+            None,
+            vec![],
+            None,
+        );
 
-        assert!(d.store.lock().unwrap().link_for_identity("mockb", "!target").unwrap().is_none(),
-            "a third party sending the code must not confirm the link");
-        assert!(d.store.lock().unwrap()
-            .find_active_challenge("mockb", "!target", "424242", Utc::now()).unwrap().is_some(),
-            "the real target's challenge must remain active");
+        assert!(
+            d.store
+                .lock()
+                .unwrap()
+                .link_for_identity("mockb", "!target")
+                .unwrap()
+                .is_none(),
+            "a third party sending the code must not confirm the link"
+        );
+        assert!(
+            d.store
+                .lock()
+                .unwrap()
+                .find_active_challenge("mockb", "!target", "424242", Utc::now())
+                .unwrap()
+                .is_some(),
+            "the real target's challenge must remain active"
+        );
     }
 
     #[test]
@@ -3902,15 +5171,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
         let now = Utc::now();
-        seed_challenge(&d, ("mockb", "!target"), ("mocka", "!req"), "424242", "Jascha", now, 15);
+        seed_challenge(
+            &d,
+            ("mockb", "!target"),
+            ("mocka", "!req"),
+            "424242",
+            "Jascha",
+            now,
+            15,
+        );
 
-        handle_inbound(&d, "mockb", "chan".into(), "!target".into(), "text".into(),
-                       "999999".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mockb",
+            "chan".into(),
+            "!target".into(),
+            "text".into(),
+            "999999".into(),
+            None,
+            vec![],
+            None,
+        );
 
-        assert!(d.store.lock().unwrap().link_for_identity("mockb", "!target").unwrap().is_none());
-        assert!(d.store.lock().unwrap()
-            .find_active_challenge("mockb", "!target", "424242", Utc::now()).unwrap().is_some(),
-            "the real code must remain valid after a wrong-code attempt");
+        assert!(d
+            .store
+            .lock()
+            .unwrap()
+            .link_for_identity("mockb", "!target")
+            .unwrap()
+            .is_none());
+        assert!(
+            d.store
+                .lock()
+                .unwrap()
+                .find_active_challenge("mockb", "!target", "424242", Utc::now())
+                .unwrap()
+                .is_some(),
+            "the real code must remain valid after a wrong-code attempt"
+        );
     }
 
     #[test]
@@ -3919,13 +5217,37 @@ mod tests {
         let d = test_daemon(dir.path());
         let past = Utc::now() - CDuration::minutes(30);
         // expires_at = past + 15min, still in the past relative to "now" below.
-        seed_challenge(&d, ("mockb", "!target"), ("mocka", "!req"), "424242", "Jascha", past, 15);
+        seed_challenge(
+            &d,
+            ("mockb", "!target"),
+            ("mocka", "!req"),
+            "424242",
+            "Jascha",
+            past,
+            15,
+        );
 
-        handle_inbound(&d, "mockb", "chan".into(), "!target".into(), "text".into(),
-                       "424242".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mockb",
+            "chan".into(),
+            "!target".into(),
+            "text".into(),
+            "424242".into(),
+            None,
+            vec![],
+            None,
+        );
 
-        assert!(d.store.lock().unwrap().link_for_identity("mockb", "!target").unwrap().is_none(),
-            "an expired challenge must not confirm");
+        assert!(
+            d.store
+                .lock()
+                .unwrap()
+                .link_for_identity("mockb", "!target")
+                .unwrap()
+                .is_none(),
+            "an expired challenge must not confirm"
+        );
     }
 
     #[test]
@@ -3933,10 +5255,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
         // no active challenge at all for this sender.
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "123456".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "123456".into(),
+            None,
+            vec![],
+            None,
+        );
 
-        let due = d.store.lock().unwrap().due_deliveries(Utc::now(), 10).unwrap();
+        let due = d
+            .store
+            .lock()
+            .unwrap()
+            .due_deliveries(Utc::now(), 10)
+            .unwrap();
         assert_eq!(due.len(), 1,
             "a 6-digit body with no active challenge bound to the sender must route normally, not vanish");
         assert_eq!(due[0].route, "general");
@@ -3948,33 +5284,83 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
         let now = Utc::now();
-        seed_challenge(&d, ("mocka", "!a"), ("mockb", "!req"), "424242", "Jascha", now, 15);
+        seed_challenge(
+            &d,
+            ("mocka", "!a"),
+            ("mockb", "!req"),
+            "424242",
+            "Jascha",
+            now,
+            15,
+        );
 
         for body in ["42424", "4242422", "42424a", "abcdef", " 424242a"] {
-            handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                           body.into(), None, vec![], None);
+            handle_inbound(
+                &d,
+                "mocka",
+                "chan".into(),
+                "!a".into(),
+                "text".into(),
+                body.into(),
+                None,
+                vec![],
+                None,
+            );
             assert!(
-                d.store.lock().unwrap()
-                    .find_active_challenge("mocka", "!a", "424242", Utc::now()).unwrap().is_some(),
+                d.store
+                    .lock()
+                    .unwrap()
+                    .find_active_challenge("mocka", "!a", "424242", Utc::now())
+                    .unwrap()
+                    .is_some(),
                 "body {body:?} must never consume the active challenge"
             );
         }
-        assert!(d.store.lock().unwrap().link_for_identity("mocka", "!a").unwrap().is_none());
+        assert!(d
+            .store
+            .lock()
+            .unwrap()
+            .link_for_identity("mocka", "!a")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn confirm_interception_is_gated_by_the_sender_rate_limit() {
         let dir = tempfile::tempdir().unwrap();
-        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
-            per_sender: crate::config::PerSender { messages_per_minute: 1, bytes_per_hour: 0 },
-            ..Default::default()
-        });
+        let d = test_daemon_with_limits(
+            dir.path(),
+            crate::config::Limits {
+                per_sender: crate::config::PerSender {
+                    messages_per_minute: 1,
+                    bytes_per_hour: 0,
+                },
+                ..Default::default()
+            },
+        );
         let now = Utc::now();
-        seed_challenge(&d, ("mocka", "!a"), ("mockb", "!req"), "424242", "Jascha", now, 15);
+        seed_challenge(
+            &d,
+            ("mocka", "!a"),
+            ("mockb", "!req"),
+            "424242",
+            "Jascha",
+            now,
+            15,
+        );
 
         // first message from "!a" consumes the 1/minute budget.
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
 
         // the confirming code, from the SAME sender, right after: must be
         // rate-limited before it ever reaches the confirm check. RATELIMITED
@@ -3983,12 +5369,27 @@ mod tests {
         // the challenge-still-active assertion below: if the confirm check
         // had run for this second message (i.e. the rate limiter did NOT
         // gate it first), the challenge would have been consumed.
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "424242".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "424242".into(),
+            None,
+            vec![],
+            None,
+        );
 
-        assert!(d.store.lock().unwrap()
-            .find_active_challenge("mocka", "!a", "424242", Utc::now()).unwrap().is_some(),
-            "a rate-limited confirm attempt must not consume the challenge");
+        assert!(
+            d.store
+                .lock()
+                .unwrap()
+                .find_active_challenge("mocka", "!a", "424242", Utc::now())
+                .unwrap()
+                .is_some(),
+            "a rate-limited confirm attempt must not consume the challenge"
+        );
     }
 
     #[test]
@@ -3996,12 +5397,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
         let now = Utc::now();
-        seed_challenge(&d, ("mocka", "!a"), ("mockb", "!req"), "424242", "Jascha", now, 15);
+        seed_challenge(
+            &d,
+            ("mocka", "!a"),
+            ("mockb", "!req"),
+            "424242",
+            "Jascha",
+            now,
+            15,
+        );
 
         for _ in 0..2 {
             // identical args each call -> identical dedup key.
-            handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                           "424242".into(), None, vec![], None);
+            handle_inbound(
+                &d,
+                "mocka",
+                "chan".into(),
+                "!a".into(),
+                "text".into(),
+                "424242".into(),
+                None,
+                vec![],
+                None,
+            );
         }
 
         // confirm_link's insert_delivery calls are NOT dedup'd/idempotent
@@ -4010,7 +5428,12 @@ mod tests {
         // is a race-free, per-test-isolated proxy for "confirmed exactly
         // once" (LINKS_VERIFIED is a process-global counter shared with
         // other concurrently-running tests, so it isn't a safe signal here).
-        let due = d.store.lock().unwrap().due_deliveries(Utc::now(), 10).unwrap();
+        let due = d
+            .store
+            .lock()
+            .unwrap()
+            .due_deliveries(Utc::now(), 10)
+            .unwrap();
         assert_eq!(due.iter().filter(|de| de.route == IDENTITY_ROUTE).count(), 2,
             "an exact-duplicate replay of the confirming message must be swallowed by dedup, not re-confirmed");
     }
@@ -4022,21 +5445,54 @@ mod tests {
         let now = Utc::now();
 
         // target already linked to some old partner...
-        d.store.lock().unwrap()
-            .insert_link("mocka", "!a", "mockc", "!old-a", "Old A", now).unwrap();
+        d.store
+            .lock()
+            .unwrap()
+            .insert_link("mocka", "!a", "mockc", "!old-a", "Old A", now)
+            .unwrap();
         // ...and the requester ALSO already linked to some other old partner.
-        d.store.lock().unwrap()
-            .insert_link("mockb", "!req", "mockd", "!old-req", "Old Req", now).unwrap();
+        d.store
+            .lock()
+            .unwrap()
+            .insert_link("mockb", "!req", "mockd", "!old-req", "Old Req", now)
+            .unwrap();
 
-        seed_challenge(&d, ("mocka", "!a"), ("mockb", "!req"), "111222", "Fresh", now, 15);
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "111222".into(), None, vec![], None);
+        seed_challenge(
+            &d,
+            ("mocka", "!a"),
+            ("mockb", "!req"),
+            "111222",
+            "Fresh",
+            now,
+            15,
+        );
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "111222".into(),
+            None,
+            vec![],
+            None,
+        );
 
         let store = d.store.lock().unwrap();
-        assert!(store.link_for_identity("mockc", "!old-a").unwrap().is_none(),
-            "the target's old partner must be unlinked (replace, not stack)");
-        assert!(store.link_for_identity("mockd", "!old-req").unwrap().is_none(),
-            "the requester's old partner must be unlinked (replace, not stack)");
+        assert!(
+            store
+                .link_for_identity("mockc", "!old-a")
+                .unwrap()
+                .is_none(),
+            "the target's old partner must be unlinked (replace, not stack)"
+        );
+        assert!(
+            store
+                .link_for_identity("mockd", "!old-req")
+                .unwrap()
+                .is_none(),
+            "the requester's old partner must be unlinked (replace, not stack)"
+        );
         let fresh = store.link_for_identity("mocka", "!a").unwrap().unwrap();
         assert_eq!(fresh.display_name, "Fresh");
         assert!(store.link_for_identity("mockb", "!req").unwrap().is_some());
@@ -4049,7 +5505,8 @@ mod tests {
     /// default, ~17k attempts) is pure churn, so this must dead-letter
     /// promptly with a reason an operator can act on, not mark_retry.
     #[tokio::test]
-    async fn process_due_identity_dead_letters_promptly_when_plugin_connected_but_not_direct_capable() {
+    async fn process_due_identity_dead_letters_promptly_when_plugin_connected_but_not_direct_capable(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let d = Arc::new(test_daemon(dir.path()));
         let _rx = register_plugin(&d, "mockb", false); // connected, but NOT direct-capable
@@ -4057,12 +5514,23 @@ mod tests {
         let target: Endpoint = "mockb:!target".parse().unwrap();
         let now = Utc::now();
         let env = Envelope::new(
-            "identity:system".parse().unwrap(), Sender { native_ref: "@identity".into() },
-            "notice".into(), "code".into(), now, now + CDuration::minutes(15), 8,
+            "identity:system".parse().unwrap(),
+            Sender {
+                native_ref: "@identity".into(),
+            },
+            "notice".into(),
+            "code".into(),
+            now,
+            now + CDuration::minutes(15),
+            8,
         );
         d.store.lock().unwrap().insert_message(&env).unwrap();
-        let del_id = d.store.lock().unwrap()
-            .insert_delivery(env.id, IDENTITY_ROUTE, &target, now, env.expires_at, 2).unwrap();
+        let del_id = d
+            .store
+            .lock()
+            .unwrap()
+            .insert_delivery(env.id, IDENTITY_ROUTE, &target, now, env.expires_at, 2)
+            .unwrap();
         let del = d.store.lock().unwrap().deliveries_for_id(del_id).unwrap();
 
         process_due(&d, del, now).await;
@@ -4086,12 +5554,23 @@ mod tests {
         let target: Endpoint = "mockb:!target".parse().unwrap();
         let now = Utc::now();
         let env = Envelope::new(
-            "identity:system".parse().unwrap(), Sender { native_ref: "@identity".into() },
-            "notice".into(), "code".into(), now, now + CDuration::minutes(15), 8,
+            "identity:system".parse().unwrap(),
+            Sender {
+                native_ref: "@identity".into(),
+            },
+            "notice".into(),
+            "code".into(),
+            now,
+            now + CDuration::minutes(15),
+            8,
         );
         d.store.lock().unwrap().insert_message(&env).unwrap();
-        let del_id = d.store.lock().unwrap()
-            .insert_delivery(env.id, IDENTITY_ROUTE, &target, now, env.expires_at, 2).unwrap();
+        let del_id = d
+            .store
+            .lock()
+            .unwrap()
+            .insert_delivery(env.id, IDENTITY_ROUTE, &target, now, env.expires_at, 2)
+            .unwrap();
         let del = d.store.lock().unwrap().deliveries_for_id(del_id).unwrap();
 
         process_due(&d, del, now).await;
@@ -4099,7 +5578,10 @@ mod tests {
         let after = d.store.lock().unwrap().deliveries_for_id(del_id).unwrap();
         assert_eq!(after.state, "pending",
             "a disconnected plugin may still reconnect, so this must keep retrying, not dead-letter");
-        assert!(after.next_attempt > now, "retry must be scheduled in the future");
+        assert!(
+            after.next_attempt > now,
+            "retry must be scheduled in the future"
+        );
     }
 
     /// End-to-end through `confirm_link` (design §Lifecycle step 2): today
@@ -4111,38 +5593,89 @@ mod tests {
     /// initiate) still gets attempted, and the link row exists regardless of
     /// either notice's fate.
     #[tokio::test]
-    async fn confirm_link_dead_letters_requester_notice_when_requester_plugin_lacks_direct_messages() {
+    async fn confirm_link_dead_letters_requester_notice_when_requester_plugin_lacks_direct_messages(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let d = Arc::new(test_daemon(dir.path()));
         let mut target_rx = register_direct_plugin(&d, "mockb"); // target: direct-capable
         let _requester_rx = register_plugin(&d, "mocka", false); // requester: connected, NOT direct-capable
 
         let now = Utc::now();
-        seed_challenge(&d, ("mockb", "!target"), ("mocka", "!req"), "424242", "Jascha", now, 15);
+        seed_challenge(
+            &d,
+            ("mockb", "!target"),
+            ("mocka", "!req"),
+            "424242",
+            "Jascha",
+            now,
+            15,
+        );
 
-        handle_inbound(&d, "mockb", "chan".into(), "!target".into(), "text".into(),
-                       "424242".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mockb",
+            "chan".into(),
+            "!target".into(),
+            "text".into(),
+            "424242".into(),
+            None,
+            vec![],
+            None,
+        );
 
         // link exists regardless of either notice's fate
-        assert!(d.store.lock().unwrap().link_for_identity("mockb", "!target").unwrap().is_some(),
-            "the link must be confirmed even though the requester's plugin can't take the notice");
+        assert!(
+            d.store
+                .lock()
+                .unwrap()
+                .link_for_identity("mockb", "!target")
+                .unwrap()
+                .is_some(),
+            "the link must be confirmed even though the requester's plugin can't take the notice"
+        );
 
-        let due = d.store.lock().unwrap().due_deliveries(Utc::now(), 10).unwrap();
+        let due = d
+            .store
+            .lock()
+            .unwrap()
+            .due_deliveries(Utc::now(), 10)
+            .unwrap();
         assert_eq!(due.len(), 2, "one confirmation notice per party: {due:?}");
-        let target_del = due.iter().find(|de| de.destination.protocol == "mockb").unwrap().clone();
-        let requester_del = due.iter().find(|de| de.destination.protocol == "mocka").unwrap().clone();
+        let target_del = due
+            .iter()
+            .find(|de| de.destination.protocol == "mockb")
+            .unwrap()
+            .clone();
+        let requester_del = due
+            .iter()
+            .find(|de| de.destination.protocol == "mocka")
+            .unwrap()
+            .clone();
 
         process_due(&d, requester_del.clone(), now).await;
-        let after_requester = d.store.lock().unwrap().deliveries_for_id(requester_del.id).unwrap();
-        assert_eq!(after_requester.state, "dead_letter",
-            "the requester-side notice must dead-letter promptly, not retry for 24h");
-        assert_eq!(after_requester.reason.as_deref(), Some("NOT_DIRECT_CAPABLE"));
+        let after_requester = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(requester_del.id)
+            .unwrap();
+        assert_eq!(
+            after_requester.state, "dead_letter",
+            "the requester-side notice must dead-letter promptly, not retry for 24h"
+        );
+        assert_eq!(
+            after_requester.reason.as_deref(),
+            Some("NOT_DIRECT_CAPABLE")
+        );
 
         process_due(&d, target_del, now).await;
         let DaemonToPlugin::SendDirect { native_ref, .. } = recv_send(&mut target_rx).await else {
             panic!("expected SendDirect");
         };
-        assert_eq!(native_ref, "!target", "the target-side notice must still be attempted");
+        assert_eq!(
+            native_ref, "!target",
+            "the target-side notice must still be attempted"
+        );
     }
 
     // ---- identity linking: rendering ---------------------------------------
@@ -4155,13 +5688,33 @@ mod tests {
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", false);
 
-        d.store.lock().unwrap()
-            .insert_link("mocka", "!a", "signal", "+1", "Jascha", Utc::now()).unwrap();
+        d.store
+            .lock()
+            .unwrap()
+            .insert_link("mocka", "!a", "signal", "+1", "Jascha", Utc::now())
+            .unwrap();
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
         let now = Utc::now();
-        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        let del = {
+            let store = d.store.lock().unwrap();
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+        };
         process_due(&d, del, now).await;
 
         let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
@@ -4171,18 +5724,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_due_never_renders_display_name_on_a_route_that_has_not_opted_into_linked_mode() {
+    async fn process_due_never_renders_display_name_on_a_route_that_has_not_opted_into_linked_mode()
+    {
         let dir = tempfile::tempdir().unwrap();
         let d = Arc::new(test_daemon(dir.path())); // default identity_mode: "pseudonymous"
         let mut rx = register_plugin(&d, "mockb", false);
 
-        d.store.lock().unwrap()
-            .insert_link("mocka", "!a", "signal", "+1", "Jascha", Utc::now()).unwrap();
+        d.store
+            .lock()
+            .unwrap()
+            .insert_link("mocka", "!a", "signal", "+1", "Jascha", Utc::now())
+            .unwrap();
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
         let now = Utc::now();
-        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        let del = {
+            let store = d.store.lock().unwrap();
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+        };
         process_due(&d, del, now).await;
 
         let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
@@ -4200,16 +5774,36 @@ mod tests {
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", false);
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
         let now = Utc::now();
-        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        let del = {
+            let store = d.store.lock().unwrap();
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+        };
         process_due(&d, del, now).await;
 
         let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
             panic!("expected Send");
         };
-        assert!(!body.contains("Jascha"), "with no verified link, linked mode must fall back to the alias: {body}");
+        assert!(
+            !body.contains("Jascha"),
+            "with no verified link, linked mode must fall back to the alias: {body}"
+        );
     }
 
     #[tokio::test]
@@ -4220,14 +5814,35 @@ mod tests {
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", false);
 
-        let link_id = d.store.lock().unwrap()
-            .insert_link("mocka", "!a", "signal", "+1", "Jascha", Utc::now()).unwrap();
+        let link_id = d
+            .store
+            .lock()
+            .unwrap()
+            .insert_link("mocka", "!a", "signal", "+1", "Jascha", Utc::now())
+            .unwrap();
 
         // first message: linked, renders display_name.
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "first".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "first".into(),
+            None,
+            vec![],
+            None,
+        );
         let now = Utc::now();
-        let del1 = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        let del1 = {
+            let store = d.store.lock().unwrap();
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+        };
         process_due(&d, del1, now).await;
         let DaemonToPlugin::Send { body: body1, .. } = recv_send(&mut rx).await else {
             panic!("expected Send");
@@ -4241,15 +5856,35 @@ mod tests {
         // second message from the same identity must revert to the
         // pseudonym immediately: rendering reads links live (§95/§22), never
         // cached from the first delivery.
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "second".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "second".into(),
+            None,
+            vec![],
+            None,
+        );
         let now2 = Utc::now();
-        let del2 = { let store = d.store.lock().unwrap(); store.due_deliveries(now2, 1).unwrap().into_iter().next().unwrap() };
+        let del2 = {
+            let store = d.store.lock().unwrap();
+            store
+                .due_deliveries(now2, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+        };
         process_due(&d, del2, now2).await;
         let DaemonToPlugin::Send { body: body2, .. } = recv_send(&mut rx).await else {
             panic!("expected Send");
         };
-        assert!(!body2.contains("Jascha"), "after unlink, rendering must revert to the pseudonym: {body2}");
+        assert!(
+            !body2.contains("Jascha"),
+            "after unlink, rendering must revert to the pseudonym: {body2}"
+        );
     }
 
     // ---- design §4: route render knobs (tag: none, max_chars) -------------
@@ -4262,16 +5897,36 @@ mod tests {
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", false);
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
         let now = Utc::now();
-        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        let del = {
+            let store = d.store.lock().unwrap();
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+        };
         process_due(&d, del, now).await;
 
         let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
             panic!("expected Send");
         };
-        assert_eq!(body, "hello", "tag: none must omit the [alias]\\n prefix entirely: {body}");
+        assert_eq!(
+            body, "hello",
+            "tag: none must omit the [alias]\\n prefix entirely: {body}"
+        );
     }
 
     /// design §4: "the route opted out of tags altogether" — `tag: none`
@@ -4288,20 +5943,42 @@ mod tests {
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", false);
 
-        d.store.lock().unwrap()
-            .insert_link("mocka", "!a", "signal", "+1", "Jascha", Utc::now()).unwrap();
+        d.store
+            .lock()
+            .unwrap()
+            .insert_link("mocka", "!a", "signal", "+1", "Jascha", Utc::now())
+            .unwrap();
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
         let now = Utc::now();
-        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        let del = {
+            let store = d.store.lock().unwrap();
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+        };
         process_due(&d, del, now).await;
 
         let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
             panic!("expected Send");
         };
-        assert_eq!(body, "hello",
-            "tag: none must suppress the linked display_name too, not just the pseudonym: {body}");
+        assert_eq!(
+            body, "hello",
+            "tag: none must suppress the linked display_name too, not just the pseudonym: {body}"
+        );
     }
 
     /// Fix round 1: `max_chars` truncates the BODY only, so the `[alias]\n`
@@ -4315,17 +5992,40 @@ mod tests {
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", false);
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "this body is much longer than twenty characters".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "this body is much longer than twenty characters".into(),
+            None,
+            vec![],
+            None,
+        );
         let now = Utc::now();
-        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        let del = {
+            let store = d.store.lock().unwrap();
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+        };
         process_due(&d, del, now).await;
 
         let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
             panic!("expected Send");
         };
-        assert!(body.starts_with('['), "tag prefix must still be present: {body}");
-        let after_tag = body.split_once('\n').expect("tag prefix followed by a newline").1;
+        assert!(
+            body.starts_with('['),
+            "tag prefix must still be present: {body}"
+        );
+        let after_tag = body
+            .split_once('\n')
+            .expect("tag prefix followed by a newline")
+            .1;
         assert_eq!(after_tag.chars().count(), 20,
             "route-level max_chars must truncate only the body (post-tag) to exactly 20 chars: {body}");
         assert!(after_tag.ends_with('…'), "body was: {body}");
@@ -4346,21 +6046,53 @@ mod tests {
         let d = Arc::new(d);
         let mut rx = register_plugin(&d, "mockb", false);
 
-        d.store.lock().unwrap()
-            .insert_link("mocka", "!a", "signal", "+1", "AVeryLongDisplayNameIndeed", Utc::now()).unwrap();
+        d.store
+            .lock()
+            .unwrap()
+            .insert_link(
+                "mocka",
+                "!a",
+                "signal",
+                "+1",
+                "AVeryLongDisplayNameIndeed",
+                Utc::now(),
+            )
+            .unwrap();
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "this body is much longer than sixteen characters".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "this body is much longer than sixteen characters".into(),
+            None,
+            vec![],
+            None,
+        );
         let now = Utc::now();
-        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        let del = {
+            let store = d.store.lock().unwrap();
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+        };
         process_due(&d, del, now).await;
 
         let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
             panic!("expected Send");
         };
-        assert!(body.starts_with("[AVeryLongDisplayNameIndeed]\n"),
-            "a long linked display_name must never be truncated by render.max_chars: {body}");
-        assert!(body.contains('…'), "the body must still be truncated: {body}");
+        assert!(
+            body.starts_with("[AVeryLongDisplayNameIndeed]\n"),
+            "a long linked display_name must never be truncated by render.max_chars: {body}"
+        );
+        assert!(
+            body.contains('…'),
+            "the body must still be truncated: {body}"
+        );
     }
 
     /// design decision (fix round 1, point 4): attachment-strip notes are
@@ -4369,7 +6101,8 @@ mod tests {
     /// attachment must reliably reach the recipient even when the body
     /// itself is truncated to make room.
     #[tokio::test]
-    async fn render_max_chars_truncates_body_before_notes_are_appended_notes_not_counted_toward_max_chars() {
+    async fn render_max_chars_truncates_body_before_notes_are_appended_notes_not_counted_toward_max_chars(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
         d.cfg.write().unwrap().routes[0].render.max_chars = 16;
@@ -4377,26 +6110,50 @@ mod tests {
         let mut rx = register_plugin(&d, "mockb", false); // no attachments capability
 
         let att = IpcAttachment {
-            filename: "photo.jpg".into(), mime: "image/jpeg".into(), data: b"bytes".to_vec(),
+            filename: "photo.jpg".into(),
+            mime: "image/jpeg".into(),
+            data: b"bytes".to_vec(),
         };
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "this body is much longer than sixteen characters".into(), None, vec![att], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "this body is much longer than sixteen characters".into(),
+            None,
+            vec![att],
+            None,
+        );
         let now = Utc::now();
-        let del = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap() };
+        let del = {
+            let store = d.store.lock().unwrap();
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+        };
         process_due(&d, del, now).await;
 
         let DaemonToPlugin::Send { body, .. } = recv_send(&mut rx).await else {
             panic!("expected Send");
         };
-        assert!(body.contains("[attachment omitted]"),
-            "the note must survive even though the body was truncated to make room: {body}");
+        assert!(
+            body.contains("[attachment omitted]"),
+            "the note must survive even though the body was truncated to make room: {body}"
+        );
         // The truncated-body portion (everything after the tag, up through
         // the truncation ellipsis) is exactly 16 chars -- the note text
         // itself is not counted toward that budget.
         let note_start = body.find("\n[attachment omitted]").expect("note present");
         let body_only = &body[body.find('\n').unwrap() + 1..note_start];
-        assert_eq!(body_only.chars().count(), 16,
-            "max_chars must bound the body alone, not the body+note total: {body}");
+        assert_eq!(
+            body_only.chars().count(),
+            16,
+            "max_chars must bound the body alone, not the body+note total: {body}"
+        );
     }
 
     // ---- apply_config (design §1: hot-reloadable config behind RwLock) ----
@@ -4407,7 +6164,10 @@ mod tests {
         let d = test_daemon(dir.path());
         let new_cfg = d.cfg.read().unwrap().clone();
         let outcome = d.apply_config(new_cfg);
-        assert!(outcome.restart_required.is_empty(), "outcome was: {outcome:?}");
+        assert!(
+            outcome.restart_required.is_empty(),
+            "outcome was: {outcome:?}"
+        );
     }
 
     #[test]
@@ -4446,9 +6206,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
         let mut new_cfg = d.cfg.read().unwrap().clone();
-        new_cfg.plugins.insert("mockc".to_string(), crate::config::PluginConfig {
-            enabled: true, command: None, config: serde_yaml::Value::Null,
-        });
+        new_cfg.plugins.insert(
+            "mockc".to_string(),
+            crate::config::PluginConfig {
+                enabled: true,
+                command: None,
+                config: serde_yaml::Value::Null,
+            },
+        );
         let outcome = d.apply_config(new_cfg);
         assert_eq!(outcome.restart_required, vec!["mockc".to_string()]);
     }
@@ -4538,7 +6303,10 @@ mod tests {
 
         let new_cfg = d.cfg.read().unwrap().clone();
         let outcome = d.apply_config(new_cfg);
-        assert!(outcome.restart_required.is_empty(), "outcome was: {outcome:?}");
+        assert!(
+            outcome.restart_required.is_empty(),
+            "outcome was: {outcome:?}"
+        );
     }
 
     /// Design §1/§4, cycle G: `discovery` gets the same `"daemon"`
@@ -4564,7 +6332,10 @@ mod tests {
 
         let new_cfg = d.cfg.read().unwrap().clone();
         let outcome = d.apply_config(new_cfg);
-        assert!(outcome.restart_required.is_empty(), "outcome was: {outcome:?}");
+        assert!(
+            outcome.restart_required.is_empty(),
+            "outcome was: {outcome:?}"
+        );
     }
 
     /// Design §3, SPEC §113.1/§113.2, cycle H: a route's `security_mode`
@@ -4579,7 +6350,10 @@ mod tests {
         let mut new_cfg = d.cfg.read().unwrap().clone();
         new_cfg.routes[0].security_mode = "sealed".to_string();
         let outcome = d.apply_config(new_cfg);
-        assert!(outcome.restart_required.is_empty(), "outcome was: {outcome:?}");
+        assert!(
+            outcome.restart_required.is_empty(),
+            "outcome was: {outcome:?}"
+        );
     }
 
     /// Design §2 (transport-class cycle, task 2): a `transports:`-only
@@ -4614,7 +6388,10 @@ mod tests {
             },
         );
         let outcome = d.apply_config(new_cfg);
-        assert!(outcome.restart_required.is_empty(), "outcome was: {outcome:?}");
+        assert!(
+            outcome.restart_required.is_empty(),
+            "outcome was: {outcome:?}"
+        );
 
         let after = d.cfg_snapshot(|c| c.transport_policy("mocka"));
         assert_eq!(after.max_payload_bytes, 32768);
@@ -4635,7 +6412,10 @@ mod tests {
         new_cfg.privacy.allow_gateway_decryption = false;
         new_cfg.privacy.allow_protocol_downgrade = false;
         let outcome = d.apply_config(new_cfg);
-        assert!(outcome.restart_required.is_empty(), "outcome was: {outcome:?}");
+        assert!(
+            outcome.restart_required.is_empty(),
+            "outcome was: {outcome:?}"
+        );
     }
 
     #[test]
@@ -4645,12 +6425,23 @@ mod tests {
         let mut new_cfg = d.cfg.read().unwrap().clone();
         new_cfg.node.public = !new_cfg.node.public;
         new_cfg.plugins.get_mut("mockb").unwrap().enabled = false;
-        new_cfg.plugins.insert("aaa-new".to_string(), crate::config::PluginConfig {
-            enabled: true, command: None, config: serde_yaml::Value::Null,
-        });
+        new_cfg.plugins.insert(
+            "aaa-new".to_string(),
+            crate::config::PluginConfig {
+                enabled: true,
+                command: None,
+                config: serde_yaml::Value::Null,
+            },
+        );
         let outcome = d.apply_config(new_cfg);
-        assert_eq!(outcome.restart_required,
-            vec!["aaa-new".to_string(), "daemon".to_string(), "mockb".to_string()]);
+        assert_eq!(
+            outcome.restart_required,
+            vec![
+                "aaa-new".to_string(),
+                "daemon".to_string(),
+                "mockb".to_string()
+            ]
+        );
     }
 
     /// Live-effect half of the matrix: a route added via `apply_config` must
@@ -4661,8 +6452,17 @@ mod tests {
         let d = test_daemon(dir.path());
 
         // "newchan" isn't wired into any route in the base config: dropped.
-        handle_inbound(&d, "mocka", "newchan".into(), "!a".into(), "text".into(),
-                       "before".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "newchan".into(),
+            "!a".into(),
+            "text".into(),
+            "before".into(),
+            None,
+            vec![],
+            None,
+        );
         assert_eq!(d.store.lock().unwrap().queue_counts().unwrap(), vec![]);
 
         let mut new_cfg = d.cfg.read().unwrap().clone();
@@ -4676,14 +6476,27 @@ mod tests {
             allow_gateway_decryption: None,
         });
         let outcome = d.apply_config(new_cfg);
-        assert!(outcome.restart_required.is_empty(),
-            "a route addition alone must never require a restart: {outcome:?}");
+        assert!(
+            outcome.restart_required.is_empty(),
+            "a route addition alone must never require a restart: {outcome:?}"
+        );
 
-        handle_inbound(&d, "mocka", "newchan".into(), "!a".into(), "text".into(),
-                       "after".into(), None, vec![], None);
-        assert_eq!(d.store.lock().unwrap().queue_counts().unwrap(),
+        handle_inbound(
+            &d,
+            "mocka",
+            "newchan".into(),
+            "!a".into(),
+            "text".into(),
+            "after".into(),
+            None,
+            vec![],
+            None,
+        );
+        assert_eq!(
+            d.store.lock().unwrap().queue_counts().unwrap(),
             vec![("pending".to_string(), 1)],
-            "the new route must be live without a restart");
+            "the new route must be live without a restart"
+        );
     }
 
     /// Live-effect half of the matrix: tightening `per_sender` must rebuild
@@ -4699,15 +6512,35 @@ mod tests {
         new_cfg.limits.per_sender.messages_per_minute = 1;
         d.apply_config(new_cfg);
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "one".into(), None, vec![], None);
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "two".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "one".into(),
+            None,
+            vec![],
+            None,
+        );
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "two".into(),
+            None,
+            vec![],
+            None,
+        );
 
-        assert_eq!(d.store.lock().unwrap().queue_counts().unwrap(),
+        assert_eq!(
+            d.store.lock().unwrap().queue_counts().unwrap(),
             vec![("pending".to_string(), 1)],
             "the second message from the same sender must be rate-limited \
-             immediately after tightening, no restart involved");
+             immediately after tightening, no restart involved"
+        );
     }
 
     /// `apply_config` must store the incoming config's `raw_yaml` (Task 3's
@@ -4718,7 +6551,11 @@ mod tests {
     fn apply_config_stores_the_new_configs_raw_yaml() {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
-        assert_eq!(d.cfg.read().unwrap().raw_yaml, "", "test_daemon's Config has no raw_yaml");
+        assert_eq!(
+            d.cfg.read().unwrap().raw_yaml,
+            "",
+            "test_daemon's Config has no raw_yaml"
+        );
 
         let mut new_cfg = d.cfg.read().unwrap().clone();
         new_cfg.raw_yaml = "node:\n  name: applied\n".to_string();
@@ -4768,10 +6605,12 @@ routes:
         let outcome = d.apply_config(cfg2);
         std::env::remove_var("RF_ENGINE_TEST_APPLY_SECRET");
 
-        assert!(outcome.restart_required.is_empty(),
+        assert!(
+            outcome.restart_required.is_empty(),
             "re-applying an unchanged config (secret resolved via the same \
              env var both times) must not report a false-positive restart: \
-             {outcome:?}");
+             {outcome:?}"
+        );
     }
 
     /// Carried fix (Task 1 review, Important -> Task 3): `apply_config` must
@@ -4799,22 +6638,54 @@ routes:
         t2.join().unwrap();
 
         let final_limit = d.cfg_snapshot(|c| c.limits.per_sender.messages_per_minute);
-        assert!(final_limit == 1 || final_limit == 1000, "unexpected limit: {final_limit}");
+        assert!(
+            final_limit == 1 || final_limit == 1000,
+            "unexpected limit: {final_limit}"
+        );
 
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "one".into(), None, vec![], None);
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "two".into(), None, vec![], None);
-        let pending = d.store.lock().unwrap().queue_counts().unwrap()
-            .into_iter().find(|(state, _)| state == "pending")
-            .map(|(_, n)| n).unwrap_or(0);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "one".into(),
+            None,
+            vec![],
+            None,
+        );
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "two".into(),
+            None,
+            vec![],
+            None,
+        );
+        let pending = d
+            .store
+            .lock()
+            .unwrap()
+            .queue_counts()
+            .unwrap()
+            .into_iter()
+            .find(|(state, _)| state == "pending")
+            .map(|(_, n)| n)
+            .unwrap_or(0);
 
         if final_limit == 1 {
-            assert_eq!(pending, 1,
-                "cfg ended up with the tight limit but the limiter let both messages through");
+            assert_eq!(
+                pending, 1,
+                "cfg ended up with the tight limit but the limiter let both messages through"
+            );
         } else {
-            assert_eq!(pending, 2,
-                "cfg ended up with the loose limit but the limiter rate-limited the second message");
+            assert_eq!(
+                pending, 2,
+                "cfg ended up with the loose limit but the limiter rate-limited the second message"
+            );
         }
     }
 
@@ -4829,10 +6700,22 @@ routes:
     fn emit_event_with_no_subscribers_at_send_time_reaches_a_later_subscriber_never() {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
         let mut rx = d.events.subscribe();
-        assert!(rx.try_recv().is_err(), "a late subscriber must not see a pre-subscription event");
+        assert!(
+            rx.try_recv().is_err(),
+            "a late subscriber must not see a pre-subscription event"
+        );
     }
 
     #[test]
@@ -4841,20 +6724,41 @@ routes:
         let d = test_daemon(dir.path());
         let mut rx = d.events.subscribe();
 
-        handle_inbound(&d, "mocka", "chan".into(), "+15551234567".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "+15551234567".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
 
-        let ev = rx.try_recv().expect("handle_inbound must emit an Ingress event on accept");
+        let ev = rx
+            .try_recv()
+            .expect("handle_inbound must emit an Ingress event on accept");
         match ev {
-            Event::Ingress { protocol, sender_masked, routes, .. } => {
+            Event::Ingress {
+                protocol,
+                sender_masked,
+                routes,
+                ..
+            } => {
                 assert_eq!(protocol, "mocka");
-                assert_eq!(sender_masked, "mocka:+1****4567",
-                    "sender must appear only in the masked \"protocol:masked_ref\" compound form");
+                assert_eq!(
+                    sender_masked, "mocka:+1****4567",
+                    "sender must appear only in the masked \"protocol:masked_ref\" compound form"
+                );
                 assert_eq!(routes, vec!["general".to_string()]);
             }
             other => panic!("expected Ingress, got {other:?}"),
         }
-        assert!(rx.try_recv().is_err(), "exactly one Ingress event per accepted message");
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one Ingress event per accepted message"
+        );
     }
 
     #[test]
@@ -4862,15 +6766,33 @@ routes:
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
         let mut rx = d.events.subscribe();
-        handle_inbound(&d, "mocka", "elsewhere".into(), "!a".into(), "text".into(),
-                       "hi".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "elsewhere".into(),
+            "!a".into(),
+            "text".into(),
+            "hi".into(),
+            None,
+            vec![],
+            None,
+        );
         assert!(rx.try_recv().is_err(),
             "an unrouted (deny-by-default) message must not emit Ingress -- design §4 says \"post-accept\"");
     }
 
     fn deliver_one_message(d: &Daemon) -> (i64, uuid::Uuid) {
-        handle_inbound(d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
         let store = d.store.lock().unwrap();
         let due = store.due_deliveries(Utc::now(), 10).unwrap();
         store.mark_attempting(due[0].id).unwrap();
@@ -4887,11 +6809,19 @@ routes:
         let mut rx = d.events.subscribe();
         handle_result(&d, delivery_id, true, None);
 
-        let ev = rx.try_recv().expect("handle_result(delivered) must emit a Delivery event");
-        let Event::Delivery { id, route, state, .. } = ev else {
+        let ev = rx
+            .try_recv()
+            .expect("handle_result(delivered) must emit a Delivery event");
+        let Event::Delivery {
+            id, route, state, ..
+        } = ev
+        else {
             panic!("expected Delivery, got {ev:?}");
         };
-        assert_eq!(id, message_id, "id must be the message UUID, correlating with its Ingress event");
+        assert_eq!(
+            id, message_id,
+            "id must be the message UUID, correlating with its Ingress event"
+        );
         assert_eq!(route, "general");
         assert_eq!(state, "delivered");
     }
@@ -4905,22 +6835,35 @@ routes:
         let mut rx = d.events.subscribe();
         handle_result(&d, delivery_id, false, Some("boom".into()));
 
-        let ev = rx.try_recv().expect("handle_result(retry) must emit a Delivery event");
+        let ev = rx
+            .try_recv()
+            .expect("handle_result(retry) must emit a Delivery event");
         let Event::Delivery { route, state, .. } = ev else {
             panic!("expected Delivery, got {ev:?}");
         };
         assert_eq!(route, "general");
-        assert_eq!(state, "retry",
+        assert_eq!(
+            state, "retry",
             "an in-budget failure must report the semantic \"retry\" label, \
-             not the raw \"pending\" deliveries.state column value");
+             not the raw \"pending\" deliveries.state column value"
+        );
     }
 
     #[test]
     fn handle_result_emits_delivery_event_state_dead_letter_once_attempts_are_exhausted() {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
         let delivery_id = {
             let store = d.store.lock().unwrap();
             let due = store.due_deliveries(Utc::now(), 10).unwrap();
@@ -4933,7 +6876,9 @@ routes:
         let mut rx = d.events.subscribe();
         handle_result(&d, delivery_id, false, Some("boom".into()));
 
-        let ev = rx.try_recv().expect("handle_result(dead_letter) must emit a Delivery event");
+        let ev = rx
+            .try_recv()
+            .expect("handle_result(dead_letter) must emit a Delivery event");
         let Event::Delivery { route, state, .. } = ev else {
             panic!("expected Delivery, got {ev:?}");
         };
@@ -4945,20 +6890,47 @@ routes:
     fn confirm_link_emits_link_verified_with_only_the_opaque_link_id() {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
-        seed_challenge(&d, ("mockb", "!target"), ("mocka", "!req"), "424242", "Jascha", Utc::now(), 15);
+        seed_challenge(
+            &d,
+            ("mockb", "!target"),
+            ("mocka", "!req"),
+            "424242",
+            "Jascha",
+            Utc::now(),
+            15,
+        );
 
         let mut rx = d.events.subscribe();
-        handle_inbound(&d, "mockb", "chan".into(), "!target".into(), "text".into(),
-                       "424242".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mockb",
+            "chan".into(),
+            "!target".into(),
+            "text".into(),
+            "424242".into(),
+            None,
+            vec![],
+            None,
+        );
 
-        let ev = rx.try_recv().expect("a matched confirm must emit a LinkVerified event");
+        let ev = rx
+            .try_recv()
+            .expect("a matched confirm must emit a LinkVerified event");
         let Event::LinkVerified { link_id, .. } = ev else {
             panic!("expected LinkVerified, got {ev:?}");
         };
-        let link = d.store.lock().unwrap().link_for_identity("mockb", "!target").unwrap().unwrap();
+        let link = d
+            .store
+            .lock()
+            .unwrap()
+            .link_for_identity("mockb", "!target")
+            .unwrap()
+            .unwrap();
         assert_eq!(link_id, link.id);
-        assert!(rx.try_recv().is_err(),
-            "the confirming message itself must not also emit an Ingress event (it's never routed)");
+        assert!(
+            rx.try_recv().is_err(),
+            "the confirming message itself must not also emit an Ingress event (it's never routed)"
+        );
     }
 
     #[test]
@@ -4971,8 +6943,13 @@ routes:
         let mut rx = d.events.subscribe();
         let outcome = d.apply_config(new_cfg);
 
-        let ev = rx.try_recv().expect("apply_config must emit a ConfigApplied event");
-        let Event::ConfigApplied { restart_required, .. } = ev else {
+        let ev = rx
+            .try_recv()
+            .expect("apply_config must emit a ConfigApplied event");
+        let Event::ConfigApplied {
+            restart_required, ..
+        } = ev
+        else {
             panic!("expected ConfigApplied, got {ev:?}");
         };
         assert_eq!(restart_required, outcome.restart_required);
@@ -4997,8 +6974,17 @@ routes:
         let mut rx = d.events.subscribe();
 
         // leg 1+2: ingress + a delivered delivery
-        handle_inbound(&d, "mocka", "chan".into(), SENTINEL_REF.into(), "text".into(),
-                       SENTINEL_BODY.into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            SENTINEL_REF.into(),
+            "text".into(),
+            SENTINEL_BODY.into(),
+            None,
+            vec![],
+            None,
+        );
         let delivery_id = {
             let store = d.store.lock().unwrap();
             let due = store.due_deliveries(Utc::now(), 10).unwrap();
@@ -5008,30 +6994,67 @@ routes:
         handle_result(&d, delivery_id, true, None);
 
         // leg 3: identity-link confirm
-        seed_challenge(&d, ("mockb", "!privacy-target"), ("mocka", "!privacy-req"),
-                       SENTINEL_CODE, SENTINEL_NAME, Utc::now(), 15);
-        handle_inbound(&d, "mockb", "chan".into(), "!privacy-target".into(), "text".into(),
-                       SENTINEL_CODE.into(), None, vec![], None);
+        seed_challenge(
+            &d,
+            ("mockb", "!privacy-target"),
+            ("mocka", "!privacy-req"),
+            SENTINEL_CODE,
+            SENTINEL_NAME,
+            Utc::now(),
+            15,
+        );
+        handle_inbound(
+            &d,
+            "mockb",
+            "chan".into(),
+            "!privacy-target".into(),
+            "text".into(),
+            SENTINEL_CODE.into(),
+            None,
+            vec![],
+            None,
+        );
 
         let mut captured = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             captured.push(ev);
         }
-        assert_eq!(captured.len(), 3, "expected exactly ingress+delivery+link_verified: {captured:?}");
+        assert_eq!(
+            captured.len(),
+            3,
+            "expected exactly ingress+delivery+link_verified: {captured:?}"
+        );
 
-        let corpus: String =
-            captured.iter().map(|e| serde_json::to_string(e).unwrap()).collect::<Vec<_>>().join("\n");
+        let corpus: String = captured
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        assert!(!corpus.contains(SENTINEL_BODY), "message body leaked: {corpus}");
-        assert!(!corpus.contains(SENTINEL_REF), "full native ref leaked: {corpus}");
-        assert!(!corpus.contains(SENTINEL_CODE), "challenge code leaked: {corpus}");
-        assert!(!corpus.contains(SENTINEL_NAME), "display_name leaked: {corpus}");
+        assert!(
+            !corpus.contains(SENTINEL_BODY),
+            "message body leaked: {corpus}"
+        );
+        assert!(
+            !corpus.contains(SENTINEL_REF),
+            "full native ref leaked: {corpus}"
+        );
+        assert!(
+            !corpus.contains(SENTINEL_CODE),
+            "challenge code leaked: {corpus}"
+        );
+        assert!(
+            !corpus.contains(SENTINEL_NAME),
+            "display_name leaked: {corpus}"
+        );
 
         // Positive control: proves the sentinel ref really was present to
         // leak (in its masked form) -- so the negative assertions above are
         // meaningful, not vacuously true because nothing matched anything.
-        assert!(corpus.contains("mocka:+1****4999"),
-            "expected the masked sender to appear in the ingress event: {corpus}");
+        assert!(
+            corpus.contains("mocka:+1****4999"),
+            "expected the masked sender to appear in the ingress event: {corpus}"
+        );
     }
 
     // ---- Finding 1 (whole-branch review): the five previously-silent
@@ -5054,12 +7077,20 @@ routes:
             raw.execute(
                 "INSERT INTO messages (id, envelope, created_at) VALUES (?1, ?2, ?3)",
                 rusqlite::params![ghost_id.to_string(), "not valid json", now.to_rfc3339()],
-            ).unwrap();
+            )
+            .unwrap();
         }
         let del = {
             let store = d.store.lock().unwrap();
             let delivery_id = store
-                .insert_delivery(ghost_id, "general", &dest, now, now + CDuration::hours(1), 2)
+                .insert_delivery(
+                    ghost_id,
+                    "general",
+                    &dest,
+                    now,
+                    now + CDuration::hours(1),
+                    2,
+                )
                 .unwrap();
             store.deliveries_for_id(delivery_id).unwrap()
         };
@@ -5067,7 +7098,8 @@ routes:
         let mut rx = d.events.subscribe();
         process_due(&d, del, now).await;
 
-        let ev = rx.try_recv()
+        let ev = rx
+            .try_recv()
             .expect("process_due must emit a Delivery event on DESTINATION_UNKNOWN");
         let Event::Delivery { route, state, .. } = ev else {
             panic!("expected Delivery, got {ev:?}");
@@ -5082,29 +7114,40 @@ routes:
         let d = Arc::new(test_daemon(dir.path()));
         let now = Utc::now();
         let env = Envelope::new(
-            "mocka:chan".parse().unwrap(), Sender { native_ref: "!a".into() },
-            "text".into(), "hello".into(),
-            now - CDuration::hours(2), now - CDuration::hours(1), 8,
+            "mocka:chan".parse().unwrap(),
+            Sender {
+                native_ref: "!a".into(),
+            },
+            "text".into(),
+            "hello".into(),
+            now - CDuration::hours(2),
+            now - CDuration::hours(1),
+            8,
         );
         let dest: Endpoint = "mockb:chan".parse().unwrap();
         let del = {
             let store = d.store.lock().unwrap();
             store.insert_message(&env).unwrap();
-            let delivery_id =
-                store.insert_delivery(env.id, "general", &dest, now, env.expires_at, 2).unwrap();
+            let delivery_id = store
+                .insert_delivery(env.id, "general", &dest, now, env.expires_at, 2)
+                .unwrap();
             store.deliveries_for_id(delivery_id).unwrap()
         };
 
         let mut rx = d.events.subscribe();
         process_due(&d, del, now).await;
 
-        let ev = rx.try_recv().expect("process_due must emit a Delivery event on TTL_EXPIRED");
+        let ev = rx
+            .try_recv()
+            .expect("process_due must emit a Delivery event on TTL_EXPIRED");
         let Event::Delivery { route, state, .. } = ev else {
             panic!("expected Delivery, got {ev:?}");
         };
         assert_eq!(route, "general");
-        assert_eq!(state, "expired",
-            "the DB state ('expired') must be emitted as-is, not folded into 'failed'");
+        assert_eq!(
+            state, "expired",
+            "the DB state ('expired') must be emitted as-is, not folded into 'failed'"
+        );
     }
 
     #[tokio::test]
@@ -5113,22 +7156,43 @@ routes:
         let d = test_daemon(dir.path());
         d.cfg.write().unwrap().policies = vec![crate::config::Policy {
             name: "deny-b".into(),
-            r#match: crate::config::PolicyMatch { destination_protocol: vec!["mockb".into()] },
-            rules: crate::config::PolicyRules { deny: true, ..Default::default() },
+            r#match: crate::config::PolicyMatch {
+                destination_protocol: vec!["mockb".into()],
+            },
+            rules: crate::config::PolicyRules {
+                deny: true,
+                ..Default::default()
+            },
         }];
         let d = Arc::new(d);
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
         let now = Utc::now();
         let del = {
             let store = d.store.lock().unwrap();
-            store.due_deliveries(now, 1).unwrap().into_iter().next().unwrap()
+            store
+                .due_deliveries(now, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
         };
 
         let mut rx = d.events.subscribe();
         process_due(&d, del, now).await;
 
-        let ev = rx.try_recv().expect("process_due must emit a Delivery event on POLICY_DENIED");
+        let ev = rx
+            .try_recv()
+            .expect("process_due must emit a Delivery event on POLICY_DENIED");
         let Event::Delivery { route, state, .. } = ev else {
             panic!("expected Delivery, got {ev:?}");
         };
@@ -5145,21 +7209,30 @@ routes:
         let target: Endpoint = "mockb:!target".parse().unwrap();
         let now = Utc::now();
         let env = Envelope::new(
-            "identity:system".parse().unwrap(), Sender { native_ref: "@identity".into() },
-            "notice".into(), "code".into(), now, now + CDuration::minutes(15), 8,
+            "identity:system".parse().unwrap(),
+            Sender {
+                native_ref: "@identity".into(),
+            },
+            "notice".into(),
+            "code".into(),
+            now,
+            now + CDuration::minutes(15),
+            8,
         );
         d.store.lock().unwrap().insert_message(&env).unwrap();
         let del = {
             let store = d.store.lock().unwrap();
-            let delivery_id =
-                store.insert_delivery(env.id, IDENTITY_ROUTE, &target, now, env.expires_at, 2).unwrap();
+            let delivery_id = store
+                .insert_delivery(env.id, IDENTITY_ROUTE, &target, now, env.expires_at, 2)
+                .unwrap();
             store.deliveries_for_id(delivery_id).unwrap()
         };
 
         let mut rx = d.events.subscribe();
         process_due(&d, del, now).await;
 
-        let ev = rx.try_recv()
+        let ev = rx
+            .try_recv()
             .expect("process_due_identity must emit a Delivery event on NOT_DIRECT_CAPABLE");
         let Event::Delivery { route, state, .. } = ev else {
             panic!("expected Delivery, got {ev:?}");
@@ -5171,16 +7244,37 @@ routes:
     #[test]
     fn handle_inbound_emits_delivery_event_state_dead_letter_on_queue_full() {
         let dir = tempfile::tempdir().unwrap();
-        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
-            per_route: crate::config::PerRoute { queue_max: 1 },
-            ..Default::default()
-        });
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "first".into(), None, vec![], None);
+        let d = test_daemon_with_limits(
+            dir.path(),
+            crate::config::Limits {
+                per_route: crate::config::PerRoute { queue_max: 1 },
+                ..Default::default()
+            },
+        );
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "first".into(),
+            None,
+            vec![],
+            None,
+        );
 
         let mut rx = d.events.subscribe();
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "second".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "second".into(),
+            None,
+            vec![],
+            None,
+        );
 
         let mut saw_dead_letter = false;
         while let Ok(ev) = rx.try_recv() {
@@ -5190,19 +7284,37 @@ routes:
                 saw_dead_letter = true;
             }
         }
-        assert!(saw_dead_letter, "queue-full must emit a Delivery(dead_letter) event");
+        assert!(
+            saw_dead_letter,
+            "queue-full must emit a Delivery(dead_letter) event"
+        );
     }
 
     #[test]
     fn initiate_link_emits_delivery_event_state_dead_letter_on_global_queue_full() {
         let dir = tempfile::tempdir().unwrap();
-        let d = test_daemon_with_limits(dir.path(), crate::config::Limits {
-            global: crate::config::GlobalLimits { queue_max: 1, ..Default::default() },
-            ..Default::default()
-        });
+        let d = test_daemon_with_limits(
+            dir.path(),
+            crate::config::Limits {
+                global: crate::config::GlobalLimits {
+                    queue_max: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
         let _rx_plugin = register_direct_plugin(&d, "mockb");
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
 
         let requester: Endpoint = "mocka:!req".parse().unwrap();
         let target: Endpoint = "mockb:!target".parse().unwrap();
@@ -5211,7 +7323,8 @@ routes:
         let err = initiate_link(&d, requester, target, "Jascha").unwrap_err();
         assert_eq!(err, "queue full");
 
-        let ev = rx.try_recv()
+        let ev = rx
+            .try_recv()
             .expect("enqueue_identity_send must emit a Delivery event on QUEUE_FULL");
         let Event::Delivery { route, state, .. } = ev else {
             panic!("expected Delivery, got {ev:?}");
@@ -5224,9 +7337,12 @@ routes:
 
     fn fed_peer_cfg(name: &str, node_id: &str, trust: &str) -> crate::config::PeerConfig {
         crate::config::PeerConfig {
-            name: name.into(), node_id: node_id.into(),
-            addr: "10.0.0.2:47000".into(), trust: trust.into(),
-            messages_per_minute: 0, sealed_key: None,
+            name: name.into(),
+            node_id: node_id.into(),
+            addr: "10.0.0.2:47000".into(),
+            trust: trust.into(),
+            messages_per_minute: 0,
+            sealed_key: None,
         }
     }
 
@@ -5235,7 +7351,11 @@ routes:
     /// route (from `test_daemon_full`) has two destinations
     /// (`mocka:chan`/`mockb:chan`), so a happy-path accept always produces
     /// two delivery rows.
-    fn fed_config(accept_from: &str, max_hops: u32, max_ttl_secs: u64) -> crate::config::FederationConfig {
+    fn fed_config(
+        accept_from: &str,
+        max_hops: u32,
+        max_ttl_secs: u64,
+    ) -> crate::config::FederationConfig {
         crate::config::FederationConfig {
             listen: None,
             accept_from: accept_from.into(),
@@ -5262,14 +7382,20 @@ routes:
         let before = metrics::FED_INGRESS.load(std::sync::atomic::Ordering::Relaxed);
         let env = signed_test_envelope(&identity, "hello federation", 0);
         let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
-        assert!(matches!(outcome, FedIngressOutcome::Accepted(_)), "expected Accepted, got {outcome:?}");
+        assert!(
+            matches!(outcome, FedIngressOutcome::Accepted(_)),
+            "expected Accepted, got {outcome:?}"
+        );
         let after = metrics::FED_INGRESS.load(std::sync::atomic::Ordering::Relaxed);
         assert!(after > before, "FED_INGRESS must increment on accept");
 
         let store = d.store.lock().unwrap();
         let counts = store.queue_counts().unwrap();
-        assert_eq!(counts, vec![("pending".to_string(), 2)],
-            "both of general's destinations must get a delivery row");
+        assert_eq!(
+            counts,
+            vec![("pending".to_string(), 2)],
+            "both of general's destinations must get a delivery row"
+        );
     }
 
     /// Fix round 1 (DoS hardening): BAD_SIGNATURE/TRUST_DENIED are
@@ -5289,9 +7415,18 @@ routes:
         let env = {
             let now = Utc::now();
             Envelope::new(
-                Endpoint { protocol: "mock".into(), endpoint: "origin-chan".into() },
-                Sender { native_ref: "!origin-sender".into() },
-                "text".into(), "unsigned".into(), now, now + CDuration::hours(1), 8,
+                Endpoint {
+                    protocol: "mock".into(),
+                    endpoint: "origin-chan".into(),
+                },
+                Sender {
+                    native_ref: "!origin-sender".into(),
+                },
+                "text".into(),
+                "unsigned".into(),
+                now,
+                now + CDuration::hours(1),
+                8,
             )
         };
         let env_id = env.id;
@@ -5300,13 +7435,20 @@ routes:
         let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
         assert_eq!(outcome, FedIngressOutcome::Rejected("BAD_SIGNATURE"));
         let after = metrics::FED_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(after > before, "FED_REJECTED must increment on rejection even though nothing persists");
+        assert!(
+            after > before,
+            "FED_REJECTED must increment on rejection even though nothing persists"
+        );
 
         let store = d.store.lock().unwrap();
-        assert!(store.queue_counts().unwrap().is_empty(),
-            "BAD_SIGNATURE must never create a delivery row (pre-trust, DoS-hardening)");
-        assert!(store.get_message(env_id).unwrap().is_none(),
-            "BAD_SIGNATURE must never persist the message either");
+        assert!(
+            store.queue_counts().unwrap().is_empty(),
+            "BAD_SIGNATURE must never create a delivery row (pre-trust, DoS-hardening)"
+        );
+        assert!(
+            store.get_message(env_id).unwrap().is_none(),
+            "BAD_SIGNATURE must never persist the message either"
+        );
     }
 
     /// A flood of DISTINCT bad-signature envelopes (an untrusted peer's
@@ -5323,17 +7465,28 @@ routes:
         for i in 0..5 {
             let now = Utc::now();
             let env = Envelope::new(
-                Endpoint { protocol: "mock".into(), endpoint: "origin-chan".into() },
-                Sender { native_ref: "!origin-sender".into() },
-                "text".into(), format!("garbage {i}"), now, now + CDuration::hours(1), 8,
+                Endpoint {
+                    protocol: "mock".into(),
+                    endpoint: "origin-chan".into(),
+                },
+                Sender {
+                    native_ref: "!origin-sender".into(),
+                },
+                "text".into(),
+                format!("garbage {i}"),
+                now,
+                now + CDuration::hours(1),
+                8,
             );
             let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
             assert_eq!(outcome, FedIngressOutcome::Rejected("BAD_SIGNATURE"));
         }
 
         let store = d.store.lock().unwrap();
-        assert!(store.queue_counts().unwrap().is_empty(),
-            "a flood of unsigned envelopes must create zero delivery rows");
+        assert!(
+            store.queue_counts().unwrap().is_empty(),
+            "a flood of unsigned envelopes must create zero delivery rows"
+        );
     }
 
     #[test]
@@ -5356,8 +7509,10 @@ routes:
         assert!(metrics::FED_REJECTED.load(std::sync::atomic::Ordering::Relaxed) > before);
 
         let store = d.store.lock().unwrap();
-        assert!(store.queue_counts().unwrap().is_empty(),
-            "TRUST_DENIED must never create a delivery row (pre-trust, DoS-hardening)");
+        assert!(
+            store.queue_counts().unwrap().is_empty(),
+            "TRUST_DENIED must never create a delivery row (pre-trust, DoS-hardening)"
+        );
         assert!(store.get_message(env_id).unwrap().is_none());
     }
 
@@ -5396,11 +7551,16 @@ routes:
             assert_eq!(outcome, FedIngressOutcome::Rejected("TRUST_DENIED"));
         }
         let after = metrics::FED_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(after >= before + 5, "FED_REJECTED must bump once per rejected envelope: {before} -> {after}");
+        assert!(
+            after >= before + 5,
+            "FED_REJECTED must bump once per rejected envelope: {before} -> {after}"
+        );
 
         let store = d.store.lock().unwrap();
-        assert!(store.queue_counts().unwrap().is_empty(),
-            "a pre-trust flood of 5 distinct envelopes must create zero delivery rows");
+        assert!(
+            store.queue_counts().unwrap().is_empty(),
+            "a pre-trust flood of 5 distinct envelopes must create zero delivery rows"
+        );
     }
 
     #[test]
@@ -5421,7 +7581,10 @@ routes:
         // gate -- Persistence::Persist, so it still lands in dead_letter
         // (operator-actionable), unlike the pre-trust NoPersist reasons.
         let store = d.store.lock().unwrap();
-        assert_eq!(store.queue_counts().unwrap(), vec![("dead_letter".to_string(), 1)]);
+        assert_eq!(
+            store.queue_counts().unwrap(),
+            vec![("dead_letter".to_string(), 1)]
+        );
         drop(store);
 
         // one under the limit: must be accepted.
@@ -5431,7 +7594,8 @@ routes:
     }
 
     #[test]
-    fn fed_ingress_route_not_federated_when_target_route_not_in_ingress_routes_and_still_dead_letters() {
+    fn fed_ingress_route_not_federated_when_target_route_not_in_ingress_routes_and_still_dead_letters(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let identity = test_peer_identity(dir.path(), "peer");
         let node_id = identity.node_id();
@@ -5447,7 +7611,10 @@ routes:
 
         // ROUTE_NOT_FEDERATED also only fires post-trust-gate -- Persist.
         let store = d.store.lock().unwrap();
-        assert_eq!(store.queue_counts().unwrap(), vec![("dead_letter".to_string(), 1)]);
+        assert_eq!(
+            store.queue_counts().unwrap(),
+            vec![("dead_letter".to_string(), 1)]
+        );
     }
 
     /// Fix round 1 Minor: the two defensive "should be unreachable"
@@ -5474,7 +7641,10 @@ routes:
         assert_eq!(outcome, FedIngressOutcome::Rejected("FED_CONFIG_MISSING"));
 
         let store = d.store.lock().unwrap();
-        assert_eq!(store.queue_counts().unwrap(), vec![("dead_letter".to_string(), 1)]);
+        assert_eq!(
+            store.queue_counts().unwrap(),
+            vec![("dead_letter".to_string(), 1)]
+        );
     }
 
     #[test]
@@ -5510,20 +7680,33 @@ routes:
         // build one with a much longer remote-claimed TTL by hand.
         let now = Utc::now();
         let mut env = Envelope::new(
-            Endpoint { protocol: "mock".into(), endpoint: "origin-chan".into() },
-            Sender { native_ref: "!origin-sender".into() },
-            "text".into(), "long ttl".into(), now, now + CDuration::days(100), 8,
+            Endpoint {
+                protocol: "mock".into(),
+                endpoint: "origin-chan".into(),
+            },
+            Sender {
+                native_ref: "!origin-sender".into(),
+            },
+            "text".into(),
+            "long ttl".into(),
+            now,
+            now + CDuration::days(100),
+            8,
         );
         env.origin = Some(fed::sign::sign_origin(&env, &identity));
 
         let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
-        let FedIngressOutcome::Accepted(id) = outcome else { panic!("expected Accepted") };
+        let FedIngressOutcome::Accepted(id) = outcome else {
+            panic!("expected Accepted")
+        };
 
         let store = d.store.lock().unwrap();
         let stored = store.get_message(id).unwrap().unwrap();
         let delta = (stored.expires_at - Utc::now()).num_seconds();
-        assert!(delta <= 3600 && delta > 3500,
-            "expires_at must be clamped to ~max_ttl_secs from now, got delta={delta}s");
+        assert!(
+            delta <= 3600 && delta > 3500,
+            "expires_at must be clamped to ~max_ttl_secs from now, got delta={delta}s"
+        );
     }
 
     #[test]
@@ -5544,8 +7727,11 @@ routes:
         // priority is deliberately unsigned, so this must still verify.
         let mut env = signed_test_envelope(&identity, "urgent!!", 0);
         env.priority = "emergency".to_string();
-        assert_eq!(fed::sign::verify_chain(&env), Ok(()),
-            "priority is unsigned by design -- tampering it must not break the signature");
+        assert_eq!(
+            fed::sign::verify_chain(&env),
+            Ok(()),
+            "priority is unsigned by design -- tampering it must not break the signature"
+        );
 
         let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
         assert!(matches!(outcome, FedIngressOutcome::Accepted(_)));
@@ -5553,11 +7739,16 @@ routes:
         let store = d.store.lock().unwrap();
         let due = store.due_deliveries(Utc::now(), 10).unwrap();
         assert_eq!(due.len(), 2);
-        assert!(due.iter().all(|d| d.priority == relay_core::priority_rank("normal")),
-            "every delivery row must be at the DEFAULT rank, never emergency's rank 0: {due:?}");
+        assert!(
+            due.iter()
+                .all(|d| d.priority == relay_core::priority_rank("normal")),
+            "every delivery row must be at the DEFAULT rank, never emergency's rank 0: {due:?}"
+        );
         let stored = store.get_message(due[0].message_id).unwrap().unwrap();
-        assert_eq!(stored.priority, "normal",
-            "the stored envelope's priority class itself must be re-stamped to \"normal\"");
+        assert_eq!(
+            stored.priority, "normal",
+            "the stored envelope's priority class itself must be re-stamped to \"normal\""
+        );
     }
 
     #[test]
@@ -5587,8 +7778,11 @@ routes:
         assert!(metrics::DUPLICATES.load(std::sync::atomic::Ordering::Relaxed) > before_dup);
 
         let store = d.store.lock().unwrap();
-        assert_eq!(store.queue_counts().unwrap(), vec![("pending".to_string(), 2)],
-            "the replay must not create any additional delivery rows");
+        assert_eq!(
+            store.queue_counts().unwrap(),
+            vec![("pending".to_string(), 2)],
+            "the replay must not create any additional delivery rows"
+        );
     }
 
     // ==== replay window (final-review I-1) =================================
@@ -5598,13 +7792,24 @@ routes:
     /// `expires_at` deliberately is NOT (any on-path relay can rewrite it),
     /// which is exactly the asymmetry these tests exercise.
     fn signed_envelope_with_times(
-        identity: &crate::node_identity::NodeIdentity, body: &str,
-        created_at: DateTime<Utc>, expires_at: DateTime<Utc>,
+        identity: &crate::node_identity::NodeIdentity,
+        body: &str,
+        created_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
     ) -> Envelope {
         let mut env = Envelope::new(
-            Endpoint { protocol: "mock".into(), endpoint: "origin-chan".into() },
-            Sender { native_ref: "!origin-sender".into() },
-            "text".into(), body.to_string(), created_at, expires_at, 8,
+            Endpoint {
+                protocol: "mock".into(),
+                endpoint: "origin-chan".into(),
+            },
+            Sender {
+                native_ref: "!origin-sender".into(),
+            },
+            "text".into(),
+            body.to_string(),
+            created_at,
+            expires_at,
+            8,
         );
         env.origin = Some(fed::sign::sign_origin(&env, identity));
         env
@@ -5618,7 +7823,8 @@ routes:
     /// post-restart replay scenario). Post-trust, so it persists as a
     /// dead_letter row.
     #[test]
-    fn fed_ingress_created_at_older_than_max_ttl_is_dead_lettered_expired_despite_fresh_expires_at() {
+    fn fed_ingress_created_at_older_than_max_ttl_is_dead_lettered_expired_despite_fresh_expires_at()
+    {
         let dir = tempfile::tempdir().unwrap();
         let identity = test_peer_identity(dir.path(), "peer");
         let node_id = identity.node_id();
@@ -5628,16 +7834,26 @@ routes:
 
         let now = Utc::now();
         let env = signed_envelope_with_times(
-            &identity, "stale replay", now - CDuration::hours(2), now + CDuration::days(100));
-        assert_eq!(fed::sign::verify_chain(&env), Ok(()),
-            "the replayed envelope's signature is genuine -- only its age gives it away");
+            &identity,
+            "stale replay",
+            now - CDuration::hours(2),
+            now + CDuration::days(100),
+        );
+        assert_eq!(
+            fed::sign::verify_chain(&env),
+            Ok(()),
+            "the replayed envelope's signature is genuine -- only its age gives it away"
+        );
 
         let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
         assert_eq!(outcome, FedIngressOutcome::Rejected("EXPIRED"));
 
         let store = d.store.lock().unwrap();
-        assert_eq!(store.queue_counts().unwrap(), vec![("dead_letter".to_string(), 1)],
-            "EXPIRED is post-trust: it must dead_letter, never silently vanish or deliver");
+        assert_eq!(
+            store.queue_counts().unwrap(),
+            vec![("dead_letter".to_string(), 1)],
+            "EXPIRED is post-trust: it must dead_letter, never silently vanish or deliver"
+        );
     }
 
     /// Just inside the window: `created_at` within `max_ttl_secs` of now is
@@ -5653,10 +7869,16 @@ routes:
 
         let now = Utc::now();
         let env = signed_envelope_with_times(
-            &identity, "nearly stale", now - CDuration::seconds(3500), now + CDuration::hours(1));
+            &identity,
+            "nearly stale",
+            now - CDuration::seconds(3500),
+            now + CDuration::hours(1),
+        );
         let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
-        assert!(matches!(outcome, FedIngressOutcome::Accepted(_)),
-            "an envelope inside the replay window must still be delivered, got {outcome:?}");
+        assert!(
+            matches!(outcome, FedIngressOutcome::Accepted(_)),
+            "an envelope inside the replay window must still be delivered, got {outcome:?}"
+        );
     }
 
     /// Far-future `created_at` (clock-skew abuse): a peer stamping
@@ -5674,12 +7896,19 @@ routes:
 
         let now = Utc::now();
         let env = signed_envelope_with_times(
-            &identity, "from the future", now + CDuration::seconds(3600), now + CDuration::hours(2));
+            &identity,
+            "from the future",
+            now + CDuration::seconds(3600),
+            now + CDuration::hours(2),
+        );
         let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
         assert_eq!(outcome, FedIngressOutcome::Rejected("EXPIRED"));
 
         let store = d.store.lock().unwrap();
-        assert_eq!(store.queue_counts().unwrap(), vec![("dead_letter".to_string(), 1)]);
+        assert_eq!(
+            store.queue_counts().unwrap(),
+            vec![("dead_letter".to_string(), 1)]
+        );
     }
 
     /// Ordinary clock skew between honest peers (seconds, not hours) must
@@ -5695,10 +7924,16 @@ routes:
 
         let now = Utc::now();
         let env = signed_envelope_with_times(
-            &identity, "slightly ahead", now + CDuration::seconds(200), now + CDuration::hours(1));
+            &identity,
+            "slightly ahead",
+            now + CDuration::seconds(200),
+            now + CDuration::hours(1),
+        );
         let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
-        assert!(matches!(outcome, FedIngressOutcome::Accepted(_)),
-            "a few seconds of clock skew must not reject honest traffic, got {outcome:?}");
+        assert!(
+            matches!(outcome, FedIngressOutcome::Accepted(_)),
+            "a few seconds of clock skew must not reject honest traffic, got {outcome:?}"
+        );
     }
 
     #[test]
@@ -5709,14 +7944,19 @@ routes:
         let mut cfg = fed_config("verified", 4, 86_400);
         cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
         let limits = crate::config::Limits {
-            per_sender: crate::config::PerSender { messages_per_minute: 1, bytes_per_hour: 0 },
+            per_sender: crate::config::PerSender {
+                messages_per_minute: 1,
+                bytes_per_hour: 0,
+            },
             ..Default::default()
         };
         let d = test_daemon_with_federation_and_limits(dir.path(), cfg, limits);
 
         let first = signed_test_envelope(&identity, "first", 0);
-        assert!(matches!(fed_ingress(&d, &node_id, first, "general".to_string()),
-            FedIngressOutcome::Accepted(_)));
+        assert!(matches!(
+            fed_ingress(&d, &node_id, first, "general".to_string()),
+            FedIngressOutcome::Accepted(_)
+        ));
 
         let before = metrics::RATELIMITED.load(std::sync::atomic::Ordering::Relaxed);
         let second = signed_test_envelope(&identity, "second, distinct body", 0);
@@ -5728,7 +7968,10 @@ routes:
         // Only the first message's two deliveries -- the rate-limited
         // second message gets no dead_letter row at all (silent drop,
         // mirroring handle_inbound's own rate-limit gate).
-        assert_eq!(store.queue_counts().unwrap(), vec![("pending".to_string(), 2)]);
+        assert_eq!(
+            store.queue_counts().unwrap(),
+            vec![("pending".to_string(), 2)]
+        );
     }
 
     // ==== fed_sealed_ingress (design §5, SPEC §113.2/§113.5, cycle H,
@@ -5738,7 +7981,10 @@ routes:
     /// own `expires_at` -- the common case every test below uses except the
     /// header-expiry test, which needs an independently-chosen header
     /// value (see `seal_env_for_with_expiry`).
-    fn seal_env_for(env: &Envelope, recipient_pub: &crypto_box::PublicKey) -> fed::seal::SealedEnvelope {
+    fn seal_env_for(
+        env: &Envelope,
+        recipient_pub: &crypto_box::PublicKey,
+    ) -> fed::seal::SealedEnvelope {
         seal_env_for_with_expiry(env, recipient_pub, env.expires_at.timestamp())
     }
 
@@ -5747,7 +7993,9 @@ routes:
     /// without touching the envelope's own (separately-checked, post-
     /// decrypt) `created_at`/`expires_at`.
     fn seal_env_for_with_expiry(
-        env: &Envelope, recipient_pub: &crypto_box::PublicKey, header_expires_at: i64,
+        env: &Envelope,
+        recipient_pub: &crypto_box::PublicKey,
+        header_expires_at: i64,
     ) -> fed::seal::SealedEnvelope {
         let mut cbor = Vec::new();
         ciborium::into_writer(env, &mut cbor).unwrap();
@@ -5759,14 +8007,18 @@ routes:
     /// fixture setup, mirroring `set_route_security_mode`'s own pattern.
     fn set_route_allow_gateway_decryption(d: &Daemon, route_name: &str, value: Option<bool>) {
         let mut cfg = d.cfg.read().unwrap().clone();
-        let route = cfg.routes.iter_mut().find(|r| r.name == route_name)
+        let route = cfg
+            .routes
+            .iter_mut()
+            .find(|r| r.name == route_name)
             .unwrap_or_else(|| panic!("route '{route_name}' not found in test fixture config"));
         route.allow_gateway_decryption = value;
         d.apply_config(cfg);
     }
 
     #[tokio::test]
-    async fn fed_sealed_ingress_happy_path_decrypts_delivers_to_mock_plugin_and_increments_sealed_ingress() {
+    async fn fed_sealed_ingress_happy_path_decrypts_delivers_to_mock_plugin_and_increments_sealed_ingress(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let identity = test_peer_identity(dir.path(), "peer");
         let node_id = identity.node_id();
@@ -5785,12 +8037,21 @@ routes:
         let before = metrics::SEALED_INGRESS.load(std::sync::atomic::Ordering::Relaxed);
         let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
         assert_eq!(outcome, FedIngressOutcome::Accepted(env_id));
-        assert!(metrics::SEALED_INGRESS.load(std::sync::atomic::Ordering::Relaxed) > before,
-            "SEALED_INGRESS must increment on accept");
+        assert!(
+            metrics::SEALED_INGRESS.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "SEALED_INGRESS must increment on accept"
+        );
 
         let now = Utc::now();
-        let dels = { let store = d.store.lock().unwrap(); store.due_deliveries(now, 10).unwrap() };
-        assert_eq!(dels.len(), 2, "both of general's destinations must get a delivery row");
+        let dels = {
+            let store = d.store.lock().unwrap();
+            store.due_deliveries(now, 10).unwrap()
+        };
+        assert_eq!(
+            dels.len(),
+            2,
+            "both of general's destinations must get a delivery row"
+        );
         for del in dels {
             process_due(&d, del, now).await;
         }
@@ -5801,8 +8062,14 @@ routes:
         let DaemonToPlugin::Send { body: got_b, .. } = recv_send(&mut rx_b).await else {
             panic!("expected Send to mockb");
         };
-        assert!(got_a.contains(body), "decrypted body must reach mocka verbatim: {got_a}");
-        assert!(got_b.contains(body), "decrypted body must reach mockb verbatim: {got_b}");
+        assert!(
+            got_a.contains(body),
+            "decrypted body must reach mocka verbatim: {got_a}"
+        );
+        assert!(
+            got_b.contains(body),
+            "decrypted body must reach mockb verbatim: {got_b}"
+        );
     }
 
     #[test]
@@ -5823,8 +8090,10 @@ routes:
         let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
         assert_eq!(outcome, FedIngressOutcome::Rejected("UNSUPPORTED_SEAL_ALG"));
         assert!(metrics::SEALED_REJECTED.load(std::sync::atomic::Ordering::Relaxed) > before);
-        assert!(d.store.lock().unwrap().queue_counts().unwrap().is_empty(),
-            "no sealed rejection ever persists a delivery row");
+        assert!(
+            d.store.lock().unwrap().queue_counts().unwrap().is_empty(),
+            "no sealed rejection ever persists a delivery row"
+        );
     }
 
     #[test]
@@ -5924,9 +8193,18 @@ routes:
         // verify_chain must reject before trust/downgrade/delivery.
         let now = Utc::now();
         let env = Envelope::new(
-            Endpoint { protocol: "mock".into(), endpoint: "origin-chan".into() },
-            Sender { native_ref: "!origin-sender".into() },
-            "text".into(), "unsigned".into(), now, now + CDuration::hours(1), 8,
+            Endpoint {
+                protocol: "mock".into(),
+                endpoint: "origin-chan".into(),
+            },
+            Sender {
+                native_ref: "!origin-sender".into(),
+            },
+            "text".into(),
+            "unsigned".into(),
+            now,
+            now + CDuration::hours(1),
+            8,
         );
         let sealed = seal_env_for(&env, &recipient_pub);
 
@@ -6001,18 +8279,31 @@ routes:
 
         let before = metrics::SEALED_REJECTED.load(std::sync::atomic::Ordering::Relaxed);
         let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
-        assert_eq!(outcome, FedIngressOutcome::Rejected("SECURITY_DOWNGRADE_REFUSED"));
+        assert_eq!(
+            outcome,
+            FedIngressOutcome::Rejected("SECURITY_DOWNGRADE_REFUSED")
+        );
         assert!(metrics::SEALED_REJECTED.load(std::sync::atomic::Ordering::Relaxed) > before);
 
         let store = d.store.lock().unwrap();
-        assert!(store.queue_counts().unwrap().is_empty(),
-            "downgrade refusal must never create a delivery row -- content stays undelivered");
-        assert!(store.get_message(env_id).unwrap().is_none(),
-            "downgrade refusal must never persist the decrypted envelope either");
+        assert!(
+            store.queue_counts().unwrap().is_empty(),
+            "downgrade refusal must never create a delivery row -- content stays undelivered"
+        );
+        assert!(
+            store.get_message(env_id).unwrap().is_none(),
+            "downgrade refusal must never persist the decrypted envelope either"
+        );
         drop(store);
 
-        assert!(rx_a.try_recv().is_err(), "mocka plugin must receive nothing on downgrade refusal");
-        assert!(rx_b.try_recv().is_err(), "mockb plugin must receive nothing on downgrade refusal");
+        assert!(
+            rx_a.try_recv().is_err(),
+            "mocka plugin must receive nothing on downgrade refusal"
+        );
+        assert!(
+            rx_b.try_recv().is_err(),
+            "mockb plugin must receive nothing on downgrade refusal"
+        );
     }
 
     #[test]
@@ -6038,8 +8329,11 @@ routes:
         assert!(metrics::DUPLICATES.load(std::sync::atomic::Ordering::Relaxed) > before_dup);
 
         let store = d.store.lock().unwrap();
-        assert_eq!(store.queue_counts().unwrap(), vec![("pending".to_string(), 2)],
-            "the replay must not create any additional delivery rows");
+        assert_eq!(
+            store.queue_counts().unwrap(),
+            vec![("pending".to_string(), 2)],
+            "the replay must not create any additional delivery rows"
+        );
     }
 
     #[test]
@@ -6066,11 +8360,16 @@ routes:
         let store = d.store.lock().unwrap();
         let due = store.due_deliveries(Utc::now(), 10).unwrap();
         assert_eq!(due.len(), 2);
-        assert!(due.iter().all(|d| d.priority == relay_core::priority_rank("normal")),
-            "every delivery row must be at the DEFAULT rank, never emergency's rank 0: {due:?}");
+        assert!(
+            due.iter()
+                .all(|d| d.priority == relay_core::priority_rank("normal")),
+            "every delivery row must be at the DEFAULT rank, never emergency's rank 0: {due:?}"
+        );
         let stored = store.get_message(due[0].message_id).unwrap().unwrap();
-        assert_eq!(stored.priority, "normal",
-            "the stored envelope's priority class itself must be re-stamped to \"normal\"");
+        assert_eq!(
+            stored.priority, "normal",
+            "the stored envelope's priority class itself must be re-stamped to \"normal\""
+        );
     }
 
     #[test]
@@ -6081,7 +8380,10 @@ routes:
         let mut cfg = fed_config("verified", 4, 86_400);
         cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
         let limits = crate::config::Limits {
-            per_sender: crate::config::PerSender { messages_per_minute: 1, bytes_per_hour: 0 },
+            per_sender: crate::config::PerSender {
+                messages_per_minute: 1,
+                bytes_per_hour: 0,
+            },
             ..Default::default()
         };
         let d = test_daemon_with_federation_and_limits(dir.path(), cfg, limits);
@@ -6089,8 +8391,10 @@ routes:
 
         let first_env = signed_test_envelope(&identity, "first", 0);
         let first_sealed = seal_env_for(&first_env, &recipient_pub);
-        assert!(matches!(fed_sealed_ingress(&d, &node_id, first_sealed, "general".to_string()),
-            FedIngressOutcome::Accepted(_)));
+        assert!(matches!(
+            fed_sealed_ingress(&d, &node_id, first_sealed, "general".to_string()),
+            FedIngressOutcome::Accepted(_)
+        ));
 
         let before = metrics::RATELIMITED.load(std::sync::atomic::Ordering::Relaxed);
         let second_env = signed_test_envelope(&identity, "second, distinct body", 0);
@@ -6103,7 +8407,10 @@ routes:
         // Only the first message's two deliveries -- the rate-limited
         // second message (per-peer quota, sealed sender is opaque) gets no
         // dead_letter row at all, mirroring fed_ingress's own category.
-        assert_eq!(store.queue_counts().unwrap(), vec![("pending".to_string(), 2)]);
+        assert_eq!(
+            store.queue_counts().unwrap(),
+            vec![("pending".to_string(), 2)]
+        );
     }
 
     // ==== process_due_fed (design §5 egress, Task 5) =======================
@@ -6115,7 +8422,11 @@ routes:
     /// connection or a `federation.peers[]` config entry for it (config's
     /// peer list is never consulted by `process_due_fed`'s connection
     /// lookup itself, only its `identity_exposure` field is).
-    fn register_fed_conn(d: &Daemon, peer_name: &str, node_id: &str) -> mpsc::Receiver<fed::wire::Fed> {
+    fn register_fed_conn(
+        d: &Daemon,
+        peer_name: &str,
+        node_id: &str,
+    ) -> mpsc::Receiver<fed::wire::Fed> {
         let (tx, rx) = mpsc::channel(8);
         d.fed.as_ref().unwrap().conns.lock().unwrap().insert(
             peer_name.to_string(),
@@ -6129,9 +8440,18 @@ routes:
     fn local_env(native_ref: &str, body: &str) -> Envelope {
         let now = Utc::now();
         Envelope::new(
-            Endpoint { protocol: "mocka".into(), endpoint: "chan".into() },
-            Sender { native_ref: native_ref.into() },
-            "text".into(), body.into(), now, now + CDuration::hours(1), 8,
+            Endpoint {
+                protocol: "mocka".into(),
+                endpoint: "chan".into(),
+            },
+            Sender {
+                native_ref: native_ref.into(),
+            },
+            "text".into(),
+            body.into(),
+            now,
+            now + CDuration::hours(1),
+            8,
         )
     }
 
@@ -6155,12 +8475,22 @@ routes:
     /// old "unknown route defaults to gateway" behavior the CRITICAL fix
     /// removed); `"general"` reproduces the same gateway-mode behavior
     /// through a route that genuinely exists instead.
-    fn queue_fed_delivery_on_route(d: &Daemon, env: &Envelope, dest_endpoint: &str, route: &str) -> i64 {
+    fn queue_fed_delivery_on_route(
+        d: &Daemon,
+        env: &Envelope,
+        dest_endpoint: &str,
+        route: &str,
+    ) -> i64 {
         let now = Utc::now();
-        let dest = Endpoint { protocol: FED_PROTOCOL.to_string(), endpoint: dest_endpoint.to_string() };
+        let dest = Endpoint {
+            protocol: FED_PROTOCOL.to_string(),
+            endpoint: dest_endpoint.to_string(),
+        };
         let store = d.store.lock().unwrap();
         store.insert_message(env).unwrap();
-        store.insert_delivery(env.id, route, &dest, now, env.expires_at, 2).unwrap()
+        store
+            .insert_delivery(env.id, route, &dest, now, env.expires_at, 2)
+            .unwrap()
     }
 
     fn queue_fed_delivery(d: &Daemon, env: &Envelope, dest_endpoint: &str) -> i64 {
@@ -6176,7 +8506,10 @@ routes:
     /// doc comment for why the two must name the same route).
     fn set_route_security_mode(d: &Daemon, route_name: &str, mode: &str) {
         let mut cfg = d.cfg.read().unwrap().clone();
-        let route = cfg.routes.iter_mut().find(|r| r.name == route_name)
+        let route = cfg
+            .routes
+            .iter_mut()
+            .find(|r| r.name == route_name)
             .unwrap_or_else(|| panic!("route '{route_name}' not found in test fixture config"));
         route.security_mode = mode.to_string();
         d.apply_config(cfg);
@@ -6195,7 +8528,10 @@ routes:
 
     fn unwrap_sealed_frame(frame: fed::wire::Fed) -> (fed::seal::SealedEnvelope, String) {
         match frame {
-            fed::wire::Fed::Sealed { sealed, target_route } => (sealed, target_route),
+            fed::wire::Fed::Sealed {
+                sealed,
+                target_route,
+            } => (sealed, target_route),
             other => panic!("expected Fed::Sealed, got {other:?}"),
         }
     }
@@ -6206,7 +8542,9 @@ routes:
     /// Minimal on everything else (`services`/`protocols` empty): only
     /// `security.sealed_key` matters to `resolve_sealed_key`.
     fn signed_sealed_key_advert(
-        identity: &NodeIdentity, node_id: &str, sealed_key_hex: &str,
+        identity: &NodeIdentity,
+        node_id: &str,
+        sealed_key_hex: &str,
     ) -> fed::advert::Advert {
         fed::advert::sign(
             fed::advert::Advert {
@@ -6216,7 +8554,9 @@ routes:
                 services: std::collections::BTreeMap::from([("federation".to_string(), true)]),
                 protocols: std::collections::BTreeMap::new(),
                 security: fed::advert::SecurityCaps {
-                    translate: true, signed: true, sealed: true,
+                    translate: true,
+                    signed: true,
+                    sealed: true,
                     sealed_key: Some(sealed_key_hex.to_string()),
                 },
                 expires: (Utc::now() + CDuration::hours(1)).timestamp(),
@@ -6229,21 +8569,33 @@ routes:
     #[tokio::test]
     async fn process_due_fed_pseudonymous_default_wire_bytes_contain_alias_not_raw_ref() {
         let dir = tempfile::tempdir().unwrap();
-        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_config("verified", 4, 86_400)));
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_config("verified", 4, 86_400),
+        ));
         let mut rx = register_fed_conn(&d, "phoenix", &format!("rf:{}", "11".repeat(32)));
 
         let env = local_env("!secret-ref", "hello federation");
         let raw_ref = env.sender.native_ref.clone();
-        let expected_alias = d.aliaser.alias("mocka", &raw_ref, "fed:phoenix/regional-chat");
+        let expected_alias = d
+            .aliaser
+            .alias("mocka", &raw_ref, "fed:phoenix/regional-chat");
 
         let delivery_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         let now = Utc::now();
         let before = metrics::FED_EGRESS.load(std::sync::atomic::Ordering::Relaxed);
         process_due(&d, del, now).await;
 
         let (sent_env, target_route) = unwrap_envelope_frame(
-            rx.try_recv().expect("process_due_fed must send a Fed::Envelope frame"));
+            rx.try_recv()
+                .expect("process_due_fed must send a Fed::Envelope frame"),
+        );
         assert_eq!(target_route, "regional-chat");
         assert_eq!(sent_env.sender.native_ref, expected_alias);
         assert_ne!(sent_env.sender.native_ref, raw_ref);
@@ -6253,20 +8605,37 @@ routes:
         // test already checked above.
         let mut buf = Vec::new();
         ciborium::into_writer(&sent_env, &mut buf).unwrap();
-        assert!(!bytes_contain(&buf, raw_ref.as_bytes()),
-            "raw native ref must never reach the wire under identity_exposure: pseudonymous");
-        assert!(bytes_contain(&buf, expected_alias.as_bytes()),
-            "the alias must actually be present in the wire bytes");
+        assert!(
+            !bytes_contain(&buf, raw_ref.as_bytes()),
+            "raw native ref must never reach the wire under identity_exposure: pseudonymous"
+        );
+        assert!(
+            bytes_contain(&buf, expected_alias.as_bytes()),
+            "the alias must actually be present in the wire bytes"
+        );
 
-        assert_eq!(sent_env.hops, 1, "hops must increment from the fixture's default of 0");
-        assert!(sent_env.origin.is_some(), "a locally-originated envelope must be origin-signed before it egresses");
+        assert_eq!(
+            sent_env.hops, 1,
+            "hops must increment from the fixture's default of 0"
+        );
+        assert!(
+            sent_env.origin.is_some(),
+            "a locally-originated envelope must be origin-signed before it egresses"
+        );
         assert_eq!(fed::sign::verify_chain(&sent_env), Ok(()),
             "the signature must verify against what was ACTUALLY sent (signed after pseudonymization)");
 
-        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         assert_eq!(after.state, "attempting");
-        assert!(metrics::FED_EGRESS.load(std::sync::atomic::Ordering::Relaxed) > before,
-            "FED_EGRESS must increment on a successful send");
+        assert!(
+            metrics::FED_EGRESS.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "FED_EGRESS must increment on a successful send"
+        );
     }
 
     #[tokio::test]
@@ -6279,12 +8648,19 @@ routes:
 
         let env = local_env("!raw-ref-stays-raw", "hi");
         let delivery_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         process_due(&d, del, Utc::now()).await;
 
         let (sent_env, _) = unwrap_envelope_frame(rx.try_recv().unwrap());
-        assert_eq!(sent_env.sender.native_ref, "!raw-ref-stays-raw",
-            "identity_exposure: full is explicit opt-in to sending the raw ref");
+        assert_eq!(
+            sent_env.sender.native_ref, "!raw-ref-stays-raw",
+            "identity_exposure: full is explicit opt-in to sending the raw ref"
+        );
         assert!(sent_env.origin.is_some());
         assert_eq!(fed::sign::verify_chain(&sent_env), Ok(()));
     }
@@ -6296,9 +8672,13 @@ routes:
     /// `identity_exposure: pseudonymous` -- only a NEW attestation and the
     /// hop increment are this hop's to add.
     #[tokio::test]
-    async fn process_due_fed_relayed_envelope_with_existing_origin_is_never_pseudonymized_or_resigned() {
+    async fn process_due_fed_relayed_envelope_with_existing_origin_is_never_pseudonymized_or_resigned(
+    ) {
         let dir = tempfile::tempdir().unwrap();
-        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_config("verified", 4, 86_400)));
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_config("verified", 4, 86_400),
+        ));
         let mut rx = register_fed_conn(&d, "seattle", &format!("rf:{}", "33".repeat(32)));
 
         let origin_identity = test_peer_identity(dir.path(), "origin-gateway");
@@ -6306,12 +8686,21 @@ routes:
         env.origin = Some(fed::sign::sign_origin(&env, &origin_identity));
         fed::sign::append_attestation(&mut env, &origin_identity, Utc::now()).unwrap();
         env.hops = 1;
-        assert_eq!(fed::sign::verify_chain(&env), Ok(()), "fixture sanity check");
+        assert_eq!(
+            fed::sign::verify_chain(&env),
+            Ok(()),
+            "fixture sanity check"
+        );
         let original_origin = env.origin.clone().unwrap();
         let original_attestation_count = env.attestations.len();
 
         let delivery_id = queue_fed_delivery(&d, &env, "seattle/regional-chat");
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         process_due(&d, del, Utc::now()).await;
 
         let (sent_env, _) = unwrap_envelope_frame(rx.try_recv().unwrap());
@@ -6319,11 +8708,20 @@ routes:
             "an already origin-signed envelope's ref must never be mutated, or its origin sig breaks");
         assert_eq!(sent_env.origin.as_ref().unwrap().node_id, original_origin.node_id,
             "origin must stay the ORIGIN gateway's identity, never overwritten by this daemon's own");
-        assert_eq!(sent_env.origin.as_ref().unwrap().sig, original_origin.sig,
-            "origin signature bytes must be byte-identical -- proof it was not recomputed");
-        assert_eq!(sent_env.attestations.len(), original_attestation_count + 1,
-            "this hop appends exactly one new attestation on top of whatever was already there");
-        assert_eq!(sent_env.hops, 2, "hops increments by exactly one on top of the relayed value");
+        assert_eq!(
+            sent_env.origin.as_ref().unwrap().sig,
+            original_origin.sig,
+            "origin signature bytes must be byte-identical -- proof it was not recomputed"
+        );
+        assert_eq!(
+            sent_env.attestations.len(),
+            original_attestation_count + 1,
+            "this hop appends exactly one new attestation on top of whatever was already there"
+        );
+        assert_eq!(
+            sent_env.hops, 2,
+            "hops increments by exactly one on top of the relayed value"
+        );
         assert_eq!(fed::sign::verify_chain(&sent_env), Ok(()),
             "the full chain -- untouched origin + all attestations including this new one -- must verify");
     }
@@ -6351,12 +8749,19 @@ routes:
         let env = local_env(raw_ref, raw_body);
         let env_id = env.id;
         let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
 
         let before = metrics::SEALED_EGRESS.load(std::sync::atomic::Ordering::Relaxed);
         process_due(&d, del, Utc::now()).await;
 
-        let frame = rx.try_recv().expect("process_due_fed must send a Fed::Sealed frame");
+        let frame = rx
+            .try_recv()
+            .expect("process_due_fed must send a Fed::Sealed frame");
         let (sealed, target_route) = unwrap_sealed_frame(frame);
         assert_eq!(target_route, "regional-chat");
         assert_eq!(sealed.id, env_id.to_string());
@@ -6367,13 +8772,21 @@ routes:
         // leave it reachable via some other field.
         let mut buf = Vec::new();
         ciborium::into_writer(
-            &fed::wire::Fed::Sealed { sealed: sealed.clone(), target_route: target_route.clone() },
+            &fed::wire::Fed::Sealed {
+                sealed: sealed.clone(),
+                target_route: target_route.clone(),
+            },
             &mut buf,
-        ).unwrap();
-        assert!(!bytes_contain(&buf, raw_body.as_bytes()),
-            "the plaintext body must never reach the wire unsealed");
-        assert!(!bytes_contain(&buf, raw_ref.as_bytes()),
-            "the raw native ref must never reach the wire under identity_exposure: pseudonymous");
+        )
+        .unwrap();
+        assert!(
+            !bytes_contain(&buf, raw_body.as_bytes()),
+            "the plaintext body must never reach the wire unsealed"
+        );
+        assert!(
+            !bytes_contain(&buf, raw_ref.as_bytes()),
+            "the raw native ref must never reach the wire under identity_exposure: pseudonymous"
+        );
 
         // Round-trip: unseal with the recipient's own key, decode as an
         // Envelope, and the ENTIRE cycle-F signature chain must verify --
@@ -6385,13 +8798,23 @@ routes:
         let decoded: Envelope = ciborium::from_reader(opened.as_slice())
             .expect("sealed plaintext must CBOR-decode as a full Envelope");
         assert_eq!(decoded.id, env_id);
-        assert_eq!(decoded.body, raw_body, "no-transform: the unsealed body is the ORIGINAL, untruncated");
+        assert_eq!(
+            decoded.body, raw_body,
+            "no-transform: the unsealed body is the ORIGINAL, untruncated"
+        );
         assert!(decoded.origin.is_some());
         assert_eq!(fed::sign::verify_chain(&decoded), Ok(()));
 
-        assert!(metrics::SEALED_EGRESS.load(std::sync::atomic::Ordering::Relaxed) > before,
-            "SEALED_EGRESS must increment on a successful sealed send");
-        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert!(
+            metrics::SEALED_EGRESS.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "SEALED_EGRESS must increment on a successful sealed send"
+        );
+        let after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         assert_eq!(after.state, "attempting");
     }
 
@@ -6418,7 +8841,10 @@ routes:
             let mut cfg = d.cfg.read().unwrap().clone();
             let route = cfg.routes.iter_mut().find(|r| r.name == "general").unwrap();
             route.security_mode = "sealed".to_string();
-            route.render = crate::config::RenderConfig { tag: "alias".to_string(), max_chars: 16 };
+            route.render = crate::config::RenderConfig {
+                tag: "alias".to_string(),
+                max_chars: 16,
+            };
             d.apply_config(cfg);
         }
         let mut rx = register_fed_conn(&d, "phoenix", &node_id);
@@ -6428,14 +8854,21 @@ routes:
         assert!(long_body.chars().count() > 16, "fixture sanity check");
         let env = local_env("!ref", long_body);
         let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         process_due(&d, del, Utc::now()).await;
 
         let (sealed, _) = unwrap_sealed_frame(rx.try_recv().unwrap());
         let opened = fed::seal::unseal(&sealed, &recipient_secret).unwrap();
         let decoded: Envelope = ciborium::from_reader(opened.as_slice()).unwrap();
-        assert_eq!(decoded.body, long_body,
-            "route render.max_chars must never truncate a sealed route's body");
+        assert_eq!(
+            decoded.body, long_body,
+            "route render.max_chars must never truncate a sealed route's body"
+        );
     }
 
     #[tokio::test]
@@ -6452,18 +8885,31 @@ routes:
 
         let env = local_env("!ref", "body");
         let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         process_due(&d, del, Utc::now()).await;
 
-        assert!(rx.try_recv().is_err(),
-            "must never send unsealed when no sealed key is available (fail-closed)");
-        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "must never send unsealed when no sealed key is available (fail-closed)"
+        );
+        let after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         assert_eq!(after.state, "dead_letter");
         assert_eq!(after.reason.as_deref(), Some("NO_SEALED_KEY"));
     }
 
     #[tokio::test]
-    async fn process_due_fed_sealed_mode_oversized_envelope_dead_letters_sealed_oversize_not_shrunk() {
+    async fn process_due_fed_sealed_mode_oversized_envelope_dead_letters_sealed_oversize_not_shrunk(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let recipient_secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
         let recipient_pub = recipient_secret.public_key();
@@ -6479,12 +8925,24 @@ routes:
         let huge_body = "x".repeat(SEALED_MAX_BYTES as usize + 1024);
         let env = local_env("!ref", &huge_body);
         let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         process_due(&d, del, Utc::now()).await;
 
-        assert!(rx.try_recv().is_err(),
-            "an oversized sealed envelope must be rejected at origin, never sent (not even shrunk)");
-        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "an oversized sealed envelope must be rejected at origin, never sent (not even shrunk)"
+        );
+        let after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         assert_eq!(after.state, "dead_letter");
         assert_eq!(after.reason.as_deref(), Some("SEALED_OVERSIZE"));
     }
@@ -6504,17 +8962,33 @@ routes:
         set_route_security_mode(&d, "general", "sealed");
 
         let advert = signed_sealed_key_advert(
-            &peer_identity, &node_id, &hex::encode(recipient_pub.to_bytes()));
+            &peer_identity,
+            &node_id,
+            &hex::encode(recipient_pub.to_bytes()),
+        );
         let mut raw = Vec::new();
         ciborium::into_writer(&advert, &mut raw).unwrap();
-        d.store.lock().unwrap()
-            .upsert_peer_advert(&node_id, &raw, "phoenix", Utc::now() + CDuration::hours(1), Utc::now())
+        d.store
+            .lock()
+            .unwrap()
+            .upsert_peer_advert(
+                &node_id,
+                &raw,
+                "phoenix",
+                Utc::now() + CDuration::hours(1),
+                Utc::now(),
+            )
             .unwrap();
 
         let mut rx = register_fed_conn(&d, "phoenix", &node_id);
         let env = local_env("!ref", "advert-learned-key body");
         let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         process_due(&d, del, Utc::now()).await;
 
         let (sealed, _) = unwrap_sealed_frame(rx.try_recv().expect("sealed frame expected"));
@@ -6543,23 +9017,38 @@ routes:
         set_route_security_mode(&d, "general", "sealed");
 
         // The peer's own advert claims a DIFFERENT (wrong) sealed_key.
-        let advert = signed_sealed_key_advert(
-            &peer_identity, &node_id, &hex::encode(wrong_pub.to_bytes()));
+        let advert =
+            signed_sealed_key_advert(&peer_identity, &node_id, &hex::encode(wrong_pub.to_bytes()));
         let mut raw = Vec::new();
         ciborium::into_writer(&advert, &mut raw).unwrap();
-        d.store.lock().unwrap()
-            .upsert_peer_advert(&node_id, &raw, "phoenix", Utc::now() + CDuration::hours(1), Utc::now())
+        d.store
+            .lock()
+            .unwrap()
+            .upsert_peer_advert(
+                &node_id,
+                &raw,
+                "phoenix",
+                Utc::now() + CDuration::hours(1),
+                Utc::now(),
+            )
             .unwrap();
 
         let mut rx = register_fed_conn(&d, "phoenix", &node_id);
         let env = local_env("!ref", "config-pin-wins body");
         let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         process_due(&d, del, Utc::now()).await;
 
         let (sealed, _) = unwrap_sealed_frame(rx.try_recv().unwrap());
-        assert!(fed::seal::unseal(&sealed, &wrong_secret).is_err(),
-            "must NOT have sealed to the disagreeing advert-learned key");
+        assert!(
+            fed::seal::unseal(&sealed, &wrong_secret).is_err(),
+            "must NOT have sealed to the disagreeing advert-learned key"
+        );
         let opened = fed::seal::unseal(&sealed, &correct_secret)
             .expect("the config pin must win over a disagreeing advert-learned key");
         let decoded: Envelope = ciborium::from_reader(opened.as_slice()).unwrap();
@@ -6583,12 +9072,22 @@ routes:
 
         let env = local_env("!ref", "ack me");
         let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         process_due(&d, del, Utc::now()).await;
 
         let (sealed, _) = unwrap_sealed_frame(rx.try_recv().unwrap());
         assert_eq!(
-            d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap().state,
+            d.store
+                .lock()
+                .unwrap()
+                .deliveries_for_id(delivery_id)
+                .unwrap()
+                .state,
             "attempting",
         );
 
@@ -6598,7 +9097,12 @@ routes:
         // already resolves against, unchanged.
         fed::conn::handle_fed_ack(&d, "phoenix", &sealed.id);
 
-        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         assert_eq!(after.state, "delivered");
     }
 
@@ -6611,7 +9115,8 @@ routes:
     /// config -- it must dead-letter `ROUTE_CONFIG_MISSING` and send
     /// NOTHING at all (neither `Fed::Envelope` nor `Fed::Sealed`).
     #[tokio::test]
-    async fn process_due_fed_sealed_route_removed_before_send_dead_letters_route_config_missing_never_sends() {
+    async fn process_due_fed_sealed_route_removed_before_send_dead_letters_route_config_missing_never_sends(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let recipient_secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
         let recipient_pub = recipient_secret.public_key();
@@ -6638,13 +9143,25 @@ routes:
             d.apply_config(cfg);
         }
 
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         process_due(&d, del, Utc::now()).await;
 
-        assert!(rx.try_recv().is_err(),
+        assert!(
+            rx.try_recv().is_err(),
             "an unresolvable route's security posture is unknown -- NOTHING may be sent, \
-             sealed or cleartext");
-        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+             sealed or cleartext"
+        );
+        let after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         assert_eq!(after.state, "dead_letter");
         assert_eq!(after.reason.as_deref(), Some("ROUTE_CONFIG_MISSING"));
     }
@@ -6655,9 +9172,13 @@ routes:
     /// point is the daemon can no longer determine what posture this
     /// delivery was queued under, at all.
     #[tokio::test]
-    async fn process_due_fed_gateway_route_removed_before_send_also_dead_letters_route_config_missing() {
+    async fn process_due_fed_gateway_route_removed_before_send_also_dead_letters_route_config_missing(
+    ) {
         let dir = tempfile::tempdir().unwrap();
-        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_config("verified", 4, 86_400)));
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_config("verified", 4, 86_400),
+        ));
         let mut rx = register_fed_conn(&d, "phoenix", &format!("rf:{}", "4a".repeat(32)));
 
         let env = local_env("!ref", "gateway body");
@@ -6671,11 +9192,24 @@ routes:
             d.apply_config(cfg);
         }
 
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         process_due(&d, del, Utc::now()).await;
 
-        assert!(rx.try_recv().is_err(), "must never send cleartext when the route is gone");
-        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "must never send cleartext when the route is gone"
+        );
+        let after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         assert_eq!(after.state, "dead_letter");
         assert_eq!(after.reason.as_deref(), Some("ROUTE_CONFIG_MISSING"));
     }
@@ -6701,8 +9235,14 @@ routes:
         set_route_security_mode(&d, "general", "sealed");
         let mut rx = register_fed_conn(&d, "phoenix", &node_id);
         let sealed_env = local_env("!ref", "sealed still works");
-        let sealed_delivery = queue_fed_delivery_on_route(&d, &sealed_env, "phoenix/regional-chat", "general");
-        let del = d.store.lock().unwrap().deliveries_for_id(sealed_delivery).unwrap();
+        let sealed_delivery =
+            queue_fed_delivery_on_route(&d, &sealed_env, "phoenix/regional-chat", "general");
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(sealed_delivery)
+            .unwrap();
         process_due(&d, del, Utc::now()).await;
         let (sealed, _) = unwrap_sealed_frame(rx.try_recv().expect("sealed send must still work"));
         let opened = fed::seal::unseal(&sealed, &recipient_secret).unwrap();
@@ -6712,10 +9252,17 @@ routes:
         // Back to gateway, route present and unmolested.
         set_route_security_mode(&d, "general", "gateway");
         let gateway_env = local_env("!ref", "gateway still works");
-        let gateway_delivery = queue_fed_delivery_on_route(&d, &gateway_env, "phoenix/regional-chat", "general");
-        let del2 = d.store.lock().unwrap().deliveries_for_id(gateway_delivery).unwrap();
+        let gateway_delivery =
+            queue_fed_delivery_on_route(&d, &gateway_env, "phoenix/regional-chat", "general");
+        let del2 = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(gateway_delivery)
+            .unwrap();
         process_due(&d, del2, Utc::now()).await;
-        let (sent_env, _) = unwrap_envelope_frame(rx.try_recv().expect("gateway send must still work"));
+        let (sent_env, _) =
+            unwrap_envelope_frame(rx.try_recv().expect("gateway send must still work"));
         assert_eq!(sent_env.body, "gateway still works");
     }
 
@@ -6753,42 +9300,83 @@ routes:
         let body = "y".repeat(body_len);
         let env = local_env("!ref", &body);
         let delivery_id = queue_fed_delivery_on_route(&d, &env, "phoenix/regional-chat", "general");
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         process_due(&d, del, Utc::now()).await;
 
-        let frame = rx.try_recv().expect("a body under SEALED_MAX_BYTES must still be sent");
+        let frame = rx
+            .try_recv()
+            .expect("a body under SEALED_MAX_BYTES must still be sent");
         let (sealed, target_route) = unwrap_sealed_frame(frame);
         let mut wire_bytes = Vec::new();
         ciborium::into_writer(
-            &fed::wire::Fed::Sealed { sealed, target_route },
+            &fed::wire::Fed::Sealed {
+                sealed,
+                target_route,
+            },
             &mut wire_bytes,
-        ).unwrap();
-        assert!(wire_bytes.len() as u64 <= u64::from(fed::noise::MAX_FRAME),
+        )
+        .unwrap();
+        assert!(
+            wire_bytes.len() as u64 <= u64::from(fed::noise::MAX_FRAME),
             "sealed wire frame ({} bytes) must fit under MAX_FRAME ({} bytes)",
-            wire_bytes.len(), fed::noise::MAX_FRAME);
+            wire_bytes.len(),
+            fed::noise::MAX_FRAME
+        );
 
-        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
-        assert_eq!(after.state, "attempting", "must not have been oversize-rejected");
+        let after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
+        assert_eq!(
+            after.state, "attempting",
+            "must not have been oversize-rejected"
+        );
     }
 
     #[tokio::test]
     async fn process_due_fed_retries_with_backoff_when_no_live_connection() {
         let dir = tempfile::tempdir().unwrap();
-        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_config("verified", 4, 86_400)));
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_config("verified", 4, 86_400),
+        ));
         // Deliberately no `register_fed_conn` call: `d.fed` exists (the
         // `federation` block is configured) but no connection to "phoenix"
         // is registered -- never connected, or currently down.
 
         let env = local_env("!ref", "hello");
         let delivery_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         let now = Utc::now();
         process_due(&d, del, now).await;
 
-        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
-        assert_eq!(after.state, "pending", "no connection => existing retry posture, never attempting");
+        let after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
+        assert_eq!(
+            after.state, "pending",
+            "no connection => existing retry posture, never attempting"
+        );
         assert!(after.next_attempt >= now + CDuration::seconds(5));
-        assert_eq!(after.attempt_count, 0, "no send was ever attempted, so mark_attempting never ran");
+        assert_eq!(
+            after.attempt_count, 0,
+            "no send was ever attempted, so mark_attempting never ran"
+        );
         // FED_EGRESS is a shared process-global counter (see fed_ingress's
         // own tests for the same constraint under parallel `cargo test`) --
         // not safely comparable to a captured "before" snapshot here.
@@ -6799,7 +9387,10 @@ routes:
     #[tokio::test]
     async fn process_due_fed_retries_when_the_peer_connections_channel_is_full() {
         let dir = tempfile::tempdir().unwrap();
-        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_config("verified", 4, 86_400)));
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_config("verified", 4, 86_400),
+        ));
         let (tx, _rx) = mpsc::channel::<fed::wire::Fed>(1);
         tx.try_send(fed::wire::Fed::Ping {}).unwrap(); // fill the connection's one slot
         d.fed.as_ref().unwrap().conns.lock().unwrap().insert(
@@ -6809,16 +9400,30 @@ routes:
 
         let env = local_env("!ref", "hello");
         let delivery_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         let now = Utc::now();
         process_due(&d, del, now).await;
 
-        let after = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
-        assert_eq!(after.state, "pending",
-            "a full connection channel must fall back to retry, not get stuck attempting forever");
+        let after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
+        assert_eq!(
+            after.state, "pending",
+            "a full connection channel must fall back to retry, not get stuck attempting forever"
+        );
         assert!(after.next_attempt >= now + CDuration::seconds(5));
-        assert_eq!(after.attempt_count, 1,
-            "mark_attempting still ran once (before the send was even attempted)");
+        assert_eq!(
+            after.attempt_count, 1,
+            "mark_attempting still ran once (before the send was even attempted)"
+        );
     }
 
     // ==== process_due_fed egress budget (design §5, Task 3) ================
@@ -6842,22 +9447,37 @@ routes:
 
         let del1 = d.store.lock().unwrap().deliveries_for_id(first_id).unwrap();
         process_due(&d, del1, now).await;
-        let del2 = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
+        let del2 = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(second_id)
+            .unwrap();
         process_due(&d, del2, now).await;
 
         let after = metrics::BUDGET_DEFERRED.load(std::sync::atomic::Ordering::Relaxed);
         // process-global counter (same "monotonic-only" reasoning as every
         // other BUDGET_DEFERRED assertion in this file) -- the real,
         // race-free proof is the exactly-one-Send check below.
-        assert!(after > before, "the second fed send within the minute must be budget-deferred");
+        assert!(
+            after > before,
+            "the second fed send within the minute must be budget-deferred"
+        );
 
         rx.try_recv().expect("the first send must go through");
-        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
-            "the budget-deferred second send must never have called try_send");
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "the budget-deferred second send must never have called try_send"
+        );
 
         let first_after = d.store.lock().unwrap().deliveries_for_id(first_id).unwrap();
         assert_eq!(first_after.state, "attempting");
-        let second_after = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
+        let second_after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(second_id)
+            .unwrap();
         assert_eq!(second_after.state, "pending", "deferred, not attempted");
         assert!(second_after.next_attempt >= now + CDuration::seconds(5));
     }
@@ -6886,7 +9506,8 @@ routes:
             process_due(&d, del, now).await;
         }
         for _ in 0..5 {
-            rx.try_recv().expect("an unlimited (messages_per_minute: 0) peer must never be budget-deferred");
+            rx.try_recv()
+                .expect("an unlimited (messages_per_minute: 0) peer must never be budget-deferred");
         }
         assert!(d.budget_limiter.lock().unwrap().allow("fed/phoenix", 0, Instant::now()),
             "the 0 fast path never accumulates per-key state (mirrors BudgetLimiter::allow's own contract)");
@@ -6915,26 +9536,45 @@ routes:
         let first_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
         // Second send, EMERGENCY priority (0) -- queue_fed_delivery always
         // hardcodes priority 2, so this row is built directly.
-        let dest = Endpoint { protocol: FED_PROTOCOL.to_string(), endpoint: "phoenix/regional-chat".to_string() };
+        let dest = Endpoint {
+            protocol: FED_PROTOCOL.to_string(),
+            endpoint: "phoenix/regional-chat".to_string(),
+        };
         let second_id = {
             let store = d.store.lock().unwrap();
             store.insert_message(&env).unwrap();
-            store.insert_delivery(env.id, "general", &dest, Utc::now(), env.expires_at, 0).unwrap()
+            store
+                .insert_delivery(env.id, "general", &dest, Utc::now(), env.expires_at, 0)
+                .unwrap()
         };
 
         let now = Utc::now();
         let del1 = d.store.lock().unwrap().deliveries_for_id(first_id).unwrap();
         process_due(&d, del1, now).await;
-        let del2 = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
-        assert_eq!(del2.priority, 0, "sanity: this really is an emergency-priority row");
+        let del2 = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(second_id)
+            .unwrap();
+        assert_eq!(
+            del2.priority, 0,
+            "sanity: this really is an emergency-priority row"
+        );
         process_due(&d, del2, now).await;
 
-        rx.try_recv().expect("the first (normal-priority) send goes through");
+        rx.try_recv()
+            .expect("the first (normal-priority) send goes through");
         assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
             "an emergency-priority fed send must STILL be budget-deferred -- federation egress has \
              no emergency bypass lane (cycle-F priority ruling)");
 
-        let second_after = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
+        let second_after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(second_id)
+            .unwrap();
         assert_eq!(second_after.state, "pending", "deferred even at priority 0");
     }
 
@@ -6962,13 +9602,29 @@ routes:
 
         let del1 = d.store.lock().unwrap().deliveries_for_id(first_id).unwrap();
         process_due(&d, del1, now).await;
-        let del2 = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
+        let del2 = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(second_id)
+            .unwrap();
         process_due(&d, del2, now).await;
 
-        let deferred = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
-        assert_eq!(deferred.state, "pending", "must be deferred before the reset");
+        let deferred = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(second_id)
+            .unwrap();
+        assert_eq!(
+            deferred.state, "pending",
+            "must be deferred before the reset"
+        );
         rx.try_recv().expect("first send");
-        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
 
         // Re-apply the SAME config: the point is that apply_config resets
         // budget_limiter unconditionally, not conditioned on `federation`
@@ -6976,11 +9632,22 @@ routes:
         let cfg = d.cfg_snapshot(|c| c.clone());
         d.apply_config(cfg);
 
-        let del2_again = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
+        let del2_again = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(second_id)
+            .unwrap();
         process_due(&d, del2_again, now).await;
         rx.try_recv().expect(
-            "after apply_config resets the budget, the previously-deferred send must go through");
-        let final_state = d.store.lock().unwrap().deliveries_for_id(second_id).unwrap();
+            "after apply_config resets the budget, the previously-deferred send must go through",
+        );
+        let final_state = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(second_id)
+            .unwrap();
         assert_eq!(final_state.state, "attempting");
     }
 
@@ -7002,10 +9669,15 @@ routes:
         let t0 = Instant::now();
         let key = "fed/phoenix";
         assert!(d.budget_limiter.lock().unwrap().allow(key, 1, t0));
-        assert!(!d.budget_limiter.lock().unwrap().allow(key, 1, t0),
-            "second send within the same window must be denied");
         assert!(
-            d.budget_limiter.lock().unwrap().allow(key, 1, t0 + std::time::Duration::from_secs(61)),
+            !d.budget_limiter.lock().unwrap().allow(key, 1, t0),
+            "second send within the same window must be denied"
+        );
+        assert!(
+            d.budget_limiter
+                .lock()
+                .unwrap()
+                .allow(key, 1, t0 + std::time::Duration::from_secs(61)),
             "a full minute later, the window must have rolled over"
         );
     }
@@ -7022,32 +9694,56 @@ routes:
     #[tokio::test]
     async fn fed_egress_row_is_found_and_delivered_by_the_real_fed_ack_handler() {
         let dir = tempfile::tempdir().unwrap();
-        let d = Arc::new(test_daemon_with_federation(dir.path(), fed_config("verified", 4, 86_400)));
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_config("verified", 4, 86_400),
+        ));
         let mut rx = register_fed_conn(&d, "phoenix", &format!("rf:{}", "55".repeat(32)));
 
         let env = local_env("!ref", "round trip");
         let delivery_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
-        let del = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         process_due(&d, del, Utc::now()).await;
 
         let (sent_env, _) = unwrap_envelope_frame(rx.try_recv().unwrap());
-        let after_send = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let after_send = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         assert_eq!(after_send.state, "attempting");
 
         // The lookup Task 4's real Ack handler performs, driven directly:
         // proves `process_due_fed`'s `dest_endpoint` write is EXACTLY what
         // `deliveries_for_fed_ack`'s `LIKE peer || '/%'` match expects.
-        let found = d.store.lock().unwrap()
-            .deliveries_for_fed_ack(sent_env.id, "phoenix").unwrap();
+        let found = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_fed_ack(sent_env.id, "phoenix")
+            .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, delivery_id);
 
         let mut events_rx = d.events.subscribe();
         crate::fed::conn::handle_fed_ack(&d, "phoenix", &sent_env.id.to_string());
 
-        let after_ack = d.store.lock().unwrap().deliveries_for_id(delivery_id).unwrap();
+        let after_ack = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
         assert_eq!(after_ack.state, "delivered");
-        let ev = events_rx.try_recv().expect("handle_fed_ack must emit a Delivery(delivered) event");
+        let ev = events_rx
+            .try_recv()
+            .expect("handle_fed_ack must emit a Delivery(delivered) event");
         match ev {
             Event::Delivery { state, .. } => assert_eq!(state, "delivered"),
             other => panic!("expected Delivery, got {other:?}"),

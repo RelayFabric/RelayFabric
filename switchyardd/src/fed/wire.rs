@@ -53,9 +53,7 @@ pub enum Fed {
     },
     /// Acknowledges successful ingress of the envelope `id` (design §5
     /// egress: `Fed::Ack{id}` ⇒ delivered).
-    Ack {
-        id: String,
-    },
+    Ack { id: String },
     /// Keepalive, sender → peer (design §5: 30s keepalive, 90s dead timer).
     Ping {},
     /// Keepalive reply.
@@ -66,9 +64,7 @@ pub enum Fed {
     /// `advert_ttl_secs / 2`). Not boxed unlike `Envelope`'s `env`: an
     /// `Advert` is far smaller (no message body/attachments), well under
     /// the size where `clippy::large_enum_variant` would flag it.
-    Advert {
-        advert: Advert,
-    },
+    Advert { advert: Advert },
     /// RFDP discovery (design §2, cycle G): "send me your current advert,
     /// if you have one" -- sent once by each side at connection-up
     /// (subject to the local discovery scope gate, `fed::conn::
@@ -112,8 +108,13 @@ mod tests {
     fn envelope() -> Envelope {
         let now = Utc::now();
         Envelope::new(
-            Endpoint { protocol: "mock".into(), endpoint: "chan".into() },
-            Sender { native_ref: "!abcd".into() },
+            Endpoint {
+                protocol: "mock".into(),
+                endpoint: "chan".into(),
+            },
+            Sender {
+                native_ref: "!abcd".into(),
+            },
             "text".into(),
             "hello".into(),
             now,
@@ -134,7 +135,10 @@ mod tests {
     fn envelope_frame_roundtrips() {
         let env = envelope();
         let id = env.id;
-        let msg = Fed::Envelope { env: Box::new(env), target_route: "regional-chat".into() };
+        let msg = Fed::Envelope {
+            env: Box::new(env),
+            target_route: "regional-chat".into(),
+        };
         match roundtrip(&msg) {
             Fed::Envelope { env, target_route } => {
                 assert_eq!(env.id, id);
@@ -146,7 +150,9 @@ mod tests {
 
     #[test]
     fn ack_frame_roundtrips() {
-        let msg = Fed::Ack { id: "0189f1e4-1111-7000-8000-000000000001".into() };
+        let msg = Fed::Ack {
+            id: "0189f1e4-1111-7000-8000-000000000001".into(),
+        };
         match roundtrip(&msg) {
             Fed::Ack { id } => assert_eq!(id, "0189f1e4-1111-7000-8000-000000000001"),
             other => panic!("wrong variant: {other:?}"),
@@ -177,7 +183,10 @@ mod tests {
             services: BTreeMap::from([("federation".to_string(), true)]),
             protocols: BTreeMap::new(),
             security: SecurityCaps {
-                translate: true, signed: true, sealed: true, sealed_key: Some("33".repeat(32)),
+                translate: true,
+                signed: true,
+                sealed: true,
+                sealed_key: Some("33".repeat(32)),
             },
             expires: 1_786_838_400,
             sig: vec![1, 2, 3, 4],
@@ -186,7 +195,9 @@ mod tests {
 
     #[test]
     fn advert_frame_roundtrips() {
-        let msg = Fed::Advert { advert: sample_advert() };
+        let msg = Fed::Advert {
+            advert: sample_advert(),
+        };
         match roundtrip(&msg) {
             Fed::Advert { advert } => assert_eq!(advert, sample_advert()),
             other => panic!("wrong variant: {other:?}"),
@@ -214,9 +225,15 @@ mod tests {
 
     #[test]
     fn sealed_frame_roundtrips() {
-        let msg = Fed::Sealed { sealed: sample_sealed(), target_route: "regional-chat".into() };
+        let msg = Fed::Sealed {
+            sealed: sample_sealed(),
+            target_route: "regional-chat".into(),
+        };
         match roundtrip(&msg) {
-            Fed::Sealed { sealed, target_route } => {
+            Fed::Sealed {
+                sealed,
+                target_route,
+            } => {
                 assert_eq!(sealed, sample_sealed());
                 assert_eq!(target_route, "regional-chat");
             }
@@ -229,7 +246,10 @@ mod tests {
     /// The base case: a tag no variant recognizes, no other fields at all.
     #[test]
     fn unknown_tag_with_no_other_fields_decodes_to_unknown() {
-        let map = Value::Map(vec![(Value::Text("t".into()), Value::Text("future_thing".into()))]);
+        let map = Value::Map(vec![(
+            Value::Text("t".into()),
+            Value::Text("future_thing".into()),
+        )]);
         let mut buf = Vec::new();
         ciborium::into_writer(&map, &mut buf).unwrap();
         let decoded: Fed = ciborium::from_reader(buf.as_slice()).unwrap();

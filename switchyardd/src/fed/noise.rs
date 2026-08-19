@@ -65,7 +65,9 @@ pub struct StaticKey {
 
 impl StaticKey {
     pub fn load_or_create(path: &Path) -> io::Result<StaticKey> {
-        Ok(StaticKey { private: crate::keyfile::load_or_create_key32(path, "fed static key")? })
+        Ok(StaticKey {
+            private: crate::keyfile::load_or_create_key32(path, "fed static key")?,
+        })
     }
 
     fn private_bytes(&self) -> [u8; 32] {

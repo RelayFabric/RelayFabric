@@ -28,35 +28,61 @@ pub async fn listen(d: Arc<Daemon>, listener: UnixListener) {
     }
 }
 
-async fn handle_conn(
-    d: Arc<Daemon>,
-    stream: tokio::net::UnixStream,
-) -> std::io::Result<()> {
+async fn handle_conn(d: Arc<Daemon>, stream: tokio::net::UnixStream) -> std::io::Result<()> {
     let (mut r, mut w) = stream.into_split();
     let hello: PluginToDaemon = read_frame(&mut r).await?;
-    let PluginToDaemon::Hello { plugin, protocol_version, capabilities, .. } = hello else {
+    let PluginToDaemon::Hello {
+        plugin,
+        protocol_version,
+        capabilities,
+        ..
+    } = hello
+    else {
         return Err(std::io::Error::other("first frame must be Hello"));
     };
     // trust boundary: only configured+enabled plugin names may attach
     let allowed = d.cfg_snapshot(|c| c.plugins.get(&plugin).map(|p| p.enabled).unwrap_or(false));
     if !allowed || protocol_version != PROTOCOL_VERSION {
-        let err = if allowed { "unsupported protocol version" } else { "unknown plugin" };
-        write_frame(&mut w, &DaemonToPlugin::HelloAck {
-            protocol_version: PROTOCOL_VERSION, error: Some(err.into()),
-        }).await?;
+        let err = if allowed {
+            "unsupported protocol version"
+        } else {
+            "unknown plugin"
+        };
+        write_frame(
+            &mut w,
+            &DaemonToPlugin::HelloAck {
+                protocol_version: PROTOCOL_VERSION,
+                error: Some(err.into()),
+            },
+        )
+        .await?;
         return Err(std::io::Error::other(format!("{plugin}: {err}")));
     }
-    write_frame(&mut w, &DaemonToPlugin::HelloAck {
-        protocol_version: PROTOCOL_VERSION, error: None,
-    }).await?;
+    write_frame(
+        &mut w,
+        &DaemonToPlugin::HelloAck {
+            protocol_version: PROTOCOL_VERSION,
+            error: None,
+        },
+    )
+    .await?;
 
     // bounded outbound channel: backpressure instead of unbounded memory (§45)
     let (tx, mut rx) = mpsc::channel::<DaemonToPlugin>(256);
-    d.plugins.lock().unwrap().insert(plugin.clone(), PluginHandle {
-        tx, capabilities, connected: true,
-    });
+    d.plugins.lock().unwrap().insert(
+        plugin.clone(),
+        PluginHandle {
+            tx,
+            capabilities,
+            connected: true,
+        },
+    );
     info!(plugin, "plugin connected");
-    d.emit_event(|| Event::Plugin { name: plugin.clone(), up: true, ts: Utc::now() });
+    d.emit_event(|| Event::Plugin {
+        name: plugin.clone(),
+        up: true,
+        ts: Utc::now(),
+    });
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -69,12 +95,31 @@ async fn handle_conn(
     let result = loop {
         match read_frame::<_, PluginToDaemon>(&mut r).await {
             Ok(PluginToDaemon::Inbound {
-                endpoint, sender, kind, body, created_at, attachments, priority,
+                endpoint,
+                sender,
+                kind,
+                body,
+                created_at,
+                attachments,
+                priority,
             }) => {
                 engine::handle_inbound(
-                    &d, &plugin, endpoint, sender, kind, body, created_at, attachments, priority);
+                    &d,
+                    &plugin,
+                    endpoint,
+                    sender,
+                    kind,
+                    body,
+                    created_at,
+                    attachments,
+                    priority,
+                );
             }
-            Ok(PluginToDaemon::DeliveryResult { corr, delivered, detail }) => {
+            Ok(PluginToDaemon::DeliveryResult {
+                corr,
+                delivered,
+                detail,
+            }) => {
                 engine::handle_result(&d, corr, delivered, detail);
             }
             Ok(PluginToDaemon::Gauges { gauges }) => {
@@ -89,14 +134,21 @@ async fn handle_conn(
     }
     writer.abort();
     info!(plugin, "plugin disconnected");
-    d.emit_event(|| Event::Plugin { name: plugin.clone(), up: false, ts: Utc::now() });
+    d.emit_event(|| Event::Plugin {
+        name: plugin.clone(),
+        up: false,
+        ts: Utc::now(),
+    });
     Err(result)
 }
 
 pub async fn supervise(d: Arc<Daemon>, name: String, command: String, socket: PathBuf) {
-    let cfg_json = d.cfg_snapshot(|c| c.plugins.get(&name)
-        .map(|p| serde_json::to_string(&p.config).unwrap_or_default())
-        .unwrap_or_default());
+    let cfg_json = d.cfg_snapshot(|c| {
+        c.plugins
+            .get(&name)
+            .map(|p| serde_json::to_string(&p.config).unwrap_or_default())
+            .unwrap_or_default()
+    });
     let backoffs = [1u64, 5, 30, 120]; // spec §69
     let mut strikes = 0usize;
     loop {
@@ -117,7 +169,9 @@ pub async fn supervise(d: Arc<Daemon>, name: String, command: String, socket: Pa
             .spawn();
         let started = Instant::now();
         match child {
-            Ok(mut c) => { let _ = c.wait().await; }
+            Ok(mut c) => {
+                let _ = c.wait().await;
+            }
             Err(e) => warn!(plugin = name, error = %e, "spawn failed"),
         }
         if started.elapsed() > Duration::from_secs(60) {
@@ -125,7 +179,10 @@ pub async fn supervise(d: Arc<Daemon>, name: String, command: String, socket: Pa
         }
         let delay = backoffs[strikes.min(backoffs.len() - 1)];
         strikes += 1;
-        warn!(plugin = name, delay, "plugin exited; restarting after backoff");
+        warn!(
+            plugin = name,
+            delay, "plugin exited; restarting after backoff"
+        );
         tokio::time::sleep(Duration::from_secs(delay)).await;
     }
 }
@@ -151,19 +208,28 @@ mod tests {
         let conn = tokio::spawn(handle_conn(d.clone(), daemon_side));
 
         let (mut r, mut w) = plugin_side.into_split();
-        write_frame(&mut w, &PluginToDaemon::Hello {
-            plugin: "mocka".into(),
-            version: "0.1.0".into(),
-            protocol_version: PROTOCOL_VERSION,
-            capabilities: Capabilities::default(),
-        }).await.unwrap();
+        write_frame(
+            &mut w,
+            &PluginToDaemon::Hello {
+                plugin: "mocka".into(),
+                version: "0.1.0".into(),
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: Capabilities::default(),
+            },
+        )
+        .await
+        .unwrap();
         let ack: DaemonToPlugin = read_frame(&mut r).await.unwrap();
-        assert!(matches!(ack, DaemonToPlugin::HelloAck { error: None, .. }),
-            "hello must be accepted: {ack:?}");
+        assert!(
+            matches!(ack, DaemonToPlugin::HelloAck { error: None, .. }),
+            "hello must be accepted: {ack:?}"
+        );
 
         let mut gauges = BTreeMap::new();
         gauges.insert("RSSI".to_string(), -71.0);
-        write_frame(&mut w, &PluginToDaemon::Gauges { gauges }).await.unwrap();
+        write_frame(&mut w, &PluginToDaemon::Gauges { gauges })
+            .await
+            .unwrap();
 
         // Dropping both halves closes the plugin side of the socket, so
         // handle_conn's next read hits EOF and the spawned task returns —
@@ -173,8 +239,10 @@ mod tests {
         let _ = conn.await;
 
         let rendered = d.gauges.render(std::time::Instant::now());
-        assert_eq!(rendered, "relayfabric_plugin_gauge{plugin=\"mocka\",name=\"rssi\"} -71\n",
-            "name must be sanitized (lowercased) and the value preserved");
+        assert_eq!(
+            rendered, "relayfabric_plugin_gauge{plugin=\"mocka\",name=\"rssi\"} -71\n",
+            "name must be sanitized (lowercased) and the value preserved"
+        );
     }
 
     /// design §4's two `plugins.rs` emission points: `up: true` right after
@@ -193,18 +261,26 @@ mod tests {
         let conn = tokio::spawn(handle_conn(d.clone(), daemon_side));
 
         let (mut r, mut w) = plugin_side.into_split();
-        write_frame(&mut w, &PluginToDaemon::Hello {
-            plugin: "mocka".into(),
-            version: "0.1.0".into(),
-            protocol_version: PROTOCOL_VERSION,
-            capabilities: Capabilities::default(),
-        }).await.unwrap();
+        write_frame(
+            &mut w,
+            &PluginToDaemon::Hello {
+                plugin: "mocka".into(),
+                version: "0.1.0".into(),
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: Capabilities::default(),
+            },
+        )
+        .await
+        .unwrap();
         let ack: DaemonToPlugin = read_frame(&mut r).await.unwrap();
-        assert!(matches!(ack, DaemonToPlugin::HelloAck { error: None, .. }),
-            "hello must be accepted: {ack:?}");
+        assert!(
+            matches!(ack, DaemonToPlugin::HelloAck { error: None, .. }),
+            "hello must be accepted: {ack:?}"
+        );
 
         let up_ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await.expect("timed out waiting for the connect event")
+            .await
+            .expect("timed out waiting for the connect event")
             .expect("connect must emit a Plugin event");
         match up_ev {
             Event::Plugin { name, up, .. } => {
@@ -222,7 +298,8 @@ mod tests {
         let _ = conn.await;
 
         let down_ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await.expect("timed out waiting for the disconnect event")
+            .await
+            .expect("timed out waiting for the disconnect event")
             .expect("disconnect must emit a Plugin event");
         match down_ev {
             Event::Plugin { name, up, .. } => {
@@ -242,15 +319,22 @@ mod tests {
         let conn = tokio::spawn(handle_conn(d.clone(), daemon_side));
 
         let (mut r, mut w) = plugin_side.into_split();
-        write_frame(&mut w, &PluginToDaemon::Hello {
-            plugin: "not-configured".into(),
-            version: "0.1.0".into(),
-            protocol_version: PROTOCOL_VERSION,
-            capabilities: Capabilities::default(),
-        }).await.unwrap();
+        write_frame(
+            &mut w,
+            &PluginToDaemon::Hello {
+                plugin: "not-configured".into(),
+                version: "0.1.0".into(),
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: Capabilities::default(),
+            },
+        )
+        .await
+        .unwrap();
         let ack: DaemonToPlugin = read_frame(&mut r).await.unwrap();
-        assert!(matches!(&ack, DaemonToPlugin::HelloAck { error: Some(e), .. } if e == "unknown plugin"),
-            "an unconfigured plugin name must be rejected: {ack:?}");
+        assert!(
+            matches!(&ack, DaemonToPlugin::HelloAck { error: Some(e), .. } if e == "unknown plugin"),
+            "an unconfigured plugin name must be rejected: {ack:?}"
+        );
         let _ = conn.await;
     }
 }

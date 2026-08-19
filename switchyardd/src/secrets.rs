@@ -61,7 +61,10 @@ pub fn resolve(r: &SecretRef) -> Result<String, String> {
     match r {
         SecretRef::Env(name) => match std::env::var(name) {
             Ok(v) if !v.is_empty() => Ok(v),
-            _ => Err(format!("secret reference {} is unset or empty", r.display_form())),
+            _ => Err(format!(
+                "secret reference {} is unset or empty",
+                r.display_form()
+            )),
         },
         SecretRef::File(path) => {
             // design §2 syntax is `${file:/abs/path}` -- a relative path
@@ -72,18 +75,22 @@ pub fn resolve(r: &SecretRef) -> Result<String, String> {
             // to be running.
             if !path.is_absolute() {
                 return Err(format!(
-                    "secret reference {} must use an absolute path", r.display_form()));
+                    "secret reference {} must use an absolute path",
+                    r.display_form()
+                ));
             }
-            let raw = std::fs::read_to_string(path).map_err(|e| {
-                format!("secret reference {} is unreadable: {e}", r.display_form())
-            })?;
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| format!("secret reference {} is unreadable: {e}", r.display_form()))?;
             let trimmed = raw.trim().to_string();
             if trimmed.is_empty() {
                 // symmetric with the env arm above: an empty/whitespace-only
                 // secret file is exactly as unusable as an unset/empty env
                 // var, and silently resolving to "" would hand plugins an
                 // empty token instead of failing loudly at config load.
-                return Err(format!("secret reference {} is empty or unset", r.display_form()));
+                return Err(format!(
+                    "secret reference {} is empty or unset",
+                    r.display_form()
+                ));
             }
             if let Some(warning) = permission_warning(path) {
                 // eprintln, not tracing::warn!: this runs inside
@@ -138,7 +145,8 @@ fn permission_warning(path: &Path) -> Option<String> {
     if mode & 0o077 != 0 {
         Some(format!(
             "secret file {} is group/world-readable (mode {:o}); consider chmod 600",
-            path.display(), mode & 0o777,
+            path.display(),
+            mode & 0o777,
         ))
     } else {
         None
@@ -154,7 +162,10 @@ mod tests {
 
     #[test]
     fn parses_env_ref() {
-        assert_eq!(parse_ref("${env:TOKEN}"), Some(SecretRef::Env("TOKEN".into())));
+        assert_eq!(
+            parse_ref("${env:TOKEN}"),
+            Some(SecretRef::Env("TOKEN".into()))
+        );
     }
 
     #[test]
@@ -215,7 +226,10 @@ mod tests {
 
     #[test]
     fn display_form_renders_canonical_syntax() {
-        assert_eq!(SecretRef::Env("TOKEN".into()).display_form(), "${env:TOKEN}");
+        assert_eq!(
+            SecretRef::Env("TOKEN".into()).display_form(),
+            "${env:TOKEN}"
+        );
         assert_eq!(
             SecretRef::File(PathBuf::from("/a/b")).display_form(),
             "${file:/a/b}",
@@ -236,14 +250,20 @@ mod tests {
     fn resolve_env_errors_naming_ref_when_unset() {
         std::env::remove_var("RF_SECRETS_TEST_ENV_UNSET");
         let err = resolve(&SecretRef::Env("RF_SECRETS_TEST_ENV_UNSET".into())).unwrap_err();
-        assert!(err.contains("${env:RF_SECRETS_TEST_ENV_UNSET}"), "err was: {err}");
+        assert!(
+            err.contains("${env:RF_SECRETS_TEST_ENV_UNSET}"),
+            "err was: {err}"
+        );
     }
 
     #[test]
     fn resolve_env_errors_naming_ref_when_empty() {
         std::env::set_var("RF_SECRETS_TEST_ENV_EMPTY", "");
         let err = resolve(&SecretRef::Env("RF_SECRETS_TEST_ENV_EMPTY".into())).unwrap_err();
-        assert!(err.contains("${env:RF_SECRETS_TEST_ENV_EMPTY}"), "err was: {err}");
+        assert!(
+            err.contains("${env:RF_SECRETS_TEST_ENV_EMPTY}"),
+            "err was: {err}"
+        );
         std::env::remove_var("RF_SECRETS_TEST_ENV_EMPTY");
     }
 
@@ -264,7 +284,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist.txt");
         let err = resolve(&SecretRef::File(path.clone())).unwrap_err();
-        assert!(err.contains(&format!("${{file:{}}}", path.display())), "err was: {err}");
+        assert!(
+            err.contains(&format!("${{file:{}}}", path.display())),
+            "err was: {err}"
+        );
     }
 
     /// Symmetric with `resolve_env_errors_naming_ref_when_empty`: a file
@@ -282,7 +305,10 @@ mod tests {
                 Err(e) => e,
                 Ok(v) => panic!("{label} file should error, not resolve to {v:?}"),
             };
-            assert!(err.contains(&format!("${{file:{}}}", path.display())), "err was: {err}");
+            assert!(
+                err.contains(&format!("${{file:{}}}", path.display())),
+                "err was: {err}"
+            );
         }
     }
 
@@ -292,7 +318,10 @@ mod tests {
     #[test]
     fn resolve_file_errors_naming_ref_for_relative_path() {
         let err = resolve(&SecretRef::File(PathBuf::from("relative/secret.txt"))).unwrap_err();
-        assert!(err.contains("${file:relative/secret.txt}"), "err was: {err}");
+        assert!(
+            err.contains("${file:relative/secret.txt}"),
+            "err was: {err}"
+        );
     }
 
     /// `parse_ref` is purely syntactic (design: exact-match shape only) --
@@ -325,10 +354,13 @@ mod tests {
             let path = dir.path().join(format!("secret-{mode:o}.txt"));
             std::fs::write(&path, "super-secret-contents").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-            let msg = permission_warning(&path)
-                .unwrap_or_else(|| panic!("mode {mode:o} should warn"));
+            let msg =
+                permission_warning(&path).unwrap_or_else(|| panic!("mode {mode:o} should warn"));
             assert!(msg.contains(&path.display().to_string()), "msg was: {msg}");
-            assert!(!msg.contains("super-secret-contents"), "msg leaked contents: {msg}");
+            assert!(
+                !msg.contains("super-secret-contents"),
+                "msg leaked contents: {msg}"
+            );
         }
     }
 

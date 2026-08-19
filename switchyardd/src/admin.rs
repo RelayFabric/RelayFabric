@@ -92,7 +92,11 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<AdminState>)> {
 }
 
 pub fn router(d: Arc<Daemon>, config_path: PathBuf) -> Router {
-    let state = AdminState { daemon: d, config_path, write_lock: Arc::new(Mutex::new(())) };
+    let state = AdminState {
+        daemon: d,
+        config_path,
+        write_lock: Arc::new(Mutex::new(())),
+    };
     let mut r: Router<AdminState> = Router::new();
     for (path, method_router) in admin_routes() {
         r = r.route(path, method_router);
@@ -113,11 +117,19 @@ pub fn router(d: Arc<Daemon>, config_path: PathBuf) -> Router {
 /// Takes an already-bound listener (bind failures must fail startup loudly in
 /// `main`, not silently kill only this background task — see `plugins.sock`).
 pub async fn serve(d: Arc<Daemon>, config_path: PathBuf, listener: tokio::net::UnixListener) {
-    axum::serve(listener, router(d, config_path)).await.expect("admin serve");
+    axum::serve(listener, router(d, config_path))
+        .await
+        .expect("admin serve");
 }
 
 fn queue_map(d: &Daemon) -> BTreeMap<String, i64> {
-    d.store.lock().unwrap().queue_counts().unwrap_or_default().into_iter().collect()
+    d.store
+        .lock()
+        .unwrap()
+        .queue_counts()
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
 }
 
 /// Cfg is read (and dropped) BEFORE `plugins` is locked -- consistent lock
@@ -126,10 +138,15 @@ fn queue_map(d: &Daemon) -> BTreeMap<String, i64> {
 /// call site in this module follows too.
 fn plugin_state(d: &Daemon) -> Vec<(String, bool)> {
     let enabled_names: Vec<String> = d.cfg_snapshot(|c| {
-        c.plugins.iter().filter(|(_, p)| p.enabled).map(|(name, _)| name.clone()).collect()
+        c.plugins
+            .iter()
+            .filter(|(_, p)| p.enabled)
+            .map(|(name, _)| name.clone())
+            .collect()
     });
     let connected = d.plugins.lock().unwrap();
-    enabled_names.into_iter()
+    enabled_names
+        .into_iter()
         .map(|name| {
             let up = connected.get(&name).map(|h| h.connected).unwrap_or(false);
             (name, up)
@@ -211,12 +228,16 @@ struct PublicResponse {
 )]
 async fn public(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let (public, services) = d.cfg_snapshot(|c| {
-        let services: Vec<_> = c.public_services.iter().map(|s| PublicServiceItem {
-            egress: s.egress.clone(),
-            ingress: s.ingress.clone(),
-            name: s.name.clone(),
-            r#type: s.r#type.clone(),
-        }).collect();
+        let services: Vec<_> = c
+            .public_services
+            .iter()
+            .map(|s| PublicServiceItem {
+                egress: s.egress.clone(),
+                ingress: s.ingress.clone(),
+                name: s.name.clone(),
+                r#type: s.r#type.clone(),
+            })
+            .collect();
         (c.node.public, services)
     });
     Json(PublicResponse { public, services })
@@ -274,15 +295,26 @@ struct LimitsResponse {
 )]
 async fn limits(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     Json(d.cfg_snapshot(|c| {
-        let transport_budgets: BTreeMap<_, _> = c.transport_budgets.iter()
-            .map(|(proto, b)| (proto.clone(), TransportBudgetItem { messages_per_minute: b.messages_per_minute }))
+        let transport_budgets: BTreeMap<_, _> = c
+            .transport_budgets
+            .iter()
+            .map(|(proto, b)| {
+                (
+                    proto.clone(),
+                    TransportBudgetItem {
+                        messages_per_minute: b.messages_per_minute,
+                    },
+                )
+            })
             .collect();
         LimitsResponse {
             global: GlobalLimitsItem {
                 cas_max_bytes: c.limits.global.cas_max_bytes,
                 queue_max: c.limits.global.queue_max,
             },
-            per_route: PerRouteLimitsItem { queue_max: c.limits.per_route.queue_max },
+            per_route: PerRouteLimitsItem {
+                queue_max: c.limits.per_route.queue_max,
+            },
             per_sender: PerSenderLimitsItem {
                 bytes_per_hour: c.limits.per_sender.bytes_per_hour,
                 messages_per_minute: c.limits.per_sender.messages_per_minute,
@@ -359,11 +391,16 @@ struct PluginsResponseDoc(BTreeMap<String, PluginEntryDoc>);
 )]
 async fn plugins(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let enabled_names: Vec<String> = d.cfg_snapshot(|c| {
-        c.plugins.iter().filter(|(_, p)| p.enabled).map(|(name, _)| name.clone()).collect()
+        c.plugins
+            .iter()
+            .filter(|(_, p)| p.enabled)
+            .map(|(name, _)| name.clone())
+            .collect()
     });
     let states: Vec<(String, bool, Option<serde_json::Value>)> = {
         let handles = d.plugins.lock().unwrap();
-        enabled_names.into_iter()
+        enabled_names
+            .into_iter()
             .map(|name| {
                 let h = handles.get(&name);
                 let connected = h.map(|h| h.connected).unwrap_or(false);
@@ -373,9 +410,12 @@ async fn plugins(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
             .collect()
     };
     let now = std::time::Instant::now();
-    let out: BTreeMap<String, serde_json::Value> = states.into_iter()
+    let out: BTreeMap<String, serde_json::Value> = states
+        .into_iter()
         .map(|(name, connected, capabilities)| {
-            let gauges: BTreeMap<String, serde_json::Value> = d.gauges.for_plugin(&name, now)
+            let gauges: BTreeMap<String, serde_json::Value> = d
+                .gauges
+                .for_plugin(&name, now)
                 .into_iter()
                 .map(|(gauge_name, (value, age_secs))| {
                     (gauge_name, json!({ "value": value, "age_secs": age_secs }))
@@ -404,12 +444,18 @@ fn policies_for_route<'a>(
     route: &crate::config::RouteConfig,
     policies: &'a [crate::config::Policy],
 ) -> Vec<&'a str> {
-    let dest_protocols: std::collections::BTreeSet<&str> =
-        route.destinations.iter().map(|e| e.protocol.as_str()).collect();
-    policies.iter()
+    let dest_protocols: std::collections::BTreeSet<&str> = route
+        .destinations
+        .iter()
+        .map(|e| e.protocol.as_str())
+        .collect();
+    policies
+        .iter()
         .filter(|p| {
             p.r#match.destination_protocol.is_empty()
-                || p.r#match.destination_protocol.iter()
+                || p.r#match
+                    .destination_protocol
+                    .iter()
                     .any(|proto| dest_protocols.contains(proto.as_str()))
         })
         .map(|p| p.name.as_str())
@@ -463,15 +509,24 @@ struct RoutesResponse {
 async fn routes(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     Json(RoutesResponse {
         routes: d.cfg_snapshot(|c| {
-            c.routes.iter().map(|r| RouteItem {
-                destinations: r.destinations.iter().map(|e| e.to_string()).collect(),
-                identity_mode: r.identity_mode.clone(),
-                name: r.name.clone(),
-                policies: policies_for_route(r, &c.policies).into_iter().map(String::from).collect(),
-                render: RouteRenderItem { max_chars: r.render.max_chars, tag: r.render.tag.clone() },
-                sources: r.sources.iter().map(|e| e.to_string()).collect(),
-            }).collect()
-        })
+            c.routes
+                .iter()
+                .map(|r| RouteItem {
+                    destinations: r.destinations.iter().map(|e| e.to_string()).collect(),
+                    identity_mode: r.identity_mode.clone(),
+                    name: r.name.clone(),
+                    policies: policies_for_route(r, &c.policies)
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                    render: RouteRenderItem {
+                        max_chars: r.render.max_chars,
+                        tag: r.render.tag.clone(),
+                    },
+                    sources: r.sources.iter().map(|e| e.to_string()).collect(),
+                })
+                .collect()
+        }),
     })
 }
 
@@ -494,7 +549,11 @@ async fn routes(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
 )]
 async fn config_yaml(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let yaml = d.cfg_snapshot(|c| c.raw_yaml.clone());
-    (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/yaml")], yaml)
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/yaml")],
+        yaml,
+    )
 }
 
 /// `?n=` selector for `GET /v1/config/prev`: which retained revision to
@@ -676,10 +735,12 @@ fn swap_with_prev(path: &Path) -> std::io::Result<()> {
 /// must reject non-UTF-8 bytes the exact same way (422, same shape as any
 /// other validation failure) before doing anything else with it.
 fn decode_body_or_422(body: &Bytes) -> Result<&str, (StatusCode, Json<serde_json::Value>)> {
-    std::str::from_utf8(body).map_err(|_| (
-        StatusCode::UNPROCESSABLE_ENTITY,
-        Json(json!({"valid": false, "errors": ["request body is not valid UTF-8"]})),
-    ))
+    std::str::from_utf8(body).map_err(|_| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"valid": false, "errors": ["request body is not valid UTF-8"]})),
+        )
+    })
 }
 
 /// `POST /v1/config/validate` (design §3): runs the exact same parse +
@@ -739,7 +800,10 @@ async fn config_validate(body: Bytes) -> impl IntoResponse {
     };
     match crate::config::load_from_str(text) {
         Ok(_) => (StatusCode::OK, Json(json!({"valid": true}))),
-        Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"valid": false, "errors": [e]}))),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"valid": false, "errors": [e]})),
+        ),
     }
 }
 
@@ -792,17 +856,24 @@ async fn config_put(State(state): State<AdminState>, body: Bytes) -> impl IntoRe
     let new_cfg = match crate::config::load_from_str(text) {
         Ok(cfg) => cfg,
         Err(e) => {
-            return (StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"valid": false, "errors": [e]})));
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"valid": false, "errors": [e]})),
+            );
         }
     };
     let _write_guard = state.write_lock.lock().unwrap();
     if let Err(e) = write_config_replacing_current(&state.config_path, text) {
-        return (StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("failed to write config file: {e}")})));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("failed to write config file: {e}")})),
+        );
     }
     let outcome = state.daemon.apply_config(new_cfg);
-    (StatusCode::OK, Json(json!({"applied": true, "restart_required": outcome.restart_required})))
+    (
+        StatusCode::OK,
+        Json(json!({"applied": true, "restart_required": outcome.restart_required})),
+    )
 }
 
 /// `POST /v1/config/rollback` (design §3): 404 if no `<path>.prev` exists.
@@ -846,14 +917,18 @@ async fn config_rollback(State(state): State<AdminState>) -> impl IntoResponse {
     let prev_path = prev_path_for(&state.config_path);
     let _write_guard = state.write_lock.lock().unwrap();
     if !prev_path.exists() {
-        return (StatusCode::NOT_FOUND,
-            Json(json!({"error": "no previous config to roll back to"})));
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no previous config to roll back to"})),
+        );
     }
     let prev_text = match std::fs::read_to_string(&prev_path) {
         Ok(t) => t,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("failed to read previous config: {e}")})));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("failed to read previous config: {e}")})),
+            );
         }
     };
     let new_cfg = match crate::config::load_from_str(&prev_text) {
@@ -861,11 +936,16 @@ async fn config_rollback(State(state): State<AdminState>) -> impl IntoResponse {
         Err(e) => return (StatusCode::CONFLICT, Json(json!({"errors": [e]}))),
     };
     if let Err(e) = swap_with_prev(&state.config_path) {
-        return (StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("failed to swap config files: {e}")})));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("failed to swap config files: {e}")})),
+        );
     }
     let outcome = state.daemon.apply_config(new_cfg);
-    (StatusCode::OK, Json(json!({"applied": true, "restart_required": outcome.restart_required})))
+    (
+        StatusCode::OK,
+        Json(json!({"applied": true, "restart_required": outcome.restart_required})),
+    )
 }
 
 /// Query params for `GET /v1/queue` (Finding 2, whole-branch review). Both
@@ -940,30 +1020,44 @@ struct QueueListingDoc {
         (status = 200, description = "Aggregate counts (default) or a masked delivery listing (with ?state=)", body = QueueListingDoc),
     ),
 )]
-async fn queue(State(d): State<Arc<Daemon>>, Query(params): Query<QueueParams>) -> impl IntoResponse {
+async fn queue(
+    State(d): State<Arc<Daemon>>,
+    Query(params): Query<QueueParams>,
+) -> impl IntoResponse {
     let Some(state) = params.state else {
         return Json(queue_map(&d)).into_response();
     };
     let limit = params.limit.unwrap_or(100).clamp(1, 1000) as i64;
-    let deliveries = d.store.lock().unwrap().list_deliveries(Some(&state), limit).unwrap_or_default();
-    let out: Vec<_> = deliveries.iter().map(|del| {
-        let destination = if del.route == IDENTITY_ROUTE {
-            format!("{}:{}", del.destination.protocol,
-                identity_links::mask_ref(&del.destination.endpoint))
-        } else {
-            del.destination.to_string()
-        };
-        json!({
-            "message_id": del.message_id,
-            "route": del.route,
-            "destination": destination,
-            "state": del.state,
-            "reason": del.reason,
-            "attempts": del.attempt_count,
-            "created_at": del.created_at,
-            "updated_at": del.updated_at,
+    let deliveries = d
+        .store
+        .lock()
+        .unwrap()
+        .list_deliveries(Some(&state), limit)
+        .unwrap_or_default();
+    let out: Vec<_> = deliveries
+        .iter()
+        .map(|del| {
+            let destination = if del.route == IDENTITY_ROUTE {
+                format!(
+                    "{}:{}",
+                    del.destination.protocol,
+                    identity_links::mask_ref(&del.destination.endpoint)
+                )
+            } else {
+                del.destination.to_string()
+            };
+            json!({
+                "message_id": del.message_id,
+                "route": del.route,
+                "destination": destination,
+                "state": del.state,
+                "reason": del.reason,
+                "attempts": del.attempt_count,
+                "created_at": del.created_at,
+                "updated_at": del.updated_at,
+            })
         })
-    }).collect();
+        .collect();
     Json(json!({ "deliveries": out })).into_response()
 }
 
@@ -1021,13 +1115,13 @@ struct TraceNotFound {
         (status = 404, description = "Unknown message id", body = TraceNotFound),
     ),
 )]
-async fn trace(
-    State(d): State<Arc<Daemon>>,
-    AxPath(id): AxPath<Uuid>,
-) -> impl IntoResponse {
+async fn trace(State(d): State<Arc<Daemon>>, AxPath(id): AxPath<Uuid>) -> impl IntoResponse {
     let store = d.store.lock().unwrap();
     let Ok(Some(env)) = store.get_message(id) else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown message"})));
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown message"})),
+        );
     };
     // spec §Security invariants: refs masked in every API response, full
     // refs never in GET responses. Ordinary routes' `destination` is a route
@@ -1036,11 +1130,17 @@ async fn trace(
     // ref verbatim in `dest_endpoint` (see `enqueue_identity_send`), so those
     // must use the same masked "protocol:masked_ref" compound form (RULING
     // 2) as `/v1/identities` and `/v1/identities/challenges`.
-    let deliveries: Vec<_> = store.deliveries_for(id).unwrap_or_default().iter()
+    let deliveries: Vec<_> = store
+        .deliveries_for(id)
+        .unwrap_or_default()
+        .iter()
         .map(|del| {
             let destination = if del.route == IDENTITY_ROUTE {
-                format!("{}:{}", del.destination.protocol,
-                    identity_links::mask_ref(&del.destination.endpoint))
+                format!(
+                    "{}:{}",
+                    del.destination.protocol,
+                    identity_links::mask_ref(&del.destination.endpoint)
+                )
             } else {
                 del.destination.to_string()
             };
@@ -1057,16 +1157,19 @@ async fn trace(
         })
         .collect();
     // spec §90: trace without content — body is summarized, never included
-    (StatusCode::OK, Json(json!({
-        "id": env.id,
-        "source": env.source.to_string(),
-        "kind": env.kind,
-        "created_at": env.created_at,
-        "received_at": env.received_at,
-        "expires_at": env.expires_at,
-        "body_bytes": env.body.len(),
-        "deliveries": deliveries,
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": env.id,
+            "source": env.source.to_string(),
+            "kind": env.kind,
+            "created_at": env.created_at,
+            "received_at": env.received_at,
+            "expires_at": env.expires_at,
+            "body_bytes": env.body.len(),
+            "deliveries": deliveries,
+        })),
+    )
 }
 
 /// `GET /metrics` (Prometheus text exposition format, not JSON): counters
@@ -1132,13 +1235,16 @@ struct IdentitiesResponse {
 )]
 async fn identities(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let links = d.store.lock().unwrap().list_links().unwrap_or_default();
-    let out: Vec<_> = links.iter().map(|l| LinkItem {
-        a: format!("{}:{}", l.a_protocol, identity_links::mask_ref(&l.a_ref)),
-        b: format!("{}:{}", l.b_protocol, identity_links::mask_ref(&l.b_ref)),
-        display_name: l.display_name.clone(),
-        id: l.id,
-        verified_at: l.verified_at,
-    }).collect();
+    let out: Vec<_> = links
+        .iter()
+        .map(|l| LinkItem {
+            a: format!("{}:{}", l.a_protocol, identity_links::mask_ref(&l.a_ref)),
+            b: format!("{}:{}", l.b_protocol, identity_links::mask_ref(&l.b_ref)),
+            display_name: l.display_name.clone(),
+            id: l.id,
+            verified_at: l.verified_at,
+        })
+        .collect();
     Json(IdentitiesResponse { links: out })
 }
 
@@ -1191,8 +1297,10 @@ async fn create_link(State(d): State<Arc<Daemon>>, body: Bytes) -> impl IntoResp
     let req: LinkRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid request body: {e}")})));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid request body: {e}")})),
+            );
         }
     };
     let requester: Endpoint = match req.requester.parse() {
@@ -1204,7 +1312,10 @@ async fn create_link(State(d): State<Arc<Daemon>>, body: Bytes) -> impl IntoResp
         Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))),
     };
     match engine::initiate_link(&d, requester, target, &req.display_name) {
-        Ok(challenge_id) => (StatusCode::ACCEPTED, Json(json!({"challenge_id": challenge_id}))),
+        Ok(challenge_id) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"challenge_id": challenge_id})),
+        ),
         Err(e) => (StatusCode::CONFLICT, Json(json!({"error": e}))),
     }
 }
@@ -1238,7 +1349,11 @@ async fn delete_link(State(d): State<Arc<Daemon>>, AxPath(id): AxPath<i64>) -> i
             false
         }
     };
-    if deleted { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }
+    if deleted {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 /// `GET /v1/identities/challenges` (design §Admin API): pending count plus
@@ -1275,13 +1390,28 @@ struct ChallengesResponse {
 )]
 async fn challenges(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let now = Utc::now();
-    let list = d.store.lock().unwrap().list_challenges(now).unwrap_or_default();
-    let out: Vec<_> = list.iter().map(|c| ChallengeItem {
-        expires_at: c.expires_at,
-        id: c.id,
-        target: format!("{}:{}", c.target_protocol, identity_links::mask_ref(&c.target_ref)),
-    }).collect();
-    Json(ChallengesResponse { pending_count: out.len(), challenges: out })
+    let list = d
+        .store
+        .lock()
+        .unwrap()
+        .list_challenges(now)
+        .unwrap_or_default();
+    let out: Vec<_> = list
+        .iter()
+        .map(|c| ChallengeItem {
+            expires_at: c.expires_at,
+            id: c.id,
+            target: format!(
+                "{}:{}",
+                c.target_protocol,
+                identity_links::mask_ref(&c.target_ref)
+            ),
+        })
+        .collect();
+    Json(ChallengesResponse {
+        pending_count: out.len(),
+        challenges: out,
+    })
 }
 
 /// `GET /v1/federation` (design §6, Task 5): every configured
@@ -1332,8 +1462,12 @@ async fn federation(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let Some(fed) = &d.fed else {
         return Json(FederationResponse { peers: Vec::new() });
     };
-    let configured: Vec<crate::config::PeerConfig> =
-        d.cfg_snapshot(|c| c.federation.as_ref().map(|f| f.peers.clone()).unwrap_or_default());
+    let configured: Vec<crate::config::PeerConfig> = d.cfg_snapshot(|c| {
+        c.federation
+            .as_ref()
+            .map(|f| f.peers.clone())
+            .unwrap_or_default()
+    });
     let trust_rows = d.store.lock().unwrap().list_trust().unwrap_or_default();
     let conns = fed.conns.lock().unwrap();
     // Keyed by node_id, not `FedState.conns`'s own map key (a configured
@@ -1349,7 +1483,10 @@ async fn federation(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     for p in &configured {
         named.insert(p.node_id.as_str());
         peers_out.push(federation_peer_item(
-            Some(p.name.as_str()), &p.node_id, &trust_rows, live.get(p.node_id.as_str()).copied(),
+            Some(p.name.as_str()),
+            &p.node_id,
+            &trust_rows,
+            live.get(p.node_id.as_str()).copied(),
         ));
     }
     for row in &trust_rows {
@@ -1357,7 +1494,12 @@ async fn federation(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
         if named.contains(node_id) {
             continue; // already listed above, under its configured name
         }
-        peers_out.push(federation_peer_item(None, node_id, &trust_rows, live.get(node_id).copied()));
+        peers_out.push(federation_peer_item(
+            None,
+            node_id,
+            &trust_rows,
+            live.get(node_id).copied(),
+        ));
     }
     drop(conns);
     Json(FederationResponse { peers: peers_out })
@@ -1373,7 +1515,10 @@ async fn federation(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
 /// in practice, since boot-time seeding covers every configured peer)
 /// case of a configured peer absent from the trust store entirely.
 fn federation_peer_item(
-    name: Option<&str>, node_id: &str, trust_rows: &[crate::storage::TrustRow], conn: Option<&PeerConn>,
+    name: Option<&str>,
+    node_id: &str,
+    trust_rows: &[crate::storage::TrustRow],
+    conn: Option<&PeerConn>,
 ) -> FederationPeerItem {
     let row = trust_rows.iter().find(|row| row.0 == node_id);
     let trust = row.map(|r| r.1.as_str()).unwrap_or("unknown");
@@ -1500,7 +1645,12 @@ async fn discovery(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let our_advert = crate::fed::conn::build_signed_advert(&d);
 
     let now = Utc::now();
-    let rows = d.store.lock().unwrap().list_peer_adverts(now).unwrap_or_default();
+    let rows = d
+        .store
+        .lock()
+        .unwrap()
+        .list_peer_adverts(now)
+        .unwrap_or_default();
     let mut peers: Vec<serde_json::Value> = Vec::new();
     for (node_id, advert_cbor, received_at) in rows {
         let decoded: Option<Advert> = ciborium::from_reader(advert_cbor.as_slice()).ok();
@@ -1561,7 +1711,9 @@ async fn discovery(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
 /// so it's unit-testable directly against a hand-built
 /// `broadcast::channel`, without going through axum/tower at all (see the
 /// `lagged_receiver_is_skipped_not_fatal` test).
-fn events_stream_from(rx: broadcast::Receiver<Event>) -> impl Stream<Item = Result<SseEvent, Infallible>> {
+fn events_stream_from(
+    rx: broadcast::Receiver<Event>,
+) -> impl Stream<Item = Result<SseEvent, Infallible>> {
     BroadcastStream::new(rx).filter_map(|item| {
         item.ok().map(|event| {
             Ok(SseEvent::default()
@@ -1772,7 +1924,12 @@ mod tests {
     /// Like `get`, but for the POST/DELETE identity-link endpoints: sets the
     /// method and (when a body is given) a `content-type: application/json`
     /// header, matching what the real ctl client sends.
-    async fn req(router: axum::Router, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+    async fn req(
+        router: axum::Router,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> (u16, String) {
         let mut builder = Request::builder().method(method).uri(path);
         let request_body = match body {
             Some(b) => {
@@ -1781,7 +1938,10 @@ mod tests {
             }
             None => Body::empty(),
         };
-        let resp = router.oneshot(builder.body(request_body).unwrap()).await.unwrap();
+        let resp = router
+            .oneshot(builder.body(request_body).unwrap())
+            .await
+            .unwrap();
         let status = resp.status().as_u16();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&bytes).into_owned())
@@ -1798,8 +1958,17 @@ mod tests {
     #[tokio::test]
     async fn status_reports_node_and_queue() {
         let d = daemon();
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
         let (code, body) = get(router(d), "/v1/status").await;
         assert_eq!(code, 200);
         assert!(body.contains("\"node\":\"t\""));
@@ -1808,7 +1977,10 @@ mod tests {
         assert!(body.contains("\"public\":false"), "status was: {body}");
     }
 
-    fn daemon_with_public(public: bool, services: Vec<crate::config::PublicService>) -> Arc<Daemon> {
+    fn daemon_with_public(
+        public: bool,
+        services: Vec<crate::config::PublicService>,
+    ) -> Arc<Daemon> {
         let dir = tempfile::tempdir().unwrap();
         let d = crate::engine::tests_support::test_daemon_with_public(dir.path(), public, services);
         std::mem::forget(dir);
@@ -1834,16 +2006,22 @@ mod tests {
 
     #[tokio::test]
     async fn public_endpoint_reports_configured_services() {
-        let d = daemon_with_public(true, vec![crate::config::PublicService {
-            name: "regional-chat".into(),
-            r#type: "chat".into(),
-            ingress: vec!["mocka".into()],
-            egress: vec!["mockb".into()],
-        }]);
+        let d = daemon_with_public(
+            true,
+            vec![crate::config::PublicService {
+                name: "regional-chat".into(),
+                r#type: "chat".into(),
+                ingress: vec!["mocka".into()],
+                egress: vec!["mockb".into()],
+            }],
+        );
         let (code, body) = get(router(d), "/v1/public").await;
         assert_eq!(code, 200);
         assert!(body.contains("\"public\":true"), "body was: {body}");
-        assert!(body.contains("\"name\":\"regional-chat\""), "body was: {body}");
+        assert!(
+            body.contains("\"name\":\"regional-chat\""),
+            "body was: {body}"
+        );
         assert!(body.contains("\"type\":\"chat\""), "body was: {body}");
         assert!(body.contains("\"ingress\":[\"mocka\"]"), "body was: {body}");
         assert!(body.contains("\"egress\":[\"mockb\"]"), "body was: {body}");
@@ -1857,51 +2035,99 @@ mod tests {
         // test_daemon's Config uses Limits::default() -- every field 0
         // (unlimited), which is the v0.1-compat default (see config.rs's
         // v0_1_style_config_parses_with_all_defaults).
-        assert!(body.contains("\"messages_per_minute\":0"), "body was: {body}");
+        assert!(
+            body.contains("\"messages_per_minute\":0"),
+            "body was: {body}"
+        );
         assert!(body.contains("\"bytes_per_hour\":0"), "body was: {body}");
         assert!(body.contains("\"queue_max\":0"), "body was: {body}");
         assert!(body.contains("\"cas_max_bytes\":0"), "body was: {body}");
-        assert!(body.contains("\"transport_budgets\":{}"), "body was: {body}");
+        assert!(
+            body.contains("\"transport_budgets\":{}"),
+            "body was: {body}"
+        );
     }
 
     #[tokio::test]
     async fn limits_endpoint_echoes_nonzero_limits_and_transport_budgets() {
         let dir = tempfile::tempdir().unwrap();
-        let d = crate::engine::tests_support::test_daemon_with_limits(dir.path(), crate::config::Limits {
-            per_sender: crate::config::PerSender { messages_per_minute: 10, bytes_per_hour: 50_000 },
-            per_route: crate::config::PerRoute { queue_max: 5_000 },
-            global: crate::config::GlobalLimits { queue_max: 50_000, cas_max_bytes: 1_000_000_000 },
-        });
+        let d = crate::engine::tests_support::test_daemon_with_limits(
+            dir.path(),
+            crate::config::Limits {
+                per_sender: crate::config::PerSender {
+                    messages_per_minute: 10,
+                    bytes_per_hour: 50_000,
+                },
+                per_route: crate::config::PerRoute { queue_max: 5_000 },
+                global: crate::config::GlobalLimits {
+                    queue_max: 50_000,
+                    cas_max_bytes: 1_000_000_000,
+                },
+            },
+        );
         std::mem::forget(dir);
         let (code, body) = get(router(Arc::new(d)), "/v1/limits").await;
         assert_eq!(code, 200);
-        assert!(body.contains("\"messages_per_minute\":10"), "body was: {body}");
-        assert!(body.contains("\"bytes_per_hour\":50000"), "body was: {body}");
+        assert!(
+            body.contains("\"messages_per_minute\":10"),
+            "body was: {body}"
+        );
+        assert!(
+            body.contains("\"bytes_per_hour\":50000"),
+            "body was: {body}"
+        );
         assert!(body.contains("\"queue_max\":5000"), "body was: {body}");
         assert!(body.contains("\"queue_max\":50000"), "body was: {body}");
-        assert!(body.contains("\"cas_max_bytes\":1000000000"), "body was: {body}");
+        assert!(
+            body.contains("\"cas_max_bytes\":1000000000"),
+            "body was: {body}"
+        );
 
         let dir2 = tempfile::tempdir().unwrap();
         let mut budgets = std::collections::BTreeMap::new();
-        budgets.insert("mockb".to_string(), crate::config::Budget { messages_per_minute: 30 });
+        budgets.insert(
+            "mockb".to_string(),
+            crate::config::Budget {
+                messages_per_minute: 30,
+            },
+        );
         let d2 = crate::engine::tests_support::test_daemon_with_budgets(dir2.path(), budgets);
         std::mem::forget(dir2);
         let (code, body) = get(router(Arc::new(d2)), "/v1/limits").await;
         assert_eq!(code, 200);
-        assert!(body.contains("\"transport_budgets\":{\"mockb\":{\"messages_per_minute\":30}}"),
-            "body was: {body}");
+        assert!(
+            body.contains("\"transport_budgets\":{\"mockb\":{\"messages_per_minute\":30}}"),
+            "body was: {body}"
+        );
     }
 
     #[tokio::test]
     async fn trace_omits_body_and_404s_unknown() {
         let d = daemon();
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "secret-content".into(), None, vec![], None);
-        let id = d.store.lock().unwrap()
-            .due_deliveries(chrono::Utc::now(), 1).unwrap()[0].message_id;
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "secret-content".into(),
+            None,
+            vec![],
+            None,
+        );
+        let id = d
+            .store
+            .lock()
+            .unwrap()
+            .due_deliveries(chrono::Utc::now(), 1)
+            .unwrap()[0]
+            .message_id;
         let (code, body) = get(router(d.clone()), &format!("/v1/messages/{id}")).await;
         assert_eq!(code, 200);
-        assert!(!body.contains("secret-content"), "trace leaked message body");
+        assert!(
+            !body.contains("secret-content"),
+            "trace leaked message body"
+        );
         assert!(body.contains("\"deliveries\""));
         let (code, _) = get(router(d), &format!("/v1/messages/{}", uuid::Uuid::now_v7())).await;
         assert_eq!(code, 404);
@@ -1914,10 +2140,24 @@ mod tests {
     #[tokio::test]
     async fn trace_deliveries_include_priority_rank() {
         let d = daemon();
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "urgent-ish".into(), None, vec![], Some("high".into()));
-        let id = d.store.lock().unwrap()
-            .due_deliveries(chrono::Utc::now(), 1).unwrap()[0].message_id;
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "urgent-ish".into(),
+            None,
+            vec![],
+            Some("high".into()),
+        );
+        let id = d
+            .store
+            .lock()
+            .unwrap()
+            .due_deliveries(chrono::Utc::now(), 1)
+            .unwrap()[0]
+            .message_id;
         let (code, body) = get(router(d), &format!("/v1/messages/{id}")).await;
         assert_eq!(code, 200);
         assert!(body.contains("\"priority\":1"), "body was: {body}");
@@ -1933,7 +2173,8 @@ mod tests {
     /// routes are unaffected: their destination is a route endpoint, not an
     /// identity ref, and must keep rendering in full.
     #[tokio::test]
-    async fn trace_masks_identity_route_destination_but_renders_ordinary_route_destination_in_full() {
+    async fn trace_masks_identity_route_destination_but_renders_ordinary_route_destination_in_full()
+    {
         let d = daemon();
         let _rx = crate::engine::tests_support::register_direct_plugin(&d, "mockb");
         let requester: Endpoint = "mocka:!alice-secret".parse().unwrap();
@@ -1942,30 +2183,58 @@ mod tests {
 
         let identity_message_id = {
             let store = d.store.lock().unwrap();
-            store.due_deliveries(Utc::now(), 10).unwrap().into_iter()
+            store
+                .due_deliveries(Utc::now(), 10)
+                .unwrap()
+                .into_iter()
                 .find(|de| de.route == crate::config::IDENTITY_ROUTE)
                 .expect("challenge delivery must be queued on the @identity route")
                 .message_id
         };
-        let (code, body) = get(router(d.clone()), &format!("/v1/messages/{identity_message_id}")).await;
+        let (code, body) = get(
+            router(d.clone()),
+            &format!("/v1/messages/{identity_message_id}"),
+        )
+        .await;
         assert_eq!(code, 200);
-        assert!(!body.contains("+14155551234"), "full target ref leaked in trace: {body}");
-        assert!(body.contains("\"destination\":\"mockb:+1****1234\""),
-            "masked destination missing: {body}");
+        assert!(
+            !body.contains("+14155551234"),
+            "full target ref leaked in trace: {body}"
+        );
+        assert!(
+            body.contains("\"destination\":\"mockb:+1****1234\""),
+            "masked destination missing: {body}"
+        );
 
         // an ordinary route's destination is a route endpoint, not an
         // identity ref, and must still render in full (existing behavior).
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
-        let ordinary_message_id = d.store.lock().unwrap()
-            .due_deliveries(Utc::now(), 10).unwrap().into_iter()
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
+        let ordinary_message_id = d
+            .store
+            .lock()
+            .unwrap()
+            .due_deliveries(Utc::now(), 10)
+            .unwrap()
+            .into_iter()
             .find(|de| de.route != crate::config::IDENTITY_ROUTE)
             .expect("ordinary delivery must exist")
             .message_id;
         let (code2, body2) = get(router(d), &format!("/v1/messages/{ordinary_message_id}")).await;
         assert_eq!(code2, 200);
-        assert!(body2.contains("\"destination\":\"mockb:chan\""),
-            "ordinary route destination must still render in full: {body2}");
+        assert!(
+            body2.contains("\"destination\":\"mockb:chan\""),
+            "ordinary route destination must still render in full: {body2}"
+        );
     }
 
     /// Finding 2 (whole-branch review, goal gate): omitting `?state=` must
@@ -1975,13 +2244,24 @@ mod tests {
     #[tokio::test]
     async fn queue_without_state_param_returns_aggregate_counts_shape_unchanged() {
         let d = daemon();
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
         let (code, body) = get(router(d), "/v1/queue").await;
         assert_eq!(code, 200);
         assert!(body.contains("\"pending\":1"), "body was: {body}");
-        assert!(!body.contains("\"deliveries\""),
-            "omitting ?state= must keep the pre-existing aggregate-counts shape: {body}");
+        assert!(
+            !body.contains("\"deliveries\""),
+            "omitting ?state= must keep the pre-existing aggregate-counts shape: {body}"
+        );
     }
 
     /// Finding 2 (whole-branch review, goal gate): `?state=dead_letter`
@@ -1994,12 +2274,23 @@ mod tests {
         let _rx = crate::engine::tests_support::register_direct_plugin(&d, "mockb");
 
         const SENTINEL_BODY: &str = "queue-listing-secret-body";
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       SENTINEL_BODY.into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            SENTINEL_BODY.into(),
+            None,
+            vec![],
+            None,
+        );
         let id_a = {
             let store = d.store.lock().unwrap();
             let id = store.due_deliveries(Utc::now(), 10).unwrap()[0].id;
-            store.mark_terminal(id, "dead_letter", "POLICY_DENIED").unwrap();
+            store
+                .mark_terminal(id, "dead_letter", "POLICY_DENIED")
+                .unwrap();
             id
         };
 
@@ -2010,46 +2301,79 @@ mod tests {
         engine::initiate_link(&d, requester, target, "Jascha").unwrap();
         let id_identity = {
             let store = d.store.lock().unwrap();
-            let del = store.due_deliveries(Utc::now(), 10).unwrap().into_iter()
+            let del = store
+                .due_deliveries(Utc::now(), 10)
+                .unwrap()
+                .into_iter()
                 .find(|de| de.route == IDENTITY_ROUTE)
                 .expect("identity challenge delivery must be queued");
-            store.mark_terminal(del.id, "dead_letter", "QUEUE_FULL").unwrap();
+            store
+                .mark_terminal(del.id, "dead_letter", "QUEUE_FULL")
+                .unwrap();
             del.id
         };
-        assert!(id_identity > id_a, "identity delivery must be the newer row");
+        assert!(
+            id_identity > id_a,
+            "identity delivery must be the newer row"
+        );
 
         // limit=1 must clamp to exactly the newest row.
         let (code, body) = get(router(d.clone()), "/v1/queue?state=dead_letter&limit=1").await;
         assert_eq!(code, 200);
-        assert!(!body.contains(SENTINEL_BODY), "queue listing must never include message content: {body}");
-        assert!(!body.contains("+14155551234"), "full target ref leaked: {body}");
-        assert!(body.contains("\"destination\":\"mockb:+1****1234\""),
-            "masked identity-route destination missing: {body}");
-        assert!(body.contains("\"reason\":\"QUEUE_FULL\""), "body was: {body}");
-        assert_eq!(body.matches("\"message_id\"").count(), 1,
-            "limit=1 must clamp to exactly one row: {body}");
+        assert!(
+            !body.contains(SENTINEL_BODY),
+            "queue listing must never include message content: {body}"
+        );
+        assert!(
+            !body.contains("+14155551234"),
+            "full target ref leaked: {body}"
+        );
+        assert!(
+            body.contains("\"destination\":\"mockb:+1****1234\""),
+            "masked identity-route destination missing: {body}"
+        );
+        assert!(
+            body.contains("\"reason\":\"QUEUE_FULL\""),
+            "body was: {body}"
+        );
+        assert_eq!(
+            body.matches("\"message_id\"").count(),
+            1,
+            "limit=1 must clamp to exactly one row: {body}"
+        );
 
         // default limit returns both, newest (identity row) first.
         let (code2, body2) = get(router(d.clone()), "/v1/queue?state=dead_letter").await;
         assert_eq!(code2, 200);
-        assert_eq!(body2.matches("\"message_id\"").count(), 2,
-            "default limit must return both dead_letter rows: {body2}");
+        assert_eq!(
+            body2.matches("\"message_id\"").count(),
+            2,
+            "default limit must return both dead_letter rows: {body2}"
+        );
         let idx_identity = body2.find("QUEUE_FULL").expect("QUEUE_FULL reason missing");
-        let idx_a = body2.find("POLICY_DENIED").expect("POLICY_DENIED reason missing");
-        assert!(idx_identity < idx_a,
-            "newest (highest id) dead_letter row must come first: {body2}");
+        let idx_a = body2
+            .find("POLICY_DENIED")
+            .expect("POLICY_DENIED reason missing");
+        assert!(
+            idx_identity < idx_a,
+            "newest (highest id) dead_letter row must come first: {body2}"
+        );
 
         // out-of-range limits clamp rather than error: 0 -> 1, 5000 -> 1000.
-        let (code3, body3) =
-            get(router(d.clone()), "/v1/queue?state=dead_letter&limit=0").await;
+        let (code3, body3) = get(router(d.clone()), "/v1/queue?state=dead_letter&limit=0").await;
         assert_eq!(code3, 200);
-        assert_eq!(body3.matches("\"message_id\"").count(), 1,
-            "limit=0 must clamp up to one row: {body3}");
-        let (code4, body4) =
-            get(router(d), "/v1/queue?state=dead_letter&limit=5000").await;
+        assert_eq!(
+            body3.matches("\"message_id\"").count(),
+            1,
+            "limit=0 must clamp up to one row: {body3}"
+        );
+        let (code4, body4) = get(router(d), "/v1/queue?state=dead_letter&limit=5000").await;
         assert_eq!(code4, 200);
-        assert_eq!(body4.matches("\"message_id\"").count(), 2,
-            "limit=5000 must clamp to 1000 and return all rows: {body4}");
+        assert_eq!(
+            body4.matches("\"message_id\"").count(),
+            2,
+            "limit=5000 must clamp to 1000 and return all rows: {body4}"
+        );
     }
 
     // ---- read surface completion (design §2) --------------------------
@@ -2063,9 +2387,15 @@ mod tests {
     async fn routes_endpoint_reports_identity_mode_render_defaults_and_empty_policies() {
         let (code, body) = get(router(daemon()), "/v1/routes").await;
         assert_eq!(code, 200);
-        assert!(body.starts_with("{\"routes\":["), "response must be wrapped in a routes object: {body}");
+        assert!(
+            body.starts_with("{\"routes\":["),
+            "response must be wrapped in a routes object: {body}"
+        );
         assert!(body.contains("\"name\":\"general\""), "body was: {body}");
-        assert!(body.contains("\"identity_mode\":\"pseudonymous\""), "body was: {body}");
+        assert!(
+            body.contains("\"identity_mode\":\"pseudonymous\""),
+            "body was: {body}"
+        );
         assert!(body.contains("\"tag\":\"alias\""), "body was: {body}");
         assert!(body.contains("\"max_chars\":0"), "body was: {body}");
         assert!(body.contains("\"policies\":[]"), "body was: {body}");
@@ -2079,7 +2409,8 @@ mod tests {
     /// `meshtastic-only` matches neither of `general`'s destinations
     /// (`mocka`, `mockb`) and must be excluded.
     #[tokio::test]
-    async fn routes_endpoint_lists_only_policies_whose_match_intersects_route_destination_protocols() {
+    async fn routes_endpoint_lists_only_policies_whose_match_intersects_route_destination_protocols(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("data");
         let yaml = format!(
@@ -2126,11 +2457,16 @@ policies:
 
         let (code, body) = get(router(d), "/v1/routes").await;
         assert_eq!(code, 200);
-        assert!(body.contains("\"identity_mode\":\"linked\""), "body was: {body}");
+        assert!(
+            body.contains("\"identity_mode\":\"linked\""),
+            "body was: {body}"
+        );
         assert!(body.contains("\"tag\":\"none\""), "body was: {body}");
         assert!(body.contains("\"max_chars\":40"), "body was: {body}");
-        assert!(body.contains("\"policies\":[\"mockb-policy\",\"catch-all-policy\"]"),
-            "matching policies (in declared order) missing or wrong: {body}");
+        assert!(
+            body.contains("\"policies\":[\"mockb-policy\",\"catch-all-policy\"]"),
+            "matching policies (in declared order) missing or wrong: {body}"
+        );
         assert!(!body.contains("meshtastic-only"),
             "a policy whose match doesn't intersect the route's destination protocols must be excluded: {body}");
     }
@@ -2150,11 +2486,16 @@ policies:
         let (code, body) = get(router(d), "/v1/plugins").await;
         assert_eq!(code, 200);
         assert!(body.contains("\"rssi\""), "mocka's gauge missing: {body}");
-        assert!(body.contains("\"value\":-71.5"), "gauge value missing: {body}");
+        assert!(
+            body.contains("\"value\":-71.5"),
+            "gauge value missing: {body}"
+        );
         assert!(body.contains("\"age_secs\":0"), "gauge age missing: {body}");
         // mockb is enabled (test_daemon's fixture) but never reported gauges.
-        assert!(body.contains("\"mockb\":{\"capabilities\":null,\"connected\":false,\"gauges\":{}}"),
-            "mockb must report an empty gauges object: {body}");
+        assert!(
+            body.contains("\"mockb\":{\"capabilities\":null,\"connected\":false,\"gauges\":{}}"),
+            "mockb must report an empty gauges object: {body}"
+        );
     }
 
     /// `GET /v1/config` (design §2): serves `Config.raw_yaml` byte-verbatim
@@ -2165,24 +2506,39 @@ policies:
         let sentinel = "sentinel-config-yaml-leak-1a2b";
         let d = daemon_with_plugin_secret("RF_ADMIN_TEST_SECRET_CONFIG_YAML", sentinel);
         let expected_yaml = d.cfg_snapshot(|c| c.raw_yaml.clone());
-        assert!(!expected_yaml.is_empty(), "test fixture sanity: raw_yaml must be populated");
+        assert!(
+            !expected_yaml.is_empty(),
+            "test fixture sanity: raw_yaml must be populated"
+        );
 
         let resp = router(d)
-            .oneshot(Request::builder().uri("/v1/config").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
             "text/yaml",
             "wrong content-type"
         );
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let body_str = String::from_utf8_lossy(&body);
         assert_eq!(body_str, expected_yaml, "raw yaml not served byte-verbatim");
-        assert!(body_str.contains("${env:RF_ADMIN_TEST_SECRET_CONFIG_YAML}"),
-            "unresolved reference form must be present: {body_str}");
-        assert!(!body_str.contains(sentinel), "resolved secret leaked in /v1/config: {body_str}");
+        assert!(
+            body_str.contains("${env:RF_ADMIN_TEST_SECRET_CONFIG_YAML}"),
+            "unresolved reference form must be present: {body_str}"
+        );
+        assert!(
+            !body_str.contains(sentinel),
+            "resolved secret leaked in /v1/config: {body_str}"
+        );
     }
 
     #[tokio::test]
@@ -2201,18 +2557,43 @@ policies:
     async fn identities_lists_masked_links_and_never_leaks_full_refs() {
         let d = daemon();
         let now = Utc::now();
-        let id = d.store.lock().unwrap().insert_link(
-            "signal", "+14155551234", "lxmf", "aabbccddeeff", "Jascha", now,
-        ).unwrap();
+        let id = d
+            .store
+            .lock()
+            .unwrap()
+            .insert_link(
+                "signal",
+                "+14155551234",
+                "lxmf",
+                "aabbccddeeff",
+                "Jascha",
+                now,
+            )
+            .unwrap();
 
         let (code, body) = get(router(d), "/v1/identities").await;
         assert_eq!(code, 200);
-        assert!(!body.contains("+14155551234"), "full requester ref leaked: {body}");
-        assert!(!body.contains("aabbccddeeff"), "full target ref leaked: {body}");
-        assert!(body.contains("\"a\":\"signal:+1****1234\""), "masked a-side missing: {body}");
-        assert!(body.contains("\"b\":\"lxmf:aa****eeff\""), "masked b-side missing: {body}");
+        assert!(
+            !body.contains("+14155551234"),
+            "full requester ref leaked: {body}"
+        );
+        assert!(
+            !body.contains("aabbccddeeff"),
+            "full target ref leaked: {body}"
+        );
+        assert!(
+            body.contains("\"a\":\"signal:+1****1234\""),
+            "masked a-side missing: {body}"
+        );
+        assert!(
+            body.contains("\"b\":\"lxmf:aa****eeff\""),
+            "masked b-side missing: {body}"
+        );
         assert!(body.contains(&format!("\"id\":{id}")), "body was: {body}");
-        assert!(body.contains("\"display_name\":\"Jascha\""), "body was: {body}");
+        assert!(
+            body.contains("\"display_name\":\"Jascha\""),
+            "body was: {body}"
+        );
     }
 
     #[tokio::test]
@@ -2230,13 +2611,19 @@ policies:
             "requester": "mocka:!alice-secret",
             "target": "mockb:!bob-secret",
             "display_name": "Jascha",
-        }).to_string();
+        })
+        .to_string();
 
         let (code, resp_body) = req(router(d), "POST", "/v1/identities/link", Some(&body)).await;
         assert_eq!(code, 202, "body was: {resp_body}");
-        assert!(resp_body.contains("\"challenge_id\""), "body was: {resp_body}");
-        assert!(!resp_body.contains("!alice-secret"),
-            "the requester's full ref must never leak in the response: {resp_body}");
+        assert!(
+            resp_body.contains("\"challenge_id\""),
+            "body was: {resp_body}"
+        );
+        assert!(
+            !resp_body.contains("!alice-secret"),
+            "the requester's full ref must never leak in the response: {resp_body}"
+        );
     }
 
     /// 409 case must name the direct-capable connected plugin(s) — mirrors
@@ -2251,14 +2638,19 @@ policies:
             "requester": "mockb:!req",
             "target": "mockb:!target-secret",
             "display_name": "X",
-        }).to_string();
+        })
+        .to_string();
 
         let (code, resp_body) = req(router(d), "POST", "/v1/identities/link", Some(&body)).await;
         assert_eq!(code, 409, "body was: {resp_body}");
-        assert!(resp_body.contains("mocka"),
-            "409 body must name the direct-capable plugin: {resp_body}");
-        assert!(!resp_body.contains("target-secret"),
-            "target ref must never leak in the 409 body: {resp_body}");
+        assert!(
+            resp_body.contains("mocka"),
+            "409 body must name the direct-capable plugin: {resp_body}"
+        );
+        assert!(
+            !resp_body.contains("target-secret"),
+            "target ref must never leak in the 409 body: {resp_body}"
+        );
     }
 
     /// RULING 1 (Task 3/4), surfaced through the HTTP layer: a global-queue-
@@ -2271,32 +2663,60 @@ policies:
     #[tokio::test]
     async fn post_identities_link_returns_409_with_queue_full_when_global_queue_is_saturated() {
         let dir = tempfile::tempdir().unwrap();
-        let d = crate::engine::tests_support::test_daemon_with_limits(dir.path(), crate::config::Limits {
-            global: crate::config::GlobalLimits { queue_max: 1, ..Default::default() },
-            ..Default::default()
-        });
+        let d = crate::engine::tests_support::test_daemon_with_limits(
+            dir.path(),
+            crate::config::Limits {
+                global: crate::config::GlobalLimits {
+                    queue_max: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
         std::mem::forget(dir);
         let d = Arc::new(d);
         let _rx = crate::engine::tests_support::register_direct_plugin(&d, "mockb");
 
         // saturate the global queue with an ordinary routed message first.
-        handle_inbound(&d, "mocka", "chan".into(), "!a".into(), "text".into(),
-                       "hello".into(), None, vec![], None);
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hello".into(),
+            None,
+            vec![],
+            None,
+        );
 
         let body = serde_json::json!({
             "requester": "mocka:!req",
             "target": "mockb:!target-secret",
             "display_name": "X",
-        }).to_string();
+        })
+        .to_string();
         let (code, resp_body) = req(router(d), "POST", "/v1/identities/link", Some(&body)).await;
         assert_eq!(code, 409, "body was: {resp_body}");
-        assert!(resp_body.contains("queue full"), "409 body must be distinguishable as queue-full: {resp_body}");
-        assert!(!resp_body.contains("target-secret"), "target ref must never leak in the 409 body: {resp_body}");
+        assert!(
+            resp_body.contains("queue full"),
+            "409 body must be distinguishable as queue-full: {resp_body}"
+        );
+        assert!(
+            !resp_body.contains("target-secret"),
+            "target ref must never leak in the 409 body: {resp_body}"
+        );
     }
 
     #[tokio::test]
     async fn post_identities_link_returns_400_on_malformed_json() {
-        let (code, _) = req(router(daemon()), "POST", "/v1/identities/link", Some("not json")).await;
+        let (code, _) = req(
+            router(daemon()),
+            "POST",
+            "/v1/identities/link",
+            Some("not json"),
+        )
+        .await;
         assert_eq!(code, 400);
     }
 
@@ -2306,7 +2726,8 @@ policies:
             "requester": "not-a-valid-endpoint",
             "target": "mocka:!b",
             "display_name": "X",
-        }).to_string();
+        })
+        .to_string();
         let (code, _) = req(router(daemon()), "POST", "/v1/identities/link", Some(&body)).await;
         assert_eq!(code, 400);
     }
@@ -2315,13 +2736,29 @@ policies:
     async fn delete_identities_link_returns_204_then_404() {
         let d = daemon();
         let now = Utc::now();
-        let id = d.store.lock().unwrap()
-            .insert_link("signal", "+1234567890", "lxmf", "abc123", "X", now).unwrap();
+        let id = d
+            .store
+            .lock()
+            .unwrap()
+            .insert_link("signal", "+1234567890", "lxmf", "abc123", "X", now)
+            .unwrap();
 
-        let (code, _) = req(router(d.clone()), "DELETE", &format!("/v1/identities/link/{id}"), None).await;
+        let (code, _) = req(
+            router(d.clone()),
+            "DELETE",
+            &format!("/v1/identities/link/{id}"),
+            None,
+        )
+        .await;
         assert_eq!(code, 204);
 
-        let (code2, _) = req(router(d), "DELETE", &format!("/v1/identities/link/{id}"), None).await;
+        let (code2, _) = req(
+            router(d),
+            "DELETE",
+            &format!("/v1/identities/link/{id}"),
+            None,
+        )
+        .await;
         assert_eq!(code2, 404);
     }
 
@@ -2332,15 +2769,32 @@ policies:
         let d = daemon();
         let now = Utc::now();
         let expires = now + chrono::Duration::minutes(15);
-        d.store.lock().unwrap().create_challenge(
-            "424242", "signal", "+14155551234", "lxmf", "abc123def456", "Jascha", now, expires,
-        ).unwrap();
+        d.store
+            .lock()
+            .unwrap()
+            .create_challenge(
+                "424242",
+                "signal",
+                "+14155551234",
+                "lxmf",
+                "abc123def456",
+                "Jascha",
+                now,
+                expires,
+            )
+            .unwrap();
 
         let (code, body) = get(router(d), "/v1/identities/challenges").await;
         assert_eq!(code, 200);
         assert!(!body.contains("424242"), "code leaked: {body}");
-        assert!(!body.contains("+14155551234"), "full target ref leaked: {body}");
-        assert!(body.contains("\"target\":\"signal:+1****1234\""), "masked target missing: {body}");
+        assert!(
+            !body.contains("+14155551234"),
+            "full target ref leaked: {body}"
+        );
+        assert!(
+            body.contains("\"target\":\"signal:+1****1234\""),
+            "masked target missing: {body}"
+        );
         assert!(body.contains("\"pending_count\":1"), "body was: {body}");
     }
 
@@ -2356,17 +2810,26 @@ policies:
 
     fn fed_peer(name: &str, node_id: &str) -> crate::config::PeerConfig {
         crate::config::PeerConfig {
-            name: name.into(), node_id: node_id.into(),
-            addr: "10.0.0.2:47000".into(), trust: "verified".into(),
-            messages_per_minute: 0, sealed_key: None,
+            name: name.into(),
+            node_id: node_id.into(),
+            addr: "10.0.0.2:47000".into(),
+            trust: "verified".into(),
+            messages_per_minute: 0,
+            sealed_key: None,
         }
     }
 
     fn fed_cfg(peers: Vec<crate::config::PeerConfig>) -> crate::config::FederationConfig {
         crate::config::FederationConfig {
-            listen: None, accept_from: "verified".into(), max_hops: 4, max_ttl_secs: 86_400,
-            identity_exposure: "pseudonymous".into(), ingress_routes: vec![],
-            peers, trusted: vec![], blocked: vec![],
+            listen: None,
+            accept_from: "verified".into(),
+            max_hops: 4,
+            max_ttl_secs: 86_400,
+            identity_exposure: "pseudonymous".into(),
+            ingress_routes: vec![],
+            peers,
+            trusted: vec![],
+            blocked: vec![],
         }
     }
 
@@ -2384,7 +2847,12 @@ policies:
     /// connected" tests, or the raw node_id for the "inbound-only,
     /// unconfigured" test (mirroring `fed::conn::accept_loop_with_cap`'s own
     /// `configured_peer_name`-or-`node_id` keying).
-    fn register_fed_conn(d: &Daemon, key: &str, node_id: &str, connected_at: chrono::DateTime<Utc>) {
+    fn register_fed_conn(
+        d: &Daemon,
+        key: &str,
+        node_id: &str,
+        connected_at: chrono::DateTime<Utc>,
+    ) {
         let (tx, _rx) = tokio::sync::mpsc::channel::<crate::fed::wire::Fed>(1);
         d.fed.as_ref().unwrap().conns.lock().unwrap().insert(
             key.to_string(),
@@ -2413,7 +2881,10 @@ policies:
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0]["name"], "phoenix");
         assert_eq!(peers[0]["node_id"], node_id);
-        assert_eq!(peers[0]["trust"], "verified", "seeded from peers[].trust at boot");
+        assert_eq!(
+            peers[0]["trust"], "verified",
+            "seeded from peers[].trust at boot"
+        );
         assert_eq!(peers[0]["connected"], true);
         assert!(!peers[0]["last_seen"].is_null());
     }
@@ -2441,7 +2912,11 @@ policies:
     async fn federation_endpoint_includes_an_inbound_only_seen_node_with_null_name() {
         let d = daemon_with_federation(fed_cfg(vec![])); // no configured peers at all
         let node_id = format!("rf:{}", "cc".repeat(32));
-        d.store.lock().unwrap().record_seen(&node_id, Utc::now()).unwrap();
+        d.store
+            .lock()
+            .unwrap()
+            .record_seen(&node_id, Utc::now())
+            .unwrap();
         register_fed_conn(&d, &node_id, &node_id, Utc::now()); // unconfigured: keyed by its own node_id
 
         let (code, body) = get(router(d), "/v1/federation").await;
@@ -2449,7 +2924,10 @@ policies:
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let peers = v["peers"].as_array().unwrap();
         assert_eq!(peers.len(), 1);
-        assert!(peers[0]["name"].is_null(), "an inbound-only node has no configured name: {body}");
+        assert!(
+            peers[0]["name"].is_null(),
+            "an inbound-only node has no configured name: {body}"
+        );
         assert_eq!(peers[0]["node_id"], node_id);
         assert_eq!(peers[0]["trust"], "seen");
         assert_eq!(peers[0]["connected"], true);
@@ -2464,8 +2942,14 @@ policies:
         register_fed_conn(&d, "phoenix", &node_id, Utc::now());
 
         let (_, body) = get(router(d), "/v1/federation").await;
-        assert!(!body.contains("addr"), "response must never surface a peer's dial address: {body}");
-        assert!(!body.contains("203.0.113.7"), "response must never surface a peer's dial address: {body}");
+        assert!(
+            !body.contains("addr"),
+            "response must never surface a peer's dial address: {body}"
+        );
+        assert!(
+            !body.contains("203.0.113.7"),
+            "response must never surface a peer's dial address: {body}"
+        );
     }
 
     // ---- discovery (design §6, Task 3) -------------------------------------
@@ -2485,8 +2969,10 @@ policies:
         assert_eq!(code, 200);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["mode"], "disabled");
-        assert!(v["our_advert"].is_null(),
-            "discovery disabled must report our_advert: null, got {body}");
+        assert!(
+            v["our_advert"].is_null(),
+            "discovery disabled must report our_advert: null, got {body}"
+        );
         assert_eq!(v["peers"], serde_json::json!([]));
     }
 
@@ -2498,7 +2984,10 @@ policies:
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["mode"], "federation");
         let our = &v["our_advert"];
-        assert!(!our.is_null(), "discovery enabled must produce a non-null our_advert: {body}");
+        assert!(
+            !our.is_null(),
+            "discovery enabled must produce a non-null our_advert: {body}"
+        );
         assert_eq!(our["node_id"], d.node_id);
         assert_eq!(our["name"], "t", "test_daemon's node.name fixture");
         assert_eq!(our["services"]["federation"], true);
@@ -2511,9 +3000,13 @@ policies:
     /// these tests are exercising `GET /v1/discovery`'s serve-side
     /// re-verification directly against hand-inserted `peer_adverts` rows.
     fn signed_peer_advert(
-        dir: &std::path::Path, key_name: &str, advert_name: &str, expires: chrono::DateTime<Utc>,
+        dir: &std::path::Path,
+        key_name: &str,
+        advert_name: &str,
+        expires: chrono::DateTime<Utc>,
     ) -> Advert {
-        let identity = crate::node_identity::NodeIdentity::load_or_create(&dir.join(key_name)).unwrap();
+        let identity =
+            crate::node_identity::NodeIdentity::load_or_create(&dir.join(key_name)).unwrap();
         let mut services = BTreeMap::new();
         services.insert("federation".to_string(), true);
         let unsigned = Advert {
@@ -2523,7 +3016,10 @@ policies:
             services,
             protocols: BTreeMap::new(),
             security: crate::fed::advert::SecurityCaps {
-                translate: true, signed: true, sealed: true, sealed_key: Some("11".repeat(32)),
+                translate: true,
+                signed: true,
+                sealed: true,
+                sealed_key: Some("11".repeat(32)),
             },
             expires: expires.timestamp(),
             sig: Vec::new(),
@@ -2539,7 +3035,9 @@ policies:
         let signed = signed_peer_advert(dir.path(), "peer1", "Phoenix", expires);
         let mut raw = Vec::new();
         ciborium::into_writer(&signed, &mut raw).unwrap();
-        d.store.lock().unwrap()
+        d.store
+            .lock()
+            .unwrap()
             .upsert_peer_advert(&signed.node_id, &raw, "Phoenix", expires, Utc::now())
             .unwrap();
 
@@ -2553,8 +3051,14 @@ policies:
         assert_eq!(peers[0]["services"]["federation"], true);
         assert_eq!(peers[0]["expires"], signed.expires);
         assert!(!peers[0]["received_at"].is_null());
-        assert!(peers[0].get("security").is_some(), "shape must include security: {body}");
-        assert!(peers[0].get("protocols").is_some(), "shape must include protocols: {body}");
+        assert!(
+            peers[0].get("security").is_some(),
+            "shape must include security: {body}"
+        );
+        assert!(
+            peers[0].get("protocols").is_some(),
+            "shape must include protocols: {body}"
+        );
     }
 
     /// The brief's exact tamper scenario: garbage bytes written straight
@@ -2564,16 +3068,29 @@ policies:
     async fn discovery_endpoint_drops_a_row_whose_stored_cbor_is_garbage() {
         let d = daemon();
         let node_id = format!("rf:{}", "ee".repeat(32));
-        d.store.lock().unwrap()
-            .upsert_peer_advert(&node_id, b"not-valid-cbor-at-all", "Tampered",
-                Utc::now() + chrono::Duration::hours(1), Utc::now())
+        d.store
+            .lock()
+            .unwrap()
+            .upsert_peer_advert(
+                &node_id,
+                b"not-valid-cbor-at-all",
+                "Tampered",
+                Utc::now() + chrono::Duration::hours(1),
+                Utc::now(),
+            )
             .unwrap();
 
         let (code, body) = get(router(d), "/v1/discovery").await;
-        assert_eq!(code, 200, "a tampered row must not crash the endpoint: {body}");
+        assert_eq!(
+            code, 200,
+            "a tampered row must not crash the endpoint: {body}"
+        );
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["peers"], serde_json::json!([]),
-            "a row that fails re-verification on serve must be dropped, not served: {body}");
+        assert_eq!(
+            v["peers"],
+            serde_json::json!([]),
+            "a row that fails re-verification on serve must be dropped, not served: {body}"
+        );
     }
 
     /// The sibling tamper case: valid CBOR shape (decodes fine) but a
@@ -2581,24 +3098,39 @@ policies:
     /// -- design §3/§6's "verify on serve" must catch this too, not just
     /// outright-unparseable bytes.
     #[tokio::test]
-    async fn discovery_endpoint_drops_a_row_whose_cbor_decodes_but_fails_signature_reverification() {
+    async fn discovery_endpoint_drops_a_row_whose_cbor_decodes_but_fails_signature_reverification()
+    {
         let d = daemon();
         let dir = tempfile::tempdir().unwrap();
         let mut signed = signed_peer_advert(
-            dir.path(), "peer2", "Seattle", Utc::now() + chrono::Duration::hours(1));
+            dir.path(),
+            "peer2",
+            "Seattle",
+            Utc::now() + chrono::Duration::hours(1),
+        );
         signed.name.push('!'); // mutate AFTER signing: valid CBOR, bad signature
         let mut raw = Vec::new();
         ciborium::into_writer(&signed, &mut raw).unwrap();
-        d.store.lock().unwrap()
-            .upsert_peer_advert(&signed.node_id, &raw, "Seattle!",
-                Utc::now() + chrono::Duration::hours(1), Utc::now())
+        d.store
+            .lock()
+            .unwrap()
+            .upsert_peer_advert(
+                &signed.node_id,
+                &raw,
+                "Seattle!",
+                Utc::now() + chrono::Duration::hours(1),
+                Utc::now(),
+            )
             .unwrap();
 
         let (code, body) = get(router(d), "/v1/discovery").await;
         assert_eq!(code, 200);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["peers"], serde_json::json!([]),
-            "a row whose stored CBOR fails signature re-verification must be dropped: {body}");
+        assert_eq!(
+            v["peers"],
+            serde_json::json!([]),
+            "a row whose stored CBOR fails signature re-verification must be dropped: {body}"
+        );
     }
 
     /// Fix round 1 (review Important finding): `advert::verify` only
@@ -2617,7 +3149,8 @@ policies:
     /// node_id still serves normally -- proving the fix doesn't just drop
     /// everything.
     #[tokio::test]
-    async fn discovery_endpoint_drops_a_row_whose_embedded_node_id_does_not_match_its_storage_key() {
+    async fn discovery_endpoint_drops_a_row_whose_embedded_node_id_does_not_match_its_storage_key()
+    {
         let d = daemon();
         let dir = tempfile::tempdir().unwrap();
 
@@ -2627,25 +3160,49 @@ policies:
         // finding describes.
         let victim_node_id = format!("rf:{}", "ff".repeat(32));
         let attacker_signed = signed_peer_advert(
-            dir.path(), "attacker", "Attacker-Controlled Name",
-            Utc::now() + chrono::Duration::hours(1));
-        assert_ne!(attacker_signed.node_id, victim_node_id, "sanity: distinct identities");
+            dir.path(),
+            "attacker",
+            "Attacker-Controlled Name",
+            Utc::now() + chrono::Duration::hours(1),
+        );
+        assert_ne!(
+            attacker_signed.node_id, victim_node_id,
+            "sanity: distinct identities"
+        );
         let mut attacker_raw = Vec::new();
         ciborium::into_writer(&attacker_signed, &mut attacker_raw).unwrap();
-        d.store.lock().unwrap()
-            .upsert_peer_advert(&victim_node_id, &attacker_raw, "Attacker-Controlled Name",
-                Utc::now() + chrono::Duration::hours(1), Utc::now())
+        d.store
+            .lock()
+            .unwrap()
+            .upsert_peer_advert(
+                &victim_node_id,
+                &attacker_raw,
+                "Attacker-Controlled Name",
+                Utc::now() + chrono::Duration::hours(1),
+                Utc::now(),
+            )
             .unwrap();
 
         // A legitimate sibling row (key == embedded node_id) must still be
         // served -- this fix must not turn into "drop every row".
         let legit_signed = signed_peer_advert(
-            dir.path(), "legit", "Legit", Utc::now() + chrono::Duration::hours(1));
+            dir.path(),
+            "legit",
+            "Legit",
+            Utc::now() + chrono::Duration::hours(1),
+        );
         let mut legit_raw = Vec::new();
         ciborium::into_writer(&legit_signed, &mut legit_raw).unwrap();
-        d.store.lock().unwrap()
-            .upsert_peer_advert(&legit_signed.node_id, &legit_raw, "Legit",
-                Utc::now() + chrono::Duration::hours(1), Utc::now())
+        d.store
+            .lock()
+            .unwrap()
+            .upsert_peer_advert(
+                &legit_signed.node_id,
+                &legit_raw,
+                "Legit",
+                Utc::now() + chrono::Duration::hours(1),
+                Utc::now(),
+            )
             .unwrap();
 
         let (code, body) = get(router(d), "/v1/discovery").await;
@@ -2655,11 +3212,18 @@ policies:
         assert!(!body.contains(&attacker_signed.node_id),
             "the row must not be served under the attacker's real node_id either -- dropping means \
              dropping, not re-keying: {body}");
-        assert!(!body.contains("Attacker-Controlled Name"), "spoofed content must not leak: {body}");
+        assert!(
+            !body.contains("Attacker-Controlled Name"),
+            "spoofed content must not leak: {body}"
+        );
 
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let peers = v["peers"].as_array().unwrap();
-        assert_eq!(peers.len(), 1, "only the legitimate row must survive: {body}");
+        assert_eq!(
+            peers.len(),
+            1,
+            "only the legitimate row must survive: {body}"
+        );
         assert_eq!(peers[0]["node_id"], legit_signed.node_id);
         assert_eq!(peers[0]["name"], "Legit");
     }
@@ -2676,17 +3240,29 @@ policies:
     /// the handler re-sanitizes the DECODED name itself rather than
     /// leaning on the (in this test, useless) stored column.
     #[tokio::test]
-    async fn discovery_endpoint_always_serves_a_sanitized_name_even_when_the_raw_stored_advert_carries_control_chars() {
+    async fn discovery_endpoint_always_serves_a_sanitized_name_even_when_the_raw_stored_advert_carries_control_chars(
+    ) {
         let d = daemon();
         let dir = tempfile::tempdir().unwrap();
         let malicious_name = "\x1b[31mRED\x1b[0m\nline2\x00null";
         let signed = signed_peer_advert(
-            dir.path(), "peer3", malicious_name, Utc::now() + chrono::Duration::hours(1));
+            dir.path(),
+            "peer3",
+            malicious_name,
+            Utc::now() + chrono::Duration::hours(1),
+        );
         let mut raw = Vec::new();
         ciborium::into_writer(&signed, &mut raw).unwrap();
-        d.store.lock().unwrap()
-            .upsert_peer_advert(&signed.node_id, &raw, "unused-column-value-also-messy\x00",
-                Utc::now() + chrono::Duration::hours(1), Utc::now())
+        d.store
+            .lock()
+            .unwrap()
+            .upsert_peer_advert(
+                &signed.node_id,
+                &raw,
+                "unused-column-value-also-messy\x00",
+                Utc::now() + chrono::Duration::hours(1),
+                Utc::now(),
+            )
             .unwrap();
 
         let (code, body) = get(router(d), "/v1/discovery").await;
@@ -2695,9 +3271,14 @@ policies:
         let peers = v["peers"].as_array().unwrap();
         assert_eq!(peers.len(), 1);
         let served_name = peers[0]["name"].as_str().unwrap();
-        assert_eq!(served_name, crate::fed::conn::sanitize_advert_name(malicious_name));
+        assert_eq!(
+            served_name,
+            crate::fed::conn::sanitize_advert_name(malicious_name)
+        );
         assert!(
-            !served_name.contains('\x1b') && !served_name.contains('\n') && !served_name.contains('\0'),
+            !served_name.contains('\x1b')
+                && !served_name.contains('\n')
+                && !served_name.contains('\0'),
             "served name must never carry control characters: {served_name:?}"
         );
     }
@@ -2746,7 +3327,12 @@ routes:
         // sanity: resolution actually happened, so a subsequent "never
         // leaked" assertion isn't vacuously true because nothing resolved.
         assert_eq!(
-            cfg.plugins["mocka"].config.get("token").unwrap().as_str().unwrap(),
+            cfg.plugins["mocka"]
+                .config
+                .get("token")
+                .unwrap()
+                .as_str()
+                .unwrap(),
             sentinel,
         );
         std::env::remove_var(var_name);
@@ -2776,7 +3362,10 @@ routes:
         for path in ["/v1/routes", "/v1/plugins", "/v1/config"] {
             let (code, body) = get(router(d.clone()), path).await;
             assert_eq!(code, 200, "path {path} status");
-            assert!(!body.contains(sentinel), "resolved secret leaked from {path}: {body}");
+            assert!(
+                !body.contains(sentinel),
+                "resolved secret leaked from {path}: {body}"
+            );
         }
     }
 
@@ -2827,8 +3416,13 @@ routes:
     async fn config_validate_returns_200_valid_true_for_good_yaml() {
         let (d, cfg_path) = daemon_with_config_file();
         let good_yaml = std::fs::read_to_string(&cfg_path).unwrap();
-        let (code, body) =
-            req(super::router(d, cfg_path), "POST", "/v1/config/validate", Some(&good_yaml)).await;
+        let (code, body) = req(
+            super::router(d, cfg_path),
+            "POST",
+            "/v1/config/validate",
+            Some(&good_yaml),
+        )
+        .await;
         assert_eq!(code, 200, "body was: {body}");
         assert_eq!(body, "{\"valid\":true}", "body was: {body}");
     }
@@ -2837,8 +3431,13 @@ routes:
     async fn config_validate_returns_422_with_errors_for_unparsable_yaml() {
         let (d, cfg_path) = daemon_with_config_file();
         let bad_yaml = "node: [unterminated";
-        let (code, body) =
-            req(super::router(d, cfg_path), "POST", "/v1/config/validate", Some(bad_yaml)).await;
+        let (code, body) = req(
+            super::router(d, cfg_path),
+            "POST",
+            "/v1/config/validate",
+            Some(bad_yaml),
+        )
+        .await;
         assert_eq!(code, 422, "body was: {body}");
         assert!(body.contains("\"valid\":false"), "body was: {body}");
         assert!(body.contains("\"errors\""), "body was: {body}");
@@ -2866,8 +3465,13 @@ routes:
 "#,
             data_dir.display()
         );
-        let (code, body) =
-            req(super::router(d, cfg_path), "POST", "/v1/config/validate", Some(&yaml)).await;
+        let (code, body) = req(
+            super::router(d, cfg_path),
+            "POST",
+            "/v1/config/validate",
+            Some(&yaml),
+        )
+        .await;
         assert_eq!(code, 422, "body was: {body}");
         assert!(body.contains("unknown plugin"), "body was: {body}");
         assert!(body.contains("mockb"), "body was: {body}");
@@ -2902,11 +3506,18 @@ routes:
 "#,
             data_dir.display()
         );
-        let (code, body) =
-            req(super::router(d, cfg_path), "POST", "/v1/config/validate", Some(&yaml)).await;
+        let (code, body) = req(
+            super::router(d, cfg_path),
+            "POST",
+            "/v1/config/validate",
+            Some(&yaml),
+        )
+        .await;
         assert_eq!(code, 422, "body was: {body}");
-        assert!(body.contains("env:RF_ADMIN_TEST_VALIDATE_UNSET_VAR"),
-            "error must name the reference form: {body}");
+        assert!(
+            body.contains("env:RF_ADMIN_TEST_VALIDATE_UNSET_VAR"),
+            "error must name the reference form: {body}"
+        );
     }
 
     /// Fix round 1 (Important) — regression sentinel pinning
@@ -2920,7 +3531,8 @@ routes:
     /// resolve anything at all -- this test exists to catch a future
     /// reordering that would change that.
     #[tokio::test]
-    async fn config_validate_returns_422_with_neither_sentinel_nor_resolved_value_when_validation_fails_for_an_unrelated_reason() {
+    async fn config_validate_returns_422_with_neither_sentinel_nor_resolved_value_when_validation_fails_for_an_unrelated_reason(
+    ) {
         let var = "RF_ADMIN_TEST_VALIDATE_BEFORE_RESOLVE";
         let sentinel = "sentinel-validate-before-resolve-6e2a";
         std::env::set_var(var, sentinel);
@@ -2946,15 +3558,25 @@ routes:
             data_dir.display()
         );
 
-        let (code, body) =
-            req(super::router(d, cfg_path), "POST", "/v1/config/validate", Some(&yaml)).await;
+        let (code, body) = req(
+            super::router(d, cfg_path),
+            "POST",
+            "/v1/config/validate",
+            Some(&yaml),
+        )
+        .await;
         std::env::remove_var(var);
 
         assert_eq!(code, 422, "body was: {body}");
         assert!(body.contains("\"valid\":false"), "body was: {body}");
-        assert!(body.contains("reserved"), "error must name the actual validate()-level cause: {body}");
-        assert!(!body.contains(sentinel),
-            "resolved secret leaked despite an unrelated validate() failure: {body}");
+        assert!(
+            body.contains("reserved"),
+            "error must name the actual validate()-level cause: {body}"
+        );
+        assert!(
+            !body.contains(sentinel),
+            "resolved secret leaked despite an unrelated validate() failure: {body}"
+        );
         assert!(!body.contains(&format!("env:{var}")),
             "the secret reference form must not even appear -- resolve_secrets must never have run: {body}");
     }
@@ -2988,20 +3610,36 @@ routes:
             data_dir.display()
         );
 
-        let (code, body) =
-            req(super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&new_yaml)).await;
+        let (code, body) = req(
+            super::router(d.clone(), cfg_path.clone()),
+            "PUT",
+            "/v1/config",
+            Some(&new_yaml),
+        )
+        .await;
         assert_eq!(code, 200, "body was: {body}");
         assert!(body.contains("\"applied\":true"), "body was: {body}");
-        assert!(body.contains("\"mockc\""), "restart_required must name the added plugin: {body}");
+        assert!(
+            body.contains("\"mockc\""),
+            "restart_required must name the added plugin: {body}"
+        );
 
         // file-state matrix: current holds the new content verbatim, .prev
         // holds the pre-PUT content verbatim, no leftover tmp artifact.
         let current = std::fs::read_to_string(&cfg_path).unwrap();
-        assert_eq!(current, new_yaml, "current config file must hold the new content verbatim");
+        assert_eq!(
+            current, new_yaml,
+            "current config file must hold the new content verbatim"
+        );
         let prev = std::fs::read_to_string(super::prev_path_for(&cfg_path)).unwrap();
-        assert_eq!(prev, original_text, ".prev must hold the pre-PUT content verbatim");
-        assert!(!super::tmp_path_for(&cfg_path).exists(),
-            "no tmp artifact must remain after a successful PUT");
+        assert_eq!(
+            prev, original_text,
+            ".prev must hold the pre-PUT content verbatim"
+        );
+        assert!(
+            !super::tmp_path_for(&cfg_path).exists(),
+            "no tmp artifact must remain after a successful PUT"
+        );
 
         // 0600 on the newly-written current file (design §3 / alias.rs precedent).
         let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode();
@@ -3011,8 +3649,15 @@ routes:
         // left at whatever mode the pre-PUT file had (`daemon_with_config_file`
         // deliberately starts it at 644 so this assertion actually exercises
         // the fix rather than passing by coincidence).
-        let prev_mode = std::fs::metadata(super::prev_path_for(&cfg_path)).unwrap().permissions().mode();
-        assert_eq!(prev_mode & 0o777, 0o600, ".prev must be 0600, not inherited from the 644 original");
+        let prev_mode = std::fs::metadata(super::prev_path_for(&cfg_path))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            prev_mode & 0o777,
+            0o600,
+            ".prev must be 0600, not inherited from the 644 original"
+        );
 
         // daemon state actually applied: GET /v1/config would now serve the new text.
         assert_eq!(d.cfg_snapshot(|c| c.raw_yaml.clone()), new_yaml);
@@ -3034,12 +3679,21 @@ routes:
         // and the original + v-nothing beyond five are dropped.
         let versions: Vec<String> = (1..=6).map(|i| cfg(&i.to_string())).collect();
         for v in &versions {
-            let (code, body) =
-                req(super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(v)).await;
+            let (code, body) = req(
+                super::router(d.clone(), cfg_path.clone()),
+                "PUT",
+                "/v1/config",
+                Some(v),
+            )
+            .await;
             assert_eq!(code, 200, "apply must succeed: {body}");
         }
 
-        assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), versions[5], "live config = v6");
+        assert_eq!(
+            std::fs::read_to_string(&cfg_path).unwrap(),
+            versions[5],
+            "live config = v6"
+        );
         // slot 1 (newest prior) = v5, slot 2 = v4, … slot 5 (oldest kept) = v1.
         for (slot, vi) in (1..=5).zip([4usize, 3, 2, 1, 0]) {
             let text = std::fs::read_to_string(super::prev_slot_path(&cfg_path, slot))
@@ -3047,20 +3701,40 @@ routes:
             assert_eq!(text, versions[vi], "slot {slot} must hold v{}", vi + 1);
         }
         // Nothing kept beyond the five-deep history.
-        assert!(!super::prev_slot_path(&cfg_path, 6).exists(),
-            "no revision may be retained beyond CONFIG_HISTORY");
+        assert!(
+            !super::prev_slot_path(&cfg_path, 6).exists(),
+            "no revision may be retained beyond CONFIG_HISTORY"
+        );
 
         // The API surfaces each slot: ?n=1 = newest prior (v5), ?n=5 = v1.
-        let (code, newest) =
-            req(super::router(d.clone(), cfg_path.clone()), "GET", "/v1/config/prev", None).await;
+        let (code, newest) = req(
+            super::router(d.clone(), cfg_path.clone()),
+            "GET",
+            "/v1/config/prev",
+            None,
+        )
+        .await;
         assert_eq!(code, 200);
-        assert_eq!(newest, versions[4], "GET /v1/config/prev (default n=1) = v5");
-        let (code, oldest) =
-            req(super::router(d.clone(), cfg_path.clone()), "GET", "/v1/config/prev?n=5", None).await;
+        assert_eq!(
+            newest, versions[4],
+            "GET /v1/config/prev (default n=1) = v5"
+        );
+        let (code, oldest) = req(
+            super::router(d.clone(), cfg_path.clone()),
+            "GET",
+            "/v1/config/prev?n=5",
+            None,
+        )
+        .await;
         assert_eq!(code, 200);
         assert_eq!(oldest, versions[0], "GET /v1/config/prev?n=5 = v1");
-        let (code, _) =
-            req(super::router(d, cfg_path), "GET", "/v1/config/prev?n=6", None).await;
+        let (code, _) = req(
+            super::router(d, cfg_path),
+            "GET",
+            "/v1/config/prev?n=6",
+            None,
+        )
+        .await;
         assert_eq!(code, 404, "n beyond the kept history is 404");
     }
 
@@ -3070,15 +3744,25 @@ routes:
         let original_text = std::fs::read_to_string(&cfg_path).unwrap();
         let bad_yaml = "node: [unterminated";
 
-        let (code, body) =
-            req(super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(bad_yaml)).await;
+        let (code, body) = req(
+            super::router(d.clone(), cfg_path.clone()),
+            "PUT",
+            "/v1/config",
+            Some(bad_yaml),
+        )
+        .await;
         assert_eq!(code, 422, "body was: {body}");
         assert!(body.contains("\"valid\":false"), "body was: {body}");
 
         let current = std::fs::read_to_string(&cfg_path).unwrap();
-        assert_eq!(current, original_text, "an invalid PUT must not touch the config file");
-        assert!(!super::prev_path_for(&cfg_path).exists(),
-            "an invalid PUT must not create .prev");
+        assert_eq!(
+            current, original_text,
+            "an invalid PUT must not touch the config file"
+        );
+        assert!(
+            !super::prev_path_for(&cfg_path).exists(),
+            "an invalid PUT must not create .prev"
+        );
     }
 
     /// Fix round 1 (Important): before the fix, `write_config_replacing_
@@ -3129,13 +3813,24 @@ routes:
         std::fs::write(&tmp_path, "pre-existing, unwritable").unwrap();
         std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o400)).unwrap();
 
-        let (code, body) =
-            req(super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&new_yaml)).await;
+        let (code, body) = req(
+            super::router(d.clone(), cfg_path.clone()),
+            "PUT",
+            "/v1/config",
+            Some(&new_yaml),
+        )
+        .await;
 
         assert_eq!(code, 500, "body was: {body}");
         let current = std::fs::read_to_string(&cfg_path).unwrap();
-        assert_eq!(current, original_text, "a write failure must leave the config file untouched");
-        assert!(!super::prev_path_for(&cfg_path).exists(), "a write failure must never create .prev");
+        assert_eq!(
+            current, original_text,
+            "a write failure must leave the config file untouched"
+        );
+        assert!(
+            !super::prev_path_for(&cfg_path).exists(),
+            "a write failure must never create .prev"
+        );
     }
 
     /// Fix round 1 (Minor) — admin-layer restart_required matrix: proves
@@ -3146,7 +3841,8 @@ routes:
     /// baseline, a route-only change (render knobs) must report an EMPTY
     /// restart_required.
     #[tokio::test]
-    async fn config_put_restart_required_names_a_plugin_config_change_and_is_empty_for_a_route_only_change() {
+    async fn config_put_restart_required_names_a_plugin_config_change_and_is_empty_for_a_route_only_change(
+    ) {
         let (d, cfg_path) = daemon_with_config_file();
         let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
 
@@ -3171,11 +3867,17 @@ routes:
             data_dir.display()
         );
         let (code1, body1) = req(
-            super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&plugin_config_changed),
-        ).await;
+            super::router(d.clone(), cfg_path.clone()),
+            "PUT",
+            "/v1/config",
+            Some(&plugin_config_changed),
+        )
+        .await;
         assert_eq!(code1, 200, "body was: {body1}");
-        assert_eq!(body1, "{\"applied\":true,\"restart_required\":[\"mocka\"]}",
-            "only the plugin whose config block changed must be named: {body1}");
+        assert_eq!(
+            body1, "{\"applied\":true,\"restart_required\":[\"mocka\"]}",
+            "only the plugin whose config block changed must be named: {body1}"
+        );
 
         // (b) route-only change from THIS new baseline -- everything else
         // (node, plugins) held identical to `plugin_config_changed`.
@@ -3202,18 +3904,29 @@ routes:
             data_dir.display()
         );
         let (code2, body2) = req(
-            super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&route_only_changed),
-        ).await;
+            super::router(d.clone(), cfg_path.clone()),
+            "PUT",
+            "/v1/config",
+            Some(&route_only_changed),
+        )
+        .await;
         assert_eq!(code2, 200, "body was: {body2}");
-        assert_eq!(body2, "{\"applied\":true,\"restart_required\":[]}",
-            "a route-only change must never require a restart: {body2}");
+        assert_eq!(
+            body2, "{\"applied\":true,\"restart_required\":[]}",
+            "a route-only change must never require a restart: {body2}"
+        );
     }
 
     #[tokio::test]
     async fn config_rollback_returns_404_when_no_prev_exists() {
         let (d, cfg_path) = daemon_with_config_file();
-        let (code, body) =
-            req(super::router(d, cfg_path), "POST", "/v1/config/rollback", None).await;
+        let (code, body) = req(
+            super::router(d, cfg_path),
+            "POST",
+            "/v1/config/rollback",
+            None,
+        )
+        .await;
         assert_eq!(code, 404, "body was: {body}");
     }
 
@@ -3245,8 +3958,13 @@ routes:
             data_dir.display()
         );
 
-        let (put_code, put_body) =
-            req(super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&new_yaml)).await;
+        let (put_code, put_body) = req(
+            super::router(d.clone(), cfg_path.clone()),
+            "PUT",
+            "/v1/config",
+            Some(&new_yaml),
+        )
+        .await;
         assert_eq!(put_code, 200, "seeding PUT failed: {put_body}");
 
         // Fix round 1 (Critical): force `.prev` back to 644 right before the
@@ -3255,25 +3973,42 @@ routes:
         // post-rollback 0600 assertion below actually exercises
         // `swap_with_prev`'s chmod rather than passing because the file
         // happened to already be 0600 from the seeding PUT.
-        std::fs::set_permissions(super::prev_path_for(&cfg_path), std::fs::Permissions::from_mode(0o644))
-            .unwrap();
+        std::fs::set_permissions(
+            super::prev_path_for(&cfg_path),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
 
-        let (code, body) =
-            req(super::router(d.clone(), cfg_path.clone()), "POST", "/v1/config/rollback", None).await;
+        let (code, body) = req(
+            super::router(d.clone(), cfg_path.clone()),
+            "POST",
+            "/v1/config/rollback",
+            None,
+        )
+        .await;
         assert_eq!(code, 200, "body was: {body}");
         assert!(body.contains("\"applied\":true"), "body was: {body}");
 
         let current = std::fs::read_to_string(&cfg_path).unwrap();
-        assert_eq!(current, original_text, "current file must hold the rolled-back content");
+        assert_eq!(
+            current, original_text,
+            "current file must hold the rolled-back content"
+        );
         let prev = std::fs::read_to_string(super::prev_path_for(&cfg_path)).unwrap();
-        assert_eq!(prev, new_yaml, ".prev must now hold what was current before the rollback");
+        assert_eq!(
+            prev, new_yaml,
+            ".prev must now hold what was current before the rollback"
+        );
 
         // Fix round 1 (Critical): the live config path after a rollback must
         // be 0600, even though the `.prev` it was just swapped in from was
         // deliberately left at 644 above.
         let live_mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode();
-        assert_eq!(live_mode & 0o777, 0o600,
-            "live config path must be 0600 after rollback, not inherited from .prev's 644");
+        assert_eq!(
+            live_mode & 0o777,
+            0o600,
+            "live config path must be 0600 after rollback, not inherited from .prev's 644"
+        );
 
         assert_eq!(d.cfg_snapshot(|c| c.raw_yaml.clone()), original_text);
     }
@@ -3311,8 +4046,13 @@ routes:
 "#,
             data_dir.display()
         );
-        let (seed1_code, seed1_body) =
-            req(super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&secret_yaml)).await;
+        let (seed1_code, seed1_body) = req(
+            super::router(d.clone(), cfg_path.clone()),
+            "PUT",
+            "/v1/config",
+            Some(&secret_yaml),
+        )
+        .await;
         assert_eq!(seed1_code, 200, "seeding PUT 1 failed: {seed1_body}");
 
         // Second PUT (still var set, so `secret_yaml` re-validates fine):
@@ -3336,28 +4076,56 @@ routes:
 "#,
             data_dir.display()
         );
-        let (seed2_code, seed2_body) =
-            req(super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&plain_yaml)).await;
+        let (seed2_code, seed2_body) = req(
+            super::router(d.clone(), cfg_path.clone()),
+            "PUT",
+            "/v1/config",
+            Some(&plain_yaml),
+        )
+        .await;
         assert_eq!(seed2_code, 200, "seeding PUT 2 failed: {seed2_body}");
 
         let current_before = std::fs::read_to_string(&cfg_path).unwrap();
         let prev_before = std::fs::read_to_string(super::prev_path_for(&cfg_path)).unwrap();
-        assert_eq!(current_before, plain_yaml, "test fixture sanity: current must be plain_yaml");
-        assert_eq!(prev_before, secret_yaml, "test fixture sanity: .prev must be secret_yaml");
+        assert_eq!(
+            current_before, plain_yaml,
+            "test fixture sanity: current must be plain_yaml"
+        );
+        assert_eq!(
+            prev_before, secret_yaml,
+            "test fixture sanity: .prev must be secret_yaml"
+        );
 
         std::env::remove_var(var);
 
-        let (code, body) =
-            req(super::router(d.clone(), cfg_path.clone()), "POST", "/v1/config/rollback", None).await;
+        let (code, body) = req(
+            super::router(d.clone(), cfg_path.clone()),
+            "POST",
+            "/v1/config/rollback",
+            None,
+        )
+        .await;
         assert_eq!(code, 409, "body was: {body}");
         assert!(body.contains("\"errors\""), "body was: {body}");
-        assert!(body.contains(&format!("env:{var}")), "error must name the reference form: {body}");
-        assert!(!body.contains("sentinel-rollback-drift-value"), "resolved secret leaked: {body}");
+        assert!(
+            body.contains(&format!("env:{var}")),
+            "error must name the reference form: {body}"
+        );
+        assert!(
+            !body.contains("sentinel-rollback-drift-value"),
+            "resolved secret leaked: {body}"
+        );
 
         let current_after = std::fs::read_to_string(&cfg_path).unwrap();
-        assert_eq!(current_after, current_before, "current file must be untouched after a 409");
+        assert_eq!(
+            current_after, current_before,
+            "current file must be untouched after a 409"
+        );
         let prev_after = std::fs::read_to_string(super::prev_path_for(&cfg_path)).unwrap();
-        assert_eq!(prev_after, prev_before, ".prev must be untouched after a 409");
+        assert_eq!(
+            prev_after, prev_before,
+            ".prev must be untouched after a 409"
+        );
     }
 
     /// Design §3's redaction invariant, extended to the three mutation
@@ -3392,19 +4160,32 @@ routes:
         );
 
         let (vcode, vbody) = req(
-            super::router(d.clone(), cfg_path.clone()), "POST", "/v1/config/validate", Some(&secret_yaml),
-        ).await;
+            super::router(d.clone(), cfg_path.clone()),
+            "POST",
+            "/v1/config/validate",
+            Some(&secret_yaml),
+        )
+        .await;
         assert_eq!(vcode, 200, "body was: {vbody}");
         assert!(!vbody.contains(sentinel), "validate leaked secret: {vbody}");
 
         let (pcode, pbody) = req(
-            super::router(d.clone(), cfg_path.clone()), "PUT", "/v1/config", Some(&secret_yaml),
-        ).await;
+            super::router(d.clone(), cfg_path.clone()),
+            "PUT",
+            "/v1/config",
+            Some(&secret_yaml),
+        )
+        .await;
         assert_eq!(pcode, 200, "body was: {pbody}");
         assert!(!pbody.contains(sentinel), "PUT leaked secret: {pbody}");
 
-        let (rcode, rbody) =
-            req(super::router(d.clone(), cfg_path.clone()), "POST", "/v1/config/rollback", None).await;
+        let (rcode, rbody) = req(
+            super::router(d.clone(), cfg_path.clone()),
+            "POST",
+            "/v1/config/rollback",
+            None,
+        )
+        .await;
         assert_eq!(rcode, 200, "body was: {rbody}");
         assert!(!rbody.contains(sentinel), "rollback leaked secret: {rbody}");
 
@@ -3428,24 +4209,33 @@ routes:
     async fn get_v1_events_streams_a_driven_ingress_event_over_tower_oneshot() {
         let d = daemon();
         let resp = router(d.clone())
-            .oneshot(Request::builder().uri("/v1/events").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
             "text/event-stream",
             "wrong content-type"
         );
 
         let id = uuid::Uuid::now_v7();
-        d.events.send(crate::events::Event::Ingress {
-            id,
-            protocol: "mocka".into(),
-            sender_masked: "mocka:si****1234".into(),
-            routes: vec!["general".into()],
-            ts: chrono::Utc::now(),
-        }).expect("send must succeed: the handler above has already subscribed");
+        d.events
+            .send(crate::events::Event::Ingress {
+                id,
+                protocol: "mocka".into(),
+                sender_masked: "mocka:si****1234".into(),
+                routes: vec!["general".into()],
+                ts: chrono::Utc::now(),
+            })
+            .expect("send must succeed: the handler above has already subscribed");
 
         let mut body = resp.into_body();
         let mut collected = String::new();
@@ -3462,10 +4252,22 @@ routes:
                 break;
             }
         }
-        assert!(collected.contains("event: ingress"), "stream was: {collected}");
-        assert!(collected.contains(&format!("\"id\":\"{id}\"")), "stream was: {collected}");
-        assert!(collected.contains("\"sender_masked\":\"mocka:si****1234\""), "stream was: {collected}");
-        assert!(collected.contains("\"routes\":[\"general\"]"), "stream was: {collected}");
+        assert!(
+            collected.contains("event: ingress"),
+            "stream was: {collected}"
+        );
+        assert!(
+            collected.contains(&format!("\"id\":\"{id}\"")),
+            "stream was: {collected}"
+        );
+        assert!(
+            collected.contains("\"sender_masked\":\"mocka:si****1234\""),
+            "stream was: {collected}"
+        );
+        assert!(
+            collected.contains("\"routes\":[\"general\"]"),
+            "stream was: {collected}"
+        );
     }
 
     /// Design §4: "lagged receivers skip missed events and continue" --
@@ -3480,8 +4282,11 @@ routes:
         let (tx, rx) = tokio::sync::broadcast::channel(256);
         for i in 0..300u32 {
             tx.send(crate::events::Event::Plugin {
-                name: format!("p{i}"), up: true, ts: chrono::Utc::now(),
-            }).unwrap();
+                name: format!("p{i}"),
+                up: true,
+                ts: chrono::Utc::now(),
+            })
+            .unwrap();
         }
 
         let mut stream = super::events_stream_from(rx);
@@ -3551,9 +4356,15 @@ routes:
                 if !documented {
                     continue;
                 }
-                let resp = live.clone()
-                    .oneshot(Request::builder().method(method).uri(&concrete_path)
-                        .body(Body::empty()).unwrap())
+                let resp = live
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(&concrete_path)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
                     .await
                     .unwrap();
                 assert_ne!(
@@ -3598,10 +4409,21 @@ routes:
         let cfg = crate::config::load_from_str(&yaml).unwrap();
         // Prove the secret genuinely resolved (not just an unused env var
         // sitting in the process environment) before checking the doc.
-        assert_eq!(cfg.plugins["mocka"].config.get("token").unwrap().as_str().unwrap(), SENTINEL);
+        assert_eq!(
+            cfg.plugins["mocka"]
+                .config
+                .get("token")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            SENTINEL
+        );
 
         let doc_json = serde_json::to_string(&ApiDoc::openapi()).unwrap();
-        assert!(!doc_json.contains(SENTINEL), "OpenAPI doc leaked a loaded secret value: {doc_json}");
+        assert!(
+            !doc_json.contains(SENTINEL),
+            "OpenAPI doc leaked a loaded secret value: {doc_json}"
+        );
         std::env::remove_var(VAR);
     }
 
@@ -3622,11 +4444,22 @@ routes:
     #[test]
     fn limits_response_serializes_byte_identical_to_the_pre_promotion_json_shape() {
         let mut transport_budgets = BTreeMap::new();
-        transport_budgets.insert("mockb".to_string(), TransportBudgetItem { messages_per_minute: 30 });
+        transport_budgets.insert(
+            "mockb".to_string(),
+            TransportBudgetItem {
+                messages_per_minute: 30,
+            },
+        );
         let resp = LimitsResponse {
-            global: GlobalLimitsItem { cas_max_bytes: 1_000_000_000, queue_max: 50_000 },
+            global: GlobalLimitsItem {
+                cas_max_bytes: 1_000_000_000,
+                queue_max: 50_000,
+            },
             per_route: PerRouteLimitsItem { queue_max: 5_000 },
-            per_sender: PerSenderLimitsItem { bytes_per_hour: 50_000, messages_per_minute: 10 },
+            per_sender: PerSenderLimitsItem {
+                bytes_per_hour: 50_000,
+                messages_per_minute: 10,
+            },
             transport_budgets,
         };
         let old = json!({
@@ -3635,7 +4468,10 @@ routes:
             "global": { "queue_max": 50_000u32, "cas_max_bytes": 1_000_000_000u64 },
             "transport_budgets": { "mockb": { "messages_per_minute": 30u32 } },
         });
-        assert_eq!(serde_json::to_string(&resp).unwrap(), serde_json::to_string(&old).unwrap());
+        assert_eq!(
+            serde_json::to_string(&resp).unwrap(),
+            serde_json::to_string(&old).unwrap()
+        );
     }
 
     #[test]
@@ -3644,13 +4480,18 @@ routes:
         let resp = FederationResponse {
             peers: vec![
                 FederationPeerItem {
-                    connected: true, last_seen: Some(ts),
-                    name: Some("phoenix".to_string()), node_id: "rf:abc".to_string(),
+                    connected: true,
+                    last_seen: Some(ts),
+                    name: Some("phoenix".to_string()),
+                    node_id: "rf:abc".to_string(),
                     trust: "trusted".to_string(),
                 },
                 FederationPeerItem {
-                    connected: false, last_seen: None,
-                    name: None, node_id: "rf:def".to_string(), trust: "unknown".to_string(),
+                    connected: false,
+                    last_seen: None,
+                    name: None,
+                    node_id: "rf:def".to_string(),
+                    trust: "unknown".to_string(),
                 },
             ],
         };
@@ -3666,7 +4507,10 @@ routes:
                 }),
             ]
         });
-        assert_eq!(serde_json::to_string(&resp).unwrap(), serde_json::to_string(&old).unwrap());
+        assert_eq!(
+            serde_json::to_string(&resp).unwrap(),
+            serde_json::to_string(&old).unwrap()
+        );
     }
 
     // ---- Task 2 (design §2): Swagger UI at GET /docs -----------------
@@ -3679,7 +4523,10 @@ routes:
     async fn docs_serves_the_swagger_ui_index_directly_at_200() {
         let (status, body) = get(router(daemon()), "/docs").await;
         assert_eq!(status, 200);
-        assert!(body.contains("swagger-ui"), "expected a Swagger UI marker in the body: {body}");
+        assert!(
+            body.contains("swagger-ui"),
+            "expected a Swagger UI marker in the body: {body}"
+        );
     }
 
     /// `/docs/` (trailing slash) is the same page, also a direct 200.
@@ -3687,7 +4534,10 @@ routes:
     async fn docs_with_trailing_slash_also_serves_200_html() {
         let (status, body) = get(router(daemon()), "/docs/").await;
         assert_eq!(status, 200);
-        assert!(body.contains("swagger-ui"), "expected a Swagger UI marker in the body: {body}");
+        assert!(
+            body.contains("swagger-ui"),
+            "expected a Swagger UI marker in the body: {body}"
+        );
     }
 
     /// `/docs` response is actually served as `text/html`, matching what a
@@ -3699,8 +4549,16 @@ routes:
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap();
-        assert!(content_type.starts_with("text/html"), "unexpected content-type: {content_type}");
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.starts_with("text/html"),
+            "unexpected content-type: {content_type}"
+        );
     }
 
     /// Self-contained assertion (design §2 Security invariants / brief):
@@ -3715,8 +4573,16 @@ routes:
     async fn docs_html_has_no_external_href_or_src() {
         let (status, body) = get(router(daemon()), "/docs").await;
         assert_eq!(status, 200);
-        for needle in ["href=\"http://", "href=\"https://", "src=\"http://", "src=\"https://"] {
-            assert!(!body.contains(needle), "self-contained /docs must not reference {needle}: {body}");
+        for needle in [
+            "href=\"http://",
+            "href=\"https://",
+            "src=\"http://",
+            "src=\"https://",
+        ] {
+            assert!(
+                !body.contains(needle),
+                "self-contained /docs must not reference {needle}: {body}"
+            );
         }
     }
 

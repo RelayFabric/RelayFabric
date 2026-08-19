@@ -2,8 +2,33 @@
 
 **RelayFabric is an open communications routing fabric for interconnecting otherwise incompatible messaging, mesh, radio, and Internet systems.** It provides one common routing, policy, identity, security, and message-processing layer, and delegates every protocol-specific detail to plugins. Bridge a Meshtastic LoRa mesh to Reticulum/LXMF, relay Signal into Nostr, or federate two gateways over an untrusted link — through a single headless daemon.
 
-!!! note "Status — v0.3"
-    Shipping: the core fabric (routing, dedup, policy, persistence, admin API), plugins for Reticulum/LXMF, Signal, Meshtastic, MeshCore, Nostr, Bitchat, and MQTT, inter-gateway **federation** with signed attestations, **RFDP** discovery, a documented admin API with Swagger UI, **sealed (blind) routing** ([§113](SPEC.md) — zero-knowledge payload routing, *not* traffic anonymity), and **transport-class-aware egress** (constrained links degrade gracefully). See the [Specification](SPEC.md) for the authoritative detail.
+!!! note "Status — v0.3.0 released · v0.4 in progress"
+    v0.4 is the hardening/proving/packaging release — no new protocols ([roadmap](proposals/v0.4-roadmap.md)). The table below is the **single source of truth** for feature status; every other page defers to it.
+
+## Feature status
+
+| Subsystem | Status | Since | Validation |
+|---|---|---|---|
+| Core fabric (routing, dedup, policy, queue, persistence, admin API) | shipped | v0.1 | unit + e2e suites |
+| Plugin Protocol v1 (CBOR IPC, golden-locked wire format) | shipped | v0.1 | golden vectors, Rust + Python |
+| MQTT plugin | shipped | v0.1 | e2e + livetest |
+| LXMF plugin | shipped | v0.1 | **field-tested** against a live RNS backbone |
+| Signal plugin | shipped | v0.1 | livetest against signal-cli |
+| Meshtastic plugin | shipped | v0.1 | livetest via MQTT JSON gateway |
+| MeshCore plugin | shipped | v0.2 | fake-backend tests; **real-hardware validation pending** (v0.4 cycle C) |
+| Nostr plugin | shipped | v0.3 | fake-relay tests; **live-relay validation pending** |
+| Bitchat plugin | shipped | v0.3 | fake tests; **real-client interop unverified** |
+| PotatoMesh feeder plugin | shipped | v0.4-dev | unit tests against the published contract |
+| Federation (Noise XX, signed envelopes, trust levels) | shipped | v0.3 | e2e |
+| RFDP discovery | shipped | v0.3 | e2e |
+| Sealed routing — phase 1, gateway-to-gateway ([§113](SPEC.md)) | shipped | v0.3 | e2e + KAT |
+| Sealed routing — user-to-user (X3DH/ratchet), MLS groups | not built | planned v0.5+ | — |
+| Transport-class egress (phase 1, static classes) | shipped | v0.3 | SHA-locked regression e2e |
+| Transport-class phase 2 (core extraction, Android) | not built | [proposed](proposals/transport-class-phase2.md) | — |
+| Web admin UI (`relayfabric-ui`) | shipped | v0.2 | manual; **no authentication yet** (v0.4 cycle E) |
+| Plugin privilege isolation | in progress | v0.4 cycle B | — |
+| Packaged releases (binaries, .deb) | in progress | v0.4 cycle D | — |
+| Federation over Tor/I2P | not built | [proposed](proposals/federation-over-tor.md) | — |
 
 ## The idea
 

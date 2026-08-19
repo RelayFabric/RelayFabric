@@ -179,7 +179,14 @@ pub fn seal(
 ) -> SealedEnvelope {
     let ephemeral_secret = SecretKey::generate(&mut OsRng);
     let nonce = ChaChaBox::generate_nonce(&mut OsRng);
-    seal_fixed(canonical_env_cbor, id, expires_at, recipient_pub, ephemeral_secret, nonce)
+    seal_fixed(
+        canonical_env_cbor,
+        id,
+        expires_at,
+        recipient_pub,
+        ephemeral_secret,
+        nonce,
+    )
 }
 
 /// The fully-deterministic core `seal` (fresh randomness) and the KAT
@@ -308,7 +315,14 @@ mod tests {
     ) -> SealedEnvelope {
         let ephemeral_secret = SecretKey::from_bytes(FIXED_EPHEMERAL);
         let nonce = *crypto_box::Nonce::from_slice(&FIXED_NONCE);
-        seal_fixed(canonical_env_cbor, id, expires_at, recipient_pub, ephemeral_secret, nonce)
+        seal_fixed(
+            canonical_env_cbor,
+            id,
+            expires_at,
+            recipient_pub,
+            ephemeral_secret,
+            nonce,
+        )
     }
 
     // --- round-trip -----------------------------------------------------
@@ -328,9 +342,14 @@ mod tests {
         let (recipient_secret, recipient_pub) = recipient_keypair();
         let env_cbor = b"another canonical envelope body".to_vec();
         let ephemeral = SecretKey::generate(&mut OsRng);
-        let sealed =
-            seal_fixed(&env_cbor, "msg-2", 1_800_000_001, &recipient_pub, ephemeral,
-                       ChaChaBox::generate_nonce(&mut OsRng));
+        let sealed = seal_fixed(
+            &env_cbor,
+            "msg-2",
+            1_800_000_001,
+            &recipient_pub,
+            ephemeral,
+            ChaChaBox::generate_nonce(&mut OsRng),
+        );
 
         let opened = unseal(&sealed, &recipient_secret).unwrap();
         assert_eq!(opened, env_cbor);
@@ -407,7 +426,10 @@ mod tests {
         let (recipient_secret, recipient_pub) = recipient_keypair();
         let mut sealed = seal(b"body", "msg-6", 1, &recipient_pub);
         sealed.id = "different-id".to_string();
-        assert_eq!(unseal(&sealed, &recipient_secret), Err(SealError::BadBinding));
+        assert_eq!(
+            unseal(&sealed, &recipient_secret),
+            Err(SealError::BadBinding)
+        );
     }
 
     #[test]
@@ -415,7 +437,10 @@ mod tests {
         let (recipient_secret, recipient_pub) = recipient_keypair();
         let mut sealed = seal(b"body", "msg-7", 1, &recipient_pub);
         sealed.expires_at = 999;
-        assert_eq!(unseal(&sealed, &recipient_secret), Err(SealError::BadBinding));
+        assert_eq!(
+            unseal(&sealed, &recipient_secret),
+            Err(SealError::BadBinding)
+        );
     }
 
     // --- wrong key / unknown alg -------------------------------------------
@@ -433,7 +458,10 @@ mod tests {
         let (recipient_secret, recipient_pub) = recipient_keypair();
         let mut sealed = seal(b"body", "msg-9", 1, &recipient_pub);
         sealed.alg = "some-future-pq-hybrid-v2".to_string();
-        assert_eq!(unseal(&sealed, &recipient_secret), Err(SealError::UnsupportedAlg));
+        assert_eq!(
+            unseal(&sealed, &recipient_secret),
+            Err(SealError::UnsupportedAlg)
+        );
     }
 
     // --- malformed wire input never panics ---------------------------------
@@ -484,7 +512,10 @@ mod tests {
     fn empty_ct_under_a_valid_alg_fails_bad_seal_not_panic() {
         let (recipient_secret, recipient_pub) = recipient_keypair();
         let mut sealed = seal(b"body", "msg-14", 1, &recipient_pub);
-        assert_eq!(sealed.alg, SEAL_ALG_V1, "fixture sanity check: alg must be the valid one");
+        assert_eq!(
+            sealed.alg, SEAL_ALG_V1,
+            "fixture sanity check: alg must be the valid one"
+        );
         sealed.ct = Vec::new();
         assert_eq!(unseal(&sealed, &recipient_secret), Err(SealError::BadSeal));
     }
@@ -496,7 +527,10 @@ mod tests {
     fn truncated_ct_under_a_valid_alg_fails_bad_seal_not_panic() {
         let (recipient_secret, recipient_pub) = recipient_keypair();
         let mut sealed = seal(b"body", "msg-15", 1, &recipient_pub);
-        assert_eq!(sealed.alg, SEAL_ALG_V1, "fixture sanity check: alg must be the valid one");
+        assert_eq!(
+            sealed.alg, SEAL_ALG_V1,
+            "fixture sanity check: alg must be the valid one"
+        );
         sealed.ct.truncate(3); // well short of the 16-byte AEAD tag alone
         assert_eq!(unseal(&sealed, &recipient_secret), Err(SealError::BadSeal));
     }
@@ -535,6 +569,9 @@ mod tests {
             nonce: vec![0u8; 1],
             ct: vec![0u8; 1],
         };
-        assert_eq!(unseal(&sealed, &recipient_secret), Err(SealError::UnsupportedAlg));
+        assert_eq!(
+            unseal(&sealed, &recipient_secret),
+            Err(SealError::UnsupportedAlg)
+        );
     }
 }

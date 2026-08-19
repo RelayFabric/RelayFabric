@@ -62,8 +62,7 @@ const HOP_BY_HOP: &[&str] = &[
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -127,7 +126,10 @@ async fn main() {
         // only resolve when the page is loaded at /docs/ (with the trailing
         // slash); the daemon serves /docs without redirecting, so send the
         // browser to /docs/ ourselves.
-        .route("/docs", any(|| async { axum::response::Redirect::permanent("/docs/") }))
+        .route(
+            "/docs",
+            any(|| async { axum::response::Redirect::permanent("/docs/") }),
+        )
         .route("/docs/", any(proxy))
         .route("/docs/{*rest}", any(proxy))
         .fallback(static_file)
@@ -157,7 +159,10 @@ async fn security_headers(req: Request, next: axum::middleware::Next) -> Respons
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
     h.insert("x-frame-options", HeaderValue::from_static("DENY"));
-    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    h.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
     h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     resp
 }
@@ -195,8 +200,7 @@ async fn forward(
         .to_string();
 
     let stream = tokio::net::UnixStream::connect(socket).await?;
-    let (mut sender, conn) =
-        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -232,28 +236,34 @@ async fn static_file(State(st): State<AppState>, req: Request) -> Response {
         return (StatusCode::FORBIDDEN, "host not allowed").into_response();
     }
     let path = req.uri().path();
-    let rel = if path == "/" { "index.html" } else { path.trim_start_matches('/') };
+    let rel = if path == "/" {
+        "index.html"
+    } else {
+        path.trim_start_matches('/')
+    };
     if rel.split('/').any(|seg| seg == ".." || seg.is_empty()) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let full = st.web_dir.join(rel);
     match tokio::fs::read(&full).await {
-        Ok(bytes) => (
-            [(header::CONTENT_TYPE, content_type(&full))],
-            bytes,
-        )
-            .into_response(),
-        Err(_) if !rel.contains('.') => match tokio::fs::read(st.web_dir.join("index.html")).await {
-            Ok(bytes) => ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], bytes)
-                .into_response(),
-            Err(_) => StatusCode::NOT_FOUND.into_response(),
-        },
+        Ok(bytes) => ([(header::CONTENT_TYPE, content_type(&full))], bytes).into_response(),
+        Err(_) if !rel.contains('.') => {
+            match tokio::fs::read(st.web_dir.join("index.html")).await {
+                Ok(bytes) => {
+                    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], bytes).into_response()
+                }
+                Err(_) => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
 fn is_state_changing(m: &Method) -> bool {
-    matches!(*m, Method::POST | Method::PUT | Method::DELETE | Method::PATCH)
+    matches!(
+        *m,
+        Method::POST | Method::PUT | Method::DELETE | Method::PATCH
+    )
 }
 
 /// The Host header (or a bare authority) with any `:port` removed, lower-cased
@@ -344,7 +354,10 @@ mod tests {
         assert!(host_allowed(&hdrs(&[("host", "127.0.0.1:8087")]), &allowed));
         assert!(host_allowed(&hdrs(&[("host", "localhost:8087")]), &allowed));
         // a rebinding attacker's own domain, resolved to 127.0.0.1, is refused
-        assert!(!host_allowed(&hdrs(&[("host", "attacker.example:8087")]), &allowed));
+        assert!(!host_allowed(
+            &hdrs(&[("host", "attacker.example:8087")]),
+            &allowed
+        ));
         // no Host at all is refused
         assert!(!host_allowed(&hdrs(&[]), &allowed));
     }
@@ -352,9 +365,15 @@ mod tests {
     #[test]
     fn origin_check_blocks_cross_site_and_allows_same_and_missing() {
         let allowed = vec!["127.0.0.1".to_string()];
-        assert!(origin_allowed(&hdrs(&[("origin", "http://127.0.0.1:8087")]), &allowed));
+        assert!(origin_allowed(
+            &hdrs(&[("origin", "http://127.0.0.1:8087")]),
+            &allowed
+        ));
         assert!(origin_allowed(&hdrs(&[]), &allowed)); // no Origin (curl/ctl)
-        assert!(!origin_allowed(&hdrs(&[("origin", "https://evil.example")]), &allowed));
+        assert!(!origin_allowed(
+            &hdrs(&[("origin", "https://evil.example")]),
+            &allowed
+        ));
         assert!(!origin_allowed(&hdrs(&[("origin", "null")]), &allowed));
     }
 }

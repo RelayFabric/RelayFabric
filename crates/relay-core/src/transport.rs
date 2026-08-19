@@ -233,7 +233,10 @@ mod tests {
     #[test]
     fn transport_class_deserializes_snake_case_names() {
         let cases = [
-            ("\"terrestrial_internet\"", TransportClass::TerrestrialInternet),
+            (
+                "\"terrestrial_internet\"",
+                TransportClass::TerrestrialInternet,
+            ),
             ("\"satellite_internet\"", TransportClass::SatelliteInternet),
             ("\"reticulum\"", TransportClass::Reticulum),
             ("\"meshtastic\"", TransportClass::Meshtastic),
@@ -255,5 +258,4 @@ mod tests {
             "expected a clear unknown-variant error, got: {err}"
         );
     }
-
 }

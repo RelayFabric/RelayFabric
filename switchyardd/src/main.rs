@@ -62,15 +62,17 @@ fn main() {
         }
     };
     if check_only {
-        println!("configuration valid: {} route(s), {} plugin(s)",
-                 cfg.routes.len(), cfg.plugins.len());
+        println!(
+            "configuration valid: {} route(s), {} plugin(s)",
+            cfg.routes.len(),
+            cfg.plugins.len()
+        );
         return;
     }
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
     let data_dir = cfg.node.data_dir.clone();
@@ -87,7 +89,11 @@ fn main() {
             if pc.enabled {
                 if let Some(cmd) = &pc.command {
                     tokio::spawn(plugins::supervise(
-                        daemon.clone(), name.clone(), cmd.clone(), plugin_sock.clone()));
+                        daemon.clone(),
+                        name.clone(),
+                        cmd.clone(),
+                        plugin_sock.clone(),
+                    ));
                 }
             }
         }
@@ -101,8 +107,14 @@ fn main() {
             tokio::net::UnixListener::bind(&admin_sock).expect("bind admin socket");
         harden_socket(&admin_sock).expect("harden admin socket permissions");
         tokio::spawn(admin::serve(
-            daemon.clone(), std::path::PathBuf::from(config_path), admin_listener));
-        tracing::info!(node = daemon.cfg_snapshot(|c| c.node.name.clone()), "switchyardd running");
+            daemon.clone(),
+            std::path::PathBuf::from(config_path),
+            admin_listener,
+        ));
+        tracing::info!(
+            node = daemon.cfg_snapshot(|c| c.node.name.clone()),
+            "switchyardd running"
+        );
         tokio::signal::ctrl_c().await.expect("ctrl_c");
         tracing::info!("shutting down");
     });
@@ -122,11 +134,17 @@ mod tests {
         // pre-condition harden_socket exists to fix.
         let _listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
         let before = std::fs::metadata(&sock_path).unwrap().permissions().mode() & 0o777;
-        assert_ne!(before, 0o600, "test assumption: a fresh bind isn't already 0600");
+        assert_ne!(
+            before, 0o600,
+            "test assumption: a fresh bind isn't already 0600"
+        );
 
         harden_socket(&sock_path).unwrap();
 
         let after = std::fs::metadata(&sock_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(after, 0o600, "harden_socket must lock the socket file to owner-only 0600");
+        assert_eq!(
+            after, 0o600,
+            "harden_socket must lock the socket file to owner-only 0600"
+        );
     }
 }

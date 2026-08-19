@@ -25,7 +25,11 @@ pub struct SenderLimiter {
 
 impl SenderLimiter {
     pub fn new(messages_per_minute: u32, bytes_per_hour: u64) -> SenderLimiter {
-        SenderLimiter { messages_per_minute, bytes_per_hour, windows: HashMap::new() }
+        SenderLimiter {
+            messages_per_minute,
+            bytes_per_hour,
+            windows: HashMap::new(),
+        }
     }
 
     /// True (and records the message against `key`'s history) if both
@@ -56,7 +60,11 @@ impl SenderLimiter {
         // has no use for anything past a minute, so pruning at the minute
         // horizon there keeps stale entries from lingering 60x longer than
         // any check will ever look back.
-        let horizon = if self.bytes_per_hour > 0 { HOUR } else { MINUTE };
+        let horizon = if self.bytes_per_hour > 0 {
+            HOUR
+        } else {
+            MINUTE
+        };
         self.windows.retain(|_, entries| {
             entries.retain(|(t, _)| now.duration_since(*t) < horizon);
             !entries.is_empty()
@@ -69,20 +77,28 @@ impl SenderLimiter {
         let existing = self.windows.get(key);
         if self.messages_per_minute > 0 {
             let count_in_minute = existing
-                .map(|e| e.iter().filter(|(t, _)| now.duration_since(*t) < MINUTE).count())
+                .map(|e| {
+                    e.iter()
+                        .filter(|(t, _)| now.duration_since(*t) < MINUTE)
+                        .count()
+                })
                 .unwrap_or(0);
             if count_in_minute as u32 >= self.messages_per_minute {
                 return false;
             }
         }
         if self.bytes_per_hour > 0 {
-            let bytes_in_hour: u64 =
-                existing.map(|e| e.iter().map(|(_, b)| b).sum()).unwrap_or(0);
+            let bytes_in_hour: u64 = existing
+                .map(|e| e.iter().map(|(_, b)| b).sum())
+                .unwrap_or(0);
             if bytes_in_hour + bytes > self.bytes_per_hour {
                 return false;
             }
         }
-        self.windows.entry(key.to_string()).or_default().push_back((now, bytes));
+        self.windows
+            .entry(key.to_string())
+            .or_default()
+            .push_back((now, bytes));
         true
     }
 }
@@ -130,7 +146,10 @@ mod tests {
         for _ in 0..5 {
             assert!(lim.allow("k", 1_000_000, now));
         }
-        assert!(lim.windows.is_empty(), "zero config must never allocate per-key state");
+        assert!(
+            lim.windows.is_empty(),
+            "zero config must never allocate per-key state"
+        );
     }
 
     #[test]
@@ -139,7 +158,10 @@ mod tests {
         let now = Instant::now();
         assert!(lim.allow("k", 10, now));
         assert!(lim.allow("k", 10, now));
-        assert!(!lim.allow("k", 10, now), "third message within the minute must be denied");
+        assert!(
+            !lim.allow("k", 10, now),
+            "third message within the minute must be denied"
+        );
     }
 
     #[test]
@@ -147,10 +169,14 @@ mod tests {
         let mut lim = SenderLimiter::new(1, 0);
         let t0 = Instant::now();
         assert!(lim.allow("k", 1, t0));
-        assert!(!lim.allow("k", 1, t0 + Duration::from_secs(30)),
-            "still inside the same 1-minute window");
-        assert!(lim.allow("k", 1, t0 + Duration::from_secs(61)),
-            "a full minute has passed, window must have rolled over");
+        assert!(
+            !lim.allow("k", 1, t0 + Duration::from_secs(30)),
+            "still inside the same 1-minute window"
+        );
+        assert!(
+            lim.allow("k", 1, t0 + Duration::from_secs(61)),
+            "a full minute has passed, window must have rolled over"
+        );
     }
 
     #[test]
@@ -158,8 +184,10 @@ mod tests {
         let mut lim = SenderLimiter::new(0, 100);
         let now = Instant::now();
         assert!(lim.allow("k", 60, now));
-        assert!(!lim.allow("k", 60, now),
-            "60 + 60 exceeds the 100-byte budget even though message count is unlimited");
+        assert!(
+            !lim.allow("k", 60, now),
+            "60 + 60 exceeds the 100-byte budget even though message count is unlimited"
+        );
     }
 
     #[test]
@@ -167,8 +195,10 @@ mod tests {
         let mut lim = SenderLimiter::new(1, 0);
         let now = Instant::now();
         assert!(lim.allow("k", 1, now));
-        assert!(!lim.allow("k", 1, now),
-            "message count is exhausted even though the byte budget (unlimited) has room");
+        assert!(
+            !lim.allow("k", 1, now),
+            "message count is exhausted even though the byte budget (unlimited) has room"
+        );
     }
 
     #[test]
@@ -189,7 +219,10 @@ mod tests {
         let mut lim = SenderLimiter::new(1, 0);
         let now = Instant::now();
         assert!(lim.allow("a", 1, now));
-        assert!(lim.allow("b", 1, now), "a different sender key must have its own budget");
+        assert!(
+            lim.allow("b", 1, now),
+            "a different sender key must have its own budget"
+        );
         assert!(!lim.allow("a", 1, now));
     }
 
@@ -212,7 +245,11 @@ mod tests {
         // one touched at t1, so the whole map must collapse to just it.
         let t1 = t0 + Duration::from_secs(3_601);
         assert!(lim.allow("fresh", 1, t1));
-        assert_eq!(lim.windows.len(), 1, "stale keys must be pruned, not just their windows");
+        assert_eq!(
+            lim.windows.len(),
+            1,
+            "stale keys must be pruned, not just their windows"
+        );
         assert!(lim.windows.contains_key("fresh"));
     }
 
@@ -234,7 +271,11 @@ mod tests {
         // actually being looked up.
         let t1 = t0 + Duration::from_secs(61);
         assert!(lim.allow("fresh", 1, t1));
-        assert_eq!(lim.windows.len(), 1, "the message-only config must not wait a full hour to prune");
+        assert_eq!(
+            lim.windows.len(),
+            1,
+            "the message-only config must not wait a full hour to prune"
+        );
         assert!(lim.windows.contains_key("fresh"));
     }
 
@@ -246,10 +287,14 @@ mod tests {
     fn a_denied_call_does_not_insert_an_empty_entry_for_a_brand_new_key() {
         let mut lim = SenderLimiter::new(0, 10); // bytes-only, tiny budget
         let now = Instant::now();
-        assert!(!lim.allow("too-big", 20, now),
-            "20 bytes exceeds the 10-byte budget on the very first call");
-        assert!(lim.windows.is_empty(),
-            "a key denied on its first-ever call must never appear in the map");
+        assert!(
+            !lim.allow("too-big", 20, now),
+            "20 bytes exceeds the 10-byte budget on the very first call"
+        );
+        assert!(
+            lim.windows.is_empty(),
+            "a key denied on its first-ever call must never appear in the map"
+        );
     }
 
     #[test]
@@ -258,9 +303,14 @@ mod tests {
         let t0 = Instant::now();
         assert!(lim.allow("mqtt", 2, t0));
         assert!(lim.allow("mqtt", 2, t0));
-        assert!(!lim.allow("mqtt", 2, t0), "third send within the minute must be denied");
-        assert!(lim.allow("mqtt", 2, t0 + Duration::from_secs(61)),
-            "window must have rolled over after a minute");
+        assert!(
+            !lim.allow("mqtt", 2, t0),
+            "third send within the minute must be denied"
+        );
+        assert!(
+            lim.allow("mqtt", 2, t0 + Duration::from_secs(61)),
+            "window must have rolled over after a minute"
+        );
     }
 
     #[test]
@@ -270,6 +320,9 @@ mod tests {
         for _ in 0..5 {
             assert!(lim.allow("mqtt", 0, now));
         }
-        assert!(lim.windows.is_empty(), "zero config must never allocate per-key state");
+        assert!(
+            lim.windows.is_empty(),
+            "zero config must never allocate per-key state"
+        );
     }
 }

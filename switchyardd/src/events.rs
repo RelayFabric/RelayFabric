@@ -129,28 +129,66 @@ mod tests {
     fn event_name_matches_design_4_wire_names_not_the_rust_variant_identifier() {
         assert_eq!(
             Event::Ingress {
-                id: Uuid::now_v7(), protocol: "mocka".into(),
-                sender_masked: "mocka:****".into(), routes: vec![], ts: ts(),
-            }.event_name(),
+                id: Uuid::now_v7(),
+                protocol: "mocka".into(),
+                sender_masked: "mocka:****".into(),
+                routes: vec![],
+                ts: ts(),
+            }
+            .event_name(),
             "ingress"
         );
         assert_eq!(
-            Event::Delivery { id: Uuid::now_v7(), route: "general".into(), state: "delivered".into(), ts: ts() }
-                .event_name(),
+            Event::Delivery {
+                id: Uuid::now_v7(),
+                route: "general".into(),
+                state: "delivered".into(),
+                ts: ts()
+            }
+            .event_name(),
             "delivery"
         );
-        assert_eq!(Event::Plugin { name: "mocka".into(), up: true, ts: ts() }.event_name(), "plugin");
-        assert_eq!(Event::LinkVerified { link_id: 1, ts: ts() }.event_name(), "link_verified");
         assert_eq!(
-            Event::ConfigApplied { restart_required: vec![], ts: ts() }.event_name(),
+            Event::Plugin {
+                name: "mocka".into(),
+                up: true,
+                ts: ts()
+            }
+            .event_name(),
+            "plugin"
+        );
+        assert_eq!(
+            Event::LinkVerified {
+                link_id: 1,
+                ts: ts()
+            }
+            .event_name(),
+            "link_verified"
+        );
+        assert_eq!(
+            Event::ConfigApplied {
+                restart_required: vec![],
+                ts: ts()
+            }
+            .event_name(),
             "config_applied"
         );
         assert_eq!(
-            Event::Federation { peer: "phoenix".into(), up: true, ts: ts() }.event_name(),
+            Event::Federation {
+                peer: "phoenix".into(),
+                up: true,
+                ts: ts()
+            }
+            .event_name(),
             "federation"
         );
         assert_eq!(
-            Event::Advert { node_id: "rf:ab".into(), name: "phoenix".into(), ts: ts() }.event_name(),
+            Event::Advert {
+                node_id: "rf:ab".into(),
+                name: "phoenix".into(),
+                ts: ts()
+            }
+            .event_name(),
             "advert"
         );
     }
@@ -158,22 +196,35 @@ mod tests {
     #[test]
     fn advert_json_has_no_variant_wrapper_and_carries_node_id_and_sanitized_name() {
         let json = serde_json::to_value(Event::Advert {
-            node_id: "rf:ab12".into(), name: "clean-name".into(), ts: ts(),
-        }).unwrap();
+            node_id: "rf:ab12".into(),
+            name: "clean-name".into(),
+            ts: ts(),
+        })
+        .unwrap();
         assert_eq!(json["node_id"], "rf:ab12");
         assert_eq!(json["name"], "clean-name");
         assert!(json.get("Advert").is_none());
-        let keys: std::collections::BTreeSet<&str> =
-            json.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, std::collections::BTreeSet::from(["node_id", "name", "ts"]),
-            "Advert must carry nothing beyond node_id/name/ts -- no services/protocols/security");
+        let keys: std::collections::BTreeSet<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["node_id", "name", "ts"]),
+            "Advert must carry nothing beyond node_id/name/ts -- no services/protocols/security"
+        );
     }
 
     #[test]
     fn federation_json_has_no_variant_wrapper_and_carries_peer_and_up() {
         let json = serde_json::to_value(Event::Federation {
-            peer: "phoenix".into(), up: true, ts: ts(),
-        }).unwrap();
+            peer: "phoenix".into(),
+            up: true,
+            ts: ts(),
+        })
+        .unwrap();
         assert_eq!(json["peer"], "phoenix");
         assert_eq!(json["up"], true);
         assert!(json.get("Federation").is_none());
@@ -184,22 +235,36 @@ mod tests {
     /// already names the type.
     #[test]
     fn json_serialization_is_untagged_flat_fields_no_variant_name_wrapper() {
-        let json = serde_json::to_value(Event::LinkVerified { link_id: 42, ts: ts() }).unwrap();
+        let json = serde_json::to_value(Event::LinkVerified {
+            link_id: 42,
+            ts: ts(),
+        })
+        .unwrap();
         assert_eq!(json["link_id"], 42);
         assert!(json.get("LinkVerified").is_none());
-        let keys: std::collections::BTreeSet<&str> =
-            json.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, std::collections::BTreeSet::from(["link_id", "ts"]),
-            "LinkVerified must carry nothing beyond link_id/ts -- no ref, no display_name");
+        let keys: std::collections::BTreeSet<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["link_id", "ts"]),
+            "LinkVerified must carry nothing beyond link_id/ts -- no ref, no display_name"
+        );
     }
 
     #[test]
     fn ingress_json_has_no_variant_wrapper_and_carries_the_expected_fields() {
         let json = serde_json::to_value(Event::Ingress {
-            id: Uuid::now_v7(), protocol: "mocka".into(),
+            id: Uuid::now_v7(),
+            protocol: "mocka".into(),
             sender_masked: "mocka:si****1234".into(),
-            routes: vec!["general".into()], ts: ts(),
-        }).unwrap();
+            routes: vec!["general".into()],
+            ts: ts(),
+        })
+        .unwrap();
         assert_eq!(json["protocol"], "mocka");
         assert_eq!(json["sender_masked"], "mocka:si****1234");
         assert_eq!(json["routes"], serde_json::json!(["general"]));

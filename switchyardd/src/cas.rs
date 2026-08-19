@@ -64,14 +64,21 @@ fn existing_bytes(dir: &Path) -> io::Result<u64> {
 /// `Path::join`, so `../../etc/passwd` (or any string containing `/`, `.`,
 /// or uppercase hex) can never be used to escape `dir`.
 fn is_valid_sha(sha: &str) -> bool {
-    sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    sha.len() == 64
+        && sha
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 impl Cas {
     pub fn new(dir: &Path, budget_bytes: u64) -> io::Result<Cas> {
         create_data_dir(dir)?;
         let total_bytes = existing_bytes(dir)?;
-        Ok(Cas { dir: dir.to_path_buf(), budget_bytes, total_bytes: AtomicU64::new(total_bytes) })
+        Ok(Cas {
+            dir: dir.to_path_buf(),
+            budget_bytes,
+            total_bytes: AtomicU64::new(total_bytes),
+        })
     }
 
     /// Writes `data` under its sha256 hex digest and returns that digest.
@@ -97,7 +104,10 @@ impl Cas {
         if self.budget_bytes > 0
             && self.total_bytes.load(Ordering::Relaxed) + size > self.budget_bytes
         {
-            return Err(io::Error::new(io::ErrorKind::QuotaExceeded, "cas budget exceeded"));
+            return Err(io::Error::new(
+                io::ErrorKind::QuotaExceeded,
+                "cas budget exceeded",
+            ));
         }
         let tmp = self.dir.join(format!(".{sha}.{}.tmp", std::process::id()));
         std::fs::write(&tmp, data)?;
@@ -144,7 +154,8 @@ impl Cas {
             Ok(()) => {
                 if let Some(size) = size {
                     let _ = self.total_bytes.fetch_update(
-                        Ordering::Relaxed, Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
                         |cur| Some(cur.saturating_sub(size)),
                     );
                 }
@@ -202,10 +213,19 @@ mod tests {
     #[test]
     fn get_rejects_anything_that_is_not_64_lowercase_hex_chars() {
         let (_d, c) = cas();
-        assert!(c.get("../../etc/passwd").is_err(), "traversal string must be rejected");
+        assert!(
+            c.get("../../etc/passwd").is_err(),
+            "traversal string must be rejected"
+        );
         assert!(c.get("short").is_err(), "too-short sha must be rejected");
-        assert!(c.get(&"A".repeat(64)).is_err(), "uppercase hex must be rejected");
-        assert!(c.get(&"g".repeat(64)).is_err(), "non-hex char must be rejected");
+        assert!(
+            c.get(&"A".repeat(64)).is_err(),
+            "uppercase hex must be rejected"
+        );
+        assert!(
+            c.get(&"g".repeat(64)).is_err(),
+            "non-hex char must be rejected"
+        );
         // exactly 64 chars but with a traversal separator baked in
         let crafted = format!("{}/{}", "a".repeat(31), "b".repeat(32));
         assert_eq!(crafted.len(), 64);
@@ -247,8 +267,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = Cas::new(&dir.path().join("attachments"), 6).unwrap();
         let sha = c.put(&[1u8; 6]).unwrap(); // fills the budget exactly
-        // re-putting the same bytes adds nothing new, so it must not refuse
-        // even though the budget is already exhausted.
+                                             // re-putting the same bytes adds nothing new, so it must not refuse
+                                             // even though the budget is already exhausted.
         assert_eq!(c.put(&[1u8; 6]).unwrap(), sha);
     }
 

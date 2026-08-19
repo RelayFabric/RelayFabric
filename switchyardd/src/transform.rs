@@ -52,7 +52,9 @@ pub fn render(tag: Option<&str>, body: &str, max_payload: Option<usize>) -> Stri
         Some(t) => format!("[{t}]\n{body}"),
         None => body.to_string(),
     };
-    let Some(limit) = max_payload else { return full };
+    let Some(limit) = max_payload else {
+        return full;
+    };
     if full.len() <= limit {
         return full;
     }
@@ -109,7 +111,10 @@ mod tests {
 
     #[test]
     fn renders_alias_tag() {
-        assert_eq!(render(Some("MESH-7F21"), "hello", None), "[MESH-7F21]\nhello");
+        assert_eq!(
+            render(Some("MESH-7F21"), "hello", None),
+            "[MESH-7F21]\nhello"
+        );
     }
 
     #[test]
@@ -129,7 +134,11 @@ mod tests {
     fn tiny_limits_never_exceed_budget() {
         for limit in 0..=4 {
             let out = render(Some("A"), "hello world", Some(limit));
-            assert!(out.len() <= limit, "limit {limit} produced {} bytes", out.len());
+            assert!(
+                out.len() <= limit,
+                "limit {limit} produced {} bytes",
+                out.len()
+            );
         }
     }
 
@@ -145,7 +154,10 @@ mod tests {
         let out = render(None, "hello world this is long", Some(8));
         assert!(out.len() <= 8, "len {} > 8", out.len());
         assert!(out.ends_with('…'));
-        assert!(!out.contains('['), "tag: none must never reintroduce a [tag] prefix: {out}");
+        assert!(
+            !out.contains('['),
+            "tag: none must never reintroduce a [tag] prefix: {out}"
+        );
     }
 
     // ---- fix round 1: max_chars is BODY-ONLY, never eats the tag ----------
@@ -193,9 +205,14 @@ mod tests {
         let tag = "VeryLongDisplayName"; // 20 chars, longer than max_chars below
         let body = truncate_body("this body is much longer than the max_chars budget", 16);
         let out = render(Some(tag), &body, None);
-        assert!(out.starts_with("[VeryLongDisplayName]\n"),
-            "the tag must survive fully intact regardless of its own length: {out}");
-        assert!(out.ends_with('…'), "the body must still be truncated: {out}");
+        assert!(
+            out.starts_with("[VeryLongDisplayName]\n"),
+            "the tag must survive fully intact regardless of its own length: {out}"
+        );
+        assert!(
+            out.ends_with('…'),
+            "the body must still be truncated: {out}"
+        );
         assert_eq!(body.chars().count(), 16);
     }
 
@@ -214,7 +231,11 @@ mod tests {
         let body = "あ".repeat(30); // 30 chars, 90 bytes
         let truncated = truncate_body(&body, 20);
         let out = render(Some("A"), &truncated, Some(30));
-        assert!(out.len() <= 30, "transport cap violated: {} bytes: {out:?}", out.len());
+        assert!(
+            out.len() <= 30,
+            "transport cap violated: {} bytes: {out:?}",
+            out.len()
+        );
         assert!(out.starts_with("[A]\n"));
         assert!(out.ends_with('…'));
         // exactly one ellipsis marker: the transport-level pass must have

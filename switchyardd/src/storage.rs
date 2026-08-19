@@ -208,7 +208,9 @@ fn ts(t: DateTime<Utc>) -> String {
 }
 
 fn parse_ts(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s).map(|t| t.with_timezone(&Utc)).unwrap_or_default()
+    DateTime::parse_from_rfc3339(s)
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or_default()
 }
 
 impl Store {
@@ -232,7 +234,11 @@ impl Store {
     /// Records which content-addressed blobs a message references, so that
     /// `purge_terminal` can later tell which shas are still live (referenced
     /// by a surviving message) versus orphaned (safe to delete from the CAS).
-    pub fn insert_attachment_refs(&self, message_id: Uuid, shas: &[String]) -> rusqlite::Result<()> {
+    pub fn insert_attachment_refs(
+        &self,
+        message_id: Uuid,
+        shas: &[String],
+    ) -> rusqlite::Result<()> {
         for sha in shas {
             self.conn.execute(
                 "INSERT INTO message_attachments (message_id, sha256) VALUES (?1, ?2)",
@@ -243,7 +249,9 @@ impl Store {
     }
 
     pub fn get_message(&self, id: Uuid) -> rusqlite::Result<Option<Envelope>> {
-        let mut stmt = self.conn.prepare("SELECT envelope FROM messages WHERE id = ?1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT envelope FROM messages WHERE id = ?1")?;
         let mut rows = stmt.query(params![id.to_string()])?;
         match rows.next()? {
             Some(row) => {
@@ -273,8 +281,16 @@ impl Store {
                (message_id, route, dest_protocol, dest_endpoint, next_attempt, expires_at, priority,
                 created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-            params![message_id.to_string(), route, dest.protocol, dest.endpoint,
-                    ts(next_attempt), ts(expires_at), priority, now],
+            params![
+                message_id.to_string(),
+                route,
+                dest.protocol,
+                dest.endpoint,
+                ts(next_attempt),
+                ts(expires_at),
+                priority,
+                now
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -299,8 +315,16 @@ impl Store {
                (message_id, route, dest_protocol, dest_endpoint, next_attempt, expires_at,
                 state, reason, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'dead_letter', ?7, ?8, ?8)",
-            params![message_id.to_string(), route, dest.protocol, dest.endpoint,
-                    ts(next_attempt), ts(expires_at), reason, now],
+            params![
+                message_id.to_string(),
+                route,
+                dest.protocol,
+                dest.endpoint,
+                ts(next_attempt),
+                ts(expires_at),
+                reason,
+                now
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -330,7 +354,10 @@ impl Store {
             id: row.get(0)?,
             message_id: row.get::<_, String>(1)?.parse().unwrap_or_default(),
             route: row.get(2)?,
-            destination: Endpoint { protocol: row.get(3)?, endpoint: row.get(4)? },
+            destination: Endpoint {
+                protocol: row.get(3)?,
+                endpoint: row.get(4)?,
+            },
             priority: row.get(5)?,
             attempt_count: row.get(6)?,
             state: row.get(7)?,
@@ -391,7 +418,8 @@ impl Store {
         self.conn.execute(
             "UPDATE deliveries SET state = 'delivered', updated_at = ?2
              WHERE id = ?1 AND state = 'attempting'",
-            params![id, ts(Utc::now())])?;
+            params![id, ts(Utc::now())],
+        )?;
         Ok(())
     }
 
@@ -466,7 +494,9 @@ impl Store {
                  HAVING SUM(CASE WHEN message_id IN (SELECT id FROM messages)
                                  THEN 1 ELSE 0 END) = 0",
             )?;
-            let rows = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let rows = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
             rows
         };
         self.conn.execute(
@@ -478,7 +508,9 @@ impl Store {
 
     pub fn recover(&self) -> rusqlite::Result<usize> {
         self.conn.execute(
-            "UPDATE deliveries SET state = 'pending' WHERE state = 'attempting'", [])
+            "UPDATE deliveries SET state = 'pending' WHERE state = 'attempting'",
+            [],
+        )
     }
 
     pub fn reclaim_stale(&self, older_than: DateTime<Utc>) -> rusqlite::Result<usize> {
@@ -528,7 +560,9 @@ impl Store {
     /// requires the `/` separator, so a peer named `"phoen"` cannot match a
     /// delivery actually addressed to `"phoenix/regional-chat"`.
     pub fn deliveries_for_fed_ack(
-        &self, message_id: Uuid, peer_key: &str,
+        &self,
+        message_id: Uuid,
+        peer_key: &str,
     ) -> rusqlite::Result<Vec<Delivery>> {
         let sql = format!(
             "SELECT {} FROM deliveries
@@ -536,12 +570,18 @@ impl Store {
             Self::DELIVERY_COLS
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![message_id.to_string(), peer_key], Self::delivery_from_row)?;
+        let rows = stmt.query_map(
+            params![message_id.to_string(), peer_key],
+            Self::delivery_from_row,
+        )?;
         rows.collect()
     }
 
     pub fn deliveries_for_id(&self, id: i64) -> Option<Delivery> {
-        let sql = format!("SELECT {} FROM deliveries WHERE id = ?1", Self::DELIVERY_COLS);
+        let sql = format!(
+            "SELECT {} FROM deliveries WHERE id = ?1",
+            Self::DELIVERY_COLS
+        );
         self.conn
             .prepare(&sql)
             .ok()?
@@ -560,7 +600,11 @@ impl Store {
     /// `handle_inbound` call stamps every row with the same wall-clock
     /// second, so `id` is the only tiebreaker precise enough for a stable
     /// ordering.
-    pub fn list_deliveries(&self, state: Option<&str>, limit: i64) -> rusqlite::Result<Vec<Delivery>> {
+    pub fn list_deliveries(
+        &self,
+        state: Option<&str>,
+        limit: i64,
+    ) -> rusqlite::Result<Vec<Delivery>> {
         match state {
             Some(s) => {
                 let sql = format!(
@@ -626,7 +670,7 @@ impl Store {
             "SELECT id, code, target_protocol, target_ref, requester_protocol, requester_ref,
                     display_name, created_at, expires_at
              FROM link_challenges
-             WHERE target_protocol = ?1 AND target_ref = ?2 AND code = ?3 AND expires_at > ?4"
+             WHERE target_protocol = ?1 AND target_ref = ?2 AND code = ?3 AND expires_at > ?4",
         )?;
         let mut rows = stmt.query(params![target_protocol, target_ref, code, ts(now)])?;
         match rows.next()? {
@@ -650,7 +694,8 @@ impl Store {
 
     /// Deletes a challenge by id.
     pub fn delete_challenge(&self, id: i64) -> rusqlite::Result<()> {
-        self.conn.execute("DELETE FROM link_challenges WHERE id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM link_challenges WHERE id = ?1", params![id])?;
         Ok(())
     }
 
@@ -665,7 +710,7 @@ impl Store {
                     display_name, created_at, expires_at
              FROM link_challenges
              WHERE expires_at > ?1
-             ORDER BY id"
+             ORDER BY id",
         )?;
         let rows = stmt.query_map(params![ts(now)], |row| {
             Ok(Challenge {
@@ -706,19 +751,25 @@ impl Store {
 
     /// Deletes a link by id. Returns true if a row was deleted, false otherwise.
     pub fn delete_link(&self, id: i64) -> rusqlite::Result<bool> {
-        let rows_affected = self.conn.execute("DELETE FROM identity_links WHERE id = ?1", params![id])?;
+        let rows_affected = self
+            .conn
+            .execute("DELETE FROM identity_links WHERE id = ?1", params![id])?;
         Ok(rows_affected > 0)
     }
 
     /// Finds a link by either side (a_protocol/a_ref OR b_protocol/b_ref).
     /// Returns the most-recently inserted/verified link (ORDER BY id DESC).
-    pub fn link_for_identity(&self, protocol: &str, reference: &str) -> rusqlite::Result<Option<Link>> {
+    pub fn link_for_identity(
+        &self,
+        protocol: &str,
+        reference: &str,
+    ) -> rusqlite::Result<Option<Link>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, a_protocol, a_ref, b_protocol, b_ref, display_name, verified_at
              FROM identity_links
              WHERE (a_protocol = ?1 AND a_ref = ?2) OR (b_protocol = ?1 AND b_ref = ?2)
              ORDER BY id DESC
-             LIMIT 1"
+             LIMIT 1",
         )?;
         let mut rows = stmt.query(params![protocol, reference])?;
         match rows.next()? {
@@ -742,7 +793,7 @@ impl Store {
     pub fn list_links(&self) -> rusqlite::Result<Vec<Link>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, a_protocol, a_ref, b_protocol, b_ref, display_name, verified_at
-             FROM identity_links ORDER BY id"
+             FROM identity_links ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Link {
@@ -809,7 +860,12 @@ impl Store {
     /// `now` on every boot instead of preserving when the node was truly
     /// first observed. `updated_at` always advances to `now`, on both the
     /// fresh-insert and the update path.
-    pub fn seed_trust(&self, node_id: &str, level: &str, now: DateTime<Utc>) -> rusqlite::Result<()> {
+    pub fn seed_trust(
+        &self,
+        node_id: &str,
+        level: &str,
+        now: DateTime<Utc>,
+    ) -> rusqlite::Result<()> {
         // Task 3 review carry-over (Important): guard the level param
         // against the 5 valid §112.7 levels — a typo'd/programmer-error
         // level string here would silently corrupt the trust store with a
@@ -823,7 +879,10 @@ impl Store {
         // regression trip-wire for a future caller, not a runtime
         // condition production code is expected to hit.
         debug_assert!(
-            matches!(level, "unknown" | "seen" | "verified" | "trusted" | "blocked"),
+            matches!(
+                level,
+                "unknown" | "seen" | "verified" | "trusted" | "blocked"
+            ),
             "seed_trust called with invalid trust level {level:?} (expected one of \
              unknown|seen|verified|trusted|blocked, design §112.7)"
         );
@@ -890,8 +949,10 @@ impl Store {
             .map(|p| p.node_id.as_str())
             .chain(fed.trusted.iter().map(|s| s.as_str()))
             .collect();
-        let placeholders =
-            (0..authorized.len()).map(|i| format!("?{}", i + 2)).collect::<Vec<_>>().join(", ");
+        let placeholders = (0..authorized.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
         self.conn.execute(
             &format!(
                 "UPDATE node_trust SET level = 'seen', updated_at = ?1
@@ -942,8 +1003,12 @@ impl Store {
     /// security/expires) MUST NOT trust its embedded `.name` for display --
     /// re-sanitize it (or read this column instead) before rendering.
     pub fn upsert_peer_advert(
-        &self, node_id: &str, advert_cbor: &[u8], name: &str,
-        expires: DateTime<Utc>, received_at: DateTime<Utc>,
+        &self,
+        node_id: &str,
+        advert_cbor: &[u8],
+        name: &str,
+        expires: DateTime<Utc>,
+        received_at: DateTime<Utc>,
     ) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO peer_adverts (node_id, advert_cbor, name, expires, received_at)
@@ -984,7 +1049,10 @@ impl Store {
     /// hourly retention sweep (`engine::pump`, alongside
     /// `purge_expired_challenges`). Returns the number of rows deleted.
     pub fn purge_expired_adverts(&self, now: DateTime<Utc>) -> rusqlite::Result<usize> {
-        self.conn.execute("DELETE FROM peer_adverts WHERE expires < ?1", params![ts(now)])
+        self.conn.execute(
+            "DELETE FROM peer_adverts WHERE expires < ?1",
+            params![ts(now)],
+        )
     }
 }
 
@@ -1004,12 +1072,20 @@ mod tests {
         let now = Utc::now();
         Envelope::new(
             "mocka:chan".parse().unwrap(),
-            Sender { native_ref: "!a".into() },
-            "text".into(), "hello".into(), now, now + Duration::hours(1), 8,
+            Sender {
+                native_ref: "!a".into(),
+            },
+            "text".into(),
+            "hello".into(),
+            now,
+            now + Duration::hours(1),
+            8,
         )
     }
 
-    fn dest() -> Endpoint { "mockb:chan".parse().unwrap() }
+    fn dest() -> Endpoint {
+        "mockb:chan".parse().unwrap()
+    }
 
     #[test]
     fn message_roundtrip() {
@@ -1028,9 +1104,18 @@ mod tests {
         let e = env();
         let now = Utc::now();
         s.insert_message(&e).unwrap();
-        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
+        let id = s
+            .insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2)
+            .unwrap();
         let _future = s
-            .insert_delivery(e.id, "general", &dest(), now + Duration::hours(1), e.expires_at, 2)
+            .insert_delivery(
+                e.id,
+                "general",
+                &dest(),
+                now + Duration::hours(1),
+                e.expires_at,
+                2,
+            )
             .unwrap();
         let due = s.due_deliveries(now, 10).unwrap();
         assert_eq!(due.len(), 1);
@@ -1045,7 +1130,9 @@ mod tests {
         let e = env();
         let now = Utc::now();
         s.insert_message(&e).unwrap();
-        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
+        let id = s
+            .insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2)
+            .unwrap();
 
         s.mark_attempting(id).unwrap();
         assert!(s.due_deliveries(now, 10).unwrap().is_empty());
@@ -1066,19 +1153,35 @@ mod tests {
         // dead-letter it.
         s.mark_retry(id, now + Duration::seconds(30)).unwrap();
         assert_eq!(s.deliveries_for(e.id).unwrap()[0].state, "delivered");
-        s.mark_terminal(id, "dead_letter", "RETRY_EXHAUSTED").unwrap();
+        s.mark_terminal(id, "dead_letter", "RETRY_EXHAUSTED")
+            .unwrap();
         assert_eq!(s.deliveries_for(e.id).unwrap()[0].state, "delivered");
 
-        let id2 = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
-        s.mark_terminal(id2, "dead_letter", "RETRY_EXHAUSTED").unwrap();
-        let d2 = s.deliveries_for(e.id).unwrap().into_iter().find(|d| d.id == id2).unwrap();
+        let id2 = s
+            .insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2)
+            .unwrap();
+        s.mark_terminal(id2, "dead_letter", "RETRY_EXHAUSTED")
+            .unwrap();
+        let d2 = s
+            .deliveries_for(e.id)
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == id2)
+            .unwrap();
         assert_eq!(d2.reason.as_deref(), Some("RETRY_EXHAUSTED"));
 
         // that same dead-lettered row is also terminal: mark_delivered must
         // not fire on it either (guarded to 'attempting' only).
         s.mark_delivered(id2).unwrap();
-        assert_eq!(s.deliveries_for(e.id).unwrap().into_iter()
-            .find(|d| d.id == id2).unwrap().state, "dead_letter");
+        assert_eq!(
+            s.deliveries_for(e.id)
+                .unwrap()
+                .into_iter()
+                .find(|d| d.id == id2)
+                .unwrap()
+                .state,
+            "dead_letter"
+        );
     }
 
     #[test]
@@ -1089,7 +1192,9 @@ mod tests {
         s.insert_message(&e).unwrap();
         // still 'pending': never entered 'attempting', so a stray delivered
         // ack must not apply.
-        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
+        let id = s
+            .insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2)
+            .unwrap();
         s.mark_delivered(id).unwrap();
         assert_eq!(s.deliveries_for(e.id).unwrap()[0].state, "pending");
     }
@@ -1103,35 +1208,59 @@ mod tests {
         // be purged.
         let delivered_msg = env();
         s.insert_message(&delivered_msg).unwrap();
-        let delivered_id = s.insert_delivery(
-            delivered_msg.id, "general", &dest(), now, delivered_msg.expires_at, 2).unwrap();
+        let delivered_id = s
+            .insert_delivery(
+                delivered_msg.id,
+                "general",
+                &dest(),
+                now,
+                delivered_msg.expires_at,
+                2,
+            )
+            .unwrap();
         s.mark_attempting(delivered_id).unwrap();
         s.mark_delivered(delivered_id).unwrap();
 
         // pending message: must survive purge untouched.
         let pending_msg = env();
         s.insert_message(&pending_msg).unwrap();
-        let pending_id = s.insert_delivery(
-            pending_msg.id, "general", &dest(), now, pending_msg.expires_at, 2).unwrap();
+        let pending_id = s
+            .insert_delivery(
+                pending_msg.id,
+                "general",
+                &dest(),
+                now,
+                pending_msg.expires_at,
+                2,
+            )
+            .unwrap();
 
         let (purged, orphans) = s.purge_terminal(now + Duration::hours(1)).unwrap();
         assert_eq!(purged, 1);
-        assert!(orphans.is_empty(), "neither message in this test has attachments");
+        assert!(
+            orphans.is_empty(),
+            "neither message in this test has attachments"
+        );
 
         assert!(s.deliveries_for(delivered_msg.id).unwrap().is_empty());
-        assert!(s.get_message(delivered_msg.id).unwrap().is_none(),
-            "orphaned message must be purged alongside its terminal delivery");
+        assert!(
+            s.get_message(delivered_msg.id).unwrap().is_none(),
+            "orphaned message must be purged alongside its terminal delivery"
+        );
 
         let remaining = s.deliveries_for(pending_msg.id).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, pending_id);
         assert_eq!(remaining[0].state, "pending");
-        assert!(s.get_message(pending_msg.id).unwrap().is_some(),
-            "message with a live pending delivery must survive purge");
+        assert!(
+            s.get_message(pending_msg.id).unwrap().is_some(),
+            "message with a live pending delivery must survive purge"
+        );
     }
 
     fn attachment_shas_for(s: &Store, message_id: Uuid) -> Vec<String> {
-        let mut stmt = s.conn
+        let mut stmt = s
+            .conn
             .prepare("SELECT sha256 FROM message_attachments WHERE message_id = ?1 ORDER BY sha256")
             .unwrap();
         stmt.query_map(params![message_id.to_string()], |r| r.get(0))
@@ -1145,8 +1274,12 @@ mod tests {
         let (_d, s) = store();
         let e = env();
         s.insert_message(&e).unwrap();
-        s.insert_attachment_refs(e.id, &["sha2".to_string(), "sha1".to_string()]).unwrap();
-        assert_eq!(attachment_shas_for(&s, e.id), vec!["sha1".to_string(), "sha2".to_string()]);
+        s.insert_attachment_refs(e.id, &["sha2".to_string(), "sha1".to_string()])
+            .unwrap();
+        assert_eq!(
+            attachment_shas_for(&s, e.id),
+            vec!["sha1".to_string(), "sha2".to_string()]
+        );
     }
 
     #[test]
@@ -1159,9 +1292,18 @@ mod tests {
         // orphaned (and the ref row itself must be cleaned up).
         let delivered_msg = env();
         s.insert_message(&delivered_msg).unwrap();
-        s.insert_attachment_refs(delivered_msg.id, &["orphan-sha".to_string()]).unwrap();
-        let delivered_id = s.insert_delivery(
-            delivered_msg.id, "general", &dest(), now, delivered_msg.expires_at, 2).unwrap();
+        s.insert_attachment_refs(delivered_msg.id, &["orphan-sha".to_string()])
+            .unwrap();
+        let delivered_id = s
+            .insert_delivery(
+                delivered_msg.id,
+                "general",
+                &dest(),
+                now,
+                delivered_msg.expires_at,
+                2,
+            )
+            .unwrap();
         s.mark_attempting(delivered_id).unwrap();
         s.mark_delivered(delivered_id).unwrap();
 
@@ -1169,17 +1311,31 @@ mod tests {
         // sha must NOT be reported as orphaned nor have its ref row deleted.
         let pending_msg = env();
         s.insert_message(&pending_msg).unwrap();
-        s.insert_attachment_refs(pending_msg.id, &["surviving-sha".to_string()]).unwrap();
-        s.insert_delivery(pending_msg.id, "general", &dest(), now, pending_msg.expires_at, 2).unwrap();
+        s.insert_attachment_refs(pending_msg.id, &["surviving-sha".to_string()])
+            .unwrap();
+        s.insert_delivery(
+            pending_msg.id,
+            "general",
+            &dest(),
+            now,
+            pending_msg.expires_at,
+            2,
+        )
+        .unwrap();
 
         let (deleted, orphans) = s.purge_terminal(now + Duration::hours(1)).unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(orphans, vec!["orphan-sha".to_string()]);
 
-        assert!(attachment_shas_for(&s, delivered_msg.id).is_empty(),
-            "orphaned attachment ref row must be deleted, not just reported");
-        assert_eq!(attachment_shas_for(&s, pending_msg.id), vec!["surviving-sha".to_string()],
-            "a pending message's attachment ref must survive purge");
+        assert!(
+            attachment_shas_for(&s, delivered_msg.id).is_empty(),
+            "orphaned attachment ref row must be deleted, not just reported"
+        );
+        assert_eq!(
+            attachment_shas_for(&s, pending_msg.id),
+            vec!["surviving-sha".to_string()],
+            "a pending message's attachment ref must survive purge"
+        );
     }
 
     /// Regression test for a real data-loss bug: a naive per-row
@@ -1198,13 +1354,19 @@ mod tests {
         // two independent messages that happen to reference the SAME sha.
         let msg1 = env();
         s.insert_message(&msg1).unwrap();
-        s.insert_attachment_refs(msg1.id, &["shared-sha".to_string()]).unwrap();
-        let id1 = s.insert_delivery(msg1.id, "general", &dest(), now, msg1.expires_at, 2).unwrap();
+        s.insert_attachment_refs(msg1.id, &["shared-sha".to_string()])
+            .unwrap();
+        let id1 = s
+            .insert_delivery(msg1.id, "general", &dest(), now, msg1.expires_at, 2)
+            .unwrap();
 
         let msg2 = env();
         s.insert_message(&msg2).unwrap();
-        s.insert_attachment_refs(msg2.id, &["shared-sha".to_string()]).unwrap();
-        let id2 = s.insert_delivery(msg2.id, "general", &dest(), now, msg2.expires_at, 2).unwrap();
+        s.insert_attachment_refs(msg2.id, &["shared-sha".to_string()])
+            .unwrap();
+        let id2 = s
+            .insert_delivery(msg2.id, "general", &dest(), now, msg2.expires_at, 2)
+            .unwrap();
 
         // terminate + purge msg1 only. msg2 (and its ref to the same sha) is
         // still alive: the shared sha must NOT be reported as orphaned, and
@@ -1213,12 +1375,23 @@ mod tests {
         s.mark_delivered(id1).unwrap();
         let (purged1, orphans1) = s.purge_terminal(now + Duration::hours(1)).unwrap();
         assert_eq!(purged1, 1);
-        assert!(orphans1.is_empty(),
-            "sha still referenced by msg2 must not be reported as orphaned: {orphans1:?}");
-        assert!(s.get_message(msg1.id).unwrap().is_none(), "msg1 must be purged");
-        assert!(s.get_message(msg2.id).unwrap().is_some(), "msg2 must survive");
-        assert_eq!(attachment_shas_for(&s, msg2.id), vec!["shared-sha".to_string()],
-            "msg2's ref row for the shared sha must remain");
+        assert!(
+            orphans1.is_empty(),
+            "sha still referenced by msg2 must not be reported as orphaned: {orphans1:?}"
+        );
+        assert!(
+            s.get_message(msg1.id).unwrap().is_none(),
+            "msg1 must be purged"
+        );
+        assert!(
+            s.get_message(msg2.id).unwrap().is_some(),
+            "msg2 must survive"
+        );
+        assert_eq!(
+            attachment_shas_for(&s, msg2.id),
+            vec!["shared-sha".to_string()],
+            "msg2's ref row for the shared sha must remain"
+        );
 
         // now finish off msg2 too and purge again: nothing references the
         // sha anymore, so it must now come back as orphaned.
@@ -1235,7 +1408,9 @@ mod tests {
         let e = env();
         let now = Utc::now();
         s.insert_message(&e).unwrap();
-        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
+        let id = s
+            .insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2)
+            .unwrap();
         s.mark_attempting(id).unwrap();
         assert_eq!(s.recover().unwrap(), 1);
         assert_eq!(s.deliveries_for(e.id).unwrap()[0].state, "pending");
@@ -1251,9 +1426,13 @@ mod tests {
         let e = env();
         let now = Utc::now();
         s.insert_message(&e).unwrap();
-        s.insert_delivery(e.id, "r", &dest(), now, e.expires_at, 2).unwrap();
-        let id2 = s.insert_delivery(e.id, "r", &dest(), now, e.expires_at, 2).unwrap();
-        s.mark_terminal(id2, "dead_letter", "POLICY_DENIED").unwrap();
+        s.insert_delivery(e.id, "r", &dest(), now, e.expires_at, 2)
+            .unwrap();
+        let id2 = s
+            .insert_delivery(e.id, "r", &dest(), now, e.expires_at, 2)
+            .unwrap();
+        s.mark_terminal(id2, "dead_letter", "POLICY_DENIED")
+            .unwrap();
         let counts = s.queue_counts().unwrap();
         assert!(counts.contains(&("pending".to_string(), 1)));
         assert!(counts.contains(&("dead_letter".to_string(), 1)));
@@ -1270,14 +1449,22 @@ mod tests {
         s.insert_message(&e).unwrap();
         let before = Utc::now();
 
-        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
-        let dead_id =
-            s.insert_dead_delivery(e.id, "general", &dest(), now, e.expires_at, "QUEUE_FULL").unwrap();
+        let id = s
+            .insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2)
+            .unwrap();
+        let dead_id = s
+            .insert_dead_delivery(e.id, "general", &dest(), now, e.expires_at, "QUEUE_FULL")
+            .unwrap();
 
         let del = s.deliveries_for_id(id).unwrap();
-        assert!(del.created_at >= before, "created_at must be stamped at insert time");
-        assert_eq!(del.created_at, del.updated_at,
-            "a freshly inserted row's created_at and updated_at must match");
+        assert!(
+            del.created_at >= before,
+            "created_at must be stamped at insert time"
+        );
+        assert_eq!(
+            del.created_at, del.updated_at,
+            "a freshly inserted row's created_at and updated_at must match"
+        );
 
         let dead = s.deliveries_for_id(dead_id).unwrap();
         assert!(dead.created_at >= before);
@@ -1293,17 +1480,23 @@ mod tests {
         let e = env();
         let now = Utc::now();
         s.insert_message(&e).unwrap();
-        let id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
+        let id = s
+            .insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2)
+            .unwrap();
         let inserted = s.deliveries_for_id(id).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         s.mark_terminal(id, "dead_letter", "POLICY_DENIED").unwrap();
         let after = s.deliveries_for_id(id).unwrap();
 
-        assert_eq!(after.created_at, inserted.created_at,
-            "created_at must never change after insert");
-        assert!(after.updated_at > inserted.created_at,
-            "updated_at must advance past the original created_at on a mark_terminal write");
+        assert_eq!(
+            after.created_at, inserted.created_at,
+            "created_at must never change after insert"
+        );
+        assert!(
+            after.updated_at > inserted.created_at,
+            "updated_at must advance past the original created_at on a mark_terminal write"
+        );
     }
 
     #[test]
@@ -1313,11 +1506,15 @@ mod tests {
         let now = Utc::now();
         s.insert_message(&e).unwrap();
 
-        let pending_id = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2).unwrap();
-        let dead_id_1 =
-            s.insert_dead_delivery(e.id, "general", &dest(), now, e.expires_at, "QUEUE_FULL").unwrap();
-        let dead_id_2 =
-            s.insert_dead_delivery(e.id, "general", &dest(), now, e.expires_at, "POLICY_DENIED").unwrap();
+        let pending_id = s
+            .insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2)
+            .unwrap();
+        let dead_id_1 = s
+            .insert_dead_delivery(e.id, "general", &dest(), now, e.expires_at, "QUEUE_FULL")
+            .unwrap();
+        let dead_id_2 = s
+            .insert_dead_delivery(e.id, "general", &dest(), now, e.expires_at, "POLICY_DENIED")
+            .unwrap();
 
         let dead = s.list_deliveries(Some("dead_letter"), 100).unwrap();
         assert_eq!(dead.len(), 2, "must only return dead_letter rows: {dead:?}");
@@ -1356,32 +1553,56 @@ mod tests {
             raw.execute(
                 "INSERT INTO messages (id, envelope, created_at) VALUES (?1, ?2, ?3)",
                 params![msg_id.to_string(), "{}", ts(now)],
-            ).unwrap();
+            )
+            .unwrap();
             raw.execute(
                 "INSERT INTO deliveries
                    (message_id, route, dest_protocol, dest_endpoint, next_attempt, expires_at)
                  VALUES (?1, 'general', 'mockb', 'chan', ?2, ?3)",
                 params![msg_id.to_string(), ts(now), ts(now + Duration::hours(1))],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         let s = Store::open(&path).unwrap();
 
-        let has_created_at: i64 = s.conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('deliveries') WHERE name = 'created_at'",
-            [], |r| r.get(0),
-        ).unwrap();
-        assert_eq!(has_created_at, 1, "migration must add the created_at column");
+        let has_created_at: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('deliveries') WHERE name = 'created_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            has_created_at, 1,
+            "migration must add the created_at column"
+        );
 
         let due = s.due_deliveries(now + Duration::seconds(1), 10).unwrap();
-        assert_eq!(due.len(), 1, "the row that existed before migration must survive it");
-        assert_eq!(due[0].created_at, now, "pre-existing rows must backfill created_at from next_attempt");
-        assert_eq!(due[0].updated_at, now, "pre-existing rows must backfill updated_at from next_attempt");
+        assert_eq!(
+            due.len(),
+            1,
+            "the row that existed before migration must survive it"
+        );
+        assert_eq!(
+            due[0].created_at, now,
+            "pre-existing rows must backfill created_at from next_attempt"
+        );
+        assert_eq!(
+            due[0].updated_at, now,
+            "pre-existing rows must backfill updated_at from next_attempt"
+        );
 
         // idempotent re-open (daemon restart).
         drop(s);
         let s2 = Store::open(&path).unwrap();
-        assert_eq!(s2.due_deliveries(now + Duration::seconds(1), 10).unwrap().len(), 1);
+        assert_eq!(
+            s2.due_deliveries(now + Duration::seconds(1), 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1390,14 +1611,27 @@ mod tests {
         let e = env();
         let now = Utc::now();
         s.insert_message(&e).unwrap();
-        let a = s.insert_delivery(e.id, "route-a", &dest(), now, e.expires_at, 2).unwrap();
-        s.insert_delivery(e.id, "route-a", &dest(), now, e.expires_at, 2).unwrap();
-        let b = s.insert_delivery(e.id, "route-b", &dest(), now, e.expires_at, 2).unwrap();
+        let a = s
+            .insert_delivery(e.id, "route-a", &dest(), now, e.expires_at, 2)
+            .unwrap();
+        s.insert_delivery(e.id, "route-a", &dest(), now, e.expires_at, 2)
+            .unwrap();
+        let b = s
+            .insert_delivery(e.id, "route-b", &dest(), now, e.expires_at, 2)
+            .unwrap();
 
         assert_eq!(s.pending_count(Some("route-a")).unwrap(), 2);
         assert_eq!(s.pending_count(Some("route-b")).unwrap(), 1);
-        assert_eq!(s.pending_count(Some("route-c")).unwrap(), 0, "unknown route counts zero");
-        assert_eq!(s.pending_count(None).unwrap(), 3, "global count sums every route");
+        assert_eq!(
+            s.pending_count(Some("route-c")).unwrap(),
+            0,
+            "unknown route counts zero"
+        );
+        assert_eq!(
+            s.pending_count(None).unwrap(),
+            3,
+            "global count sums every route"
+        );
 
         // 'attempting' still counts as in-flight for both scopes.
         s.mark_attempting(a).unwrap();
@@ -1423,8 +1657,11 @@ mod tests {
         let d = s.deliveries_for_id(id).unwrap();
         assert_eq!(d.state, "dead_letter");
         assert_eq!(d.reason.as_deref(), Some("QUEUE_FULL"));
-        assert_eq!(s.pending_count(Some("general")).unwrap(), 0,
-            "a dead-lettered row must never count as in-flight");
+        assert_eq!(
+            s.pending_count(Some("general")).unwrap(),
+            0,
+            "a dead-lettered row must never count as in-flight"
+        );
         let counts = s.queue_counts().unwrap();
         assert!(counts.contains(&("dead_letter".to_string(), 1)));
     }
@@ -1437,16 +1674,23 @@ mod tests {
         s.insert_message(&e).unwrap();
 
         // two bulk (rank 3) rows inserted first...
-        let bulk1 = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 3).unwrap();
-        let bulk2 = s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 3).unwrap();
+        let bulk1 = s
+            .insert_delivery(e.id, "general", &dest(), now, e.expires_at, 3)
+            .unwrap();
+        let bulk2 = s
+            .insert_delivery(e.id, "general", &dest(), now, e.expires_at, 3)
+            .unwrap();
         // ...then one emergency (rank 0) row inserted last, same next_attempt.
-        let emergency =
-            s.insert_delivery(e.id, "general", &dest(), now, e.expires_at, 0).unwrap();
+        let emergency = s
+            .insert_delivery(e.id, "general", &dest(), now, e.expires_at, 0)
+            .unwrap();
 
         let due = s.due_deliveries(now, 10).unwrap();
         assert_eq!(due.len(), 3);
-        assert_eq!(due[0].id, emergency,
-            "emergency (priority 0) must be scheduled first despite being inserted last: {due:?}");
+        assert_eq!(
+            due[0].id, emergency,
+            "emergency (priority 0) must be scheduled first despite being inserted last: {due:?}"
+        );
         assert_eq!(due[0].priority, 0);
         let remaining_ids: Vec<i64> = due[1..].iter().map(|d| d.id).collect();
         assert!(remaining_ids.contains(&bulk1) && remaining_ids.contains(&bulk2));
@@ -1501,35 +1745,53 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
             raw.execute(
                 "INSERT INTO messages (id, envelope, created_at) VALUES (?1, ?2, ?3)",
                 params![msg_id.to_string(), "{}", ts(now)],
-            ).unwrap();
+            )
+            .unwrap();
             raw.execute(
                 "INSERT INTO deliveries
                    (message_id, route, dest_protocol, dest_endpoint, next_attempt, expires_at)
                  VALUES (?1, 'general', 'mockb', 'chan', ?2, ?3)",
                 params![msg_id.to_string(), ts(now), ts(now + Duration::hours(1))],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // Store::open must migrate this in place, not error or wipe it.
         let s = Store::open(&path).unwrap();
 
-        let has_priority: i64 = s.conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('deliveries') WHERE name = 'priority'",
-            [], |r| r.get(0),
-        ).unwrap();
+        let has_priority: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('deliveries') WHERE name = 'priority'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(has_priority, 1, "migration must add the priority column");
 
         // the pre-existing row must survive, backfilled to the default rank.
         let due = s.due_deliveries(now + Duration::seconds(1), 10).unwrap();
-        assert_eq!(due.len(), 1, "the row that existed before migration must survive it");
-        assert_eq!(due[0].priority, 2, "pre-existing rows must backfill to the default rank");
+        assert_eq!(
+            due.len(),
+            1,
+            "the row that existed before migration must survive it"
+        );
+        assert_eq!(
+            due[0].priority, 2,
+            "pre-existing rows must backfill to the default rank"
+        );
         assert_eq!(due[0].message_id, msg_id);
 
         // and the migration is idempotent: reopening (e.g. a daemon restart)
         // must not error or re-run the ALTER TABLE.
         drop(s);
         let s2 = Store::open(&path).unwrap();
-        assert_eq!(s2.due_deliveries(now + Duration::seconds(1), 10).unwrap().len(), 1);
+        assert_eq!(
+            s2.due_deliveries(now + Duration::seconds(1), 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1539,13 +1801,24 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let expires = now + Duration::minutes(15);
 
         let id = s
-            .create_challenge("123456", "signal", "+1234567890", "lxmf", "abc123", "Jascha", now, expires)
+            .create_challenge(
+                "123456",
+                "signal",
+                "+1234567890",
+                "lxmf",
+                "abc123",
+                "Jascha",
+                now,
+                expires,
+            )
             .unwrap();
 
         assert!(id > 0);
 
         // Verify it can be found
-        let challenge = s.find_active_challenge("signal", "+1234567890", "123456", now).unwrap();
+        let challenge = s
+            .find_active_challenge("signal", "+1234567890", "123456", now)
+            .unwrap();
         assert!(challenge.is_some());
         let c = challenge.unwrap();
         assert_eq!(c.code, "123456");
@@ -1568,16 +1841,43 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let expires = now + Duration::minutes(15);
         // 999888 is chosen to NOT be a substring of any other field below
         // (target_ref "+1234567890" would coincidentally contain "123456").
-        s.create_challenge("999888", "signal", "+1234567890", "lxmf", "abc123", "Jascha", now, expires)
+        s.create_challenge(
+            "999888",
+            "signal",
+            "+1234567890",
+            "lxmf",
+            "abc123",
+            "Jascha",
+            now,
+            expires,
+        )
+        .unwrap();
+        let c = s
+            .find_active_challenge("signal", "+1234567890", "999888", now)
+            .unwrap()
             .unwrap();
-        let c = s.find_active_challenge("signal", "+1234567890", "999888", now).unwrap().unwrap();
 
         let debug = format!("{c:?}");
-        assert!(!debug.contains("999888"), "the code must never appear in Debug output: {debug}");
-        assert!(debug.contains("<redacted>"), "Debug output must show a redaction marker: {debug}");
-        assert!(debug.contains("+1234567890"), "other fields must still render: {debug}");
-        assert!(debug.contains("signal"), "other fields must still render: {debug}");
-        assert!(debug.contains("Jascha"), "other fields must still render: {debug}");
+        assert!(
+            !debug.contains("999888"),
+            "the code must never appear in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("<redacted>"),
+            "Debug output must show a redaction marker: {debug}"
+        );
+        assert!(
+            debug.contains("+1234567890"),
+            "other fields must still render: {debug}"
+        );
+        assert!(
+            debug.contains("signal"),
+            "other fields must still render: {debug}"
+        );
+        assert!(
+            debug.contains("Jascha"),
+            "other fields must still render: {debug}"
+        );
     }
 
     #[test]
@@ -1588,20 +1888,42 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
 
         // Create first challenge
         let _id1 = s
-            .create_challenge("111111", "signal", "+1234567890", "lxmf", "abc123", "Jascha", now, expires)
+            .create_challenge(
+                "111111",
+                "signal",
+                "+1234567890",
+                "lxmf",
+                "abc123",
+                "Jascha",
+                now,
+                expires,
+            )
             .unwrap();
 
         // Create second challenge for same target (should delete first)
         let _id2 = s
-            .create_challenge("222222", "signal", "+1234567890", "lxmf", "xyz789", "Alice", now, expires)
+            .create_challenge(
+                "222222",
+                "signal",
+                "+1234567890",
+                "lxmf",
+                "xyz789",
+                "Alice",
+                now,
+                expires,
+            )
             .unwrap();
 
         // Old code should not be found
-        let old = s.find_active_challenge("signal", "+1234567890", "111111", now).unwrap();
+        let old = s
+            .find_active_challenge("signal", "+1234567890", "111111", now)
+            .unwrap();
         assert!(old.is_none());
 
         // New code should be found
-        let new = s.find_active_challenge("signal", "+1234567890", "222222", now).unwrap();
+        let new = s
+            .find_active_challenge("signal", "+1234567890", "222222", now)
+            .unwrap();
         assert!(new.is_some());
         assert_eq!(new.unwrap().code, "222222");
     }
@@ -1612,11 +1934,23 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let now = Utc::now();
         let expires = now + Duration::minutes(15);
 
-        s.create_challenge("123456", "signal", "+1234567890", "lxmf", "abc123", "Jascha", now, expires)
-            .unwrap();
+        s.create_challenge(
+            "123456",
+            "signal",
+            "+1234567890",
+            "lxmf",
+            "abc123",
+            "Jascha",
+            now,
+            expires,
+        )
+        .unwrap();
 
         // Should be found before expiry
-        assert!(s.find_active_challenge("signal", "+1234567890", "123456", now).unwrap().is_some());
+        assert!(s
+            .find_active_challenge("signal", "+1234567890", "123456", now)
+            .unwrap()
+            .is_some());
 
         // Should not be found after expiry
         let after_expiry = expires + Duration::seconds(1);
@@ -1632,8 +1966,17 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let now = Utc::now();
         let expires = now + Duration::minutes(15);
 
-        s.create_challenge("123456", "signal", "+1234567890", "lxmf", "abc123", "Jascha", now, expires)
-            .unwrap();
+        s.create_challenge(
+            "123456",
+            "signal",
+            "+1234567890",
+            "lxmf",
+            "abc123",
+            "Jascha",
+            now,
+            expires,
+        )
+        .unwrap();
 
         // Wrong code
         assert!(s
@@ -1654,8 +1997,17 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let now = Utc::now();
         let expires = now + Duration::minutes(15);
 
-        s.create_challenge("123456", "signal", "+1234567890", "lxmf", "abc123", "Jascha", now, expires)
-            .unwrap();
+        s.create_challenge(
+            "123456",
+            "signal",
+            "+1234567890",
+            "lxmf",
+            "abc123",
+            "Jascha",
+            now,
+            expires,
+        )
+        .unwrap();
 
         // Different target protocol
         assert!(s
@@ -1683,11 +2035,23 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let expires = now + Duration::minutes(15);
 
         let id = s
-            .create_challenge("123456", "signal", "+1234567890", "lxmf", "abc123", "Jascha", now, expires)
+            .create_challenge(
+                "123456",
+                "signal",
+                "+1234567890",
+                "lxmf",
+                "abc123",
+                "Jascha",
+                now,
+                expires,
+            )
             .unwrap();
 
         // Should exist
-        assert!(s.find_active_challenge("signal", "+1234567890", "123456", now).unwrap().is_some());
+        assert!(s
+            .find_active_challenge("signal", "+1234567890", "123456", now)
+            .unwrap()
+            .is_some());
 
         // Delete it
         s.delete_challenge(id).unwrap();
@@ -1704,16 +2068,47 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let (_d, s) = store();
         let now = Utc::now();
 
-        s.create_challenge("111111", "signal", "+1111111111", "lxmf", "a", "Alice", now,
-            now + Duration::minutes(15)).unwrap();
-        s.create_challenge("222222", "matrix", "+2222222222", "lxmf", "b", "Bob", now,
-            now + Duration::minutes(15)).unwrap();
+        s.create_challenge(
+            "111111",
+            "signal",
+            "+1111111111",
+            "lxmf",
+            "a",
+            "Alice",
+            now,
+            now + Duration::minutes(15),
+        )
+        .unwrap();
+        s.create_challenge(
+            "222222",
+            "matrix",
+            "+2222222222",
+            "lxmf",
+            "b",
+            "Bob",
+            now,
+            now + Duration::minutes(15),
+        )
+        .unwrap();
         // already expired -- must not appear
-        s.create_challenge("333333", "signal", "+3333333333", "lxmf", "c", "Carol", now,
-            now - Duration::seconds(1)).unwrap();
+        s.create_challenge(
+            "333333",
+            "signal",
+            "+3333333333",
+            "lxmf",
+            "c",
+            "Carol",
+            now,
+            now - Duration::seconds(1),
+        )
+        .unwrap();
 
         let list = s.list_challenges(now).unwrap();
-        assert_eq!(list.len(), 2, "the expired challenge must be excluded: {list:?}");
+        assert_eq!(
+            list.len(),
+            2,
+            "the expired challenge must be excluded: {list:?}"
+        );
         assert_eq!(list[0].display_name, "Alice");
         assert_eq!(list[1].display_name, "Bob");
     }
@@ -1731,13 +2126,31 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
 
         // Create one expired challenge
         let expires_old = now - Duration::minutes(1);
-        s.create_challenge("111111", "signal", "+1111111111", "lxmf", "a", "A", now - Duration::minutes(16), expires_old)
-            .unwrap();
+        s.create_challenge(
+            "111111",
+            "signal",
+            "+1111111111",
+            "lxmf",
+            "a",
+            "A",
+            now - Duration::minutes(16),
+            expires_old,
+        )
+        .unwrap();
 
         // Create one active challenge
         let expires_new = now + Duration::minutes(15);
-        s.create_challenge("222222", "signal", "+2222222222", "lxmf", "b", "B", now, expires_new)
-            .unwrap();
+        s.create_challenge(
+            "222222",
+            "signal",
+            "+2222222222",
+            "lxmf",
+            "b",
+            "B",
+            now,
+            expires_new,
+        )
+        .unwrap();
 
         // Purge
         let deleted = s.purge_expired_challenges(now).unwrap();
@@ -1795,17 +2208,30 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
 
         // Replace the original link with new verified_at (should return the SAME id, not a new one)
         let id_replaced = s
-            .insert_link("signal", "+1234567890", "lxmf", "abc123", "Jascha Updated", later)
+            .insert_link(
+                "signal",
+                "+1234567890",
+                "lxmf",
+                "abc123",
+                "Jascha Updated",
+                later,
+            )
             .unwrap();
 
         // CRITICAL: RETURNING id must give us the original link's id, not the unrelated link's id
-        assert_eq!(id_replaced, id1, "replace-path must return the updated row's id, not a new row id");
+        assert_eq!(
+            id_replaced, id1,
+            "replace-path must return the updated row's id, not a new row id"
+        );
 
         // Should only have two links (original + unrelated)
         let links = s.list_links().unwrap();
         assert_eq!(links.len(), 2);
 
-        let link = s.link_for_identity("signal", "+1234567890").unwrap().unwrap();
+        let link = s
+            .link_for_identity("signal", "+1234567890")
+            .unwrap()
+            .unwrap();
         assert!(link.verified_at > now);
         assert_eq!(link.id, id1);
     }
@@ -1858,14 +2284,20 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
             .unwrap();
 
         // Should exist
-        assert!(s.link_for_identity("signal", "+1234567890").unwrap().is_some());
+        assert!(s
+            .link_for_identity("signal", "+1234567890")
+            .unwrap()
+            .is_some());
 
         // Delete it
         let deleted = s.delete_link(id).unwrap();
         assert!(deleted);
 
         // Should not exist
-        assert!(s.link_for_identity("signal", "+1234567890").unwrap().is_none());
+        assert!(s
+            .link_for_identity("signal", "+1234567890")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1885,8 +2317,15 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
             .unwrap();
         s.insert_link("signal", "+2222222222", "lxmf", "b", "Bob", now)
             .unwrap();
-        s.insert_link("matrix", "@charlie:example.com", "telegram", "charlie_bot", "Charlie", now)
-            .unwrap();
+        s.insert_link(
+            "matrix",
+            "@charlie:example.com",
+            "telegram",
+            "charlie_bot",
+            "Charlie",
+            now,
+        )
+        .unwrap();
 
         let links = s.list_links().unwrap();
         assert_eq!(links.len(), 3);
@@ -2010,10 +2449,20 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         s.seed_trust(&id, "verified", reseed_at).unwrap();
 
         assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("verified"));
-        let (_, _, first_seen, updated_at) =
-            s.list_trust().unwrap().into_iter().find(|r| r.0 == id).unwrap();
-        assert_eq!(first_seen, first_seen_at, "first_seen must survive the level change");
-        assert_eq!(updated_at, reseed_at, "updated_at must advance to the reseed time");
+        let (_, _, first_seen, updated_at) = s
+            .list_trust()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.0 == id)
+            .unwrap();
+        assert_eq!(
+            first_seen, first_seen_at,
+            "first_seen must survive the level change"
+        );
+        assert_eq!(
+            updated_at, reseed_at,
+            "updated_at must advance to the reseed time"
+        );
     }
 
     /// Same shape as above but re-seeding at a LOWER-sounding level than
@@ -2061,8 +2510,14 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
             vec![],
         );
         s.seed_federation_trust(&fed, now).unwrap();
-        assert_eq!(s.trust_level(&node_id(1)).unwrap().as_deref(), Some("trusted"));
-        assert_eq!(s.trust_level(&node_id(2)).unwrap().as_deref(), Some("verified"));
+        assert_eq!(
+            s.trust_level(&node_id(1)).unwrap().as_deref(),
+            Some("trusted")
+        );
+        assert_eq!(
+            s.trust_level(&node_id(2)).unwrap().as_deref(),
+            Some("verified")
+        );
     }
 
     #[test]
@@ -2071,8 +2526,14 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let now = Utc::now();
         let fed = fed_cfg(vec![], vec![node_id(1)], vec![node_id(2)]);
         s.seed_federation_trust(&fed, now).unwrap();
-        assert_eq!(s.trust_level(&node_id(1)).unwrap().as_deref(), Some("trusted"));
-        assert_eq!(s.trust_level(&node_id(2)).unwrap().as_deref(), Some("blocked"));
+        assert_eq!(
+            s.trust_level(&node_id(1)).unwrap().as_deref(),
+            Some("trusted")
+        );
+        assert_eq!(
+            s.trust_level(&node_id(2)).unwrap().as_deref(),
+            Some("blocked")
+        );
     }
 
     /// A node_id listed both as a `verified` peer AND in `blocked` (an
@@ -2085,7 +2546,11 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let (_d, s) = store();
         let now = Utc::now();
         let id = node_id(1);
-        let fed = fed_cfg(vec![peer("phoenix", &id, "trusted")], vec![], vec![id.clone()]);
+        let fed = fed_cfg(
+            vec![peer("phoenix", &id, "trusted")],
+            vec![],
+            vec![id.clone()],
+        );
         s.seed_federation_trust(&fed, now).unwrap();
         assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("blocked"));
     }
@@ -2110,10 +2575,17 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let boot2 = boot1 + Duration::hours(1);
         s.seed_federation_trust(&fed, boot2).unwrap();
 
-        let (_, level, first_seen, updated_at) =
-            s.list_trust().unwrap().into_iter().find(|r| r.0 == id).unwrap();
+        let (_, level, first_seen, updated_at) = s
+            .list_trust()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.0 == id)
+            .unwrap();
         assert_eq!(level, "verified");
-        assert_eq!(first_seen, first_seen_at, "first_seen must survive repeated re-seeding");
+        assert_eq!(
+            first_seen, first_seen_at,
+            "first_seen must survive repeated re-seeding"
+        );
         assert_eq!(updated_at, boot2);
     }
 
@@ -2130,18 +2602,32 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let first_seen_at = Utc::now();
         let boot1 = first_seen_at + Duration::hours(1);
         s.record_seen(&id, first_seen_at).unwrap();
-        s.seed_federation_trust(&fed_cfg(vec![peer("phoenix", &id, "verified")], vec![], vec![]), boot1)
-            .unwrap();
+        s.seed_federation_trust(
+            &fed_cfg(vec![peer("phoenix", &id, "verified")], vec![], vec![]),
+            boot1,
+        )
+        .unwrap();
         assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("verified"));
 
         // Boot 2: the peer entry is gone from config entirely.
         let boot2 = boot1 + Duration::hours(1);
-        s.seed_federation_trust(&fed_cfg(vec![], vec![], vec![]), boot2).unwrap();
+        s.seed_federation_trust(&fed_cfg(vec![], vec![], vec![]), boot2)
+            .unwrap();
 
-        let (_, level, first_seen, updated_at) =
-            s.list_trust().unwrap().into_iter().find(|r| r.0 == id).unwrap();
-        assert_eq!(level, "seen", "a removed peer's config-derived level must be revoked");
-        assert_eq!(first_seen, first_seen_at, "downgrade must preserve first_seen");
+        let (_, level, first_seen, updated_at) = s
+            .list_trust()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.0 == id)
+            .unwrap();
+        assert_eq!(
+            level, "seen",
+            "a removed peer's config-derived level must be revoked"
+        );
+        assert_eq!(
+            first_seen, first_seen_at,
+            "downgrade must preserve first_seen"
+        );
         assert_eq!(updated_at, boot2, "downgrade must advance updated_at");
     }
 
@@ -2152,10 +2638,12 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let (_d, s) = store();
         let id = node_id(1);
         let boot1 = Utc::now();
-        s.seed_federation_trust(&fed_cfg(vec![], vec![id.clone()], vec![]), boot1).unwrap();
+        s.seed_federation_trust(&fed_cfg(vec![], vec![id.clone()], vec![]), boot1)
+            .unwrap();
         assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("trusted"));
 
-        s.seed_federation_trust(&fed_cfg(vec![], vec![], vec![]), boot1 + Duration::hours(1)).unwrap();
+        s.seed_federation_trust(&fed_cfg(vec![], vec![], vec![]), boot1 + Duration::hours(1))
+            .unwrap();
         assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("seen"));
     }
 
@@ -2169,18 +2657,25 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let removed = node_id(1);
         let kept = node_id(2);
         let both = fed_cfg(
-            vec![peer("phoenix", &removed, "verified"), peer("tucson", &kept, "trusted")],
+            vec![
+                peer("phoenix", &removed, "verified"),
+                peer("tucson", &kept, "trusted"),
+            ],
             vec![],
             vec![],
         );
         s.seed_federation_trust(&both, now).unwrap();
 
         let only_kept = fed_cfg(vec![peer("tucson", &kept, "trusted")], vec![], vec![]);
-        s.seed_federation_trust(&only_kept, now + Duration::hours(1)).unwrap();
+        s.seed_federation_trust(&only_kept, now + Duration::hours(1))
+            .unwrap();
 
         assert_eq!(s.trust_level(&removed).unwrap().as_deref(), Some("seen"));
-        assert_eq!(s.trust_level(&kept).unwrap().as_deref(), Some("trusted"),
-            "a still-configured peer must keep its config level through the downgrade pass");
+        assert_eq!(
+            s.trust_level(&kept).unwrap().as_deref(),
+            Some("trusted"),
+            "a still-configured peer must keep its config level through the downgrade pass"
+        );
     }
 
     /// `blocked` is sticky by design: removing a blocked node_id from config
@@ -2192,12 +2687,17 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let (_d, s) = store();
         let now = Utc::now();
         let id = node_id(1);
-        s.seed_federation_trust(&fed_cfg(vec![], vec![], vec![id.clone()]), now).unwrap();
+        s.seed_federation_trust(&fed_cfg(vec![], vec![], vec![id.clone()]), now)
+            .unwrap();
         assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("blocked"));
 
-        s.seed_federation_trust(&fed_cfg(vec![], vec![], vec![]), now + Duration::hours(1)).unwrap();
-        assert_eq!(s.trust_level(&id).unwrap().as_deref(), Some("blocked"),
-            "blocked is sticky: config removal must not implicitly unblock");
+        s.seed_federation_trust(&fed_cfg(vec![], vec![], vec![]), now + Duration::hours(1))
+            .unwrap();
+        assert_eq!(
+            s.trust_level(&id).unwrap().as_deref(),
+            Some("blocked"),
+            "blocked is sticky: config removal must not implicitly unblock"
+        );
     }
 
     /// A runtime-learned `seen` row (never config-derived at all) is not the
@@ -2210,13 +2710,24 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let id = node_id(1);
         s.record_seen(&id, seen_at).unwrap();
 
-        s.seed_federation_trust(&fed_cfg(vec![], vec![], vec![]), seen_at + Duration::hours(1)).unwrap();
+        s.seed_federation_trust(
+            &fed_cfg(vec![], vec![], vec![]),
+            seen_at + Duration::hours(1),
+        )
+        .unwrap();
 
-        let (_, level, first_seen, updated_at) =
-            s.list_trust().unwrap().into_iter().find(|r| r.0 == id).unwrap();
+        let (_, level, first_seen, updated_at) = s
+            .list_trust()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.0 == id)
+            .unwrap();
         assert_eq!(level, "seen");
         assert_eq!(first_seen, seen_at);
-        assert_eq!(updated_at, seen_at, "a runtime seen row must not even have updated_at touched");
+        assert_eq!(
+            updated_at, seen_at,
+            "a runtime seen row must not even have updated_at touched"
+        );
     }
 
     #[test]
@@ -2234,7 +2745,10 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
     // ---- fed ack -> delivery resolution (design §5 egress) ---------------
 
     fn fed_dest(peer_and_route: &str) -> Endpoint {
-        Endpoint { protocol: "fed".into(), endpoint: peer_and_route.into() }
+        Endpoint {
+            protocol: "fed".into(),
+            endpoint: peer_and_route.into(),
+        }
     }
 
     #[test]
@@ -2243,8 +2757,15 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let e = env();
         s.insert_message(&e).unwrap();
         let now = Utc::now();
-        s.insert_delivery(e.id, "general", &fed_dest("phoenix/regional-chat"), now,
-                           e.expires_at, 2).unwrap();
+        s.insert_delivery(
+            e.id,
+            "general",
+            &fed_dest("phoenix/regional-chat"),
+            now,
+            e.expires_at,
+            2,
+        )
+        .unwrap();
 
         let rows = s.deliveries_for_fed_ack(e.id, "phoenix").unwrap();
         assert_eq!(rows.len(), 1);
@@ -2257,10 +2778,20 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let e = env();
         s.insert_message(&e).unwrap();
         let now = Utc::now();
-        s.insert_delivery(e.id, "general", &fed_dest("phoenix/regional-chat"), now,
-                           e.expires_at, 2).unwrap();
+        s.insert_delivery(
+            e.id,
+            "general",
+            &fed_dest("phoenix/regional-chat"),
+            now,
+            e.expires_at,
+            2,
+        )
+        .unwrap();
 
-        assert!(s.deliveries_for_fed_ack(e.id, "seattle").unwrap().is_empty());
+        assert!(s
+            .deliveries_for_fed_ack(e.id, "seattle")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2272,8 +2803,15 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         let e = env();
         s.insert_message(&e).unwrap();
         let now = Utc::now();
-        s.insert_delivery(e.id, "general", &fed_dest("phoenix/regional-chat"), now,
-                           e.expires_at, 2).unwrap();
+        s.insert_delivery(
+            e.id,
+            "general",
+            &fed_dest("phoenix/regional-chat"),
+            now,
+            e.expires_at,
+            2,
+        )
+        .unwrap();
 
         assert!(s.deliveries_for_fed_ack(e.id, "phoen").unwrap().is_empty());
     }
@@ -2287,11 +2825,23 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         // A normal (non-fed) delivery to a destination whose endpoint just
         // happens to look like "peer/route" must never be picked up here --
         // only dest_protocol = 'fed' rows are eligible.
-        s.insert_delivery(e.id, "general",
-                           &Endpoint { protocol: "mocka".into(), endpoint: "phoenix/regional-chat".into() },
-                           now, e.expires_at, 2).unwrap();
+        s.insert_delivery(
+            e.id,
+            "general",
+            &Endpoint {
+                protocol: "mocka".into(),
+                endpoint: "phoenix/regional-chat".into(),
+            },
+            now,
+            e.expires_at,
+            2,
+        )
+        .unwrap();
 
-        assert!(s.deliveries_for_fed_ack(e.id, "phoenix").unwrap().is_empty());
+        assert!(s
+            .deliveries_for_fed_ack(e.id, "phoenix")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2304,10 +2854,24 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         s.insert_message(&e1).unwrap();
         s.insert_message(&e2).unwrap();
         let now = Utc::now();
-        s.insert_delivery(e1.id, "general", &fed_dest("phoenix/regional-chat"), now,
-                           e1.expires_at, 2).unwrap();
-        s.insert_delivery(e2.id, "general", &fed_dest("phoenix/regional-chat"), now,
-                           e2.expires_at, 2).unwrap();
+        s.insert_delivery(
+            e1.id,
+            "general",
+            &fed_dest("phoenix/regional-chat"),
+            now,
+            e1.expires_at,
+            2,
+        )
+        .unwrap();
+        s.insert_delivery(
+            e2.id,
+            "general",
+            &fed_dest("phoenix/regional-chat"),
+            now,
+            e2.expires_at,
+            2,
+        )
+        .unwrap();
 
         let rows = s.deliveries_for_fed_ack(e1.id, "phoenix").unwrap();
         assert_eq!(rows.len(), 1);
@@ -2320,21 +2884,30 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
     fn upsert_peer_advert_newer_expires_wins_older_or_equal_ignored() {
         let (_d, s) = store();
         let now = Utc::now();
-        s.upsert_peer_advert("rf:aa", b"first", "Alice", now + Duration::hours(1), now).unwrap();
+        s.upsert_peer_advert("rf:aa", b"first", "Alice", now + Duration::hours(1), now)
+            .unwrap();
 
         // Older expires: ignored entirely -- the first row survives as-is.
-        s.upsert_peer_advert("rf:aa", b"stale", "AliceOld", now + Duration::minutes(30), now)
-            .unwrap();
+        s.upsert_peer_advert(
+            "rf:aa",
+            b"stale",
+            "AliceOld",
+            now + Duration::minutes(30),
+            now,
+        )
+        .unwrap();
         let rows = s.list_peer_adverts(now).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1, b"first".to_vec());
 
         // Equal expires: also ignored (strictly newer required to win).
-        s.upsert_peer_advert("rf:aa", b"equal", "AliceEq", now + Duration::hours(1), now).unwrap();
+        s.upsert_peer_advert("rf:aa", b"equal", "AliceEq", now + Duration::hours(1), now)
+            .unwrap();
         assert_eq!(s.list_peer_adverts(now).unwrap()[0].1, b"first".to_vec());
 
         // Strictly newer expires: wins, replacing the whole row.
-        s.upsert_peer_advert("rf:aa", b"newer", "AliceNew", now + Duration::hours(2), now).unwrap();
+        s.upsert_peer_advert("rf:aa", b"newer", "AliceNew", now + Duration::hours(2), now)
+            .unwrap();
         assert_eq!(s.list_peer_adverts(now).unwrap()[0].1, b"newer".to_vec());
     }
 
@@ -2342,8 +2915,10 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
     fn upsert_peer_advert_two_distinct_node_ids_do_not_collide() {
         let (_d, s) = store();
         let now = Utc::now();
-        s.upsert_peer_advert("rf:aa", b"a", "Alice", now + Duration::hours(1), now).unwrap();
-        s.upsert_peer_advert("rf:bb", b"b", "Bob", now + Duration::hours(1), now).unwrap();
+        s.upsert_peer_advert("rf:aa", b"a", "Alice", now + Duration::hours(1), now)
+            .unwrap();
+        s.upsert_peer_advert("rf:bb", b"b", "Bob", now + Duration::hours(1), now)
+            .unwrap();
         let rows = s.list_peer_adverts(now).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, "rf:aa");
@@ -2354,8 +2929,10 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
     fn list_peer_adverts_excludes_expired_rows() {
         let (_d, s) = store();
         let now = Utc::now();
-        s.upsert_peer_advert("rf:bb", b"live", "Bob", now + Duration::hours(1), now).unwrap();
-        s.upsert_peer_advert("rf:cc", b"dead", "Carol", now - Duration::hours(1), now).unwrap();
+        s.upsert_peer_advert("rf:bb", b"live", "Bob", now + Duration::hours(1), now)
+            .unwrap();
+        s.upsert_peer_advert("rf:cc", b"dead", "Carol", now - Duration::hours(1), now)
+            .unwrap();
         let rows = s.list_peer_adverts(now).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "rf:bb");
@@ -2365,8 +2942,10 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
     fn purge_expired_adverts_deletes_only_expired_rows() {
         let (_d, s) = store();
         let now = Utc::now();
-        s.upsert_peer_advert("rf:dd", b"live", "Dave", now + Duration::hours(1), now).unwrap();
-        s.upsert_peer_advert("rf:ee", b"dead", "Eve", now - Duration::hours(1), now).unwrap();
+        s.upsert_peer_advert("rf:dd", b"live", "Dave", now + Duration::hours(1), now)
+            .unwrap();
+        s.upsert_peer_advert("rf:ee", b"dead", "Eve", now - Duration::hours(1), now)
+            .unwrap();
 
         let purged = s.purge_expired_adverts(now).unwrap();
         assert_eq!(purged, 1);

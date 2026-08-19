@@ -125,9 +125,11 @@ plainly rather than implying a protection that doesn't exist:
   identity-linking permissions apart from route-management permissions
   (`docs/webui-notes.md` §78, since correlation data is more sensitive than
   routing config) — is explicitly the job of the separate `relayfabric-ui`
-  service described in `docs/webui-notes.md`, fronting this socket. **That
-  service is not built yet.** Until it exists, do not expose this API to
-  anyone you wouldn't give a shell on this host.
+  service described in `docs/webui-notes.md`, fronting this socket.
+  **`relayfabric-ui` exists (v0.2) but has no authentication yet** —
+  WebAuthn/passkeys + scoped roles land in v0.4 (cycle E of the
+  [roadmap](proposals/v0.4-roadmap.md)). Until then, do not expose this API
+  or the UI's TCP listener to anyone you wouldn't give a shell on this host.
 
 The OpenAPI document's `info.description` states this same boundary, and
 deliberately declares no `securityScheme` — inventing a bearer/OAuth scheme

@@ -307,7 +307,7 @@ Look at this
 The same pipeline stage is responsible for any other capability-driven adaptation: truncating to `max_payload`, stripping location data, or reformatting a reply chain for a plugin that has no native reply concept. See [Transport Classes](transport-classes.md) for how constrained links factor into this decision, and [Routing & Policy](routing.md) for how policy rules select the transform to apply.
 
 !!! warning "Sealed routing is out of scope for the transform pipeline"
-    SPEC §113 describes a future *sealed* security mode where the payload is end-to-end encrypted and the fabric cannot transform it at all — no downscaling, no truncation, no attachment stripping. That mode is deferred (targeted alongside v0.3 federation and later); the transform pipeline described here applies to `native`/`gateway` mode messages, where the gateway can read and adapt plaintext.
+    SPEC §113's *sealed* security mode — payload end-to-end encrypted between gateways, untransformable by the fabric — **shipped in v0.3 (phase 1, gateway-to-gateway)**; see [Security & Sealed Routing](security.md). Sealed routes are structurally exempt from this transform pipeline: no downscaling, no truncation, no attachment stripping. The pipeline described here applies to `native`/`gateway` mode messages, where the gateway can read and adapt plaintext.
 
 ## See also
 
