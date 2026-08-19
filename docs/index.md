@@ -7,6 +7,8 @@
 
 ## Feature status
 
+Per-plugin interop coverage (inbound/outbound/replies/attachments/reconnect/dedup/offline/restart/payload/failure-injection) lives in the [Interoperability Matrix](interop-matrix.md).
+
 | Subsystem | Status | Since | Validation |
 |---|---|---|---|
 | Core fabric (routing, dedup, policy, queue, persistence, admin API) | shipped | v0.1 | unit + e2e suites |
