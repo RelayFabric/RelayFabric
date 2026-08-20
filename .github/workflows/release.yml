@@ -1,18 +1,18 @@
 name: Release
 
-# Packaged releases (v0.4 cycle D): on a version tag, build the Rust
-# binaries for x86-64 and aarch64, package tarballs + a .deb, generate
-# checksums and GitHub build-provenance attestations, and attach everything
-# to the GitHub release for that tag. Operators deploy without compiling.
+# Packaged releases (v0.4 cycle D + cosign signing): on a version tag, build
+# the Rust binaries for x86-64 and aarch64 and package tarballs + a .deb per
+# arch; then one signing job creates a unified checksums.txt, signs every
+# artifact (and the checksums file itself) with keyless Sigstore cosign,
+# generates GitHub build-provenance attestations, attaches everything to the
+# tag's release, and appends verification instructions to the release notes.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -68,17 +68,82 @@ jobs:
           done
           cargo deb -p switchyardd --no-build --no-strip --output dist/
 
-      - name: Checksums
-        working-directory: dist
-        run: sha256sum * > "sha256sums-${{ matrix.target }}.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  sign-and-attach:
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: binaries-*
+          merge-multiple: true
+
+      - name: Unified checksums
+        working-directory: artifacts
+        run: |
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign artifacts with cosign (keyless)
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          for file in *.tar.gz *.deb; do
+            [ -f "$file" ] || continue
+            echo "Signing $file..."
+            cosign sign-blob --yes "$file" \
+              --output-signature "${file}.sig" --output-certificate "${file}.pem"
+          done
+          # the checksums manifest is signed too
+          cosign sign-blob --yes checksums.txt \
+            --output-signature checksums.txt.sig --output-certificate checksums.txt.pem
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: "dist/*"
+          subject-path: |
+            artifacts/*.tar.gz
+            artifacts/*.deb
 
-      - name: Attach to release
+      - name: Attach to release and append verification notes
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" artifacts/* --clobber \
+            -R "$GITHUB_REPOSITORY"
+          gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
+            --json body -q .body > body.md
+          cat >> body.md <<'EOF'
+
+          ### Verification
+
+          SHA256 checksums are in `checksums.txt` (itself signed). Every
+          tarball and `.deb` is signed with keyless
+          [Sigstore cosign](https://docs.sigstore.dev/); verify with:
+
+          ```bash
+          cosign verify-blob --certificate <file>.pem --signature <file>.sig <file> \
+            --certificate-identity-regexp="https://github.com/RelayFabric/RelayFabric" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+          ```
+
+          GitHub build-provenance attestations are also available:
+          `gh attestation verify <file> -R RelayFabric/RelayFabric`.
+          EOF
+          gh release edit "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
+            --notes-file body.md
