@@ -4,7 +4,8 @@ name: Publish
 # crates.io (relayfabric-core, then relayfabric-ipc — order matters) and PyPI
 # (relayfabric-sdk), on version tags or manual dispatch. Both registries use
 # OIDC Trusted Publishing — no long-lived tokens in repo secrets — which
-# needs the one-time registry-side setup described in the runbook. Every
+# needs one-time registry-side setup (trusted publisher per crate/project +
+# the crates-io/pypi GitHub environments). Every
 # publish step is idempotent: already-published versions are skipped, so a
 # re-run after a partial failure is safe.
 on:
