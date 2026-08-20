@@ -26,16 +26,8 @@ empty; add reviewers if you want a manual approval gate on publishes).
 
 ### crates.io (first publish is manual)
 
-crates.io Trusted Publishing is configured per-crate and only on crates
-you already own — so the FIRST publish of each crate is manual:
-
-```sh
-cargo login   # with your crates.io token
-cargo publish -p relayfabric-core     # first: ipc depends on it
-cargo publish -p relayfabric-ipc
-```
-
-Then, on each crate's Settings → Trusted Publishing page, add:
+**DONE 2026-08-19:** relayfabric-core 0.4.0 and relayfabric-ipc 0.4.0 are
+published. Remaining: on each crate's Settings → Trusted Publishing page, add:
 
 - owner/repo: `RelayFabric/RelayFabric`
 - workflow: `publish.yml`
