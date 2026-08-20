@@ -11,10 +11,14 @@ plugins. MeshCore uses the native MIT Companion Radio Protocol (spec §8's
 preferred style), while Meshtastic uses MQTT (licensing favors it). Initial
 target networks: Reticulum/LXMF, Signal, Meshtastic, MeshCore, Bitchat, Nostr.
 
-**Status:** [v0.3.0 released](https://github.com/RelayFabric/RelayFabric/releases/tag/v0.3.0)
-— core fabric, eight plugins, federation + RFDP, sealed routing phase 1,
-transport-class-aware egress, admin API + web UI. **v0.4 in progress** — the
-hardening/proving/packaging release ([roadmap](docs/proposals/v0.4-roadmap.md)).
+**Status:** [v0.4.0 released](https://github.com/RelayFabric/RelayFabric/releases/tag/v0.4.0)
+— the "trustworthy intermesh" release: core fabric, eight plugins,
+federation + RFDP, sealed routing phase 1, transport-class-aware egress,
+plus per-plugin privilege isolation, passkey-authenticated web UI, a
+five-plugin interoperability matrix, signed packaged releases (binaries +
+`.deb` + cosign), and a published SDK ([crates.io](https://crates.io/crates/relayfabric-ipc)
+/ [PyPI](https://pypi.org/project/relayfabric-sdk/)). The public federation
+(roadmap cycle G) follows in a v0.4.x point release.
 The [feature-status table](https://docs.relayfabric.org/#feature-status) is
 the single source of truth for what is shipped, validated, or pending.
 
@@ -33,7 +37,46 @@ the single source of truth for what is shipped, validated, or pending.
   [Nostr](plugins/nostr/README.md), [Bitchat](plugins/bitchat/README.md), or
   [PotatoMesh](plugins/potatomesh/README.md) docs.
 
-## Build
+## Install
+
+Every [release](https://github.com/RelayFabric/RelayFabric/releases) ships
+prebuilt, signed artifacts for x86-64 and aarch64 — no need to compile
+unless you're developing.
+
+**Debian/Ubuntu (`.deb`)** — daemon, CLI, MQTT plugin, and the hardened
+systemd units:
+
+```
+# pick your arch from the release assets
+sudo dpkg -i relayfabric_0.4.0-1_amd64.deb
+sudo systemctl enable --now switchyardd
+```
+
+**Tarball** — the same binaries plus the web UI, `deploy/` units, and the
+example config:
+
+```
+tar xzf relayfabric-0.4.0-x86_64-unknown-linux-gnu.tar.gz
+```
+
+**Container image** (semver-tagged on GHCR):
+
+```
+docker run ghcr.io/relayfabric/relayfabric:0.4.0
+```
+
+**Verify** — every tarball and `.deb` is cosign-signed and checksummed;
+`checksums.txt` (itself signed) and GitHub build-provenance attestations
+accompany each release. Verification commands are in the release notes.
+
+**SDK packages** — for writing plugins in your own project:
+
+```
+cargo add relayfabric-ipc      # crates.io — the Plugin Protocol v1 codec
+pip install relayfabric-sdk    # PyPI — the Python plugin SDK
+```
+
+## Build from source
 
 ```
 cargo build -j2 --release

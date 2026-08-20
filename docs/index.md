@@ -2,8 +2,8 @@
 
 **RelayFabric is an open communications routing fabric for interconnecting otherwise incompatible messaging, mesh, radio, and Internet systems.** It provides one common routing, policy, identity, security, and message-processing layer, and delegates every protocol-specific detail to plugins. Bridge a Meshtastic LoRa mesh to Reticulum/LXMF, relay Signal into Nostr, or federate two gateways over an untrusted link — through a single headless daemon.
 
-!!! note "Status — v0.3.0 released · v0.4 in progress"
-    v0.4 is the hardening/proving/packaging release — no new protocols ([roadmap](proposals/v0.4-roadmap.md)). The table below is the **single source of truth** for feature status; every other page defers to it.
+!!! note "Status — v0.4.0 released"
+    v0.4 was the hardening/proving/packaging release — no new protocols ([roadmap](proposals/v0.4-roadmap.md)): per-plugin isolation, passkey-authenticated UI, the interop matrix, signed packaged releases, and a published SDK. The public federation (cycle G) follows in a v0.4.x point release. The table below is the **single source of truth** for feature status; every other page defers to it.
 
 ## Feature status
 
