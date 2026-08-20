@@ -305,8 +305,10 @@ async fn auth_endpoint(State(st): State<AppState>, req: Request) -> Response {
             }
         }
         ("POST", "/auth/register/options") => {
-            let bootstrap =
-                !a.has_credentials() && setup_header.as_deref() == Some(a.setup_token.as_str());
+            let bootstrap = !a.has_credentials()
+                && setup_header
+                    .as_deref()
+                    .is_some_and(|h| ct_eq(h.as_bytes(), a.setup_token.as_bytes()));
             if !is_admin && !bootstrap {
                 return (StatusCode::FORBIDDEN, "registration requires administrator")
                     .into_response();
@@ -318,8 +320,10 @@ async fn auth_endpoint(State(st): State<AppState>, req: Request) -> Response {
             .into_response()
         }
         ("POST", "/auth/register") => {
-            let bootstrap =
-                !a.has_credentials() && setup_header.as_deref() == Some(a.setup_token.as_str());
+            let bootstrap = !a.has_credentials()
+                && setup_header
+                    .as_deref()
+                    .is_some_and(|h| ct_eq(h.as_bytes(), a.setup_token.as_bytes()));
             if !is_admin && !bootstrap {
                 return (StatusCode::FORBIDDEN, "registration requires administrator")
                     .into_response();
@@ -350,7 +354,7 @@ async fn auth_endpoint(State(st): State<AppState>, req: Request) -> Response {
             } else {
                 r.role.unwrap_or(auth::Role::Viewer)
             };
-            match a.register(&r.challenge_token, &cdj, &ao, role, r.label) {
+            match a.register(&r.challenge_token, &cdj, &ao, role, r.label, bootstrap) {
                 Ok(id) => axum::Json(serde_json::json!({ "id": id, "role": role })).into_response(),
                 Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
             }
@@ -410,6 +414,20 @@ async fn proxy(State(st): State<AppState>, req: Request) -> Response {
     if is_state_changing(req.method()) && !origin_allowed(req.headers(), &st.allowed_hosts) {
         return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
     }
+    // Path canonicality (audit finding): the role gate matches the raw path,
+    // and `forward` sends that same raw path upstream. If the two disagreed
+    // on decoding (`%69` vs `i`) or traversal (`..`, `//`), a role scope
+    // could be dodged. Legitimate admin paths never carry percent-encoding,
+    // `..`, or empty segments, so refuse any that do BEFORE gating —
+    // gate and upstream then match byte-for-byte, independent of the
+    // daemon's own router behavior.
+    let path = req.uri().path();
+    if path.contains('%')
+        || path.split('/').any(|seg| seg == ".." || seg == ".")
+        || path.contains("//")
+    {
+        return (StatusCode::BAD_REQUEST, "non-canonical request path").into_response();
+    }
     // Role gate (v0.4 cycle E): every proxied admin request needs a live
     // session whose role permits (method, path).
     if let Some(a) = &st.auth {
@@ -417,7 +435,7 @@ async fn proxy(State(st): State<AppState>, req: Request) -> Response {
         let Some(role) = role else {
             return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
         };
-        if !role.permits(req.method().as_str(), req.uri().path()) {
+        if !role.permits(req.method().as_str(), path) {
             return (StatusCode::FORBIDDEN, "role does not permit this action").into_response();
         }
     }
@@ -501,6 +519,19 @@ async fn static_file(State(st): State<AppState>, req: Request) -> Response {
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// Constant-time byte-slice equality for the one-time setup-token compare
+/// (audit finding). Length is not secret; content is.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn is_state_changing(m: &Method) -> bool {
