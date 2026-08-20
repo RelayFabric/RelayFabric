@@ -30,7 +30,7 @@ Per-plugin interop coverage (inbound/outbound/replies/attachments/reconnect/dedu
 | Web admin UI (`relayfabric-ui`) | shipped | v0.2 | passkey (WebAuthn) auth + scoped roles since v0.4-dev; ceremony suite in `auth.rs` |
 | Plugin privilege isolation (per-plugin sockets, `SO_PEERCRED`, systemd sandboxing) | shipped | v0.4-dev | unit + e2e; hardened units in `deploy/systemd/` |
 | Packaged releases (tarballs, .deb, GHCR semver images, provenance attestations) | shipped | v0.4-dev | release.yml on version tags; first artifacts at the v0.4.0 tag |
-| SDK as a product (crates.io/PyPI packages, echo example, conformance runner) | shipped | v0.4-dev | `switchyardctl plugin test` green on echo + potatomesh; relayfabric-core/-ipc 0.4.0 **live on crates.io**; PyPI pending one-time Trusted Publishing setup |
+| SDK as a product (crates.io/PyPI packages, echo example, conformance runner) | shipped | v0.4-dev | `switchyardctl plugin test` green on echo + potatomesh; relayfabric-core/-ipc 0.4.0 live on crates.io; relayfabric-sdk 0.4.0 **live on PyPI** |
 | Federation over Tor/I2P | not built | [proposed](proposals/federation-over-tor.md) | — |
 
 ## The idea

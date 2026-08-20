@@ -12,9 +12,11 @@ account owner:
 
 ## One-time setup
 
-### PyPI (works before the project exists)
+### PyPI
 
-Add a **pending publisher** at pypi.org → Account → Publishing:
+**DONE 2026-08-19:** relayfabric-sdk 0.4.0 is published
+(https://pypi.org/project/relayfabric-sdk/). Remaining for automation: on
+the project's Publishing settings, add a **trusted publisher** at pypi.org → Account → Publishing:
 
 - project: `relayfabric-sdk`
 - owner/repo: `RelayFabric/RelayFabric`
