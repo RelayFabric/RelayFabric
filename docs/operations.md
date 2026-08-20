@@ -299,3 +299,22 @@ delayed bursts.
 Under this layout a compromised plugin parser cannot read the daemon's
 identity/sealed keys, open `admin.sock`, impersonate another plugin, or
 reach devices and networks outside its allowlist.
+
+## Key rotation
+
+Every key the daemon holds, what rotating it costs, and how (v0.4 security
+review item 5). Stop the daemon before touching key files; all of them are
+created-if-absent on startup.
+
+| Key | File (under `data_dir`) | Rotation cost |
+|---|---|---|
+| Fed Noise static (X25519) | `fed_static.key` | **Free.** Peers never pin it — each handshake carries an Ed25519-signed identity binding over the current static. Delete the file, restart; existing connections reconnect and rebind. |
+| Sealed-routing key (X25519) | `sealed.key` | **Bounded staleness.** Peers learn it from your signed advert. Delete + restart publishes the new key on the next advert refresh (`advert_ttl_secs / 2`); until each peer refreshes, sealed envelopes they encrypt to the OLD key are rejected `BAD_SEAL` (never silently readable — the old private key is gone). Rotate during a quiet window. |
+| Node identity (Ed25519) | `identity/node.key` | **This is replacement, not rotation.** The `rf:` node_id IS this key: every peer's `federation.peers[].node_id`, trust store entry, and allow list names it. A new key is a new node — coordinate with every peer, or you drop out of the fabric. Treat compromise as decommission + re-introduction. |
+| Alias key (HMAC) | `alias.key` | **A deliberate privacy reset.** Every route-scoped pseudonym changes at once; persona continuity across all bridged networks breaks by design. Never rotate casually; rotate immediately if the key may have leaked (it enables offline alias-to-sender correlation attempts). |
+| UI passkeys | `<ui state-dir>/credentials.json` | Remove individual credentials as an administrator (`DELETE /auth/credentials/<id>`); full reset = delete the file and restart `relayfabric-ui`, which prints a fresh one-time setup token. Sessions are in-memory — a UI restart revokes all of them. |
+
+Compromise triage order: **node identity** (decommission), then **sealed
+key** (rotate now — future sealed traffic; past traffic to the old key is
+compromised), then **alias key** (rotate — pseudonym unlinkability), then
+Noise static (rotate, cheap), then UI credentials.

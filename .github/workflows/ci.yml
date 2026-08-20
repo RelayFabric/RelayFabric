@@ -54,6 +54,14 @@ jobs:
             echo "== $t"
             python "$t"
           done
+      - name: pip-audit (advisory, non-blocking)
+        # Python-side twin of the audit job's cargo-audit: scans the
+        # installed plugin/SDK dependency set for known vulnerabilities.
+        # Advisory-only for the same reason -- an upstream CVE must not
+        # wedge unrelated PRs. Flip to blocking with triage habits.
+        run: |
+          pip install pip-audit
+          pip-audit || true
 
   audit:
     runs-on: ubuntu-latest

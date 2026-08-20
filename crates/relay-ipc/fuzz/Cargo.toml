@@ -1,0 +1,35 @@
+# Fuzz harness for the attacker-facing library decode surfaces (v0.4
+# security review item 3). Not a workspace member: needs nightly +
+# libfuzzer, and must never burden normal builds. `unseal`/fed-wire fuzzing
+# waits on the Phase-2 relayfabric-core extraction (those live in the
+# bin-only switchyardd today).
+[package]
+name = "relayfabric-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ciborium = "0.2"
+relay-ipc = { path = "..", package = "relayfabric-ipc" }
+relay-core = { path = "../../relay-core", package = "relayfabric-core" }
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope_decode"
+path = "fuzz_targets/envelope_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

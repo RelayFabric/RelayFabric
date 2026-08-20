@@ -1,0 +1,40 @@
+name: Fuzz
+
+# Continuous fuzzing of the attacker-facing library decode surfaces (v0.4
+# security review item 3): the Plugin Protocol frame codec and the canonical
+# Envelope decode. Runs weekly and on demand — deliberately NOT a PR gate;
+# a libfuzzer session is time-bounded exploration, not a determinate check.
+# unseal/fed-wire targets follow the Phase-2 relayfabric-core extraction.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [frame_decode, envelope_decode]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/relay-ipc/fuzz
+          key: fuzz-${{ matrix.target }}
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz ${{ matrix.target }} (10 minutes)
+        working-directory: crates/relay-ipc
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: crates/relay-ipc/fuzz/artifacts/
+          if-no-files-found: ignore
