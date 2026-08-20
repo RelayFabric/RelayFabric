@@ -96,8 +96,7 @@ pub fn resolve(r: &SecretRef) -> Result<String, String> {
                 // eprintln, not tracing::warn!: this runs inside
                 // `config::load`, which happens before `main` initializes
                 // `tracing_subscriber` (and never initializes it at all on
-                // the `--check-config` path) -- same rationale as
-                // `config::warn_if_public_with_no_limits`.
+                // the `--check-config` path).
                 eprintln!("warning: {warning}");
             }
             Ok(trimmed)

@@ -1159,25 +1159,26 @@ fn sealed_reject(peer_node_id: &str, reason: &'static str) -> FedIngressOutcome 
 ///    `sealed_reject`, no persistence, just the shared `DUPLICATES`
 ///    metric). Peek-only: anything rejected below must not be recorded as
 ///    seen yet.
-/// 4. `fed::seal::unseal` with THIS node's OWN `sealed_key` -> `SealError`
+/// 4. `federation` config present -> else `FED_CONFIG_MISSING`; trust gate
+///    (`peer_node_id`'s stored level >= `accept_from`) -> else
+///    `TRUST_DENIED`. BEFORE unseal (2026-08-20 hardening): an untrusted
+///    peer never reaches the asymmetric crypto below.
+/// 5. `fed::seal::unseal` with THIS node's OWN `sealed_key` -> `SealError`
 ///    maps to `UNSUPPORTED_SEAL_ALG`/`BAD_SEAL`/`BAD_BINDING` (the header/
 ///    inner id+expiry binding check is inside `unseal` itself).
-/// 5. CBOR-decode the unsealed plaintext as an `Envelope` -> malformed
+/// 6. CBOR-decode the unsealed plaintext as an `Envelope` -> malformed
 ///    (decrypted-but-not-a-valid-Envelope) -> `BAD_SEAL`, via
 ///    `ciborium::from_reader`'s own `Result`, never a panic on
 ///    attacker-shaped-but-successfully-decrypted bytes.
-/// 6. Priority strip (cycle-F's CONTROLLER RULING, design §5: applies
+/// 7. Priority strip (cycle-F's CONTROLLER RULING, design §5: applies
 ///    identically here -- `priority` is deliberately unsigned, so a sealed
 ///    envelope must not carry an emergency-budget bypass any more than a
 ///    cleartext federated one can). Applied before `verify_chain` (safe:
 ///    `fed::sign::canonical_bytes` never includes `priority`) and before
 ///    every gate below, so nothing downstream ever sees the remote-claimed
 ///    value.
-/// 7. `fed::sign::verify_chain` (origin sig over the DECODED envelope) ->
+/// 8. `fed::sign::verify_chain` (origin sig over the DECODED envelope) ->
 ///    else `BAD_SIGNATURE`.
-/// 8. `federation` config present -> else `FED_CONFIG_MISSING`.
-/// 9. Trust gate (`peer_node_id`'s stored level >= `accept_from`) -> else
-///    `TRUST_DENIED`.
 /// 10. Replay-window bound (final-review I-1's cycle-F fix, reused
 ///     verbatim here on the now-decrypted, SIGNED `created_at`): stale
 ///     (older than `max_ttl_secs`) or far-future (clock-skew abuse) ->
@@ -1245,6 +1246,25 @@ pub fn fed_sealed_ingress(
         return FedIngressOutcome::Rejected("DUPLICATE");
     }
 
+    // Trust gate BEFORE unseal (public-node security review, 2026-08-20):
+    // `peer_node_id` comes from the Noise handshake, not the envelope, so
+    // nothing about trust needs the decrypted payload -- and running it
+    // here means an untrusted peer can never make this node spend
+    // X25519+AEAD cycles on its ciphertext. `fed_cfg` is fetched here for
+    // the same reason and reused by every later gate.
+    let fed_cfg = d.cfg_snapshot(|c| c.federation.clone());
+    let Some(fed_cfg) = fed_cfg else {
+        // Federation config vanished from under a live connection -- a
+        // config-invariant violation this daemon's own operator caused,
+        // never an untrusted peer (same defensive posture as
+        // `fed_ingress`'s identical check).
+        return sealed_reject(peer_node_id, "FED_CONFIG_MISSING");
+    };
+
+    if fed_trust_denied(d, peer_node_id, &fed_cfg.accept_from) {
+        return sealed_reject(peer_node_id, "TRUST_DENIED");
+    }
+
     let canonical_env_cbor = match fed::seal::unseal(&sealed, d.sealed_key.secret()) {
         Ok(bytes) => bytes,
         // Defensive/unreachable in practice: step 1 above already checked
@@ -1279,19 +1299,6 @@ pub fn fed_sealed_ingress(
 
     if fed::sign::verify_chain(&env).is_err() {
         return sealed_reject(peer_node_id, "BAD_SIGNATURE");
-    }
-
-    let fed_cfg = d.cfg_snapshot(|c| c.federation.clone());
-    let Some(fed_cfg) = fed_cfg else {
-        // Federation config vanished from under a live connection -- a
-        // config-invariant violation this daemon's own operator caused,
-        // never an untrusted peer (same defensive posture as
-        // `fed_ingress`'s identical check).
-        return sealed_reject(peer_node_id, "FED_CONFIG_MISSING");
-    };
-
-    if fed_trust_denied(d, peer_node_id, &fed_cfg.accept_from) {
-        return sealed_reject(peer_node_id, "TRUST_DENIED");
     }
 
     // Replay-window bound + TTL clamp (`bound_replay_and_clamp_ttl`,
@@ -8213,6 +8220,30 @@ routes:
 
         let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
         assert_eq!(outcome, FedIngressOutcome::Rejected("BAD_SIGNATURE"));
+        assert!(d.store.lock().unwrap().queue_counts().unwrap().is_empty());
+    }
+
+    /// DoS hardening (public-node review, 2026-08-20): the trust gate runs
+    /// BEFORE `unseal`, so an untrusted peer can never make this node do
+    /// X25519+AEAD work. Proven by the rejection reason: a tampered seal
+    /// from an untrusted peer must fail TRUST_DENIED (pre-crypto), never
+    /// BAD_SEAL (which would mean unseal ran).
+    #[test]
+    fn fed_sealed_ingress_untrusted_peer_is_denied_before_unseal() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("trusted", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+        let recipient_pub = crypto_box::PublicKey::from(d.sealed_key.public());
+
+        let env = signed_test_envelope(&identity, "hello", 0);
+        let mut sealed = seal_env_for(&env, &recipient_pub);
+        sealed.ct[0] ^= 0xFF; // would be BAD_SEAL if unseal were reached
+
+        let outcome = fed_sealed_ingress(&d, &node_id, sealed, "general".to_string());
+        assert_eq!(outcome, FedIngressOutcome::Rejected("TRUST_DENIED"));
         assert!(d.store.lock().unwrap().queue_counts().unwrap().is_empty());
     }
 

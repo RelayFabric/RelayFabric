@@ -3022,7 +3022,7 @@ transport_budgets:
   lxmf: { messages_per_minute: 200 }
 ```
 
-`limits` and `transport_budgets` are siblings at the top of the config, not nested inside each other. Every `limits` field defaults to 0, meaning unlimited — a node MAY ship with no quotas configured at all, but if `node.public` is true and both `per_sender` and `global` are left at 0, `switchyardd` logs a startup warning (unlimited on a public node is allowed, not silently assumed safe). `transport_budgets` keys must name enabled plugins; a configured budget of 0 is rejected at load rather than silently meaning unlimited, so omit the entry instead. These ship in v0.1+ config (`switchyardd`'s `Config::limits` / `Config::transport_budgets`).
+`limits` and `transport_budgets` are siblings at the top of the config, not nested inside each other. Every `limits` field defaults to 0, meaning unlimited — a PRIVATE node MAY ship with no quotas configured at all, but if `node.public` is true and both `per_sender` and `global` are left entirely at 0, config validation REJECTS the config (hardened from a startup warning, 2026-08-20: an unlimited public node is an amplification/exhaustion hazard to the fabric, not just to itself — setting any one quota field satisfies the rule). `transport_budgets` keys must name enabled plugins; a configured budget of 0 is rejected at load rather than silently meaning unlimited, so omit the entry instead. These ship in v0.1+ config (`switchyardd`'s `Config::limits` / `Config::transport_budgets`).
 
 Transport classes carry different budgets: Reticulum/IP generous, LoRa constrained, Signal controlled, satellite extremely restricted (extends §45, §46, §79).
 

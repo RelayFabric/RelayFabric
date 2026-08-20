@@ -613,6 +613,10 @@ node:
   name: test-node
   public: true
   data_dir: /tmp/relayfabric-test
+limits:
+  per_sender:
+    messages_per_minute: 10
+    bytes_per_hour: 0
 plugins:
   mocka:
     enabled: true

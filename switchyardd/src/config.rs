@@ -649,7 +649,6 @@ pub fn load_from_str(raw: &str) -> Result<Config, String> {
     cfg.raw_yaml = raw.to_string();
     validate(&cfg)?;
     resolve_secrets(&mut cfg)?;
-    warn_if_public_with_no_limits(&cfg);
     warn_if_federation_node_id_overlap(&cfg);
     Ok(cfg)
 }
@@ -732,19 +731,6 @@ fn resolve_value(v: &serde_yaml::Value, errors: &mut Vec<String>) -> serde_yaml:
 /// (every `limits` field defaults to 0, meaning unlimited — see §112.8) but
 /// almost certainly not what the operator intended: printed at load time,
 /// not enforced by `validate()`, because unlimited-but-public is a footgun
-/// warning, not a config error. Runs before `tracing_subscriber` is
-/// initialized (in particular on the `--check-config` path, which never
-/// initializes it at all), so this goes straight to stderr rather than
-/// through `tracing::warn!`.
-fn warn_if_public_with_no_limits(cfg: &Config) {
-    let per_sender_unset =
-        cfg.limits.per_sender.messages_per_minute == 0 && cfg.limits.per_sender.bytes_per_hour == 0;
-    let global_unset = cfg.limits.global.queue_max == 0 && cfg.limits.global.cas_max_bytes == 0;
-    if cfg.node.public && per_sender_unset && global_unset {
-        eprintln!("warning: node.public is true but limits are unset (unlimited); see SPEC §112.8");
-    }
-}
-
 /// The node_ids that appear in more than one of `federation.peers[]`
 /// (their own `node_id` field), `federation.trusted`, and
 /// `federation.blocked` — a pure helper so the overlap computation itself
@@ -803,6 +789,24 @@ fn require_enabled_plugin(cfg: &Config, proto: &str, what: &str, hint: &str) -> 
 }
 
 pub fn validate(cfg: &Config) -> Result<(), String> {
+    // Public-node hardening (v0.4 security review): a public node with no
+    // quotas at all is refused at load, not merely warned about -- SPEC
+    // §112.8's "unlimited is allowed" stance was downgraded 2026-08-20
+    // because an unlimited public node is an amplification/exhaustion
+    // hazard to the fabric, not just to itself. Setting ANY per_sender or
+    // global limit satisfies the rule.
+    let per_sender_unset =
+        cfg.limits.per_sender.messages_per_minute == 0 && cfg.limits.per_sender.bytes_per_hour == 0;
+    let global_unset = cfg.limits.global.queue_max == 0 && cfg.limits.global.cas_max_bytes == 0;
+    if cfg.node.public && per_sender_unset && global_unset {
+        return Err(
+            "node.public is true but limits are entirely unset (unlimited): a public node must \
+             configure at least one of limits.per_sender.{messages_per_minute,bytes_per_hour} or \
+             limits.global.{queue_max,cas_max_bytes} (SPEC §112.8)"
+                .to_string(),
+        );
+    }
+
     if cfg.plugins.contains_key(FED_PROTOCOL) {
         return Err(format!(
             "plugin name '{FED_PROTOCOL}' is reserved for federation (design §4/§5) and cannot be used as a plugin name"
@@ -1641,6 +1645,10 @@ node:
   name: test-node
   public: true
   data_dir: /tmp/relayfabric-test
+limits:
+  per_sender:
+    messages_per_minute: 10
+    bytes_per_hour: 0
 plugins:
   mocka:
     enabled: true
@@ -1670,6 +1678,10 @@ node:
   name: test-node
   public: true
   data_dir: /tmp/relayfabric-test
+limits:
+  per_sender:
+    messages_per_minute: 10
+    bytes_per_hour: 0
 plugins:
   mocka:
     enabled: true
@@ -1698,6 +1710,10 @@ node:
   name: test-node
   public: true
   data_dir: /tmp/relayfabric-test
+limits:
+  per_sender:
+    messages_per_minute: 10
+    bytes_per_hour: 0
 plugins:
   mocka:
     enabled: true
@@ -1954,6 +1970,10 @@ node:
   name: test-node
   public: true
   data_dir: /tmp/relayfabric-test
+limits:
+  per_sender:
+    messages_per_minute: 10
+    bytes_per_hour: 0
 plugins:
   mocka:
     enabled: true
@@ -2889,7 +2909,8 @@ federation:
             "node:\n  name: test-node\n  data_dir: /tmp/relayfabric-test",
             "node:\n  name: test-node\n  public: true\n  data_dir: /tmp/relayfabric-test",
         ) + "\npublic_services:\n  - name: svc\n    type: chat\n    ingress: [mocka, mockb]\n    \
-           egress: [mocka, mockb]\ndiscovery:\n  mode: public\n";
+           egress: [mocka, mockb]\ndiscovery:\n  mode: public\nlimits:\n  per_sender:\n    \
+           messages_per_minute: 10\n    bytes_per_hour: 0\n";
         let cfg = parse(&yaml).unwrap();
         assert_eq!(cfg.discovery.mode, "public");
         assert!(cfg.node.public);
@@ -3100,6 +3121,35 @@ federation:
         assert_eq!(cfg.privacy.minimum_security, "gateway");
         assert!(cfg.privacy.allow_gateway_decryption);
         assert!(cfg.privacy.allow_protocol_downgrade);
+    }
+
+    #[test]
+    fn public_node_with_no_limits_is_a_config_error() {
+        let mut cfg = parse(GOOD).unwrap();
+        cfg.node.public = true;
+        // public_services coverage is a different rule; empty routes
+        // sidestep it so only the limits rule is under test.
+        cfg.routes.clear();
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.contains("node.public") && err.contains("limits"),
+            "error must name the public/limits rule: {err}"
+        );
+    }
+
+    #[test]
+    fn public_node_with_any_limit_set_passes_the_limits_rule() {
+        let mut cfg = parse(GOOD).unwrap();
+        cfg.node.public = true;
+        cfg.routes.clear();
+        cfg.limits.per_sender.messages_per_minute = 10;
+        let result = validate(&cfg);
+        if let Err(e) = &result {
+            assert!(
+                !e.contains("limits"),
+                "must not fail the limits rule once a quota is set: {e}"
+            );
+        }
     }
 
     #[test]
