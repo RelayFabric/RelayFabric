@@ -1,0 +1,93 @@
+name: Publish
+
+# Registry publishing (v0.4 cycle F, per docs/proposals/publishing-runbook.md):
+# crates.io (relayfabric-core, then relayfabric-ipc — order matters) and PyPI
+# (relayfabric-sdk), on version tags or manual dispatch. Both registries use
+# OIDC Trusted Publishing — no long-lived tokens in repo secrets — which
+# needs the one-time registry-side setup described in the runbook. Every
+# publish step is idempotent: already-published versions are skipped, so a
+# re-run after a partial failure is safe.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  crates:
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test the crates being published
+        run: cargo test -p relayfabric-core -p relayfabric-ipc
+
+      - name: Authenticate to crates.io (Trusted Publishing)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish relayfabric-core then relayfabric-ipc
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          published() {
+            curl -sf --retry 3 -A "relayfabric-ci (github.com/RelayFabric/RelayFabric)" \
+              "https://crates.io/api/v1/crates/$1/versions" \
+              | python3 -c "import json,sys; vs=json.load(sys.stdin).get('versions',[]); \
+                            sys.exit(0 if any(v['num']=='$2' for v in vs) else 1)"
+          }
+          for crate in relayfabric-core relayfabric-ipc; do
+            if published "$crate" "$version"; then
+              echo "$crate $version already on crates.io — skipping"
+              continue
+            fi
+            cargo publish -p "$crate"
+            # the next crate's publish resolves this one from the index;
+            # poll until the registry serves it (usually seconds).
+            for _ in $(seq 30); do
+              published "$crate" "$version" && break
+              sleep 10
+            done
+          done
+
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test the SDK being published
+        working-directory: sdk/python
+        run: |
+          pip install cbor2 coincurve
+          PYTHONPATH=. python -m unittest discover -s tests
+
+      - name: Build sdist + wheel
+        working-directory: sdk/python
+        run: |
+          pip install build
+          python -m build
+
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdk/python/dist/
+          # idempotent re-runs: an already-uploaded version is not an error
+          skip-existing: true

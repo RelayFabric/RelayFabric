@@ -1,32 +1,63 @@
 # Publishing Runbook (v0.4 cycle F)
 
-Everything is prepared and validated; the only missing ingredient is
-registry credentials, which stay with the operator. Publish order matters.
+Publishing is automated: `.github/workflows/publish.yml` runs on every
+version tag (and on manual dispatch), tests the packages being published,
+and pushes `relayfabric-core` → `relayfabric-ipc` to crates.io and
+`relayfabric-sdk` to PyPI. Every step is idempotent — already-published
+versions are skipped, so re-running after a partial failure is safe.
 
-## crates.io (needs `cargo login` with your token)
+Both registries authenticate via **OIDC Trusted Publishing** — no
+long-lived tokens live in repo secrets. That needs one-time setup by the
+account owner:
+
+## One-time setup
+
+### PyPI (works before the project exists)
+
+Add a **pending publisher** at pypi.org → Account → Publishing:
+
+- project: `relayfabric-sdk`
+- owner/repo: `RelayFabric/RelayFabric`
+- workflow: `publish.yml`
+- environment: `pypi`
+
+Also create the `pypi` environment in the GitHub repo settings (it can be
+empty; add reviewers if you want a manual approval gate on publishes).
+
+### crates.io (first publish is manual)
+
+crates.io Trusted Publishing is configured per-crate and only on crates
+you already own — so the FIRST publish of each crate is manual:
 
 ```sh
+cargo login   # with your crates.io token
 cargo publish -p relayfabric-core     # first: ipc depends on it
 cargo publish -p relayfabric-ipc
 ```
 
-Validated locally: `cargo package -p relayfabric-core` builds the packaged
-crate cleanly; `relayfabric-ipc` resolves its dep only once core is on the
-registry (expected publish-order behavior). In-tree consumers keep
-`use relay_core::` / `use relay_ipc::` through Cargo dependency renaming in
-the workspace manifest.
+Then, on each crate's Settings → Trusted Publishing page, add:
 
-## PyPI (needs a token; `pip install twine build`)
+- owner/repo: `RelayFabric/RelayFabric`
+- workflow: `publish.yml`
+- environment: `crates-io`
 
-```sh
-cd sdk/python
-python -m build          # wheel validated locally: relayfabric_sdk-0.4.0
-twine upload dist/*
-```
+and create the `crates-io` environment in the GitHub repo settings. Every
+later version publishes automatically on tag.
 
-## After publishing
+## Local validation already done
 
-- Flip the "publish pending registry tokens" note in the docs/index.md
+- `cargo package -p relayfabric-core` builds the packaged crate cleanly;
+  `relayfabric-ipc` resolves its dep once core is on the registry
+  (expected publish-order behavior — the workflow polls the index between
+  the two publishes).
+- The wheel builds: `relayfabric_sdk-0.4.0-py3-none-any.whl`.
+- In-tree consumers keep `use relay_core::` / `use relay_ipc::` through
+  Cargo dependency renaming in the workspace manifest.
+
+## After the first release
+
+- Flip the "publish pending registry setup" note in the docs/index.md
   feature-status row.
-- Tag `v0.4.0` — release.yml packages binaries/.deb and docker.yml pushes
-  semver images automatically.
+- Tagging `v0.4.0` triggers all three release workflows: `release.yml`
+  (binaries/.deb/attestations), `docker.yml` (semver images), and
+  `publish.yml` (registries).
