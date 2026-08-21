@@ -71,6 +71,34 @@ plugins:
       attachment_dir: ~/.local/share/signal-cli/attachments
       max_attachment_bytes: 8000000
 
+  # meshcore: disabled for tiers 0-3. Tier 4 (real MeshCore radio): install
+  # deps into .venv, attach the companion radio over USB, set the serial
+  # path below, flip enabled to true, and uncomment the meshcore-bridge
+  # route.
+  meshcore:
+    enabled: false
+    command: __REPO__/.venv/bin/python __REPO__/plugins/meshcore/relayfabric-meshcore
+    config:
+      connection: serial:///dev/ttyUSB0   # your MeshCore companion radio
+      max_text_bytes: 160
+      channels:
+        primary: {index: 0}
+
+  # nostr: disabled for tiers 0-4. Tier 5 (live relay): install deps into
+  # .venv, point at a real relay, flip enabled to true, and uncomment the
+  # nostr-bridge route. The livetest tag keeps the test off public feeds.
+  nostr:
+    enabled: false
+    command: __REPO__/.venv/bin/python __REPO__/plugins/nostr/relayfabric-nostr
+    config:
+      identity_file: __REPO__/livetest/run/data/nostr.nsec   # generated if absent
+      relays: ["wss://relay.damus.io"]                        # a real relay you can reach
+      channels:
+        livetest:
+          filter: {kinds: [1], "#t": ["relayfabric-livetest"]}
+          publish_tags: [["t", "relayfabric-livetest"]]
+      max_text_bytes: 280
+
 routes:
   # Tier 0: MQTT loopback between two local topics.
   - name: tier0
@@ -96,6 +124,12 @@ routes:
   # - name: signal-bridge
   #   sources: ["signal:livetest", "mqtt:chat/a"]
   #   destinations: ["signal:livetest", "mqtt:chat/a"]
+  # - name: meshcore-bridge
+  #   sources: ["meshcore:primary", "mqtt:chat/a"]
+  #   destinations: ["meshcore:primary", "mqtt:chat/a"]
+  # - name: nostr-bridge
+  #   sources: ["nostr:livetest", "mqtt:chat/a"]
+  #   destinations: ["nostr:livetest", "mqtt:chat/a"]
 
 ttl_default_secs: 86400
 dedup_ttl_secs: 86400

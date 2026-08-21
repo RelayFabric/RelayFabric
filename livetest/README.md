@@ -1,5 +1,11 @@
 # RelayFabric live-test kit
 
+For a full-hardware interop-validation runbook (RNode LXMF over RF, two
+Meshtastic, MeshCore, Signal, Nostr — closing the interop-matrix cells),
+see [PLAN.md](PLAN.md). The tiers below are the incremental ladder it
+builds on.
+
+
 A copy-paste runbook for the four-tier live-testing ladder: MQTT loopback,
 then LXMF, then Signal, then real Meshtastic hardware. Each tier adds one
 more moving part on top of the last.
