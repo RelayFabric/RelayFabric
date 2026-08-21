@@ -16,8 +16,8 @@ Per-plugin interop coverage (inbound/outbound/replies/attachments/reconnect/dedu
 | MQTT plugin | shipped | v0.1 | e2e + livetest |
 | LXMF plugin | shipped | v0.1 | **field-tested** against a live RNS backbone |
 | Signal plugin | shipped | v0.1 | livetest against signal-cli |
-| Meshtastic plugin | shipped | v0.1 | livetest via MQTT JSON gateway |
-| MeshCore plugin | shipped | v0.2 | fake-backend tests; **real-hardware validation pending** (v0.4 cycle C) |
+| Meshtastic plugin | shipped | v0.1 | livetest via MQTT JSON gateway + real-node downlink (interop matrix C-2) |
+| MeshCore plugin | shipped | v0.2 | fake-backend tests + real-hardware livetest (interop matrix C-1) |
 | Nostr plugin | shipped | v0.3 | fake-relay tests; **live-relay validation pending** |
 | Bitchat plugin | shipped | v0.3 | fake tests; **real-client interop unverified** |
 | PotatoMesh feeder plugin | shipped | v0.4-dev | unit tests against the published contract |
