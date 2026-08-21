@@ -41,48 +41,51 @@ A crashed Signal plugin must not take down Reticulum, MeshCore, or any other ada
 
 A RelayFabric deployment is one `switchyardd` process, zero or more plugin processes (one per configured protocol), and `switchyardctl` invoked as needed for administration. Nothing else is required to run.
 
+Read it top-to-bottom: a native network reaches the daemon through its
+plugin, the daemon's pipeline routes the message stage by stage, and it
+leaves through another plugin to another network.
+
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph NetA["Native networks (ingress side)"]
+        direction LR
         N1[Reticulum / LXMF]
         N2[Meshtastic LoRa]
     end
 
     subgraph Plugins1["Plugin processes"]
+        direction LR
         P1[relayfabric-lxmf]
         P2[relayfabric-meshtastic]
     end
 
     subgraph Daemon["switchyardd"]
-        direction TB
-        Ingress[Ingress / Normalizer]
-        Router[Policy / Router]
-        Queue[Queue Manager]
-        Transform[Transform Pipeline]
-        Egress[Egress]
-        Ingress --> Router --> Queue --> Transform --> Egress
+        direction LR
+        Ingress[Ingress /<br/>Normalizer] --> Router[Policy /<br/>Router] --> Queue[Queue<br/>Manager] --> Transform[Transform<br/>Pipeline] --> Egress[Egress]
     end
 
     subgraph Plugins2["Plugin processes"]
+        direction LR
         P3[relayfabric-signal]
         P4[relayfabric-nostr]
     end
 
     subgraph NetB["Native networks (egress side)"]
+        direction LR
         N3[Signal service]
         N4[Nostr relays]
     end
 
-    CLI[switchyardctl] -. admin API .-> Daemon
+    N1 <-->|native| P1
+    N2 <-->|native| P2
+    P1 <-->|CBOR/socket| Ingress
+    P2 <-->|CBOR/socket| Ingress
+    Egress <-->|CBOR/socket| P3
+    Egress <-->|CBOR/socket| P4
+    P3 <-->|native| N3
+    P4 <-->|native| N4
 
-    N1 <-->|native protocol| P1
-    N2 <-->|native protocol| P2
-    P1 <-->|CBOR / Unix socket| Ingress
-    P2 <-->|CBOR / Unix socket| Ingress
-    Egress <-->|CBOR / Unix socket| P3
-    Egress <-->|CBOR / Unix socket| P4
-    P3 <-->|native protocol| N3
-    P4 <-->|native protocol| N4
+    CLI[switchyardctl] -. admin API .-> Daemon
 ```
 
 Plugins are symmetric — the diagram splits ingress/egress plugin groups only to show data flow for one hop; in practice every plugin can both receive from and send to `switchyardd` over the same socket connection (SPEC §5, §9).

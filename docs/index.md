@@ -38,18 +38,26 @@ Per-plugin interop coverage (inbound/outbound/replies/attachments/reconnect/dedu
 Every messaging network speaks its own protocol, carries its own identity model, and makes its own trust assumptions. RelayFabric refuses to reinvent any of them. Instead it routes **messages, not identities**, across a boundary you control:
 
 ```mermaid
-flowchart LR
+flowchart TB
   subgraph Networks
+    direction LR
     R[Reticulum / LXMF]
     S[Signal]
     M[Meshtastic]
     N[Nostr]
   end
-  R <--> PR[lxmf plugin]
-  S <--> PS[signal plugin]
-  M <--> PM[meshtastic plugin]
-  N <--> PN[nostr plugin]
-  PR & PS & PM & PN <-->|CBOR IPC| D[(switchyardd\nrouting · policy · identity · security · queue)]
+  subgraph Plugins["Plugin processes"]
+    direction LR
+    PR[lxmf plugin]
+    PS[signal plugin]
+    PM[meshtastic plugin]
+    PN[nostr plugin]
+  end
+  R <--> PR
+  S <--> PS
+  M <--> PM
+  N <--> PN
+  PR & PS & PM & PN <-->|CBOR IPC| D[("switchyardd<br/>routing · policy · identity · security · queue")]
   D <-->|Noise + attestation| F[peer gateway]
 ```
 
