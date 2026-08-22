@@ -26,6 +26,7 @@ RelayFabric ships **two** Meshtastic plugins; run whichever suits you:
 | Downlink | sends `from: 0` (some firmware rejects — verify) | sends as the node's **own** identity; no `from:0` issue |
 | Sender identity | from the JSON stream | real per-node `fromId` |
 | Data | JSON-serialized subset | full protobuf packet |
+| Direct messages | channel-only | **DMs supported** (`direct_messages`) |
 
 The direct plugin removes the broker, fixes the downlink-`from:0` risk, and
 surfaces real node identities — at the cost of the GPL dependency. The MQTT
@@ -65,8 +66,11 @@ loop guard drops the node's re-broadcast of our own downlinks (1h window on
 
 - **Text only** — the constrained-LoRa transport class caps payloads
   (~237 B) and demotes media to a note at egress, same as the MQTT plugin.
-- **Channel broadcast** — this version bridges channel messages; direct
-  messages (PKI DMs) that the device API also exposes are a future addition
-  (they'd let this plugin advertise `direct_messages` and support
-  identity-linking).
+- **Channels + direct messages** — bridges channel broadcasts, and (via
+  the `direct_messages` capability) delivers a direct message to a node's
+  own identity and bridges the reply back. This is what enables
+  **identity-linking**: the daemon sends a challenge DM through this plugin
+  and matches the reply. An inbound DM is presented on a synthetic
+  `direct:<sender>` endpoint, so a non-challenge DM matches no route and is
+  dropped by deny-by-default rather than leaking onto a channel.
 - Do not run both Meshtastic plugins against the same radio.

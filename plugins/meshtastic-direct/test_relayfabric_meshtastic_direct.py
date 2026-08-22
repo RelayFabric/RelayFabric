@@ -144,22 +144,40 @@ class HelloMaxPayloadTests(unittest.TestCase):
         self.assertEqual(plug.hello_max_payload(plug.load_config(base_cfg(max_text_bytes=100))), 100)
 
 
+class NodeRefTests(unittest.TestCase):
+    def test_valid_refs(self):
+        self.assertTrue(plug.looks_like_node_ref("!7efeee00"))
+        self.assertTrue(plug.looks_like_node_ref("2130636288"))
+
+    def test_invalid_refs(self):
+        self.assertFalse(plug.looks_like_node_ref("!short"))
+        self.assertFalse(plug.looks_like_node_ref("!7efeee0g"))
+        self.assertFalse(plug.looks_like_node_ref("not-a-ref"))
+        self.assertFalse(plug.looks_like_node_ref(""))
+        self.assertFalse(plug.looks_like_node_ref(None))
+
+
 class FakeBackend:
-    def __init__(self):
+    def __init__(self, my_node_num=None):
         self.sent = []
+        self.direct = []
         self.qd = 0
+        self.my_node_num = my_node_num
 
     def send_channel(self, idx, text):
         self.sent.append((idx, text))
+
+    def send_direct(self, node_ref, text):
+        self.direct.append((node_ref, text))
 
     def queue_depth(self):
         return self.qd
 
 
 class BridgeTests(unittest.TestCase):
-    def _bridge(self):
+    def _bridge(self, my_node_num=None):
         sock = FakeSock()
-        backend = FakeBackend()
+        backend = FakeBackend(my_node_num=my_node_num)
         bridge = plug.Bridge(plug.load_config(base_cfg()), backend, sock)
         return bridge, backend, sock
 
@@ -194,6 +212,44 @@ class BridgeTests(unittest.TestCase):
         bridge.handle_event(packet(decoded={"portnum": "TEXT_MESSAGE_APP", "text": "echo me"}))
         inbound = [f for f in sock.frames() if f["t"] == "inbound"]
         self.assertEqual(inbound, [])
+
+    def test_direct_message_to_us_bridges_on_synthetic_endpoint(self):
+        my = 0x11223344
+        bridge, _b, sock = self._bridge(my_node_num=my)
+        # a DM addressed to our node (not broadcast)
+        bridge.handle_event(packet(to=my, decoded={"portnum": "TEXT_MESSAGE_APP", "text": "123456"}))
+        inbound = [f for f in sock.frames() if f["t"] == "inbound"]
+        self.assertEqual(len(inbound), 1)
+        self.assertEqual(inbound[0]["endpoint"], "direct:!7efeee00")
+        self.assertEqual(inbound[0]["sender"], "!7efeee00")
+        self.assertEqual(inbound[0]["body"], "123456")
+
+    def test_broadcast_still_takes_channel_path_when_my_node_known(self):
+        bridge, _b, sock = self._bridge(my_node_num=0x11223344)
+        bridge.handle_event(packet(to=plug.BROADCAST_NUM, channel=0))
+        inbound = [f for f in sock.frames() if f["t"] == "inbound"]
+        self.assertEqual(inbound[0]["endpoint"], "mesh")
+
+    def test_send_direct_delivers_to_native_ref(self):
+        bridge, backend, sock = self._bridge()
+        bridge.handle_send_direct({"t": "send_direct", "corr": "d1",
+                                   "native_ref": "!7efeee00", "body": "code 123456"})
+        self.assertEqual(backend.direct, [("!7efeee00", "code 123456")])
+        dr = [f for f in sock.frames() if f["t"] == "delivery_result"][0]
+        self.assertTrue(dr["delivered"])
+
+    def test_send_direct_rejects_bad_ref(self):
+        bridge, backend, sock = self._bridge()
+        bridge.handle_send_direct({"t": "send_direct", "corr": "d2",
+                                   "native_ref": "garbage", "body": "x"})
+        self.assertEqual(backend.direct, [])
+        dr = [f for f in sock.frames() if f["t"] == "delivery_result"][0]
+        self.assertFalse(dr["delivered"])
+        self.assertEqual(dr["detail"], "invalid destination ref")
+
+    def test_direct_messages_capability_advertised(self):
+        caps = plug._caps(base_cfg())
+        self.assertTrue(caps["direct_messages"])
 
 
 if __name__ == "__main__":

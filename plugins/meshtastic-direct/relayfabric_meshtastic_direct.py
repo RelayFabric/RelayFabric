@@ -127,26 +127,19 @@ def channels_by_index(cfg):
     return {spec["index"]: name for name, spec in cfg["channels"].items()}
 
 
-def normalize_packet(pkt, by_index):
-    """Parse a meshtastic receive packet into (name, sender, text, ts) or None.
+BROADCAST_NUM = 0xFFFFFFFF
 
-    A meshtastic text packet has `decoded.portnum == "TEXT_MESSAGE_APP"` and
-    `decoded.text`. The channel index is `channel` (absent = primary/0). The
-    sender is the real per-node id `fromId` ("!hex"), falling back to the
-    numeric `from`. `rxTime` is the receive timestamp (may be absent).
-    """
+
+def _text_fields(pkt):
+    """(sender, text, ts) from a Meshtastic text packet, or None if it isn't
+    a usable text message. Sender is the real per-node id `fromId` ("!hex"),
+    falling back to the numeric `from`; `rxTime` is the receive timestamp."""
     decoded = pkt.get("decoded") or {}
     if decoded.get("portnum") != "TEXT_MESSAGE_APP":
         return None
     text = decoded.get("text")
     if not text or not isinstance(text, str):
         return None
-
-    channel_idx = pkt.get("channel", 0)
-    if channel_idx not in by_index:
-        return None
-    name = by_index[channel_idx]
-
     sender = pkt.get("fromId")
     if sender is None:
         from_num = pkt.get("from")
@@ -154,8 +147,34 @@ def normalize_packet(pkt, by_index):
             sender = f"!{from_num & 0xFFFFFFFF:08x}"
         else:
             return None
+    return sender, text, pkt.get("rxTime")
 
-    return name, sender, text, pkt.get("rxTime")
+
+def normalize_packet(pkt, by_index):
+    """Parse a channel-broadcast text packet into (name, sender, text, ts)
+    or None. The channel index is `channel` (absent = primary/0); an
+    unmapped index is dropped. Direct messages (to a specific node) are
+    handled separately in the bridge, not here."""
+    fields = _text_fields(pkt)
+    if fields is None:
+        return None
+    sender, text, ts = fields
+    channel_idx = pkt.get("channel", 0)
+    if channel_idx not in by_index:
+        return None
+    return by_index[channel_idx], sender, text, ts
+
+
+def looks_like_node_ref(ref):
+    """Plausible Meshtastic destination: a `!` + 8 hex-digit node id, or a
+    bare numeric node number. Gate on a SendDirect native_ref before handing
+    it to the radio (mirrors the LXMF plugin's looks_like_hex_ref)."""
+    if not isinstance(ref, str) or not ref:
+        return False
+    if ref.startswith("!"):
+        h = ref[1:]
+        return len(h) == 8 and all(c in "0123456789abcdefABCDEF" for c in h)
+    return ref.isdigit()
 
 
 class MeshtasticDirectBackend:
@@ -174,6 +193,9 @@ class MeshtasticDirectBackend:
         self._kind, self._target, self._opts = parse_connection(connection_url)
         self._queue = queue.Queue(maxsize=256)
         self._iface = None
+        # Our own node number, captured at connect — used to tell a direct
+        # message (to == us) from a channel broadcast.
+        self.my_node_num = None
 
     def start(self):
         # lazy imports keep the module top-level free of the GPL lib + pubsub
@@ -194,6 +216,14 @@ class MeshtasticDirectBackend:
             self._iface = meshtastic.ble_interface.BLEInterface(address=self._target)
         else:
             raise ValueError(f"unsupported connection kind: {self._kind!r}")
+
+        # Capture our own node number so inbound DMs (to == us) can be told
+        # from channel broadcasts. Best-effort: if the lib layout differs,
+        # DM detection simply stays off and channel bridging is unaffected.
+        try:
+            self.my_node_num = self._iface.myInfo.my_node_num
+        except AttributeError:
+            log.warning("meshtastic: could not read my_node_num; DMs won't be distinguished")
 
     def _on_receive(self, packet, interface):  # noqa: ARG002 - pubsub signature
         try:
@@ -222,6 +252,14 @@ class MeshtasticDirectBackend:
         # Sends as THIS node's own identity (not from:0), on the given
         # channel, broadcast to the channel. Raises on transport failure.
         self._iface.sendText(text, destinationId=BROADCAST_ADDR, channelIndex=idx)
+
+    def send_direct(self, node_ref, text):
+        """A direct message to a specific node (identity-link challenge
+        delivery). Sent as this node's own identity; the library selects the
+        channel/PKI for the destination."""
+        if self._iface is None:
+            raise RuntimeError("meshtastic backend not started")
+        self._iface.sendText(text, destinationId=node_ref)
 
 
 class Bridge(FrameWriter):
@@ -278,14 +316,32 @@ class Bridge(FrameWriter):
 
     def handle_event(self, pkt):
         self._maybe_emit_gauges(pkt)
+        from relayfabric_sdk import ipc as relay_ipc
+
+        # Direct message to us (to == our own node) vs. channel broadcast.
+        my = self.backend.my_node_num
+        to = pkt.get("to")
+        if my is not None and to == my and to != BROADCAST_NUM:
+            fields = _text_fields(pkt)
+            if fields is None:
+                return
+            sender, text, ts = fields
+            # Present on a synthetic per-sender endpoint. The daemon's
+            # identity-link challenge matcher keys on (plugin, sender, body)
+            # and runs before routing, so a challenge reply is consumed;
+            # a non-challenge DM matches no route and is dropped by
+            # deny-by-default (a private DM never leaks onto a channel).
+            # No echo guard: a DM to us is never our own re-broadcast.
+            self._send_frame(relay_ipc.inbound(f"direct:{sender}", sender, text, ts))
+            log.info(f"Bridged Meshtastic DM from {sender} ({len(text)} chars)")
+            return
+
         parsed = normalize_packet(pkt, self.by_index)
         if parsed is None:
             return
         name, sender, text, ts = parsed
         if self.sent_cache.match(name, text):
             return  # loop guard: node re-broadcast our own downlink
-        from relayfabric_sdk import ipc as relay_ipc
-
         self._send_frame(relay_ipc.inbound(name, sender, text, ts))
         log.info(f"Bridged Meshtastic message from {sender} to '{name}' ({len(text)} chars)")
 
@@ -294,6 +350,24 @@ class Bridge(FrameWriter):
     def handle_send(self, frame):
         capped_text_send(self, frame, "Meshtastic", "Meshtastic message",
                          lambda spec, endpoint, body: self.backend.send_channel(spec["index"], body))
+
+    def handle_send_direct(self, frame):
+        """One-shot direct message to a native node ref (identity-link
+        challenge delivery today; gated by the direct_messages capability)."""
+        from relayfabric_sdk import ipc as relay_ipc
+
+        corr, native_ref, body = frame["corr"], frame["native_ref"], frame["body"]
+        if not looks_like_node_ref(native_ref):
+            self._send_frame(relay_ipc.delivery_result(corr, False, "invalid destination ref"))
+            return
+        try:
+            self.backend.send_direct(native_ref, body)
+        except Exception as e:  # noqa: BLE001 - report, don't crash
+            log.warning(f"Meshtastic DM to {native_ref} failed: {e}")
+            self._send_frame(relay_ipc.delivery_result(corr, False, str(e)))
+            return
+        self._send_frame(relay_ipc.delivery_result(corr, True))
+        log.info(f"Sent Meshtastic DM to {native_ref} ({len(body)} B)")
 
 
 def hello_max_payload(cfg):
@@ -305,7 +379,10 @@ def hello_max_payload(cfg):
 def _caps(raw_cfg):
     from relayfabric_sdk import ipc as relay_ipc
 
-    return relay_ipc.capabilities(groups=True,
+    # direct_messages: the direct API can deliver a DM to a node's own
+    # identity (identity-link challenge delivery), unlike the MQTT-JSON
+    # plugin which advertises channel-only.
+    return relay_ipc.capabilities(groups=True, direct_messages=True,
                                   max_payload=hello_max_payload(load_config(raw_cfg)))
 
 

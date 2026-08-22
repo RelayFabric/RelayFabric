@@ -272,8 +272,10 @@ plugins:
         mesh: {index: 0}
 ```
 
-Text only (constrained-LoRa transport class caps payload, demotes media);
-channel-broadcast only for now (direct/PKI messages are a future addition).
+Text only (constrained-LoRa transport class caps payload, demotes media).
+Supports channel broadcasts **and direct messages** — it advertises
+`direct_messages`, so it can deliver identity-link challenges to a node and
+bridge the reply back, unlike the MQTT-JSON plugin.
 
 ---
 
