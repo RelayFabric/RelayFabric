@@ -1,0 +1,31 @@
+RelayFabric Meshtastic (direct) plugin
+Copyright (C) 2026 Jascha Wanger / RelayFabric contributors
+
+SPDX-License-Identifier: GPL-3.0-or-later
+
+This plugin is licensed under the GNU General Public License, version 3 or
+(at your option) any later version — NOT the Apache-2.0 license the rest of
+RelayFabric uses. The reason: it imports the official `meshtastic` Python
+library, which is GPL-3.0 (the entire Meshtastic library ecosystem, and the
+protobuf definitions it derives from, are GPL-3.0). A work that imports a
+GPL library is itself GPL, so this plugin carries GPL-3.0.
+
+The copyleft is isolated to this plugin's own process. It is a separate
+process that communicates with the RelayFabric daemon (`switchyardd`) only
+over the Apache-2.0-licensed CBOR-over-Unix-socket Plugin Protocol, and it
+depends on the Apache-2.0 `relayfabric_sdk` (permissive licenses are one-way
+compatible with the GPL). The daemon, the SDK, and every other RelayFabric
+component therefore remain Apache-2.0; only this optional plugin is GPL.
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+more details.
+
+The full text of the GNU General Public License version 3 is available at:
+https://www.gnu.org/licenses/gpl-3.0.html

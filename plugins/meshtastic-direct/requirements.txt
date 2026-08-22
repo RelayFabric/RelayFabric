@@ -1,0 +1,4 @@
+cbor2
+meshtastic  # GPL-3.0 — this plugin is therefore GPL-3.0 (see LICENSE); the
+            # GPL stays isolated to this plugin's process (out-of-process IPC
+            # to the Apache-2.0 daemon), like the signal-cli/simplex sidecars.

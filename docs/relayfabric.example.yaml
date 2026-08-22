@@ -87,6 +87,23 @@ plugins:
   #       zone1: {index: 0, topic_channel: "general"}
   #       zone2: {index: 1, topic_channel: "tactics"}
 
+  # meshtastic-direct:
+  #   enabled: true
+  #   # DIRECT device API (serial/TCP/BLE) instead of the MQTT-JSON gateway:
+  #   # no broker, downlinks sent as the node's own identity, real per-node
+  #   # sender ids. THIS PLUGIN IS GPL-3.0 (imports the GPL meshtastic lib;
+  #   # the GPL stays isolated to this process) -- see
+  #   # plugins/meshtastic-direct/LICENSE. Run this OR the meshtastic plugin
+  #   # above, not both against one radio. venv must have run:
+  #   #   pip install -r plugins/meshtastic-direct/requirements.txt
+  #   command: /path/to/RelayFabric/.venv/bin/python /path/to/RelayFabric/plugins/meshtastic-direct/relayfabric-meshtastic-direct
+  #   config:
+  #     connection: serial:///dev/ttyUSB0   # or tcp://host[:4403], ble://<addr>
+  #     max_text_bytes: 200
+  #     channels:
+  #       zone1: {index: 0}
+  #       zone2: {index: 1}
+
   # potatomesh:
   #   enabled: true
   #   # Ingest-only: feeds a PotatoMesh community dashboard from the same
