@@ -1,7 +1,7 @@
 /target
 /.venv/
 __pycache__/
-/livetest/run/
+/livetest/
 
 # agent process artifacts — never committed
 /.claude/
