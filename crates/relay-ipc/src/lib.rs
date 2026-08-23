@@ -133,6 +133,22 @@ mod tests {
     use relay_core::Capabilities;
 
     #[tokio::test]
+    async fn deeply_nested_frame_is_rejected_not_a_stack_overflow() {
+        // 1000 nested CBOR arrays (0x81 = array(1)) then a 0 -- well past
+        // ciborium's default recursion limit (256), which serde's
+        // internally-tagged buffering runs under. Must return an Err, never
+        // recurse into a stack overflow that would crash the whole daemon on
+        // a single frame from one (compromised/buggy) plugin.
+        let mut body = vec![0x81u8; 1000];
+        body.push(0x00);
+        let mut framed = (body.len() as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&body);
+        let mut r = &framed[..];
+        let res = read_frame::<_, DaemonToPlugin>(&mut r).await;
+        assert!(res.is_err(), "a deeply-nested frame must be rejected as an error");
+    }
+
+    #[tokio::test]
     async fn roundtrips_a_frame() {
         let (mut a, mut b) = tokio::io::duplex(1024);
         let msg = PluginToDaemon::Hello {
