@@ -185,12 +185,15 @@ for messages routed onward there).
 
 ---
 
-## Meshtastic
+## Meshtastic (MQTT-JSON)
 
-Bridges Meshtastic device channels. Each configured channel maps to a
-RelayFabric channel: text uplinks arrive over the node's MQTT JSON stream,
-and messages sent to the channel are delivered back over MQTT (one topic
-per Meshtastic channel).
+Bridges Meshtastic device channels over the node's **MQTT-JSON** gateway —
+one of **two** Meshtastic plugins (see [Meshtastic (direct)](#meshtastic-direct)
+below for the direct serial/TCP/BLE alternative; run whichever suits you,
+not both against one radio). Each configured channel maps to a RelayFabric
+channel: text uplinks arrive over the node's MQTT JSON stream, and messages
+sent to the channel are delivered back over MQTT (one topic per Meshtastic
+channel).
 
 !!! note "Licensing"
     Meshtastic's official Python/protobuf client libraries are GPL-3.0.
@@ -434,8 +437,8 @@ configured geohashes are subscribed).
 Feeds a [PotatoMesh](https://github.com/l5yth/potato-mesh) community
 dashboard from the Meshtastic MQTT JSON stream. Unlike every other plugin
 this one bridges no channel traffic into the fabric — it is **ingest-only**:
-it subscribes to the same `<root>/2/json/#` topics the Meshtastic plugin
-uses, maps `text` / `position` / `telemetry` / `nodeinfo` events onto
+it subscribes to the same `<root>/2/json/#` topics the Meshtastic
+(MQTT-JSON) plugin uses, maps `text` / `position` / `telemetry` / `nodeinfo` events onto
 PotatoMesh's documented ingest contract, and POSTs them with a bearer
 token (`/api/messages`, `/api/positions`, `/api/telemetry`, `/api/nodes`).
 Routed sends are rejected.
