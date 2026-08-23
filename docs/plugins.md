@@ -193,20 +193,9 @@ Meshtastic plugins (see [Meshtastic (MQTT-JSON)](#meshtastic-mqtt-json)
 below for the broker-based alternative; run whichever suits you, not both
 against one radio).
 
-!!! danger "This plugin is GPL-3.0"
-    Unlike the rest of RelayFabric (Apache-2.0), `meshtastic-direct` is
-    **GPL-3.0-or-later**, because it imports the official `meshtastic`
-    library (the whole Meshtastic library ecosystem, and the protobufs
-    behind it, are GPL). The copyleft is isolated to this plugin's own
-    process — it speaks only the Apache-2.0 CBOR IPC to the daemon and
-    depends on the Apache-2.0 SDK — so `switchyardd` and every other
-    component stay Apache-2.0, exactly as the signal-cli sidecar's GPL
-    stays in signal-cli's process. See `plugins/meshtastic-direct/LICENSE`.
-
 Why choose it over the MQTT-JSON plugin: **no MQTT broker**, downlinks sent
 as the node's **own identity** (so the MQTT plugin's `from: 0` firmware-
-rejection risk does not apply), and **real per-node sender ids**. The cost
-is the GPL dependency; the MQTT-JSON plugin remains the permissive default.
+rejection risk does not apply), and **real per-node sender ids**.
 
 | Key | Default | Notes |
 |---|---|---|
