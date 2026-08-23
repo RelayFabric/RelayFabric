@@ -104,11 +104,22 @@ def run_plugin(plugin_name, version, bridge_factory, capabilities, *,
             else:
                 write_frame(sock, pong())
         elif kind == "send":
-            bridge.handle_send(frame)
+            # Guard dispatch: a malformed "send" frame (missing corr/endpoint/
+            # body) would otherwise raise out of the loop and kill the plugin.
+            # The inbound-read path is already hardened; make the dispatch path
+            # symmetric so one bad frame can't take the plugin down.
+            try:
+                bridge.handle_send(frame)
+            except Exception as e:  # noqa: BLE001 - one bad frame must not kill the plugin
+                print(f"{plugin_name}: error handling send frame: {e}", file=sys.stderr)
         elif kind == "send_direct":
             handle_send_direct = getattr(bridge, "handle_send_direct", None)
             if handle_send_direct is not None:
-                handle_send_direct(frame)
+                try:
+                    handle_send_direct(frame)
+                except Exception as e:  # noqa: BLE001 - one bad frame must not kill the plugin
+                    print(f"{plugin_name}: error handling send_direct frame: {e}",
+                          file=sys.stderr)
         elif kind == "shutdown":
             stop = getattr(bridge, "stop", None)
             if stop is not None:

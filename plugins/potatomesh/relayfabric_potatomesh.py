@@ -459,5 +459,8 @@ def main():
     from relayfabric_sdk import ipc as relay_ipc
     from relayfabric_sdk import run_plugin
 
+    # text=False: this plugin is ingest-only (handle_send rejects every
+    # send), so it must NOT advertise the default text=True -- otherwise the
+    # daemon routes text sends here expecting delivery and they all fail.
     run_plugin(os.environ.get("RELAYFABRIC_PLUGIN_NAME", "potatomesh"),
-               PLUGIN_VERSION, _make_bridge, relay_ipc.capabilities())
+               PLUGIN_VERSION, _make_bridge, relay_ipc.capabilities(text=False))

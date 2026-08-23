@@ -243,6 +243,27 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
+class MalformedDispatchTests(unittest.TestCase):
+    """A malformed send/send_direct frame must not kill the plugin: the loop
+    logs and keeps going (symmetry with the hardened read path)."""
+
+    def test_malformed_send_does_not_kill_the_loop(self):
+        class _RaisingBridge(_MinimalBridge):
+            def handle_send(self, frame):
+                # simulate capped_text_send's KeyError on a missing field
+                raise KeyError("endpoint")
+
+        # a bad send, then a good shutdown: if the bad send killed the loop we
+        # would exit(1) on the raise; instead we must reach shutdown -> exit(0)
+        sock = FakeSock(queued_frames=[HELLO_ACK_OK, {"t": "send"}, {"t": "shutdown"}])
+        env = _env(**{CONFIG_ENV: "{}"})
+        with mock.patch.dict(os.environ, env, clear=True), self.assertRaises(SystemExit) as ctx:
+            run_plugin("p", "1.0", _RaisingBridge, relay_ipc.capabilities(),
+                       socket_env=SOCKET_ENV, config_env=CONFIG_ENV,
+                       connect=lambda path: sock)
+        self.assertEqual(ctx.exception.code, 0, "a bad send frame must not crash the plugin")
+
+
 class PingTests(unittest.TestCase):
     """A daemon Ping (liveness probe) must be answered with a Pong, or the
     daemon will restart the plugin as wedged."""
