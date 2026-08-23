@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -262,6 +264,57 @@ class MalformedDispatchTests(unittest.TestCase):
                        socket_env=SOCKET_ENV, config_env=CONFIG_ENV,
                        connect=lambda path: sock)
         self.assertEqual(ctx.exception.code, 0, "a bad send frame must not crash the plugin")
+
+
+class SendConcurrencyTests(unittest.TestCase):
+    """Sends run on a worker thread, so a slow/blocking send must not stall
+    the read loop -- ping liveness (and shutdown) keep flowing regardless.
+    If handle_send ran inline (the pre-refactor behavior), the read loop would
+    block inside it and never reach the ping, so no pong would be written."""
+
+    def test_a_blocking_send_does_not_stall_ping_liveness(self):
+        started = threading.Event()
+        release = threading.Event()
+        captured = []
+
+        class _SlowBridge(_MinimalBridge):
+            def _send_frame(self, obj):
+                captured.append(obj)
+
+            def handle_send(self, frame):
+                started.set()
+                release.wait(5)  # block the worker until the test releases it
+
+        # send (will block the worker), then a ping the read loop must still
+        # answer; after ping the queued frames exhaust -> the loop exits(1).
+        sock = FakeSock(queued_frames=[
+            HELLO_ACK_OK,
+            {"t": "send", "corr": 1, "endpoint": "x", "body": "hi"},
+            {"t": "ping"},
+        ])
+
+        def run():
+            with mock.patch.dict(os.environ, _env(**{CONFIG_ENV: "{}"}), clear=True):
+                try:
+                    run_plugin("p", "1.0", _SlowBridge, relay_ipc.capabilities(),
+                               socket_env=SOCKET_ENV, config_env=CONFIG_ENV,
+                               connect=lambda path: sock)
+                except SystemExit:
+                    pass
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        self.assertTrue(started.wait(5), "the send should have started on the worker")
+        # the read loop must have moved past the blocked send to answer the ping
+        deadline = time.time() + 5
+        while time.time() < deadline and not any(f.get("t") == "pong" for f in captured):
+            time.sleep(0.01)
+        self.assertTrue(
+            any(f.get("t") == "pong" for f in captured),
+            "ping must be answered while a send is still blocked on the worker",
+        )
+        release.set()
+        t.join(5)
 
 
 class PingTests(unittest.TestCase):

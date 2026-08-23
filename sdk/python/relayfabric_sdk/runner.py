@@ -10,12 +10,22 @@ in their main() functions. A plugin adopts it by building a `bridge_factory`
 real AF_UNIX connect + a single duplex `sock.makefile("rwb")` (one object
 used for both read_frame and write_frame, exactly like FakeSock), and every
 real caller leaves it at the default.
+
+Send handling runs on a dedicated worker thread, NOT the read loop: a
+plugin's `handle_send` can block up to ~30s on a slow/unreachable backend
+(capped_text_send's publish timeout), and doing that inline would stall the
+read loop -- ping/pong liveness (the daemon restarts a plugin that stops
+answering) and shutdown must keep flowing regardless. One worker preserves
+send ordering and single-threaded backend access; a plugin that wants
+concurrent sends (LXMF) still does its own internal fan-out.
 """
 
 import json
 import os
+import queue
 import socket
 import sys
+import threading
 
 from .ipc import hello, pong, read_frame, write_frame
 
@@ -82,6 +92,34 @@ def run_plugin(plugin_name, version, bridge_factory, capabilities, *,
     if start is not None:
         start()
 
+    # Send/send_direct run on this worker, off the read loop (see module
+    # docstring). One worker => sends stay ordered and the backend is touched
+    # from a single thread, exactly as when they ran inline.
+    send_q = queue.Queue()
+
+    def _dispatch(kind, frame):
+        # A malformed frame (missing corr/endpoint/body) must not kill the
+        # worker; the read path is already hardened, keep dispatch symmetric.
+        try:
+            if kind == "send":
+                bridge.handle_send(frame)
+            else:  # "send_direct"
+                handle_send_direct = getattr(bridge, "handle_send_direct", None)
+                if handle_send_direct is not None:
+                    handle_send_direct(frame)
+        except Exception as e:  # noqa: BLE001 - one bad frame must not kill the worker
+            print(f"{plugin_name}: error handling {kind} frame: {e}", file=sys.stderr)
+
+    def _sender_loop():
+        while True:
+            item = send_q.get()
+            if item is None:  # shutdown sentinel
+                return
+            _dispatch(*item)
+
+    sender = threading.Thread(target=_sender_loop, name=f"{plugin_name}-sender", daemon=True)
+    sender.start()
+
     while True:
         try:
             frame = read_frame(sock)
@@ -94,33 +132,26 @@ def run_plugin(plugin_name, version, bridge_factory, capabilities, *,
 
         kind = frame.get("t")
         if kind == "ping":
-            # Liveness probe: answer promptly or the daemon restarts us. Go
-            # through the bridge's locked writer so this never interleaves
-            # with a frame the bridge's reader thread is writing; fall back to
-            # a direct write for a bridge that isn't a FrameWriter.
+            # Liveness probe: answered ON the read loop (never queued behind a
+            # slow send) or the daemon would restart us as wedged. Go through
+            # the bridge's locked writer so this never interleaves with a frame
+            # the bridge's reader thread or the sender worker is writing; fall
+            # back to a direct write for a bridge that isn't a FrameWriter.
             send_frame = getattr(bridge, "_send_frame", None)
             if send_frame is not None:
                 send_frame(pong())
             else:
                 write_frame(sock, pong())
         elif kind == "send":
-            # Guard dispatch: a malformed "send" frame (missing corr/endpoint/
-            # body) would otherwise raise out of the loop and kill the plugin.
-            # The inbound-read path is already hardened; make the dispatch path
-            # symmetric so one bad frame can't take the plugin down.
-            try:
-                bridge.handle_send(frame)
-            except Exception as e:  # noqa: BLE001 - one bad frame must not kill the plugin
-                print(f"{plugin_name}: error handling send frame: {e}", file=sys.stderr)
+            send_q.put(("send", frame))
         elif kind == "send_direct":
-            handle_send_direct = getattr(bridge, "handle_send_direct", None)
-            if handle_send_direct is not None:
-                try:
-                    handle_send_direct(frame)
-                except Exception as e:  # noqa: BLE001 - one bad frame must not kill the plugin
-                    print(f"{plugin_name}: error handling send_direct frame: {e}",
-                          file=sys.stderr)
+            send_q.put(("send_direct", frame))
         elif kind == "shutdown":
+            # Let already-queued sends drain (bounded) before tearing down, so
+            # a send accepted just before shutdown still goes out; a wedged
+            # send is abandoned at the join timeout rather than hanging exit.
+            send_q.put(None)
+            sender.join(timeout=2.0)
             stop = getattr(bridge, "stop", None)
             if stop is not None:
                 stop()
