@@ -304,6 +304,11 @@ pub async fn supervise(d: Arc<Daemon>, name: String, command: String, socket: Pa
             // unbuffered so plugin logs surface live. Harmless for the Rust
             // plugins, which don't read it.
             .env("PYTHONUNBUFFERED", "1")
+            // Kill the child if this supervise task's Child handle is dropped
+            // -- e.g. when the runtime shuts down on daemon exit. Without it a
+            // standalone (non-systemd) run orphans every plugin subprocess on
+            // exit/restart, leaving duplicate plugins holding devices/sockets.
+            .kill_on_drop(true)
             .spawn();
         let started = Instant::now();
         match child {

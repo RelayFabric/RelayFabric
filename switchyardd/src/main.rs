@@ -148,8 +148,27 @@ fn main() {
             node = daemon.cfg_snapshot(|c| c.node.name.clone()),
             "switchyardd running"
         );
-        tokio::signal::ctrl_c().await.expect("ctrl_c");
+        // Shut down on SIGINT (ctrl-c) OR SIGTERM (systemd `stop`, docker
+        // stop). Previously only ctrl_c was awaited, so under systemd a
+        // SIGTERM took the default disposition -- immediate death, skipping
+        // the graceful plugin shutdown below.
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            tokio::select! {
+                r = tokio::signal::ctrl_c() => { r.expect("ctrl_c"); }
+                _ = term.recv() => {}
+            }
+        }
         tracing::info!("shutting down");
+        // Best-effort graceful plugin shutdown: let each plugin release its
+        // resources (radios, sockets) before we exit and kill_on_drop reaps
+        // whatever remains.
+        let signalled = daemon.request_plugin_shutdown();
+        if signalled > 0 {
+            tracing::info!(plugins = signalled, "sent shutdown to plugins");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
     });
 }
 

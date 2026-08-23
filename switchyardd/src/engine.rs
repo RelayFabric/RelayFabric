@@ -237,6 +237,23 @@ impl Daemon {
         f(&self.cfg.read().unwrap())
     }
 
+    /// Best-effort graceful shutdown: send `Shutdown` to every connected
+    /// plugin so it can run its `stop()` (release radios, close sockets)
+    /// before the runtime drops and `kill_on_drop` SIGKILLs any stragglers.
+    /// Returns how many plugins were signalled. `try_send` (not `.await`) so a
+    /// wedged plugin with a full outbound buffer can't stall the shutdown --
+    /// it just gets SIGKILLed instead.
+    pub fn request_plugin_shutdown(&self) -> usize {
+        let plugins = self.plugins.lock().unwrap();
+        let mut signalled = 0;
+        for h in plugins.values() {
+            if h.connected && h.tx.try_send(DaemonToPlugin::Shutdown).is_ok() {
+                signalled += 1;
+            }
+        }
+        signalled
+    }
+
     /// Hot-swaps `cfg` under the write lock (design §1): computes
     /// `restart_required` from the OLD config (plugin names whose
     /// `{command, config, enabled}` changed, plus added/removed plugin
@@ -3332,6 +3349,20 @@ mod tests {
             .unwrap();
         assert_eq!(after.state, "failed");
         assert_eq!(after.reason.as_deref(), Some("DESTINATION_UNKNOWN"));
+    }
+
+    #[tokio::test]
+    async fn request_plugin_shutdown_signals_every_connected_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut rx_a = register_plugin(&d, "mocka", false);
+        let mut rx_b = register_plugin(&d, "mockb", false);
+
+        let n = d.request_plugin_shutdown();
+
+        assert_eq!(n, 2, "both connected plugins must be signalled");
+        assert!(matches!(rx_a.try_recv(), Ok(DaemonToPlugin::Shutdown)));
+        assert!(matches!(rx_b.try_recv(), Ok(DaemonToPlugin::Shutdown)));
     }
 
     #[tokio::test]
