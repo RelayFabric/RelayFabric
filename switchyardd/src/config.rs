@@ -849,6 +849,25 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         ));
     }
 
+    // Core lifecycle scalars (audit finding): a zero here isn't a valid
+    // "unlimited"/"disabled" mode, it's a silent total-message-loss footgun
+    // from a typo -- hop_limit 0 drops every message, ttl_default_secs 0
+    // expires every message on arrival, dedup_ttl_secs 0 leaves no dedup
+    // window. Reject them at load with a clear message.
+    if cfg.hop_limit == 0 {
+        return Err("hop_limit must be at least 1 (0 drops every message)".to_string());
+    }
+    if cfg.ttl_default_secs == 0 {
+        return Err(
+            "ttl_default_secs must be at least 1 (0 expires every message on arrival)".to_string(),
+        );
+    }
+    if cfg.dedup_ttl_secs == 0 {
+        return Err(
+            "dedup_ttl_secs must be at least 1 (0 leaves no dedup window)".to_string(),
+        );
+    }
+
     // node.name (final cycle-G review finding): design §1's advert contract
     // says a node's name is "validated <=64 chars, no newlines" -- but that
     // was only ever enforced on a RECEIVED advert's name
@@ -1237,6 +1256,21 @@ fn validate_federation(cfg: &Config) -> Result<(), String> {
             "federation.accept_from '{}' is invalid (expected \"verified\" or \"trusted\")",
             fed.accept_from
         ));
+    }
+    // Zero here silently breaks federation (audit finding): max_hops 0
+    // dead-letters all inbound federated traffic, and max_ttl_secs 0 defeats
+    // the replay/amplification bound. Neither is a meaningful "unlimited".
+    if fed.max_hops == 0 {
+        return Err(
+            "federation.max_hops must be at least 1 (0 dead-letters all federated traffic)"
+                .to_string(),
+        );
+    }
+    if fed.max_ttl_secs == 0 {
+        return Err(
+            "federation.max_ttl_secs must be at least 1 (0 defeats the replay/amplification bound)"
+                .to_string(),
+        );
     }
     if fed.identity_exposure != "pseudonymous" && fed.identity_exposure != "full" {
         return Err(format!(
@@ -3192,6 +3226,33 @@ federation:
         // must not fail on the socket-length rule (may pass entirely)
         if let Err(e) = validate(&cfg) {
             assert!(!e.contains("Unix-socket"), "short data_dir wrongly rejected: {e}");
+        }
+    }
+
+    #[test]
+    fn zero_lifecycle_scalars_are_rejected() {
+        for (mutate, needle) in [
+            (
+                Box::new(|c: &mut Config| c.hop_limit = 0) as Box<dyn Fn(&mut Config)>,
+                "hop_limit",
+            ),
+            (Box::new(|c: &mut Config| c.ttl_default_secs = 0), "ttl_default_secs"),
+            (Box::new(|c: &mut Config| c.dedup_ttl_secs = 0), "dedup_ttl_secs"),
+        ] {
+            let mut cfg = parse(GOOD).unwrap();
+            mutate(&mut cfg);
+            let err = validate(&cfg).unwrap_err();
+            assert!(err.contains(needle), "error must name {needle}: {err}");
+        }
+    }
+
+    #[test]
+    fn zero_federation_bounds_are_rejected() {
+        for (field, needle) in [("max_hops: 0", "max_hops"), ("max_ttl_secs: 0", "max_ttl_secs")] {
+            let raw = format!("{GOOD}\nfederation:\n  {field}\n");
+            // parse() runs validate(), so the zero bound surfaces as the error.
+            let err = parse(&raw).unwrap_err();
+            assert!(err.contains(needle), "error must name federation.{needle}: {err}");
         }
     }
 
