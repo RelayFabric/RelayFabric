@@ -1889,6 +1889,30 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
         emit_delivery(d, del.message_id, del.route.clone(), "expired");
         return;
     }
+    // Retry-exhaustion cap (audit finding). handle_result dead-letters at
+    // MAX_ATTEMPTS on a plugin's failure ACK, but a plugin that ACCEPTS a
+    // Send and never acks -- or whose ack is lost -- has its row reclaimed by
+    // reclaim_stale and re-attempted, with no ack to ever trigger that check;
+    // it would re-send every 60s until TTL. Cap it here too: a delivery
+    // already attempted MAX_ATTEMPTS times (each real send bumps
+    // attempt_count via mark_attempting) is dead-lettered instead of re-sent.
+    // Transient pre-send defers (plugin offline, budget) return BEFORE
+    // mark_attempting, so they never bump the count and are never caught here.
+    if del.attempt_count >= queue::MAX_ATTEMPTS {
+        let result =
+            d.store
+                .lock()
+                .unwrap()
+                .mark_terminal(del.id, "dead_letter", "RETRY_EXHAUSTED");
+        warn_if_mark_failed(del.id, "dead_letter", result);
+        warn!(
+            delivery = del.id,
+            attempts = del.attempt_count,
+            "dead-lettered (retry exhausted with no terminal delivery result)"
+        );
+        emit_delivery(d, del.message_id, del.route.clone(), "dead_letter");
+        return;
+    }
     if del.route == IDENTITY_ROUTE {
         process_due_identity(d, del, env, now).await;
         return;
@@ -3297,6 +3321,39 @@ mod tests {
             .unwrap();
         assert_eq!(after.state, "failed");
         assert_eq!(after.reason.as_deref(), Some("DESTINATION_UNKNOWN"));
+    }
+
+    #[tokio::test]
+    async fn process_due_dead_letters_a_delivery_that_exhausted_its_attempts() {
+        // Black-hole: a plugin that accepts sends but never acks (row keeps
+        // getting reclaimed) must eventually dead-letter, not re-send forever.
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let now = Utc::now();
+        handle_inbound(
+            &d, "mocka", "chan".into(), "!a".into(), "text".into(),
+            "hi".into(), None, vec![], None,
+        );
+        // Query slightly in the future: handle_inbound stamps next_attempt at
+        // its own (later) now, so `now` captured above wouldn't see it as due.
+        let query_at = Utc::now() + CDuration::seconds(1);
+        let del = {
+            let store = d.store.lock().unwrap();
+            let due = store.due_deliveries(query_at, 10).unwrap();
+            let del = due.into_iter().next().expect("a due delivery");
+            // simulate MAX_ATTEMPTS real send attempts with no terminal ack
+            for _ in 0..queue::MAX_ATTEMPTS {
+                store.mark_attempting(del.id).unwrap();
+            }
+            store.deliveries_for_id(del.id).unwrap()
+        };
+        assert!(del.attempt_count >= queue::MAX_ATTEMPTS);
+
+        process_due(&d, del.clone(), now).await;
+
+        let after = d.store.lock().unwrap().deliveries_for_id(del.id).unwrap();
+        assert_eq!(after.state, "dead_letter");
+        assert_eq!(after.reason.as_deref(), Some("RETRY_EXHAUSTED"));
     }
 
     #[test]
