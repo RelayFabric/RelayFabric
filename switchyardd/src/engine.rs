@@ -1809,19 +1809,30 @@ pub async fn pump(d: Arc<Daemon>) {
             // is the upgrade path once there's an actual
             // disk-pressure signal to tune it by.
             let cutoff = now - CDuration::hours(24);
-            let result = d.store.lock().unwrap().purge_terminal(cutoff);
-            match result {
-                Ok((n, orphans)) => {
-                    if n > 0 {
-                        info!(purged = n, "retention purge removed old deliveries");
-                    }
-                    for sha in &orphans {
-                        if let Err(e) = d.cas.remove(sha) {
-                            warn!(sha = %sha, error = %e, "failed to remove orphaned attachment");
+            {
+                // Hold the store lock ACROSS the CAS removals (audit TOCTOU):
+                // purge_terminal computes the orphan set under this lock, and
+                // keeping it held until every orphan is unlinked means no
+                // concurrent handle_inbound can insert_attachment_ref a sha
+                // between "computed orphan" and "unlinked" -- which would
+                // otherwise delete a blob a freshly-arrived message now
+                // references. The orphan set is bounded (one hourly purge), so
+                // the brief FS I/O under the lock is acceptable; cas.remove
+                // takes no store lock, so there is no lock-order hazard.
+                let store = d.store.lock().unwrap();
+                match store.purge_terminal(cutoff) {
+                    Ok((n, orphans)) => {
+                        if n > 0 {
+                            info!(purged = n, "retention purge removed old deliveries");
+                        }
+                        for sha in &orphans {
+                            if let Err(e) = d.cas.remove(sha) {
+                                warn!(sha = %sha, error = %e, "failed to remove orphaned attachment");
+                            }
                         }
                     }
+                    Err(e) => warn!(error = %e, "retention purge failed"),
                 }
-                Err(e) => warn!(error = %e, "retention purge failed"),
             }
             // Expired challenges (15-min TTL, design §Security invariants):
             // swept on the same hourly cadence as the retention purge above
