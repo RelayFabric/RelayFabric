@@ -18,6 +18,18 @@ from concurrent.futures import ThreadPoolExecutor
 import media
 
 
+def _validate_stamp_cost(field, value):
+    """A stamp cost is a proof-of-work difficulty in bits. LXMF only honors
+    an integer in 1..254 (see LXMRouter.set_inbound_stamp_cost); None means no
+    stamp. Reject anything else at load rather than silently no-op'ing it."""
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{field} must be an int (proof-of-work bits) or null")
+    if not 1 <= value <= 254:
+        raise ValueError(f"{field} must be between 1 and 254, got {value}")
+
+
 def load_config(raw):
     cfg = dict(raw)
     if not cfg.get("storage"):
@@ -26,6 +38,9 @@ def load_config(raw):
     cfg.setdefault("rns_configdir", None)
     cfg.setdefault("announce_interval", 3600)
     cfg.setdefault("stamp_cost", None)
+    cfg.setdefault("outbound_stamp_cost", None)
+    _validate_stamp_cost("stamp_cost", cfg["stamp_cost"])
+    _validate_stamp_cost("outbound_stamp_cost", cfg["outbound_stamp_cost"])
     cfg.setdefault("propagation_node", None)
     cfg.setdefault("max_attachment_bytes", 1_000_000)
     cfg.setdefault("image_max_bytes", None)
@@ -374,6 +389,17 @@ class Bridge:
             storagepath=os.path.join(storage, "lxmf"),
             delivery_limit=cfg["lxmf_delivery_limit_kb"])
         self.stamp_cost = cfg["stamp_cost"]
+        # Delivery stamp cost WE pay on outbound messages. When set, every
+        # message we send carries a proof-of-work stamp of this cost, so a
+        # stamp-enforcing recipient (e.g. Sideband with a stamp requirement)
+        # accepts and displays it even if we have not cached its announce.
+        # When None, LXMF still auto-generates a stamp from the recipient's
+        # announced cost -- this only forces/overrides that. Distinct from
+        # stamp_cost above, which is the cost we REQUIRE of inbound senders.
+        self.outbound_stamp_cost = cfg["outbound_stamp_cost"]
+        if self.outbound_stamp_cost is not None:
+            RNS.log(f"Outbound LXMF messages will carry a delivery stamp of "
+                     f"cost {self.outbound_stamp_cost}", RNS.LOG_INFO)
         self.dest = self.router.register_delivery_identity(
             self.identity,
             display_name=cfg["display_name"],
@@ -611,6 +637,12 @@ class Bridge:
                 destination, self.dest, text,
                 fields=fields,
                 desired_method=method,
+                # Force our outbound delivery stamp cost when configured; None
+                # leaves LXMF's announce-driven auto-config in place. LXMF
+                # generates the proof-of-work itself (defer_stamp defaults
+                # True); a PROPAGATED send likewise gets a propagation-node
+                # stamp from the PN's advertised cost automatically.
+                stamp_cost=self.outbound_stamp_cost,
                 include_ticket=self.stamp_cost is not None)
             lxm.register_delivery_callback(
                 lambda m, d=dest_hex, meth=method, r=on_result:

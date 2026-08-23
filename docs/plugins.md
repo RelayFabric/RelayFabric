@@ -110,7 +110,8 @@ delivery fails.
 | `storage` | — | Directory for Reticulum/LXMF state and dynamic membership |
 | `rns_configdir` | `null` | `null` = default `~/.reticulum` |
 | `announce_interval` | `3600` | Seconds between RNS announces |
-| `stamp_cost` | `null` | Set to require inbound proof-of-work stamps |
+| `stamp_cost` | `null` | Proof-of-work bits (1–254) this gateway *requires* of inbound senders |
+| `outbound_stamp_cost` | `null` | Proof-of-work bits (1–254) this gateway *pays* on every outbound message. Set it when a recipient enforces stamps (e.g. Sideband) so the message is accepted and displayed even before the gateway has cached the recipient's announce. `null` still lets LXMF auto-generate a stamp from the recipient's announced cost; a PROPAGATED send also gets a propagation-node stamp from the PN's advertised cost automatically. |
 | `propagation_node` | `"auto"` | `"auto"` \| explicit dest hash hex \| `null` |
 | `max_attachment_bytes` | `1000000` | Per-attachment cap, applied both directions |
 | `image_max_bytes` | `null` | Falls back to `max_attachment_bytes` |

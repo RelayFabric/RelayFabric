@@ -62,6 +62,22 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg["voice_to_codec2"], 1200)
         self.assertEqual(cfg["lxmf_delivery_limit_kb"], 256)
 
+    def test_outbound_stamp_cost_defaults_none(self):
+        self.assertIsNone(plug.load_config(CFG)["outbound_stamp_cost"])
+
+    def test_outbound_stamp_cost_settable(self):
+        self.assertEqual(
+            plug.load_config(dict(CFG, outbound_stamp_cost=16))["outbound_stamp_cost"], 16)
+
+    def test_outbound_stamp_cost_rejects_out_of_range(self):
+        for bad in (0, -1, 255, 1000):
+            with self.assertRaises(ValueError):
+                plug.load_config(dict(CFG, outbound_stamp_cost=bad))
+
+    def test_outbound_stamp_cost_rejects_non_int(self):
+        with self.assertRaises(TypeError):
+            plug.load_config(dict(CFG, outbound_stamp_cost="16"))
+
     def test_missing_storage_rejected(self):
         with self.assertRaises(ValueError):
             plug.load_config({"channels": []})
@@ -571,6 +587,70 @@ class BridgeEgressAttachmentTests(unittest.TestCase):
         call = self.send_calls[0]
         self.assertIsNone(call["fields"])
         self.assertEqual(call["text"], "hello")
+
+
+class OutboundStampTests(unittest.TestCase):
+    """send_lxmf passes the configured outbound delivery stamp cost to the
+    LXMessage, so a stamp-enforcing recipient (e.g. Sideband) accepts and
+    displays the message. LXMF generates the proof-of-work stamp itself on
+    its stamp thread (defer_stamp defaults True); we only set the cost."""
+
+    def _capture_lxmessage_kwargs(self, outbound_stamp_cost):
+        captured = {}
+
+        class FakeLXMessage:
+            DIRECT = 1
+            PROPAGATED = 2
+
+            def __init__(self, dest, source, content, **kw):
+                captured.update(kw)
+
+            def register_delivery_callback(self, cb):
+                pass
+
+            def register_failed_callback(self, cb):
+                pass
+
+        fake_lxmf = types.SimpleNamespace(LXMessage=FakeLXMessage)
+        fake_rns = types.SimpleNamespace(
+            Transport=types.SimpleNamespace(
+                has_path=lambda h: True, request_path=lambda h: None),
+            Identity=types.SimpleNamespace(recall=lambda h: object()),
+            Destination=types.SimpleNamespace(
+                OUT=0, SINGLE=0,
+                __call__=lambda *a, **k: object()),
+            log=lambda *a, **k: None,
+            LOG_INFO=0, LOG_WARNING=0, LOG_ERROR=0, LOG_NOTICE=0)
+        # RNS.Destination is called as a constructor; make it callable
+        fake_rns.Destination = lambda *a, **k: object()
+        fake_rns.Destination.OUT = 0
+        fake_rns.Destination.SINGLE = 0
+
+        bridge = _bare_bridge(plug.load_config(dict(CFG, outbound_stamp_cost=outbound_stamp_cost)))
+        bridge.outbound_stamp_cost = outbound_stamp_cost
+        bridge.stamp_cost = None
+        bridge.dest = object()
+        bridge.router = types.SimpleNamespace(handle_outbound=lambda lxm: None)
+
+        old = {k: sys.modules.get(k) for k in ("RNS", "LXMF")}
+        sys.modules["RNS"], sys.modules["LXMF"] = fake_rns, fake_lxmf
+        try:
+            bridge.send_lxmf("a91d00aa", "hi")
+        finally:
+            for k, v in old.items():
+                if v is not None:
+                    sys.modules[k] = v
+                else:
+                    sys.modules.pop(k, None)
+        return captured
+
+    def test_configured_cost_reaches_the_lxmessage(self):
+        self.assertEqual(self._capture_lxmessage_kwargs(16)["stamp_cost"], 16)
+
+    def test_none_leaves_lxmf_announce_driven_autoconfig(self):
+        # stamp_cost None -> LXMF still auto-generates from the recipient's
+        # announced cost; we must not clobber that with a value.
+        self.assertIsNone(self._capture_lxmessage_kwargs(None)["stamp_cost"])
 
 
 class SendDirectTests(unittest.TestCase):

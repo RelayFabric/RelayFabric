@@ -32,7 +32,8 @@ plugins:
       storage: /var/lib/relayfabric/lxmf
       rns_configdir: null          # null = default ~/.reticulum
       announce_interval: 3600
-      stamp_cost: null             # set to require inbound proof-of-work
+      stamp_cost: null             # PoW bits (1-254) we REQUIRE of inbound senders
+      outbound_stamp_cost: null    # PoW bits (1-254) we PAY on outbound (e.g. 16 for Sideband)
       propagation_node: "auto"     # "auto" | explicit dest hash hex | null
       max_attachment_bytes: 1000000  # per-attachment cap, applied both ways
       image_max_bytes: null        # null = falls back to max_attachment_bytes
