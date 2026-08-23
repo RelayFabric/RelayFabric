@@ -144,6 +144,10 @@ const DEMO = {
     { name: 'hub.oakmesh', services: ['relay', 'store'], seen: new Date(Date.now() - 21000).toISOString() },
     { name: 'fen-relay', services: ['relay'], seen: new Date(Date.now() - 8000).toISOString() },
   ] },
+  pub: { public: true, services: [
+    { name: 'lxmf-relay', type: 'lxmf', ingress: true, egress: true },
+    { name: 'mesh-egress', type: 'meshtastic', ingress: false, egress: true },
+  ] },
   identities: { links: [
     { id: 1, display_name: 'Dana', a: 'matrix:@d****mple', b: 'smtp:op****.net', verified_at: '2026-07-02' },
     { id: 2, display_name: 'Ops pager', a: 'matrix:@r****mple', b: 'xmpp:pa****.net', verified_at: '2026-07-15' },
@@ -172,6 +176,7 @@ class App extends Component {
     live: false, ready: false,
     status: null, plugins: {}, routes: [], federation: { peers: [] },
     discovery: { mode: 'disabled', our_advert: null, peers: [] },
+    pub: { public: false, services: [] },
     identities: { links: [] }, challenges: [], limits: null, metricsText: '',
     filter: 'pending', deliveries: [], sel: null,
     events: [], paused: false, demoPlay: false,
@@ -205,7 +210,7 @@ class App extends Component {
       this.setState({
         live: false, ready: true,
         status: DEMO.status, plugins: DEMO.plugins, routes: DEMO.routes,
-        federation: DEMO.federation, discovery: DEMO.discovery,
+        federation: DEMO.federation, discovery: DEMO.discovery, pub: DEMO.pub,
         identities: DEMO.identities, challenges: DEMO.challenges, limits: DEMO.limits,
         deliveries: DEMO.deliveries,
         cfgText: DEMO_CONFIG,
@@ -225,6 +230,7 @@ class App extends Component {
     try { this.setState({ routes: (await api('/v1/routes')).routes || [] }); } catch (_) {}
     try { this.setState({ federation: await api('/v1/federation') }); } catch (_) {}
     try { this.setState({ discovery: await api('/v1/discovery') }); } catch (_) {}
+    try { this.setState({ pub: await api('/v1/public') }); } catch (_) {}
   }
   async refreshLight() {
     if (!this.state.live) return;
@@ -710,8 +716,26 @@ class App extends Component {
     const peers = (s.federation.peers || []);
     const adverts = (s.discovery.peers || []);
     const our = s.discovery.our_advert;
+    const pub = s.pub || { public: false, services: [] };
+    const svcs = pub.services || [];
     return html`
-      ${this.header('Federation & discovery', 'GET /v1/federation · GET /v1/discovery · dial addresses deliberately omitted')}
+      ${this.header('Federation & discovery', 'GET /v1/federation · GET /v1/discovery · GET /v1/public · dial addresses deliberately omitted')}
+      <div class="card elev-sm" style="gap:var(--space-3);margin-bottom:22px;max-width:900px">
+        <span class="card-kicker">Public node · <span class=${tagFor(String(pub.public))}>${pub.public ? 'public' : 'private'}</span></span>
+        ${pub.public ? html`
+          <table class="table">
+            <thead><tr><th>Service</th><th>Protocol</th><th>Ingress</th><th>Egress</th></tr></thead>
+            <tbody>
+              ${svcs.map((sv) => html`<tr>
+                <td>${sv.name || '—'}</td>
+                <td><span class="tag tag-neutral">${sv.type || '—'}</span></td>
+                <td><span class=${tagFor(String(!!sv.ingress))}>${String(!!sv.ingress)}</span></td>
+                <td><span class=${tagFor(String(!!sv.egress))}>${String(!!sv.egress)}</span></td>
+              </tr>`)}
+              ${svcs.length === 0 && html`<tr><td colspan="4" class="text-muted" style="padding:16px 6px">Public, but no public_services declared — every federated route's protocols must be covered by an ingress/egress entry (SPEC §112.8), so this node accepts no federated traffic yet.</td></tr>`}
+            </tbody>
+          </table>` : html`<span class="text-muted" style="font-size:12.5px">This node is private: it does not advertise services or accept federated ingress. Set <code>node.public: true</code> and declare <code>public_services</code> to expose it.</span>`}
+      </div>
       <table class="table" style="margin-bottom:22px">
         <thead><tr><th>Peer</th><th>node_id</th><th>Trust</th><th>Connected</th><th>Last seen</th></tr></thead>
         <tbody>
