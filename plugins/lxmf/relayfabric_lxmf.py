@@ -242,12 +242,23 @@ def _harden_storage(storage, identity_path):
 PLUGIN_VERSION = "0.1.0"
 
 
+# How long a channel fan-out waits before reporting on whatever has resolved.
+# Kept under the daemon's ~60s "attempting" reclaim window so a partly-stuck
+# fan-out reports a terminal result (and releases the corr) before the daemon
+# re-dispatches it. send_lxmf's own path wait is 15s, leaving ~30s for a proof.
+FANOUT_TIMEOUT_SECS = 45
+
+
 class FanoutTracker:
     """Tracks per-`corr` fan-out delivery outcomes across channel members.
 
     Thread-safe (internal lock). `member_done()` returns the
     `delivery_result` dict exactly once, when the last member reaches a
-    terminal state; every other call returns None.
+    terminal state; every other call returns None. `finalize_on_timeout()`
+    forces that single report early, so one member stuck "attempting" in LXMF
+    (no proof, no failure -- observed in the live test) cannot block the
+    delivery_result forever: whatever resolved is reported, the unresolved
+    members are named as still-attempting, and the corr is released.
 
     # at-least-one delivery semantics — the whole send counts as
     # delivered as soon as *any* member received it (or a propagation node
@@ -257,47 +268,72 @@ class FanoutTracker:
 
     def __init__(self, corr, members):
         self.corr = corr
+        self._members = [m[:8] for m in members]
         self.total = len(members)
         self._lock = threading.Lock()
-        self._done = 0
+        self._resolved = set()
         self._delivered = 0
         self._failed = []
         # members delivered by something weaker than a direct delivery proof
         # (propagation custody / proof-timeout inference): delivered=True, but
         # the recipient device has NOT necessarily received it yet.
         self._soft = []
+        self._pending = []   # members still unresolved at timeout
         self._reported = False
+        # The bridge attaches its watchdog timer here so normal completion
+        # can cancel it (see Bridge._fanout_done / _fanout_timeout).
+        self.timer = None
 
     def member_done(self, member, success, kind=None):
         from relayfabric_sdk import ipc as relay_ipc
 
         with self._lock:
-            self._done += 1
+            if self._reported:
+                return None
+            self._resolved.add(member)
             if success:
                 self._delivered += 1
                 if kind and kind != "direct":
                     self._soft.append((member, kind))
             else:
                 self._failed.append(member)
-            if self._done < self.total or self._reported:
+            if len(self._resolved) < self.total:
                 return None
             self._reported = True
             return relay_ipc.delivery_result(
                 self.corr, self._delivered > 0, self._detail())
 
+    def finalize_on_timeout(self):
+        """Report now with whatever has resolved, naming the members still
+        stuck attempting. Returns the delivery_result once, or None if a
+        normal completion already reported it."""
+        from relayfabric_sdk import ipc as relay_ipc
+
+        with self._lock:
+            if self._reported:
+                return None
+            self._reported = True
+            self._pending = [m for m in self._members if m not in self._resolved]
+            return relay_ipc.delivery_result(
+                self.corr, self._delivered > 0, self._detail())
+
     def _detail(self):
-        """Human-readable qualifier on the delivery. None means every
-        delivered member returned a direct delivery proof (device confirmed).
-        A failure list takes precedence; otherwise, if any member was only
-        soft-delivered (queued/unconfirmed), say so, so 'delivered' is never
-        misread as 'seen on the recipient's device'."""
+        """Human-readable qualifier on the delivery. None means every member
+        resolved and every delivered one returned a direct delivery proof
+        (device confirmed). Otherwise the clauses that apply are joined:
+        failures, members still attempting at timeout, and soft (queued /
+        unconfirmed) deliveries -- so 'delivered' is never misread as 'seen
+        on the recipient's device'."""
+        parts = []
         if self._failed:
-            return "failed: " + ",".join(self._failed)
+            parts.append("failed: " + ",".join(self._failed))
+        if self._pending:
+            parts.append("timed out, still attempting: " + ",".join(self._pending))
         if self._soft:
-            parts = ",".join(f"{m}={k}" for m, k in self._soft)
-            return (f"delivered but unconfirmed at recipient device "
-                    f"(queued via {parts})")
-        return None
+            soft = ",".join(f"{m}={k}" for m, k in self._soft)
+            parts.append(f"delivered but unconfirmed at recipient device "
+                         f"(queued via {soft})")
+        return "; ".join(parts) if parts else None
 
 
 def failure_disposition(is_direct, has_propagation_node, has_path):
@@ -561,6 +597,12 @@ class Bridge:
         text = "\n".join(p for p in [body, *notes] if p)
 
         tracker = FanoutTracker(corr, members)
+        # Watchdog: if a member stays stuck "attempting" in LXMF, report on
+        # whatever resolved instead of blocking forever (live-test finding).
+        tracker.timer = threading.Timer(
+            FANOUT_TIMEOUT_SECS, self._fanout_timeout, [tracker])
+        tracker.timer.daemon = True
+        tracker.timer.start()
         for member in members:
             self.pool.submit(
                 self.send_lxmf, member, text,
@@ -571,8 +613,23 @@ class Bridge:
     def _fanout_done(self, tracker, member, success, kind=None):
         result = tracker.member_done(member[:8], success, kind)
         if result is not None:
+            if tracker.timer is not None:
+                tracker.timer.cancel()  # normal completion; stop the watchdog
             self._release_corr(tracker.corr)
             self._send_frame(result)
+
+    def _fanout_timeout(self, tracker):
+        """Watchdog fired: a member is stuck attempting. Report on whatever
+        resolved (the tracker's _reported guard makes this a no-op if a normal
+        completion already won the race) and release the corr."""
+        result = tracker.finalize_on_timeout()
+        if result is not None:
+            self._release_corr(tracker.corr)
+            self._send_frame(result)
+            import RNS
+            RNS.log(f"LXMF fan-out for corr {tracker.corr} timed out after "
+                     f"{FANOUT_TIMEOUT_SECS}s; reported on resolved members "
+                     f"({result['detail']})", RNS.LOG_WARNING)
 
     def handle_send_direct(self, corr, native_ref, body):
         """A single one-shot direct send to a native ref, outside any

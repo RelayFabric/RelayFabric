@@ -5,8 +5,10 @@ import stat
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "sdk", "python"))
@@ -194,6 +196,36 @@ class FanoutTests(unittest.TestCase):
         result = t.member_done("a", True, "proof-timeout")
         self.assertTrue(result["delivered"])
         self.assertIn("proof-timeout", result["detail"])
+
+    def test_timeout_reports_delivered_with_pending_members_named(self):
+        # the live-test bug: one member delivered, another stuck "attempting".
+        # finalize_on_timeout must report the delivery we already have and
+        # name the unresolved member rather than blocking forever.
+        t = plug.FanoutTracker(corr=20, members=["aaaaaaaa", "bbbbbbbb"])
+        self.assertIsNone(t.member_done("aaaaaaaa", True, "direct"))
+        result = t.finalize_on_timeout()
+        self.assertTrue(result["delivered"])
+        self.assertIn("bbbbbbbb", result["detail"])
+        self.assertIn("attempting", result["detail"])
+
+    def test_timeout_with_no_resolutions_reports_undelivered(self):
+        t = plug.FanoutTracker(corr=21, members=["aaaaaaaa", "bbbbbbbb"])
+        result = t.finalize_on_timeout()
+        self.assertFalse(result["delivered"])
+        self.assertIn("aaaaaaaa", result["detail"])
+        self.assertIn("bbbbbbbb", result["detail"])
+
+    def test_timeout_after_all_members_done_is_a_noop(self):
+        t = plug.FanoutTracker(corr=22, members=["aaaaaaaa"])
+        self.assertIsNotNone(t.member_done("aaaaaaaa", True, "direct"))
+        # the timer firing after normal completion must not double-report
+        self.assertIsNone(t.finalize_on_timeout())
+
+    def test_member_done_after_timeout_is_a_noop(self):
+        t = plug.FanoutTracker(corr=23, members=["aaaaaaaa", "bbbbbbbb"])
+        self.assertIsNotNone(t.finalize_on_timeout())
+        # a late resolution arriving after the timeout must not double-report
+        self.assertIsNone(t.member_done("aaaaaaaa", True, "direct"))
 
 
 class FailureDispositionTests(unittest.TestCase):
@@ -587,6 +619,67 @@ class BridgeEgressAttachmentTests(unittest.TestCase):
         call = self.send_calls[0]
         self.assertIsNone(call["fields"])
         self.assertEqual(call["text"], "hello")
+
+
+class BridgeFanoutTimeoutTests(unittest.TestCase):
+    """A stuck channel member must not block the delivery_result forever
+    (live-test bug): a bounded timer finalizes the fan-out on whatever
+    resolved, and normal completion cancels the timer."""
+
+    def test_fanout_timeout_emits_result_and_releases_corr(self):
+        bridge, sock = _bare_bridge_with_sock(plug.load_config(CFG))
+        bridge._claim_corr(99)
+        tracker = plug.FanoutTracker(99, ["aaaaaaaa", "bbbbbbbb"])
+        tracker.member_done("aaaaaaaa", True, "direct")  # one delivered
+
+        bridge._fanout_timeout(tracker)
+
+        frames = [f for f in sock.frames() if f["t"] == "delivery_result"]
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["corr"], 99)
+        self.assertTrue(frames[0]["delivered"])
+        self.assertIn("bbbbbbbb", frames[0]["detail"])
+        self.assertNotIn(99, bridge.inflight_corrs)
+
+    def test_normal_completion_cancels_the_timer(self):
+        bridge, sock = _bare_bridge_with_sock(plug.load_config(CFG))
+        bridge._claim_corr(1)
+        tracker = plug.FanoutTracker(1, ["aaaaaaaa"])
+        fired = []
+        tracker.timer = threading.Timer(30, fired.append, [True])
+        tracker.timer.start()
+
+        bridge._fanout_done(tracker, "aaaaaaaa", True, "direct")
+
+        self.assertTrue(tracker.timer.finished.is_set())  # cancelled
+        self.assertEqual(fired, [])
+        self.assertNotIn(1, bridge.inflight_corrs)
+
+    def test_stuck_member_still_reports_via_the_real_timer(self):
+        # end-to-end: one member delivers, one never calls on_result; the
+        # timer must still produce a delivery_result.
+        bridge, sock = _bare_bridge_with_sock(plug.load_config(
+            dict(CFG, channels=[{"name": "pasadena",
+                                 "members": ["aaaaaaaa", "bbbbbbbb"], "open": False}])))
+
+        def fake_send(dest_hex, text, on_result=None, method=None, fields=None):
+            if dest_hex == "aaaaaaaa" and on_result:
+                on_result(True, "direct")
+            # "bbbbbbbb": simulate a stuck member — never call on_result
+
+        bridge.send_lxmf = fake_send
+        with mock.patch.object(plug, "FANOUT_TIMEOUT_SECS", 0.3):
+            bridge.handle_send(7, "pasadena", "hi")
+            deadline = time.time() + 3
+            while time.time() < deadline and not [
+                    f for f in sock.frames() if f["t"] == "delivery_result"]:
+                time.sleep(0.05)
+
+        frames = [f for f in sock.frames() if f["t"] == "delivery_result"]
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["corr"], 7)
+        self.assertTrue(frames[0]["delivered"])
+        self.assertIn("bbbbbbbb", frames[0]["detail"])
 
 
 class OutboundStampTests(unittest.TestCase):
