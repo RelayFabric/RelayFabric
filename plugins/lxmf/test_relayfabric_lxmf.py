@@ -156,6 +156,29 @@ class FanoutTests(unittest.TestCase):
         self.assertIsNone(t.member_done("a", True))
         self.assertIsNone(t.member_done("a", False))
 
+    def test_direct_proof_delivery_has_no_detail(self):
+        # a genuine device-side delivery proof: delivered, detail None
+        t = plug.FanoutTracker(corr=10, members=["a"])
+        result = t.member_done("a", True, "direct")
+        self.assertTrue(result["delivered"])
+        self.assertIsNone(result["detail"])
+
+    def test_propagated_delivery_is_marked_queued_not_confirmed(self):
+        # store-and-forward custody: delivered=True but the recipient device
+        # has NOT necessarily received it yet -- the detail must say so, so an
+        # operator doesn't read "delivered" as "seen on the device".
+        t = plug.FanoutTracker(corr=11, members=["a"])
+        result = t.member_done("a", True, "propagated")
+        self.assertTrue(result["delivered"])
+        self.assertIn("propagated", result["detail"])
+        self.assertIn("queued", result["detail"])
+
+    def test_proof_timeout_delivery_is_marked_unconfirmed(self):
+        t = plug.FanoutTracker(corr=12, members=["a"])
+        result = t.member_done("a", True, "proof-timeout")
+        self.assertTrue(result["delivered"])
+        self.assertIn("proof-timeout", result["detail"])
+
 
 class FailureDispositionTests(unittest.TestCase):
     def test_direct_with_propagation_node_propagates(self):
@@ -194,7 +217,9 @@ class OnFailedWiringTests(unittest.TestCase):
         old = {k: sys.modules.get(k) for k in ("RNS", "LXMF")}
         sys.modules["RNS"], sys.modules["LXMF"] = fake_rns, fake_lxmf
         try:
-            bridge._on_failed("a91d00aa", "hi", method, results.append)
+            # on_result now carries (success, kind); collect both
+            bridge._on_failed("a91d00aa", "hi", method,
+                              lambda s, k=None: results.append((s, k)))
         finally:
             for k, v in old.items():
                 if v is not None:
@@ -204,10 +229,14 @@ class OnFailedWiringTests(unittest.TestCase):
         return results
 
     def test_proof_timeout_with_path_reports_delivered(self):
-        self.assertEqual(self._run(has_path=True, has_prop=False), [True])
+        # delivered, but tagged proof-timeout so the daemon/operator knows the
+        # device receipt was inferred from a known path, not a delivery proof
+        self.assertEqual(self._run(has_path=True, has_prop=False),
+                         [(True, "proof-timeout")])
 
     def test_unreachable_reports_failure(self):
-        self.assertEqual(self._run(has_path=False, has_prop=False), [False])
+        self.assertEqual(self._run(has_path=False, has_prop=False),
+                         [(False, "failed")])
 
 
 class EgressIdempotencyTests(unittest.TestCase):

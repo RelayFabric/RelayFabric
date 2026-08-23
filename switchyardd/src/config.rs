@@ -788,7 +788,43 @@ fn require_enabled_plugin(cfg: &Config, proto: &str, what: &str, hint: &str) -> 
     }
 }
 
+/// Conservative max length for a Unix-domain socket path. The Linux
+/// `sockaddr_un.sun_path` is 108 bytes and macOS/BSD is 104; use 104 minus
+/// a null terminator so a config that validates here binds on any platform.
+/// (Live-test finding 2026-08-22: a long `data_dir` made the per-plugin
+/// socket path exceed this and the daemon panicked at `bind` with a cryptic
+/// `SUN_LEN` error — this turns that into a clear load-time rejection.)
+const SOCKET_PATH_MAX: usize = 103;
+
+/// The socket paths the daemon will bind, so `validate` can reject an
+/// over-long `data_dir` before `bind` panics: `<data_dir>/admin.sock` and
+/// `<data_dir>/plugins.d/<name>.sock` for each enabled plugin.
+fn bound_socket_paths(cfg: &Config) -> Vec<std::path::PathBuf> {
+    let mut paths = vec![cfg.node.data_dir.join("admin.sock")];
+    let plugins_d = cfg.node.data_dir.join("plugins.d");
+    for (name, p) in &cfg.plugins {
+        if p.enabled {
+            paths.push(plugins_d.join(format!("{name}.sock")));
+        }
+    }
+    paths
+}
+
 pub fn validate(cfg: &Config) -> Result<(), String> {
+    // Socket-path length (live-test finding): reject an over-long data_dir
+    // at load with a clear error rather than panicking at bind time.
+    for path in bound_socket_paths(cfg) {
+        let len = path.as_os_str().len();
+        if len > SOCKET_PATH_MAX {
+            return Err(format!(
+                "socket path '{}' is {len} bytes, over the {SOCKET_PATH_MAX}-byte Unix-socket \
+                 limit; shorten node.data_dir (a short absolute path like /var/lib/relayfabric \
+                 or /run/relayfabric is recommended)",
+                path.display()
+            ));
+        }
+    }
+
     // Public-node hardening (v0.4 security review): a public node with no
     // quotas at all is refused at load, not merely warned about -- SPEC
     // §112.8's "unlimited is allowed" stance was downgraded 2026-08-20
@@ -3135,6 +3171,28 @@ federation:
             err.contains("node.public") && err.contains("limits"),
             "error must name the public/limits rule: {err}"
         );
+    }
+
+    #[test]
+    fn over_long_data_dir_is_rejected_with_a_clear_socket_error() {
+        let mut cfg = parse(GOOD).unwrap();
+        cfg.node.data_dir = std::path::PathBuf::from(format!("/{}", "d".repeat(120)));
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.contains("Unix-socket") && err.contains("data_dir"),
+            "error must name the socket-length rule and point at data_dir: {err}"
+        );
+    }
+
+    #[test]
+    fn normal_data_dir_passes_the_socket_length_check() {
+        let mut cfg = parse(GOOD).unwrap();
+        cfg.node.data_dir = std::path::PathBuf::from("/var/lib/relayfabric");
+        cfg.routes.clear(); // isolate: only exercising the socket-length gate
+        // must not fail on the socket-length rule (may pass entirely)
+        if let Err(e) = validate(&cfg) {
+            assert!(!e.contains("Unix-socket"), "short data_dir wrongly rejected: {e}");
+        }
     }
 
     #[test]

@@ -57,6 +57,41 @@ MESHTASTIC_MAX_PAYLOAD = 237
 BROADCAST_ADDR = "^all"
 DEFAULT_TCP_PORT = 4403
 
+# Bound the (blocking) interface construction. A BLE connect to a node that is
+# out of range, powered off, or already held by another central (e.g. a phone
+# running the Meshtastic app) blocks forever, leaving a plugin that is
+# IPC-connected but radio-dead and un-restartable by the supervisor. On
+# timeout start() raises, so run_plugin's start-failure exits the process for
+# the supervisor to restart -- mirroring the MeshCore backend's 30s posture.
+CONNECT_TIMEOUT_SECS = 30
+
+
+def _build_with_timeout(builder, timeout):
+    """Run blocking `builder()` on a worker thread, returning its result.
+
+    Raises RuntimeError if it doesn't finish within `timeout` seconds, or
+    re-raises whatever the builder raised. The worker is a daemon thread, so a
+    builder still stuck at timeout does not keep the process alive.
+    """
+    box = {}
+
+    def _run():
+        try:
+            box["result"] = builder()
+        except BaseException as e:  # noqa: BLE001 - surfaced to caller below
+            box["error"] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise RuntimeError(
+            f"meshtastic connect timed out after {timeout:g}s "
+            "(node out of range, powered off, or held by another BLE central?)")
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
+
 
 def load_config(raw):
     """Load and validate direct-Meshtastic config.
@@ -208,14 +243,19 @@ class MeshtasticDirectBackend:
         pub.subscribe(self._on_lost, "meshtastic.connection.lost")
 
         if self._kind == "serial":
-            self._iface = meshtastic.serial_interface.SerialInterface(devPath=self._target)
+            build = lambda: meshtastic.serial_interface.SerialInterface(devPath=self._target)
         elif self._kind == "tcp":
             host, port = self._target
-            self._iface = meshtastic.tcp_interface.TCPInterface(hostname=host, portNumber=port)
+            build = lambda: meshtastic.tcp_interface.TCPInterface(hostname=host, portNumber=port)
         elif self._kind == "ble":
-            self._iface = meshtastic.ble_interface.BLEInterface(address=self._target)
+            build = lambda: meshtastic.ble_interface.BLEInterface(address=self._target)
         else:
             raise ValueError(f"unsupported connection kind: {self._kind!r}")
+
+        # Bounded connect: a hung BLE/TCP connect raises instead of blocking
+        # forever, so the supervisor restarts a radio-dead plugin (see
+        # CONNECT_TIMEOUT_SECS).
+        self._iface = _build_with_timeout(build, CONNECT_TIMEOUT_SECS)
 
         # Capture our own node number so inbound DMs (to == us) can be told
         # from channel broadcasts. Best-effort: if the lib layout differs,
@@ -261,6 +301,19 @@ class MeshtasticDirectBackend:
             raise RuntimeError("meshtastic backend not started")
         self._iface.sendText(text, destinationId=node_ref)
 
+    def stop(self):
+        """Close the radio interface so a BLE link isn't left
+        connected-not-advertising (which blocks the next connect). Best-effort
+        and idempotent: a close error must not derail daemon shutdown."""
+        iface = self._iface
+        self._iface = None
+        if iface is None:
+            return
+        try:
+            iface.close()
+        except Exception as e:  # noqa: BLE001 - shutdown must not crash on a bad close
+            log.warning(f"meshtastic: error closing interface on stop: {e}")
+
 
 class Bridge(FrameWriter):
     """Bridges normalized Meshtastic packets <-> Plugin Protocol frames.
@@ -286,6 +339,10 @@ class Bridge(FrameWriter):
     def start(self):
         self.backend.start()
         threading.Thread(target=self._reader_loop, daemon=True).start()
+
+    def stop(self):
+        # run_plugin calls this on "shutdown"; release the radio cleanly.
+        self.backend.stop()
 
     def _reader_loop(self):
         for pkt in self.backend.events():

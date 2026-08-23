@@ -247,22 +247,42 @@ class FanoutTracker:
         self._done = 0
         self._delivered = 0
         self._failed = []
+        # members delivered by something weaker than a direct delivery proof
+        # (propagation custody / proof-timeout inference): delivered=True, but
+        # the recipient device has NOT necessarily received it yet.
+        self._soft = []
         self._reported = False
 
-    def member_done(self, member, success):
+    def member_done(self, member, success, kind=None):
         from relayfabric_sdk import ipc as relay_ipc
 
         with self._lock:
             self._done += 1
             if success:
                 self._delivered += 1
+                if kind and kind != "direct":
+                    self._soft.append((member, kind))
             else:
                 self._failed.append(member)
             if self._done < self.total or self._reported:
                 return None
             self._reported = True
-            detail = "failed: " + ",".join(self._failed) if self._failed else None
-            return relay_ipc.delivery_result(self.corr, self._delivered > 0, detail)
+            return relay_ipc.delivery_result(
+                self.corr, self._delivered > 0, self._detail())
+
+    def _detail(self):
+        """Human-readable qualifier on the delivery. None means every
+        delivered member returned a direct delivery proof (device confirmed).
+        A failure list takes precedence; otherwise, if any member was only
+        soft-delivered (queued/unconfirmed), say so, so 'delivered' is never
+        misread as 'seen on the recipient's device'."""
+        if self._failed:
+            return "failed: " + ",".join(self._failed)
+        if self._soft:
+            parts = ",".join(f"{m}={k}" for m, k in self._soft)
+            return (f"delivered but unconfirmed at recipient device "
+                    f"(queued via {parts})")
+        return None
 
 
 def failure_disposition(is_direct, has_propagation_node, has_path):
@@ -518,11 +538,12 @@ class Bridge:
         for member in members:
             self.pool.submit(
                 self.send_lxmf, member, text,
-                lambda success, m=member: self._fanout_done(tracker, m, success),
+                lambda success, kind=None, m=member:
+                    self._fanout_done(tracker, m, success, kind),
                 fields=fields or None)
 
-    def _fanout_done(self, tracker, member, success):
-        result = tracker.member_done(member[:8], success)
+    def _fanout_done(self, tracker, member, success, kind=None):
+        result = tracker.member_done(member[:8], success, kind)
         if result is not None:
             self._release_corr(tracker.corr)
             self._send_frame(result)
@@ -542,13 +563,18 @@ class Bridge:
             return  # duplicate re-dispatch; the in-flight send reports the result
         self.pool.submit(
             self.send_lxmf, native_ref, body,
-            lambda success: self._direct_done(corr, success))
+            lambda success, kind=None: self._direct_done(corr, success, kind))
 
-    def _direct_done(self, corr, success):
+    def _direct_done(self, corr, success, kind=None):
         from relayfabric_sdk import ipc as relay_ipc
 
         self._release_corr(corr)
-        detail = None if success else "delivery failed"
+        if not success:
+            detail = "delivery failed"
+        elif kind and kind != "direct":
+            detail = f"delivered but unconfirmed at recipient device (via {kind})"
+        else:
+            detail = None
         self._send_frame(relay_ipc.delivery_result(corr, success, detail))
 
     def send_lxmf(self, dest_hex, text, on_result=None, method=None, fields=None):
@@ -576,7 +602,7 @@ class Bridge:
                 RNS.log(f"No identity known for {dest_hex}, dropping",
                          RNS.LOG_WARNING)
                 if on_result:
-                    on_result(False)
+                    on_result(False, "failed")
                 return
             destination = RNS.Destination(
                 identity, RNS.Destination.OUT, RNS.Destination.SINGLE,
@@ -587,7 +613,8 @@ class Bridge:
                 desired_method=method,
                 include_ticket=self.stamp_cost is not None)
             lxm.register_delivery_callback(
-                lambda m, d=dest_hex, r=on_result: self._on_delivered(d, r))
+                lambda m, d=dest_hex, meth=method, r=on_result:
+                    self._on_delivered(d, meth, r))
             lxm.register_failed_callback(
                 lambda m, d=dest_hex, t=text, meth=method, r=on_result, f=fields:
                     self._on_failed(d, t, meth, r, f))
@@ -595,14 +622,20 @@ class Bridge:
         except Exception as e:  # noqa: BLE001 - daemon must survive bad sends
             RNS.log(f"LXMF send to {dest_hex} failed: {e}", RNS.LOG_ERROR)
             if on_result:
-                on_result(False)
+                on_result(False, "failed")
 
-    def _on_delivered(self, dest_hex, on_result):
+    def _on_delivered(self, dest_hex, method, on_result):
+        import LXMF
         import RNS
 
-        RNS.log(f"LXMF delivered to {dest_hex}", RNS.LOG_INFO)
+        # A PROPAGATED message's delivery callback fires when the propagation
+        # node accepts custody (store-and-forward), NOT when the recipient's
+        # device fetches it -- that's a weaker guarantee than a DIRECT delivery
+        # proof, so tag it accordingly.
+        kind = "propagated" if method == LXMF.LXMessage.PROPAGATED else "direct"
+        RNS.log(f"LXMF delivered to {dest_hex} ({kind})", RNS.LOG_INFO)
         if on_result:
-            on_result(True)
+            on_result(True, kind)
 
     def _on_failed(self, dest_hex, text, method, on_result, fields=None):
         import LXMF
@@ -626,12 +659,12 @@ class Bridge:
                      f"established; treating as delivered (proof-timeout "
                      f"fallback)", RNS.LOG_NOTICE)
             if on_result:
-                on_result(True)
+                on_result(True, "proof-timeout")
         else:
             RNS.log(f"LXMF delivery FAILED to {dest_hex} (unreachable)",
                      RNS.LOG_WARNING)
             if on_result:
-                on_result(False)
+                on_result(False, "failed")
 
     # ----- announce loop -----
 

@@ -250,6 +250,9 @@ class MeshCoreBackend:
         self._queue = queue.Queue(maxsize=256)
         self._loop = None
         self._mc = None
+        # Set by stop() so the DISCONNECTED that our own disconnect() triggers
+        # is treated as a clean shutdown, not an unexpected drop to exit(1) on.
+        self._stopping = False
 
     def start(self):
         import meshcore  # lazy: keeps module import stdlib-only (see module docstring)
@@ -319,7 +322,29 @@ class MeshCoreBackend:
         except queue.Full:
             log.debug("Dropping meshcore channel event: event queue full")
 
+    def stop(self):
+        """Cleanly release the radio on daemon shutdown: mark stopping (so the
+        resulting DISCONNECTED isn't treated as a crash), disconnect the node
+        on its own loop, then stop the loop thread. Idempotent, best-effort:
+        an error here must not derail shutdown."""
+        self._stopping = True
+        loop, mc = self._loop, self._mc
+        if loop is None:
+            return
+        if mc is not None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(mc.disconnect(), loop)
+                fut.result(timeout=5)
+            except Exception as e:  # noqa: BLE001 - shutdown must not crash on a bad disconnect
+                log.warning(f"meshcore: error disconnecting on stop: {e}")
+        self._mc = None
+        loop.call_soon_threadsafe(loop.stop)
+
     def _on_disconnected(self, event):
+        # A clean shutdown (stop()) disconnects the radio itself, which fires
+        # this event; that is expected, not a crash -- don't exit(1) on it.
+        if self._stopping:
+            return
         # This callback runs on the backend's private asyncio loop thread,
         # not the main thread -- main() is blocked in relay_ipc.read_frame()
         # on the daemon socket, so a plain sys.exit()/raise here would only
@@ -390,6 +415,10 @@ class Bridge(FrameWriter):
     def start(self):
         self.backend.start()
         threading.Thread(target=self._reader_loop, daemon=True).start()
+
+    def stop(self):
+        # run_plugin calls this on "shutdown"; release the radio cleanly.
+        self.backend.stop()
 
     def _reader_loop(self):
         for ev in self.backend.events():

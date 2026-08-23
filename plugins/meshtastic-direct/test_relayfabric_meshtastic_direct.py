@@ -163,6 +163,7 @@ class FakeBackend:
         self.direct = []
         self.qd = 0
         self.my_node_num = my_node_num
+        self.stopped = 0
 
     def send_channel(self, idx, text):
         self.sent.append((idx, text))
@@ -172,6 +173,9 @@ class FakeBackend:
 
     def queue_depth(self):
         return self.qd
+
+    def stop(self):
+        self.stopped += 1
 
 
 class BridgeTests(unittest.TestCase):
@@ -250,6 +254,61 @@ class BridgeTests(unittest.TestCase):
     def test_direct_messages_capability_advertised(self):
         caps = plug._caps(base_cfg())
         self.assertTrue(caps["direct_messages"])
+
+    def test_stop_releases_the_backend(self):
+        # Fix 3: shutdown must close the radio so BLE isn't left
+        # connected-not-advertising, blocking the next connect.
+        bridge, backend, _sock = self._bridge()
+        bridge.stop()
+        self.assertEqual(backend.stopped, 1)
+
+
+class BackendStopTests(unittest.TestCase):
+    def test_stop_closes_iface_and_clears_it(self):
+        class FakeIface:
+            def __init__(self):
+                self.closed = 0
+
+            def close(self):
+                self.closed += 1
+
+        b = plug.MeshtasticDirectBackend("serial:///dev/ttyUSB0")
+        iface = FakeIface()
+        b._iface = iface
+        b.stop()
+        self.assertEqual(iface.closed, 1)
+        self.assertIsNone(b._iface)
+
+    def test_stop_is_a_noop_when_never_started(self):
+        b = plug.MeshtasticDirectBackend("serial:///dev/ttyUSB0")
+        b.stop()  # must not raise when _iface is None
+
+    def test_stop_swallows_close_errors(self):
+        class BadIface:
+            def close(self):
+                raise RuntimeError("boom")
+
+        b = plug.MeshtasticDirectBackend("serial:///dev/ttyUSB0")
+        b._iface = BadIface()
+        b.stop()  # a failing close must not crash shutdown
+        self.assertIsNone(b._iface)
+
+
+class ConnectTimeoutTests(unittest.TestCase):
+    def test_returns_builder_result_on_success(self):
+        self.assertEqual(plug._build_with_timeout(lambda: "iface", 5.0), "iface")
+
+    def test_raises_on_timeout(self):
+        import time as _t
+        with self.assertRaises(RuntimeError) as ctx:
+            plug._build_with_timeout(lambda: _t.sleep(5), 0.05)
+        self.assertIn("timed out", str(ctx.exception))
+
+    def test_reraises_builder_error(self):
+        def boom():
+            raise ValueError("no radio")
+        with self.assertRaises(ValueError):
+            plug._build_with_timeout(boom, 5.0)
 
 
 if __name__ == "__main__":

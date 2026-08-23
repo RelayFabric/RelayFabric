@@ -17,7 +17,7 @@ starting point rather than writing a config from scratch.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `name` | string | *required* | This node's identifier. Signed into RFDP adverts, so it's capped at 64 characters and rejects control characters, newlines, and Unicode bidi/spoofing codepoints. |
-| `data_dir` | path | *required* | Directory for the plugin/admin Unix sockets, storage (CAS, delivery queue), and node identity keys. |
+| `data_dir` | path | *required* | Directory for the plugin/admin Unix sockets, storage (CAS, delivery queue), and node identity keys. Keep it a **short absolute path** (e.g. `/var/lib/relayfabric` or `/run/relayfabric`): the derived socket paths must fit the OS Unix-socket limit (~104 bytes), and `--check-config` rejects a `data_dir` long enough to overflow it rather than letting the daemon fail at bind. |
 | `public` | bool | `false` | When `true`, every route's source/destination protocols must be covered by `public_services` ingress/egress lists (see below); `--check-config` rejects an uncovered route. |
 
 !!! warning "Restart required"

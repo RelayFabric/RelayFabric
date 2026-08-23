@@ -483,6 +483,62 @@ class MeshCoreBackendTests(unittest.TestCase):
             backend._on_disconnected(fake_event)
         fake_exit.assert_called_once_with(1)
 
+    def test_stopping_suppresses_the_disconnect_exit(self):
+        # A clean shutdown (stop()) tears down the radio, which itself fires
+        # DISCONNECTED. That must NOT be treated as an unexpected drop and
+        # exit(1) (which the supervisor would restart) -- stop() sets a flag
+        # the disconnect handler honors.
+        backend = plug.MeshCoreBackend("serial:///dev/ttyUSB0")
+        backend._stopping = True
+        fake_event = types.SimpleNamespace(payload={"reason": "requested"})
+        with mock.patch.object(plug.os, "_exit") as fake_exit:
+            backend._on_disconnected(fake_event)
+        fake_exit.assert_not_called()
+
+    def test_stop_disconnects_and_stops_the_loop(self):
+        disconnected = []
+
+        class FakeCommands:
+            async def send_chan_msg(self, chan, msg, timestamp=None):
+                raise NotImplementedError
+
+        class FakeMC:
+            def __init__(self):
+                self.commands = FakeCommands()
+
+            def subscribe(self, event_type, callback):
+                pass
+
+            async def start_auto_message_fetching(self):
+                pass
+
+            async def disconnect(self):
+                disconnected.append(True)
+
+        async def fake_create_serial(port, baudrate=115200, **kw):
+            return FakeMC()
+
+        fake_module = types.ModuleType("meshcore")
+        fake_module.MeshCore = types.SimpleNamespace(create_serial=fake_create_serial)
+        fake_module.EventType = types.SimpleNamespace(
+            CHANNEL_MSG_RECV="channel_message", DISCONNECTED="disconnected")
+
+        with mock.patch.dict(sys.modules, {"meshcore": fake_module}):
+            backend = plug.MeshCoreBackend("serial:///dev/ttyUSB0")
+            backend.start()
+            backend.stop()
+
+        self.addCleanup(_stop_and_close_loop, backend._loop)
+        self.assertEqual(disconnected, [True])
+        self.assertTrue(backend._stopping)
+        # loop.stop() is scheduled cross-thread; give the loop thread a moment
+        # to observe it before asserting it has wound down.
+        for _ in range(50):
+            if not backend._loop.is_running():
+                break
+            time.sleep(0.01)
+        self.assertFalse(backend._loop.is_running())
+
     def test_start_timeout_raises_runtime_error(self):
         # ready.wait(timeout=30)'s return value must be checked: a timeout
         # (e.g. a slow BLE scan) previously returned silently, leaving
@@ -572,6 +628,7 @@ class FakeBackend:
         self.fail_with = None
         self._scripted = scripted_events or []
         self._depth = depth
+        self.stopped = 0
 
     def send_channel(self, idx, text):
         if self.fail_with:
@@ -583,6 +640,9 @@ class FakeBackend:
 
     def queue_depth(self):
         return self._depth
+
+    def stop(self):
+        self.stopped += 1
 
 
 class BridgeTests(unittest.TestCase):
@@ -596,6 +656,12 @@ class BridgeTests(unittest.TestCase):
         # design mandate: 1h, not SentCache's 86400s default (mirrors
         # meshtastic's radio-echo loop guard window).
         self.assertEqual(self.bridge.sent_cache.ttl, 3600)
+
+    def test_stop_releases_the_backend(self):
+        # run_plugin calls bridge.stop() on "shutdown"; it must release the
+        # radio so the link isn't left open, blocking the next connect.
+        self.bridge.stop()
+        self.assertEqual(self.backend.stopped, 1)
 
     def test_inbound_mapped_channel_bridges(self):
         self.bridge.handle_event(channel_event())
