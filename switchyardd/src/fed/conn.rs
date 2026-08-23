@@ -132,6 +132,15 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// ceiling, not yet an operator-tunable value.
 const MAX_INBOUND_CONNS: usize = 64;
 
+/// Bound on how long a Noise handshake may take before the connection is
+/// dropped. Without it a peer that completes TCP but stalls mid-handshake
+/// holds its inbound `Semaphore` permit for the whole task lifetime; enough
+/// such slow-loris connections wedge all `MAX_INBOUND_CONNS` inbound slots and
+/// deny federation to everyone (audit HIGH finding). Applied to both the
+/// responder (inbound) and initiator (outbound, where a stalled peer would
+/// otherwise wedge that peer's redial loop) sides.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
 // ---- RFDP discovery tunables (design §2/§3, cycle G) ----------------------
 
 /// Cap on a received `Fed::Advert`'s own serialized size -- NOT `noise::
@@ -210,7 +219,7 @@ async fn run_listener(d: Arc<Daemon>, addr: String, static_key: Arc<StaticKey>) 
 /// production `MAX_INBOUND_CONNS` cap; `accept_loop_with_cap` (below) is
 /// the same loop with the cap as a parameter, for the accept-cap test.
 async fn accept_loop(d: Arc<Daemon>, listener: TcpListener, static_key: Arc<StaticKey>) {
-    accept_loop_with_cap(d, listener, static_key, MAX_INBOUND_CONNS).await
+    accept_loop_with_cap(d, listener, static_key, MAX_INBOUND_CONNS, HANDSHAKE_TIMEOUT).await
 }
 
 /// Accepts connections up to `max_inbound` concurrently active at once
@@ -225,6 +234,7 @@ async fn accept_loop_with_cap(
     listener: TcpListener,
     static_key: Arc<StaticKey>,
     max_inbound: usize,
+    handshake_timeout: Duration,
 ) {
     let permits = Arc::new(Semaphore::new(max_inbound));
     loop {
@@ -246,8 +256,16 @@ async fn accept_loop_with_cap(
                     // when the task ends, freeing the slot for the next
                     // accept.
                     let _permit = permit;
-                    match noise::handshake_responder(stream, &static_key, &d.identity).await {
-                        Ok((channel, node_id)) => {
+                    // Bound the handshake so a stalled peer can't hold this
+                    // permit forever (slow-loris DoS); on timeout the task
+                    // ends and the permit is freed for the next accept.
+                    let hs = tokio::time::timeout(
+                        handshake_timeout,
+                        noise::handshake_responder(stream, &static_key, &d.identity),
+                    )
+                    .await;
+                    match hs {
+                        Ok(Ok((channel, node_id))) => {
                             // A configured peer that dials US is still keyed
                             // by its config `name` (matching whatever a live
                             // OUTBOUND connection to the same peer would use)
@@ -257,7 +275,8 @@ async fn accept_loop_with_cap(
                                 .unwrap_or_else(|| node_id.clone());
                             admit_and_run(d, channel, peer_key, node_id).await;
                         }
-                        Err(e) => warn!(error = %e, "federation inbound handshake failed"),
+                        Ok(Err(e)) => warn!(error = %e, "federation inbound handshake failed"),
+                        Err(_) => warn!("federation inbound handshake timed out"),
                     }
                 });
             }
@@ -324,21 +343,25 @@ async fn spawn_outbound(d: Arc<Daemon>, peer: PeerConfig, static_key: Arc<Static
         }
         let handshake_ok = match TcpStream::connect(&peer.addr).await {
             Ok(stream) => {
-                match noise::handshake_initiator(
-                    stream,
-                    &static_key,
-                    &d.identity,
-                    Some(&peer.node_id),
+                // Bound the handshake so a peer that stalls mid-handshake
+                // can't wedge this peer's redial loop.
+                let hs = tokio::time::timeout(
+                    HANDSHAKE_TIMEOUT,
+                    noise::handshake_initiator(stream, &static_key, &d.identity, Some(&peer.node_id)),
                 )
-                .await
-                {
-                    Ok(channel) => {
+                .await;
+                match hs {
+                    Ok(Ok(channel)) => {
                         admit_and_run(d.clone(), channel, peer.name.clone(), peer.node_id.clone())
                             .await;
                         true
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         warn!(peer = %peer.name, error = %e, "federation outbound handshake failed");
+                        false
+                    }
+                    Err(_) => {
+                        warn!(peer = %peer.name, "federation outbound handshake timed out");
                         false
                     }
                 }
@@ -1562,8 +1585,13 @@ mod tests {
         let daemon_static = Arc::new(daemon_static);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        // Cap forced to 1 for this test (the production constant is 64).
-        tokio::spawn(async move { accept_loop_with_cap(d, listener, daemon_static, 1).await });
+        // Cap forced to 1 for this test (the production constant is 64). The
+        // production handshake timeout (15s) far exceeds this test's ~2s
+        // window, so the stalled first connection still holds its permit
+        // throughout -- exactly the pre-timeout behavior this test asserts.
+        tokio::spawn(async move {
+            accept_loop_with_cap(d, listener, daemon_static, 1, HANDSHAKE_TIMEOUT).await
+        });
 
         // First connection: never sends a single handshake byte, so the
         // spawned responder task blocks forever reading message 1 and
@@ -1590,6 +1618,49 @@ mod tests {
         );
         assert_eq!(result.unwrap().unwrap(), 0,
             "an over-cap connection must be closed with EOF and zero bytes (no handshake attempted)");
+    }
+
+    /// Slow-loris DoS (audit HIGH): a peer that completes TCP but stalls
+    /// mid-handshake must NOT hold its inbound permit forever. With cap=1 and
+    /// a short handshake timeout, a stalled connection frees its slot after
+    /// the timeout, so a subsequent real handshake succeeds -- without the
+    /// timeout the slot would be held permanently and this would hang.
+    #[tokio::test]
+    async fn a_stalled_handshake_frees_its_permit_after_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let (peer_key, peer_id) = keypair(dir.path());
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_cfg(vec![], vec![]),
+        ));
+        let (daemon_static, _daemon_identity) = keypair(dir.path());
+        let daemon_static = Arc::new(daemon_static);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let short = std::time::Duration::from_millis(200);
+        tokio::spawn(async move {
+            accept_loop_with_cap(d, listener, daemon_static, 1, short).await
+        });
+
+        // A stalls: connects, sends nothing, holds the single permit.
+        let _stalled = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Wait past the handshake timeout so A's slot is reclaimed.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // A real handshake must now succeed -- proof the permit was freed.
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let handshake = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            handshake_initiator(stream, &peer_key, &peer_id, None),
+        )
+        .await;
+        let ok = matches!(handshake, Ok(Ok(_)));
+        assert!(
+            ok,
+            "handshake after a stalled peer's timeout should succeed (permit must have been freed)"
+        );
     }
 
     // ---- I/O timeouts, fake-clock (Task 4 review fix round 1, DoS
