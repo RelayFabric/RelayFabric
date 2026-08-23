@@ -208,9 +208,18 @@ fn ts(t: DateTime<Utc>) -> String {
 }
 
 fn parse_ts(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|t| t.with_timezone(&Utc))
-        .unwrap_or_default()
+    match DateTime::parse_from_rfc3339(s) {
+        Ok(t) => t.with_timezone(&Utc),
+        Err(e) => {
+            // A corrupt/empty stored timestamp must not silently become the
+            // epoch: as an `expires_at` that drops the message as "expired",
+            // as a `next_attempt` that marks it perpetually due. Surface the
+            // corruption and fall back to now -- the least-harmful generic
+            // default across the fields this parses.
+            tracing::warn!(value = %s, error = %e, "corrupt timestamp in storage row; defaulting to now");
+            Utc::now()
+        }
+    }
 }
 
 impl Store {
@@ -1061,6 +1070,21 @@ mod tests {
     use super::*;
     use chrono::{Duration, Utc};
     use relay_core::{Endpoint, Envelope, Sender};
+
+    #[test]
+    fn parse_ts_defaults_corrupt_value_to_now_not_epoch() {
+        let got = parse_ts("not-a-timestamp");
+        // must be ~now, not the 1970 epoch (which would drop mail as expired)
+        assert!(
+            (Utc::now() - got).num_seconds().abs() < 5,
+            "corrupt timestamp must default to ~now, got {got}"
+        );
+        // sanity: a valid value still round-trips
+        assert_eq!(
+            parse_ts("2026-08-23T00:00:00Z").to_rfc3339(),
+            "2026-08-23T00:00:00+00:00"
+        );
+    }
 
     fn store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();

@@ -122,6 +122,18 @@ pub async fn serve(d: Arc<Daemon>, config_path: PathBuf, listener: tokio::net::U
         .expect("admin serve");
 }
 
+/// A 500 for a storage read that failed, so the control plane surfaces the
+/// error instead of returning an empty `200 OK` that reads as "no data" and
+/// masks a real DB failure (audit: fail-quiet control plane).
+fn storage_error(e: impl std::fmt::Display) -> Response {
+    warn!(error = %e, "admin storage read failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": format!("storage error: {e}")})),
+    )
+        .into_response()
+}
+
 fn queue_map(d: &Daemon) -> BTreeMap<String, i64> {
     d.store
         .lock()
@@ -1078,12 +1090,10 @@ async fn queue(
         return Json(queue_map(&d)).into_response();
     };
     let limit = params.limit.unwrap_or(100).clamp(1, 1000) as i64;
-    let deliveries = d
-        .store
-        .lock()
-        .unwrap()
-        .list_deliveries(Some(&state), limit)
-        .unwrap_or_default();
+    let deliveries = match d.store.lock().unwrap().list_deliveries(Some(&state), limit) {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
     let out: Vec<_> = deliveries
         .iter()
         .map(|del| {
@@ -1171,7 +1181,8 @@ async fn trace(State(d): State<Arc<Daemon>>, AxPath(id): AxPath<Uuid>) -> impl I
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "unknown message"})),
-        );
+        )
+            .into_response();
     };
     // spec §Security invariants: refs masked in every API response, full
     // refs never in GET responses. Ordinary routes' `destination` is a route
@@ -1180,9 +1191,11 @@ async fn trace(State(d): State<Arc<Daemon>>, AxPath(id): AxPath<Uuid>) -> impl I
     // ref verbatim in `dest_endpoint` (see `enqueue_identity_send`), so those
     // must use the same masked "protocol:masked_ref" compound form (RULING
     // 2) as `/v1/identities` and `/v1/identities/challenges`.
-    let deliveries: Vec<_> = store
-        .deliveries_for(id)
-        .unwrap_or_default()
+    let del_rows = match store.deliveries_for(id) {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
+    let deliveries: Vec<_> = del_rows
         .iter()
         .map(|del| {
             let destination = if del.route == IDENTITY_ROUTE {
@@ -1220,6 +1233,7 @@ async fn trace(State(d): State<Arc<Daemon>>, AxPath(id): AxPath<Uuid>) -> impl I
             "deliveries": deliveries,
         })),
     )
+        .into_response()
 }
 
 /// `GET /metrics` (Prometheus text exposition format, not JSON): counters
@@ -1284,7 +1298,10 @@ struct IdentitiesResponse {
     ),
 )]
 async fn identities(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
-    let links = d.store.lock().unwrap().list_links().unwrap_or_default();
+    let links = match d.store.lock().unwrap().list_links() {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
     let out: Vec<_> = links
         .iter()
         .map(|l| LinkItem {
@@ -1295,7 +1312,7 @@ async fn identities(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
             verified_at: l.verified_at,
         })
         .collect();
-    Json(IdentitiesResponse { links: out })
+    Json(IdentitiesResponse { links: out }).into_response()
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -1392,17 +1409,16 @@ async fn create_link(State(d): State<Arc<Daemon>>, body: Bytes) -> impl IntoResp
     ),
 )]
 async fn delete_link(State(d): State<Arc<Daemon>>, AxPath(id): AxPath<i64>) -> impl IntoResponse {
-    let deleted = match d.store.lock().unwrap().delete_link(id) {
-        Ok(b) => b,
+    // A storage error must be a 500, not a 404: 404 means "no such link",
+    // which would tell the caller the delete succeeded/was unnecessary when it
+    // actually failed (audit: fail-quiet control plane).
+    match d.store.lock().unwrap().delete_link(id) {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::NOT_FOUND,
         Err(e) => {
             warn!(error = %e, id, "failed to delete identity link");
-            false
+            StatusCode::INTERNAL_SERVER_ERROR
         }
-    };
-    if deleted {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
     }
 }
 
@@ -1440,12 +1456,10 @@ struct ChallengesResponse {
 )]
 async fn challenges(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let now = Utc::now();
-    let list = d
-        .store
-        .lock()
-        .unwrap()
-        .list_challenges(now)
-        .unwrap_or_default();
+    let list = match d.store.lock().unwrap().list_challenges(now) {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
     let out: Vec<_> = list
         .iter()
         .map(|c| ChallengeItem {
@@ -1462,6 +1476,7 @@ async fn challenges(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
         pending_count: out.len(),
         challenges: out,
     })
+    .into_response()
 }
 
 /// `GET /v1/federation` (design §6, Task 5): every configured
@@ -1510,7 +1525,7 @@ struct FederationResponse {
 )]
 async fn federation(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let Some(fed) = &d.fed else {
-        return Json(FederationResponse { peers: Vec::new() });
+        return Json(FederationResponse { peers: Vec::new() }).into_response();
     };
     let configured: Vec<crate::config::PeerConfig> = d.cfg_snapshot(|c| {
         c.federation
@@ -1518,7 +1533,10 @@ async fn federation(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
             .map(|f| f.peers.clone())
             .unwrap_or_default()
     });
-    let trust_rows = d.store.lock().unwrap().list_trust().unwrap_or_default();
+    let trust_rows = match d.store.lock().unwrap().list_trust() {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
     let conns = fed.conns.lock().unwrap();
     // Keyed by node_id, not `FedState.conns`'s own map key (a configured
     // peer's NAME, or an unconfigured connection's raw node_id -- see
@@ -1552,7 +1570,7 @@ async fn federation(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
         ));
     }
     drop(conns);
-    Json(FederationResponse { peers: peers_out })
+    Json(FederationResponse { peers: peers_out }).into_response()
 }
 
 /// One `GET /v1/federation` peer entry. `last_seen` (Task 5 choice,
@@ -1695,12 +1713,10 @@ async fn discovery(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     let our_advert = crate::fed::conn::build_signed_advert(&d);
 
     let now = Utc::now();
-    let rows = d
-        .store
-        .lock()
-        .unwrap()
-        .list_peer_adverts(now)
-        .unwrap_or_default();
+    let rows = match d.store.lock().unwrap().list_peer_adverts(now) {
+        Ok(v) => v,
+        Err(e) => return storage_error(e),
+    };
     let mut peers: Vec<serde_json::Value> = Vec::new();
     for (node_id, advert_cbor, received_at) in rows {
         let decoded: Option<Advert> = ciborium::from_reader(advert_cbor.as_slice()).ok();
@@ -1746,7 +1762,7 @@ async fn discovery(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
         }
     }
 
-    Json(json!({ "mode": mode, "our_advert": our_advert, "peers": peers }))
+    Json(json!({ "mode": mode, "our_advert": our_advert, "peers": peers })).into_response()
 }
 
 /// Builds the `GET /v1/events` (design §4) SSE stream from a live broadcast
