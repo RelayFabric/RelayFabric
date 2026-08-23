@@ -128,13 +128,19 @@ jobs:
             -R "$GITHUB_REPOSITORY"
           gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
             --json body -q .body > body.md
+          # Idempotent: append the Verification section only once. A re-run of
+          # this job would otherwise append a second (third, ...) copy. Prose
+          # lines are kept unwrapped so GitHub (which renders a single newline
+          # as a line break in release notes) doesn't show ragged mid-sentence
+          # breaks.
+          if grep -q '^### Verification' body.md; then
+            echo "verification section already present; leaving notes as-is"
+          else
           cat >> body.md <<'EOF'
 
           ### Verification
 
-          SHA256 checksums are in `checksums.txt` (itself signed). Every
-          tarball and `.deb` is signed with keyless
-          [Sigstore cosign](https://docs.sigstore.dev/); verify with:
+          SHA256 checksums are in `checksums.txt` (itself signed). Every tarball and `.deb` is signed with keyless [Sigstore cosign](https://docs.sigstore.dev/); verify with:
 
           ```bash
           cosign verify-blob --certificate <file>.pem --signature <file>.sig <file> \
@@ -142,8 +148,8 @@ jobs:
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
           ```
 
-          GitHub build-provenance attestations are also available:
-          `gh attestation verify <file> -R RelayFabric/RelayFabric`.
+          GitHub build-provenance attestations are also available: `gh attestation verify <file> -R RelayFabric/RelayFabric`.
           EOF
           gh release edit "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
             --notes-file body.md
+          fi
