@@ -832,6 +832,37 @@ struct ConfigWriteError {
     error: String,
 }
 
+/// Plugin `command`s an admin-API config write is trying to introduce or
+/// change, relative to the currently-running config. Executing a plugin
+/// command is deferred RCE (the daemon `sh -c`s it), and a command change
+/// needs a restart to take effect anyway, so the admin API refuses to be the
+/// path that sets one (defense-in-depth: the write socket's safety no longer
+/// rests solely on it never being reachable). Setting a command to null,
+/// removing a plugin, or leaving a command byte-identical is allowed; only
+/// the on-disk config file, edited out of band, may introduce or change a
+/// non-null command.
+fn rejected_command_changes(
+    current: &BTreeMap<String, Option<String>>,
+    new: &crate::config::Config,
+) -> Vec<String> {
+    let mut names: Vec<String> = new
+        .plugins
+        .iter()
+        .filter_map(|(name, p)| {
+            p.command.as_ref().and_then(|cmd| {
+                let prev = current.get(name).and_then(|c| c.as_ref());
+                if prev == Some(cmd) {
+                    None
+                } else {
+                    Some(name.clone())
+                }
+            })
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 /// `PUT /v1/config` (design §3): validates the POSTed YAML text (422 on
 /// failure, zero filesystem changes), then replaces the on-disk config file
 /// and applies it.
@@ -862,6 +893,25 @@ async fn config_put(State(state): State<AdminState>, body: Bytes) -> impl IntoRe
             );
         }
     };
+    // Defense-in-depth (audit HIGH): the admin API must not be able to set or
+    // change a plugin's executable command -- that would be deferred RCE.
+    let current_commands: BTreeMap<String, Option<String>> = state.daemon.cfg_snapshot(|c| {
+        c.plugins
+            .iter()
+            .map(|(k, v)| (k.clone(), v.command.clone()))
+            .collect()
+    });
+    let rejected = rejected_command_changes(&current_commands, &new_cfg);
+    if !rejected.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"valid": false, "errors": [format!(
+                "plugin command may not be set or changed via the admin API \
+                 (edit the config file and restart the daemon instead): {}",
+                rejected.join(", ")
+            )]})),
+        );
+    }
     let _write_guard = state.write_lock.lock().unwrap();
     if let Err(e) = write_config_replacing_current(&state.config_path, text) {
         return (
@@ -1900,6 +1950,45 @@ mod tests {
     use http_body_util::BodyExt;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    fn cfg_with_plugins(yaml_plugins: &str) -> crate::config::Config {
+        let raw = format!(
+            "node:\n  name: t\n  data_dir: /tmp/rf-admin-test\nplugins:\n{yaml_plugins}"
+        );
+        crate::config::load_from_str(&raw).expect("test config must parse")
+    }
+
+    #[test]
+    fn admin_config_write_rejects_introducing_or_changing_a_plugin_command() {
+        // currently running: plugin "a" with a command, "b" with none
+        let mut current = BTreeMap::new();
+        current.insert("a".to_string(), Some("/bin/a".to_string()));
+        current.insert("b".to_string(), None);
+
+        // identical command for "a" is fine; a NEW command on "b" and a NEW
+        // plugin "c" with a command are both rejected.
+        let new = cfg_with_plugins(
+            "  a:\n    enabled: true\n    command: /bin/a\n\
+             \x20 b:\n    enabled: true\n    command: /bin/evil\n\
+             \x20 c:\n    enabled: true\n    command: /bin/rce\n",
+        );
+        let rejected = rejected_command_changes(&current, &new);
+        assert_eq!(rejected, vec!["b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn admin_config_write_allows_non_command_changes() {
+        let mut current = BTreeMap::new();
+        current.insert("a".to_string(), Some("/bin/a".to_string()));
+
+        // same command, changed config only -> allowed; and a new plugin with
+        // NO command (operator runs it themselves) -> allowed.
+        let new = cfg_with_plugins(
+            "  a:\n    enabled: false\n    command: /bin/a\n\
+             \x20 d:\n    enabled: true\n",
+        );
+        assert!(rejected_command_changes(&current, &new).is_empty());
+    }
 
     /// Shadows `super::router` (now `fn(Arc<Daemon>, PathBuf) -> Router`)
     /// for the pre-Task-3 call sites in this module, none of which exercise
