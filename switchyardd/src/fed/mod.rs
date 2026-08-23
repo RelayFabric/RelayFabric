@@ -39,6 +39,13 @@ pub(crate) fn warn_throttle_due(
 ) -> bool {
     let now = std::time::Instant::now();
     let mut throttle = map.lock().unwrap();
+    // Prune-on-access (bounds an attacker-mintable-key map): drop entries
+    // older than the interval. A pruned key would be "due" again anyway, so
+    // eviction changes no throttle decision -- it just caps the map to peers
+    // seen within the last `interval`, instead of growing one permanent entry
+    // per distinct node_id a flood of minted identities can produce. Mirrors
+    // the eviction dedup/limits already do for their own such maps.
+    throttle.retain(|_, last| now.duration_since(*last) < interval);
     let due = match throttle.get(key) {
         Some(last) => now.duration_since(*last) >= interval,
         None => true,
@@ -47,6 +54,27 @@ pub(crate) fn warn_throttle_due(
         throttle.insert(key.to_string(), now);
     }
     due
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[test]
+    fn warn_throttle_prunes_expired_keys() {
+        let map = Mutex::new(HashMap::new());
+        let interval = Duration::from_millis(20);
+        assert!(warn_throttle_due(&map, "a", interval)); // first: due, stamps "a"
+        assert!(!warn_throttle_due(&map, "a", interval)); // immediate repeat: throttled
+        std::thread::sleep(Duration::from_millis(40)); // "a" now expired
+        assert!(warn_throttle_due(&map, "b", interval)); // stamps "b", prunes "a"
+        let m = map.lock().unwrap();
+        assert!(!m.contains_key("a"), "expired key must be pruned, bounding the map");
+        assert!(m.contains_key("b"));
+    }
 }
 
 pub mod advert;

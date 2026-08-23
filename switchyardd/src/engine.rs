@@ -755,13 +755,11 @@ enum Persistence {
 /// review fix round 1): at most one warn per peer per minute, so an
 /// untrusted flood can't also flood the log the way it's barred from
 /// flooding SQLite. Keyed by the FULL node_id (never truncated — a
-/// truncated key could conflate two distinct peers' throttles); unbounded
-/// key growth over the daemon's lifetime is an accepted trade-off for
-/// this fix round (peers are already rate-limited in practice by
-/// `fed::conn::MAX_INBOUND_CONNS` plus the cost of completing a fresh
-/// Noise handshake per distinct identity) rather than the eviction
-/// machinery `dedup`/`limits` use for their own attacker-mintable-key
-/// maps.
+/// truncated key could conflate two distinct peers' throttles).
+/// `warn_throttle_due` prunes entries older than the interval on every
+/// access, so the map is bounded to peers seen within the last minute --
+/// the eviction machinery `dedup`/`limits` use for their own
+/// attacker-mintable-key maps (audit: was previously unbounded).
 static PRE_TRUST_REJECT_WARN_THROTTLE: std::sync::LazyLock<Mutex<HashMap<String, Instant>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
