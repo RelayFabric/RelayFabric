@@ -185,15 +185,60 @@ for messages routed onward there).
 
 ---
 
+## Meshtastic (direct)
+
+Bridges Meshtastic radios by talking to the device **directly over the
+device API** — serial, TCP, or BLE — with no MQTT broker. One of **two**
+Meshtastic plugins (see [Meshtastic (MQTT-JSON)](#meshtastic-mqtt-json)
+below for the broker-based alternative; run whichever suits you, not both
+against one radio).
+
+!!! danger "This plugin is GPL-3.0"
+    Unlike the rest of RelayFabric (Apache-2.0), `meshtastic-direct` is
+    **GPL-3.0-or-later**, because it imports the official `meshtastic`
+    library (the whole Meshtastic library ecosystem, and the protobufs
+    behind it, are GPL). The copyleft is isolated to this plugin's own
+    process — it speaks only the Apache-2.0 CBOR IPC to the daemon and
+    depends on the Apache-2.0 SDK — so `switchyardd` and every other
+    component stay Apache-2.0, exactly as the signal-cli sidecar's GPL
+    stays in signal-cli's process. See `plugins/meshtastic-direct/LICENSE`.
+
+Why choose it over the MQTT-JSON plugin: **no MQTT broker**, downlinks sent
+as the node's **own identity** (so the MQTT plugin's `from: 0` firmware-
+rejection risk does not apply), and **real per-node sender ids**. The cost
+is the GPL dependency; the MQTT-JSON plugin remains the permissive default.
+
+| Key | Default | Notes |
+|---|---|---|
+| `connection` | — | `serial:///dev/ttyUSB0`, `tcp://host[:4403]`, or `ble://<addr>` |
+| `max_text_bytes` | `200` | Truncation applied to upstream text |
+| `channels` | — | `index` per named channel (maps a Meshtastic channel index to an endpoint) |
+
+```yaml
+plugins:
+  meshtastic-direct:
+    enabled: true
+    config:
+      connection: serial:///dev/ttyUSB0
+      channels:
+        mesh: {index: 0}
+```
+
+Text only (constrained-LoRa transport class caps payload, demotes media).
+Supports channel broadcasts **and direct messages** — it advertises
+`direct_messages`, so it can deliver identity-link challenges to a node and
+bridge the reply back, unlike the MQTT-JSON plugin.
+
+---
+
 ## Meshtastic (MQTT-JSON)
 
 Bridges Meshtastic device channels over the node's **MQTT-JSON** gateway —
-one of **two** Meshtastic plugins (see [Meshtastic (direct)](#meshtastic-direct)
-below for the direct serial/TCP/BLE alternative; run whichever suits you,
-not both against one radio). Each configured channel maps to a RelayFabric
-channel: text uplinks arrive over the node's MQTT JSON stream, and messages
-sent to the channel are delivered back over MQTT (one topic per Meshtastic
-channel).
+the broker-based alternative to [Meshtastic (direct)](#meshtastic-direct)
+above, and the **permissive (Apache-2.0) default**. Each configured channel
+maps to a RelayFabric channel: text uplinks arrive over the node's MQTT JSON
+stream, and messages sent to the channel are delivered back over MQTT (one
+topic per Meshtastic channel).
 
 !!! note "Licensing"
     Meshtastic's official Python/protobuf client libraries are GPL-3.0.
@@ -236,50 +281,6 @@ and the next matching uplink is dropped instead of re-bridged.
     - A lost echo (downlink never re-uplinks over the air) leaves the
       loop-guard entry live for its full 1-hour TTL, during which one
       identical genuine uplink can be swallowed.
-
----
-
-## Meshtastic (direct)
-
-A second Meshtastic plugin that talks to the radio **directly over the
-device API** — serial, TCP, or BLE — instead of through an MQTT-JSON
-gateway. Run whichever of the two suits you; not both against one radio.
-
-!!! danger "This plugin is GPL-3.0"
-    Unlike the rest of RelayFabric (Apache-2.0), `meshtastic-direct` is
-    **GPL-3.0-or-later**, because it imports the official `meshtastic`
-    library (the whole Meshtastic library ecosystem, and the protobufs
-    behind it, are GPL). The copyleft is isolated to this plugin's own
-    process — it speaks only the Apache-2.0 CBOR IPC to the daemon and
-    depends on the Apache-2.0 SDK — so `switchyardd` and every other
-    component stay Apache-2.0, exactly as the signal-cli sidecar's GPL
-    stays in signal-cli's process. See `plugins/meshtastic-direct/LICENSE`.
-
-Why choose it over the MQTT plugin: **no MQTT broker**, downlinks sent as
-the node's **own identity** (so the MQTT plugin's `from: 0` firmware-
-rejection risk does not apply), and **real per-node sender ids**. The cost
-is the GPL dependency; the MQTT-JSON plugin remains the permissive default.
-
-| Key | Default | Notes |
-|---|---|---|
-| `connection` | — | `serial:///dev/ttyUSB0`, `tcp://host[:4403]`, or `ble://<addr>` |
-| `max_text_bytes` | `200` | Truncation applied to upstream text |
-| `channels` | — | `index` per named channel (maps a Meshtastic channel index to an endpoint) |
-
-```yaml
-plugins:
-  meshtastic-direct:
-    enabled: true
-    config:
-      connection: serial:///dev/ttyUSB0
-      channels:
-        mesh: {index: 0}
-```
-
-Text only (constrained-LoRa transport class caps payload, demotes media).
-Supports channel broadcasts **and direct messages** — it advertises
-`direct_messages`, so it can deliver identity-link challenges to a node and
-bridge the reply back, unlike the MQTT-JSON plugin.
 
 ---
 

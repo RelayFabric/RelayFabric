@@ -104,7 +104,9 @@ The RF parameters must match the network you intend to reach; do not guess frequ
 
 ## Bridging Meshtastic to LXMF
 
-RelayFabric's Meshtastic plugin consumes the **MQTT JSON gateway**, not the serial device (the official Meshtastic code is GPL and is never linked). So a Meshtastic node's traffic must reach an MQTT broker the plugin reads. Two ways in:
+RelayFabric ships **two** Meshtastic plugins (see [Plugins](plugins.md#meshtastic-direct)). For a bench test the simplest is usually **`meshtastic-direct`**: it talks to the radio straight over serial/TCP/BLE with no broker and no proxy — plug the node in over USB and set `connection: serial:///dev/ttyUSB0` (it was field-tested over BLE with channel + direct messages). It is **GPL-3.0** because it links the official `meshtastic` library, isolated to that plugin's own process.
+
+The recipe below instead uses the permissive **`meshtastic` (MQTT-JSON)** plugin, which never links the GPL library — it consumes the node's **MQTT JSON gateway**, so the node's traffic must reach an MQTT broker the plugin reads. Two ways in:
 
 1. **WiFi + MQTT** — the node joins WiFi and connects to a broker on the LAN. Simple when it works; note the ESP32-S3 in a Heltec V3 is **2.4 GHz only**.
 2. **USB MQTT client-proxy** — the node speaks MQTT over its USB link and a small relay forwards it to a local broker. No WiFi, no subnet, no firewall. This is the most reliable path for a bench setup.
