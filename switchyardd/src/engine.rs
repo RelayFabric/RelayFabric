@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 pub struct PluginHandle {
     pub tx: mpsc::Sender<DaemonToPlugin>,
@@ -1750,6 +1750,33 @@ pub(crate) fn emit_delivery(d: &Daemon, id: uuid::Uuid, route: impl Into<String>
 
 const PURGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// Run an essential loop under panic supervision: spawn `make_fut()`, and if
+/// it panics, log and restart it after `backoff` instead of letting the task
+/// die silently. Returns only when the future completes normally or its task
+/// is cancelled. Without this a panic in the delivery pump would permanently
+/// halt all delivery while the rest of the daemon (admin API, listeners) kept
+/// running and looked healthy -- the audit's highest-severity finding.
+///
+/// `backoff` bounds the restart rate so a persistent panic (e.g. a poisoned
+/// mutex, which restart alone can't clear) degrades to a logged, throttled
+/// retry loop rather than a hot spin.
+pub async fn supervise<F, Fut>(name: &str, backoff: std::time::Duration, mut make_fut: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    loop {
+        match tokio::spawn(make_fut()).await {
+            Ok(()) => return, // normal completion: nothing to restart
+            Err(e) if e.is_panic() => {
+                error!(task = name, error = ?e, "supervised task panicked; restarting after backoff");
+                tokio::time::sleep(backoff).await;
+            }
+            Err(_) => return, // task cancelled (shutdown): do not restart
+        }
+    }
+}
+
 pub async fn pump(d: Arc<Daemon>) {
     let mut last_purge = Instant::now();
     loop {
@@ -3050,6 +3077,41 @@ mod tests {
         test_daemon_with_budgets, test_daemon_with_federation,
         test_daemon_with_federation_and_limits, test_daemon_with_limits, test_peer_identity,
     };
+
+    #[tokio::test]
+    async fn supervise_restarts_a_panicking_task_until_it_completes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // A transient panic in an essential loop must self-heal, not halt it
+        // forever: the task panics twice, then completes on the third run.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let a = attempts.clone();
+        supervise("test-task", std::time::Duration::from_millis(1), move || {
+            let a = a.clone();
+            async move {
+                let n = a.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    panic!("transient boom {n}");
+                }
+            }
+        })
+        .await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn supervise_returns_when_the_task_completes_first_try() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runs = Arc::new(AtomicUsize::new(0));
+        let r = runs.clone();
+        supervise("test-task", std::time::Duration::from_millis(1), move || {
+            let r = r.clone();
+            async move {
+                r.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1); // no restart on clean completion
+    }
 
     #[test]
     fn inbound_routes_to_other_endpoint_and_dedups() {
