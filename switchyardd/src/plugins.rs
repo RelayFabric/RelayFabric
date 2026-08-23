@@ -456,9 +456,18 @@ mod tests {
     #[test]
     fn is_wedged_only_when_connected_and_past_the_liveness_window() {
         let t = Duration::from_secs(90);
-        assert!(is_wedged(true, Duration::from_secs(91), t), "stale + connected = wedged");
-        assert!(!is_wedged(true, Duration::from_secs(89), t), "fresh = not wedged");
-        assert!(!is_wedged(false, Duration::from_secs(300), t), "disconnected is never 'wedged'");
+        assert!(
+            is_wedged(true, Duration::from_secs(91), t),
+            "stale + connected = wedged"
+        );
+        assert!(
+            !is_wedged(true, Duration::from_secs(89), t),
+            "fresh = not wedged"
+        );
+        assert!(
+            !is_wedged(false, Duration::from_secs(300), t),
+            "disconnected is never 'wedged'"
+        );
     }
 
     /// Any received frame must refresh the connection's liveness deadline, or
@@ -472,24 +481,52 @@ mod tests {
         let conn = tokio::spawn(handle_conn(d.clone(), daemon_side, "mocka".into()));
 
         let (mut r, mut w) = plugin_side.into_split();
-        write_frame(&mut w, &PluginToDaemon::Hello {
-            plugin: "mocka".into(), version: "0.1.0".into(),
-            protocol_version: PROTOCOL_VERSION, capabilities: Capabilities::default(),
-        }).await.unwrap();
+        write_frame(
+            &mut w,
+            &PluginToDaemon::Hello {
+                plugin: "mocka".into(),
+                version: "0.1.0".into(),
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: Capabilities::default(),
+            },
+        )
+        .await
+        .unwrap();
         let _ack: DaemonToPlugin = read_frame(&mut r).await.unwrap();
 
-        let before = *d.plugins.lock().unwrap().get("mocka").unwrap().last_seen.lock().unwrap();
+        let before = *d
+            .plugins
+            .lock()
+            .unwrap()
+            .get("mocka")
+            .unwrap()
+            .last_seen
+            .lock()
+            .unwrap();
         // a small gap so the refreshed instant is strictly later
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         let mut gauges = std::collections::BTreeMap::new();
         gauges.insert("rssi".to_string(), -70.0);
-        write_frame(&mut w, &PluginToDaemon::Gauges { gauges }).await.unwrap();
+        write_frame(&mut w, &PluginToDaemon::Gauges { gauges })
+            .await
+            .unwrap();
 
         // wait until the daemon has processed the frame and advanced last_seen
         let mut advanced = false;
         for _ in 0..200 {
-            let now = *d.plugins.lock().unwrap().get("mocka").unwrap().last_seen.lock().unwrap();
-            if now > before { advanced = true; break; }
+            let now = *d
+                .plugins
+                .lock()
+                .unwrap()
+                .get("mocka")
+                .unwrap()
+                .last_seen
+                .lock()
+                .unwrap();
+            if now > before {
+                advanced = true;
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert!(advanced, "receiving a frame must advance last_seen");
@@ -507,16 +544,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = Arc::new(test_daemon(dir.path()));
 
-        async fn connect(d: &Arc<Daemon>) -> (tokio::task::JoinHandle<std::io::Result<()>>,
-                                              tokio::net::unix::OwnedReadHalf,
-                                              tokio::net::unix::OwnedWriteHalf) {
+        async fn connect(
+            d: &Arc<Daemon>,
+        ) -> (
+            tokio::task::JoinHandle<std::io::Result<()>>,
+            tokio::net::unix::OwnedReadHalf,
+            tokio::net::unix::OwnedWriteHalf,
+        ) {
             let (plugin_side, daemon_side) = UnixStream::pair().unwrap();
             let conn = tokio::spawn(handle_conn(d.clone(), daemon_side, "mocka".into()));
             let (mut r, mut w) = plugin_side.into_split();
-            write_frame(&mut w, &PluginToDaemon::Hello {
-                plugin: "mocka".into(), version: "0.1.0".into(),
-                protocol_version: PROTOCOL_VERSION, capabilities: Capabilities::default(),
-            }).await.unwrap();
+            write_frame(
+                &mut w,
+                &PluginToDaemon::Hello {
+                    plugin: "mocka".into(),
+                    version: "0.1.0".into(),
+                    protocol_version: PROTOCOL_VERSION,
+                    capabilities: Capabilities::default(),
+                },
+            )
+            .await
+            .unwrap();
             let ack: DaemonToPlugin = read_frame(&mut r).await.unwrap();
             assert!(matches!(ack, DaemonToPlugin::HelloAck { error: None, .. }));
             (conn, r, w)
@@ -536,7 +584,10 @@ mod tests {
         let h = d.plugins.lock().unwrap();
         let handle = h.get("mocka").expect("B's handle must remain installed");
         assert!(handle.connected, "reconnected plugin must stay connected");
-        assert_eq!(handle.conn_id, b_conn_id, "B's handle must not be replaced or cleared");
+        assert_eq!(
+            handle.conn_id, b_conn_id,
+            "B's handle must not be replaced or cleared"
+        );
     }
 
     /// A Hello claiming a name other than the one this socket is bound to

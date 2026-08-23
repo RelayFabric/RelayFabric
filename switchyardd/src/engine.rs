@@ -3109,7 +3109,7 @@ pub mod tests_support {
                 },
                 connected: true,
                 conn_id: 0,
-            last_seen: Arc::new(Mutex::new(Instant::now())),
+                last_seen: Arc::new(Mutex::new(Instant::now())),
             },
         );
         rx
@@ -3130,7 +3130,7 @@ pub mod tests_support {
                 },
                 connected: true,
                 conn_id: 0,
-            last_seen: Arc::new(Mutex::new(Instant::now())),
+                last_seen: Arc::new(Mutex::new(Instant::now())),
             },
         );
         rx
@@ -3153,15 +3153,19 @@ mod tests {
         // forever: the task panics twice, then completes on the third run.
         let attempts = Arc::new(AtomicUsize::new(0));
         let a = attempts.clone();
-        supervise("test-task", std::time::Duration::from_millis(1), move || {
-            let a = a.clone();
-            async move {
-                let n = a.fetch_add(1, Ordering::SeqCst);
-                if n < 2 {
-                    panic!("transient boom {n}");
+        supervise(
+            "test-task",
+            std::time::Duration::from_millis(1),
+            move || {
+                let a = a.clone();
+                async move {
+                    let n = a.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        panic!("transient boom {n}");
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
@@ -3171,12 +3175,16 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let runs = Arc::new(AtomicUsize::new(0));
         let r = runs.clone();
-        supervise("test-task", std::time::Duration::from_millis(1), move || {
-            let r = r.clone();
-            async move {
-                r.fetch_add(1, Ordering::SeqCst);
-            }
-        })
+        supervise(
+            "test-task",
+            std::time::Duration::from_millis(1),
+            move || {
+                let r = r.clone();
+                async move {
+                    r.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
         .await;
         assert_eq!(runs.load(Ordering::SeqCst), 1); // no restart on clean completion
     }
@@ -3371,8 +3379,15 @@ mod tests {
         let d = Arc::new(test_daemon(dir.path()));
         let now = Utc::now();
         handle_inbound(
-            &d, "mocka", "chan".into(), "!a".into(), "text".into(),
-            "hi".into(), None, vec![], None,
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hi".into(),
+            None,
+            vec![],
+            None,
         );
         // Query slightly in the future: handle_inbound stamps next_attempt at
         // its own (later) now, so `now` captured above wouldn't see it as due.
@@ -3456,7 +3471,7 @@ mod tests {
                 capabilities: Capabilities::default(),
                 connected: true,
                 conn_id: 0,
-            last_seen: Arc::new(Mutex::new(Instant::now())),
+                last_seen: Arc::new(Mutex::new(Instant::now())),
             },
         );
 
@@ -4137,7 +4152,7 @@ mod tests {
                 },
                 connected: true,
                 conn_id: 0,
-            last_seen: Arc::new(Mutex::new(Instant::now())),
+                last_seen: Arc::new(Mutex::new(Instant::now())),
             },
         );
 
@@ -4191,7 +4206,7 @@ mod tests {
                 },
                 connected: true,
                 conn_id: 0,
-            last_seen: Arc::new(Mutex::new(Instant::now())),
+                last_seen: Arc::new(Mutex::new(Instant::now())),
             },
         );
 

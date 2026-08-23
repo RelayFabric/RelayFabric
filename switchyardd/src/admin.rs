@@ -1968,9 +1968,8 @@ mod tests {
     use tower::ServiceExt;
 
     fn cfg_with_plugins(yaml_plugins: &str) -> crate::config::Config {
-        let raw = format!(
-            "node:\n  name: t\n  data_dir: /tmp/rf-admin-test\nplugins:\n{yaml_plugins}"
-        );
+        let raw =
+            format!("node:\n  name: t\n  data_dir: /tmp/rf-admin-test\nplugins:\n{yaml_plugins}");
         crate::config::load_from_str(&raw).expect("test config must parse")
     }
 

@@ -219,7 +219,14 @@ async fn run_listener(d: Arc<Daemon>, addr: String, static_key: Arc<StaticKey>) 
 /// production `MAX_INBOUND_CONNS` cap; `accept_loop_with_cap` (below) is
 /// the same loop with the cap as a parameter, for the accept-cap test.
 async fn accept_loop(d: Arc<Daemon>, listener: TcpListener, static_key: Arc<StaticKey>) {
-    accept_loop_with_cap(d, listener, static_key, MAX_INBOUND_CONNS, HANDSHAKE_TIMEOUT).await
+    accept_loop_with_cap(
+        d,
+        listener,
+        static_key,
+        MAX_INBOUND_CONNS,
+        HANDSHAKE_TIMEOUT,
+    )
+    .await
 }
 
 /// Accepts connections up to `max_inbound` concurrently active at once
@@ -347,7 +354,12 @@ async fn spawn_outbound(d: Arc<Daemon>, peer: PeerConfig, static_key: Arc<Static
                 // can't wedge this peer's redial loop.
                 let hs = tokio::time::timeout(
                     HANDSHAKE_TIMEOUT,
-                    noise::handshake_initiator(stream, &static_key, &d.identity, Some(&peer.node_id)),
+                    noise::handshake_initiator(
+                        stream,
+                        &static_key,
+                        &d.identity,
+                        Some(&peer.node_id),
+                    ),
                 )
                 .await;
                 match hs {
@@ -1638,9 +1650,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let short = std::time::Duration::from_millis(200);
-        tokio::spawn(async move {
-            accept_loop_with_cap(d, listener, daemon_static, 1, short).await
-        });
+        tokio::spawn(
+            async move { accept_loop_with_cap(d, listener, daemon_static, 1, short).await },
+        );
 
         // A stalls: connects, sends nothing, holds the single permit.
         let _stalled = TcpStream::connect(addr).await.unwrap();

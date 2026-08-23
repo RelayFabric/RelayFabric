@@ -863,9 +863,7 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         );
     }
     if cfg.dedup_ttl_secs == 0 {
-        return Err(
-            "dedup_ttl_secs must be at least 1 (0 leaves no dedup window)".to_string(),
-        );
+        return Err("dedup_ttl_secs must be at least 1 (0 leaves no dedup window)".to_string());
     }
 
     // node.name (final cycle-G review finding): design §1's advert contract
@@ -3223,9 +3221,12 @@ federation:
         let mut cfg = parse(GOOD).unwrap();
         cfg.node.data_dir = std::path::PathBuf::from("/var/lib/relayfabric");
         cfg.routes.clear(); // isolate: only exercising the socket-length gate
-        // must not fail on the socket-length rule (may pass entirely)
+                            // must not fail on the socket-length rule (may pass entirely)
         if let Err(e) = validate(&cfg) {
-            assert!(!e.contains("Unix-socket"), "short data_dir wrongly rejected: {e}");
+            assert!(
+                !e.contains("Unix-socket"),
+                "short data_dir wrongly rejected: {e}"
+            );
         }
     }
 
@@ -3236,8 +3237,14 @@ federation:
                 Box::new(|c: &mut Config| c.hop_limit = 0) as Box<dyn Fn(&mut Config)>,
                 "hop_limit",
             ),
-            (Box::new(|c: &mut Config| c.ttl_default_secs = 0), "ttl_default_secs"),
-            (Box::new(|c: &mut Config| c.dedup_ttl_secs = 0), "dedup_ttl_secs"),
+            (
+                Box::new(|c: &mut Config| c.ttl_default_secs = 0),
+                "ttl_default_secs",
+            ),
+            (
+                Box::new(|c: &mut Config| c.dedup_ttl_secs = 0),
+                "dedup_ttl_secs",
+            ),
         ] {
             let mut cfg = parse(GOOD).unwrap();
             mutate(&mut cfg);
@@ -3248,11 +3255,17 @@ federation:
 
     #[test]
     fn zero_federation_bounds_are_rejected() {
-        for (field, needle) in [("max_hops: 0", "max_hops"), ("max_ttl_secs: 0", "max_ttl_secs")] {
+        for (field, needle) in [
+            ("max_hops: 0", "max_hops"),
+            ("max_ttl_secs: 0", "max_ttl_secs"),
+        ] {
             let raw = format!("{GOOD}\nfederation:\n  {field}\n");
             // parse() runs validate(), so the zero bound surfaces as the error.
             let err = parse(&raw).unwrap_err();
-            assert!(err.contains(needle), "error must name federation.{needle}: {err}");
+            assert!(
+                err.contains(needle),
+                "error must name federation.{needle}: {err}"
+            );
         }
     }
 

@@ -72,7 +72,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(40)); // "a" now expired
         assert!(warn_throttle_due(&map, "b", interval)); // stamps "b", prunes "a"
         let m = map.lock().unwrap();
-        assert!(!m.contains_key("a"), "expired key must be pruned, bounding the map");
+        assert!(
+            !m.contains_key("a"),
+            "expired key must be pruned, bounding the map"
+        );
         assert!(m.contains_key("b"));
     }
 }

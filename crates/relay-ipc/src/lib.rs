@@ -145,7 +145,10 @@ mod tests {
         framed.extend_from_slice(&body);
         let mut r = &framed[..];
         let res = read_frame::<_, DaemonToPlugin>(&mut r).await;
-        assert!(res.is_err(), "a deeply-nested frame must be rejected as an error");
+        assert!(
+            res.is_err(),
+            "a deeply-nested frame must be rejected as an error"
+        );
     }
 
     #[tokio::test]

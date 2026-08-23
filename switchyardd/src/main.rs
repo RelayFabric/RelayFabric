@@ -127,10 +127,14 @@ fn main() {
         }
         // Supervise the delivery pump: a transient panic must not silently
         // halt all delivery for the life of the process (see engine::supervise).
-        tokio::spawn(engine::supervise("delivery-pump", std::time::Duration::from_secs(1), {
-            let d = daemon.clone();
-            move || engine::pump(d.clone())
-        }));
+        tokio::spawn(engine::supervise(
+            "delivery-pump",
+            std::time::Duration::from_secs(1),
+            {
+                let d = daemon.clone();
+                move || engine::pump(d.clone())
+            },
+        ));
         if let Some(fed_cfg) = daemon.cfg_snapshot(|c| c.federation.clone()) {
             fed::conn::spawn_federation(daemon.clone(), fed_cfg);
         }
