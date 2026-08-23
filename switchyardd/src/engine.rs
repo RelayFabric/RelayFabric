@@ -34,6 +34,13 @@ pub struct PluginHandle {
     /// "down" (the audit's reconnect-race finding). 0 in tests that install a
     /// handle directly without going through the connection path.
     pub conn_id: u64,
+    /// Last time any frame (incl. a Pong to the daemon's heartbeat Ping) was
+    /// received on this connection. `supervise` restarts a connected plugin
+    /// whose `last_seen` goes stale past the liveness window -- that is how a
+    /// process-alive-but-wedged plugin (the most common failure mode) is
+    /// detected and recovered. Shared Arc so the connection task refreshes it
+    /// without locking the whole plugins map.
+    pub last_seen: Arc<Mutex<Instant>>,
 }
 
 /// Result of `Daemon::apply_config` (design §1): names of plugins that were
@@ -3052,6 +3059,7 @@ pub mod tests_support {
                 },
                 connected: true,
                 conn_id: 0,
+            last_seen: Arc::new(Mutex::new(Instant::now())),
             },
         );
         rx
@@ -3072,6 +3080,7 @@ pub mod tests_support {
                 },
                 connected: true,
                 conn_id: 0,
+            last_seen: Arc::new(Mutex::new(Instant::now())),
             },
         );
         rx
@@ -3350,6 +3359,7 @@ mod tests {
                 capabilities: Capabilities::default(),
                 connected: true,
                 conn_id: 0,
+            last_seen: Arc::new(Mutex::new(Instant::now())),
             },
         );
 
@@ -4030,6 +4040,7 @@ mod tests {
                 },
                 connected: true,
                 conn_id: 0,
+            last_seen: Arc::new(Mutex::new(Instant::now())),
             },
         );
 
@@ -4083,6 +4094,7 @@ mod tests {
                 },
                 connected: true,
                 conn_id: 0,
+            last_seen: Arc::new(Mutex::new(Instant::now())),
             },
         );
 

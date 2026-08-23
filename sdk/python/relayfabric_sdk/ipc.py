@@ -102,3 +102,10 @@ def gauges(values):
     on receipt, not here.
     """
     return {"t": "gauges", "gauges": {k: float(values[k]) for k in sorted(values)}}
+
+
+def pong():
+    """Reply to a daemon Ping (liveness probe). The daemon restarts a
+    connected plugin that stops answering, so a healthy plugin must respond
+    promptly -- see relay_ipc PluginToDaemon::Pong."""
+    return {"t": "pong"}

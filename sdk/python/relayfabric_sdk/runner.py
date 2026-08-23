@@ -17,7 +17,7 @@ import os
 import socket
 import sys
 
-from .ipc import hello, read_frame, write_frame
+from .ipc import hello, pong, read_frame, write_frame
 
 
 def _connect_socket(sock_path):
@@ -93,7 +93,17 @@ def run_plugin(plugin_name, version, bridge_factory, capabilities, *,
             sys.exit(1)
 
         kind = frame.get("t")
-        if kind == "send":
+        if kind == "ping":
+            # Liveness probe: answer promptly or the daemon restarts us. Go
+            # through the bridge's locked writer so this never interleaves
+            # with a frame the bridge's reader thread is writing; fall back to
+            # a direct write for a bridge that isn't a FrameWriter.
+            send_frame = getattr(bridge, "_send_frame", None)
+            if send_frame is not None:
+                send_frame(pong())
+            else:
+                write_frame(sock, pong())
+        elif kind == "send":
             bridge.handle_send(frame)
         elif kind == "send_direct":
             handle_send_direct = getattr(bridge, "handle_send_direct", None)

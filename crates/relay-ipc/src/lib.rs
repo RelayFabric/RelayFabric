@@ -60,6 +60,11 @@ pub enum PluginToDaemon {
     Gauges {
         gauges: BTreeMap<String, f64>,
     },
+    // additive (liveness, kept LAST so pre-existing variants' canonical CBOR
+    // is unchanged): reply to a daemon Ping. Lets the daemon distinguish an
+    // idle-but-healthy plugin from a wedged one -- any received frame,
+    // including this, refreshes the plugin's liveness deadline.
+    Pong,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +93,11 @@ pub enum DaemonToPlugin {
         native_ref: String,
         body: String,
     },
+    // additive (liveness, kept LAST so pre-existing variants' canonical CBOR
+    // is unchanged): a liveness probe. A healthy plugin answers with Pong;
+    // the daemon restarts a connected plugin that stops answering (see
+    // plugins::supervise). Idempotent and side-effect-free for the plugin.
+    Ping,
 }
 
 pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(

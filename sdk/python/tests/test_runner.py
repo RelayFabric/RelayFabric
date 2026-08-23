@@ -243,5 +243,46 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
+class PingTests(unittest.TestCase):
+    """A daemon Ping (liveness probe) must be answered with a Pong, or the
+    daemon will restart the plugin as wedged."""
+
+    def test_ping_is_answered_with_pong_via_socket_fallback(self):
+        sock = FakeSock(queued_frames=[HELLO_ACK_OK, {"t": "ping"}, {"t": "shutdown"}])
+        env = _env(**{CONFIG_ENV: "{}"})
+        with mock.patch.dict(os.environ, env, clear=True), self.assertRaises(SystemExit) as ctx:
+            run_plugin("p", "1.0", _MinimalBridge, relay_ipc.capabilities(),
+                       socket_env=SOCKET_ENV, config_env=CONFIG_ENV,
+                       connect=lambda path: sock)
+        self.assertEqual(ctx.exception.code, 0)
+        written = sock.frames()
+        self.assertTrue(any(f.get("t") == "pong" for f in written),
+                        f"ping must be answered with pong: {written}")
+
+    def test_ping_uses_the_bridges_locked_writer_when_available(self):
+        class _LockedBridge(_MinimalBridge):
+            def __init__(self, cfg, s):
+                super().__init__(cfg, s)
+                self.sent = []
+
+            def _send_frame(self, obj):
+                self.sent.append(obj)
+
+        sock = FakeSock(queued_frames=[HELLO_ACK_OK, {"t": "ping"}, {"t": "shutdown"}])
+        holder = {}
+
+        def factory(cfg, s):
+            holder["b"] = _LockedBridge(cfg, s)
+            return holder["b"]
+
+        env = _env(**{CONFIG_ENV: "{}"})
+        with mock.patch.dict(os.environ, env, clear=True), self.assertRaises(SystemExit):
+            run_plugin("p", "1.0", factory, relay_ipc.capabilities(),
+                       socket_env=SOCKET_ENV, config_env=CONFIG_ENV,
+                       connect=lambda path: sock)
+        self.assertTrue(any(f.get("t") == "pong" for f in holder["b"].sent),
+                        f"pong must go through the bridge's locked writer: {holder['b'].sent}")
+
+
 if __name__ == "__main__":
     unittest.main()

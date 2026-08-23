@@ -312,6 +312,13 @@ async fn main() {
                     }
                 }
                 Some(DaemonToPlugin::Shutdown) | None => return,
+                Some(DaemonToPlugin::Ping) => {
+                    // Liveness probe: answer or the daemon restarts us.
+                    if write_frame(&mut w, &PluginToDaemon::Pong).await.is_err() {
+                        warn!("daemon connection lost");
+                        return;
+                    }
+                }
                 Some(_) => {}
             },
         }

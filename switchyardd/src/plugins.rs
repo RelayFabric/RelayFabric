@@ -11,6 +11,55 @@ use std::time::{Duration, Instant};
 /// fresh id so a stale teardown can tell whether a newer connection has since
 /// replaced it in the handle map (see the reconnect-race guard below).
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// How often the daemon sends a heartbeat Ping to each connected plugin.
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+/// How stale a plugin's `last_seen` may get before `supervise` treats it as
+/// wedged and restarts the process. Comfortably above PING_INTERVAL (several
+/// missed pings) and above the ~30s a synchronous plugin can spend inside one
+/// blocking send, so a slow-but-healthy plugin is never falsely killed.
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(90);
+/// How often `supervise` re-checks a running child's liveness.
+const LIVENESS_POLL: Duration = Duration::from_secs(15);
+
+/// A plugin is wedged when it is still connected but no frame (not even a
+/// Pong to our heartbeat) has arrived within the liveness window. Pure so the
+/// decision is unit-tested without spawning a process or waiting on a clock.
+fn is_wedged(connected: bool, since_last_seen: Duration, timeout: Duration) -> bool {
+    connected && since_last_seen > timeout
+}
+
+/// Monitor a running plugin child until it exits on its own OR goes
+/// unresponsive (connected but no frame within LIVENESS_TIMEOUT), in which
+/// case kill it so the supervise loop restarts it. This is what recovers a
+/// process-alive-but-wedged plugin -- a failure the bare `child.wait()` can
+/// never see. Returns once the child has exited (naturally or killed).
+async fn monitor_child(d: &Arc<Daemon>, name: &str, child: &mut tokio::process::Child) {
+    let mut poll = tokio::time::interval(LIVENESS_POLL);
+    poll.tick().await; // consume the immediate first tick
+    loop {
+        tokio::select! {
+            _ = child.wait() => return, // exited on its own
+            _ = poll.tick() => {
+                let wedged = d
+                    .plugins
+                    .lock()
+                    .unwrap()
+                    .get(name)
+                    .map(|h| is_wedged(h.connected, h.last_seen.lock().unwrap().elapsed(), LIVENESS_TIMEOUT))
+                    .unwrap_or(false);
+                if wedged {
+                    warn!(
+                        plugin = name,
+                        "plugin unresponsive (no frame within liveness window); killing for restart"
+                    );
+                    let _ = child.kill().await;
+                    return;
+                }
+            }
+        }
+    }
+}
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -109,13 +158,15 @@ async fn handle_conn(
     // bounded outbound channel: backpressure instead of unbounded memory (§45)
     let (tx, mut rx) = mpsc::channel::<DaemonToPlugin>(256);
     let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+    let last_seen = Arc::new(std::sync::Mutex::new(Instant::now()));
     d.plugins.lock().unwrap().insert(
         plugin.clone(),
         PluginHandle {
-            tx,
+            tx: tx.clone(),
             capabilities,
             connected: true,
             conn_id,
+            last_seen: last_seen.clone(),
         },
     );
     info!(plugin, "plugin connected");
@@ -133,43 +184,74 @@ async fn handle_conn(
         }
     });
 
+    // Heartbeat: probe an idle plugin so `last_seen` reflects liveness, not
+    // just traffic. A healthy plugin answers Ping with Pong (refreshing
+    // last_seen in the read loop); a wedged one never does, and `supervise`
+    // restarts it once last_seen goes stale. try_send (not send().await) so a
+    // full outbound buffer -- itself a sign the plugin is behind -- doesn't
+    // block the heartbeat; liveness will catch it either way.
+    let heartbeat = {
+        let hb_tx = tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(PING_INTERVAL);
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                match hb_tx.try_send(DaemonToPlugin::Ping) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+        })
+    };
+
     let result = loop {
         match read_frame::<_, PluginToDaemon>(&mut r).await {
-            Ok(PluginToDaemon::Inbound {
-                endpoint,
-                sender,
-                kind,
-                body,
-                created_at,
-                attachments,
-                priority,
-            }) => {
-                engine::handle_inbound(
-                    &d,
-                    &plugin,
-                    endpoint,
-                    sender,
-                    kind,
-                    body,
-                    created_at,
-                    attachments,
-                    priority,
-                );
+            Ok(frame) => {
+                // Any received frame proves the plugin is alive; refresh the
+                // liveness deadline before dispatching.
+                *last_seen.lock().unwrap() = Instant::now();
+                match frame {
+                    PluginToDaemon::Inbound {
+                        endpoint,
+                        sender,
+                        kind,
+                        body,
+                        created_at,
+                        attachments,
+                        priority,
+                    } => {
+                        engine::handle_inbound(
+                            &d,
+                            &plugin,
+                            endpoint,
+                            sender,
+                            kind,
+                            body,
+                            created_at,
+                            attachments,
+                            priority,
+                        );
+                    }
+                    PluginToDaemon::DeliveryResult {
+                        corr,
+                        delivered,
+                        detail,
+                    } => {
+                        engine::handle_result(&d, corr, delivered, detail);
+                    }
+                    PluginToDaemon::Gauges { gauges } => {
+                        d.gauges.record(&plugin, gauges);
+                    }
+                    PluginToDaemon::Pong => {} // liveness refresh only (done above)
+                    PluginToDaemon::Hello { .. } => {} // ignore repeat hello
+                }
             }
-            Ok(PluginToDaemon::DeliveryResult {
-                corr,
-                delivered,
-                detail,
-            }) => {
-                engine::handle_result(&d, corr, delivered, detail);
-            }
-            Ok(PluginToDaemon::Gauges { gauges }) => {
-                d.gauges.record(&plugin, gauges);
-            }
-            Ok(PluginToDaemon::Hello { .. }) => {} // ignore repeat hello
             Err(e) => break e,
         }
     };
+    heartbeat.abort();
     writer.abort();
     // Reconnect-race guard: only clear `connected` (and emit "down") if THIS
     // connection is still the installed one. If a fresh connection already
@@ -226,7 +308,7 @@ pub async fn supervise(d: Arc<Daemon>, name: String, command: String, socket: Pa
         let started = Instant::now();
         match child {
             Ok(mut c) => {
-                let _ = c.wait().await;
+                monitor_child(&d, &name, &mut c).await;
             }
             Err(e) => warn!(plugin = name, error = %e, "spawn failed"),
         }
@@ -364,6 +446,52 @@ mod tests {
             }
             other => panic!("expected Plugin, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn is_wedged_only_when_connected_and_past_the_liveness_window() {
+        let t = Duration::from_secs(90);
+        assert!(is_wedged(true, Duration::from_secs(91), t), "stale + connected = wedged");
+        assert!(!is_wedged(true, Duration::from_secs(89), t), "fresh = not wedged");
+        assert!(!is_wedged(false, Duration::from_secs(300), t), "disconnected is never 'wedged'");
+    }
+
+    /// Any received frame must refresh the connection's liveness deadline, or
+    /// a busy-but-healthy plugin would be killed as wedged. Proves the
+    /// last_seen wiring feeds the supervisor's is_wedged check.
+    #[tokio::test]
+    async fn a_received_frame_refreshes_last_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+        let (plugin_side, daemon_side) = UnixStream::pair().unwrap();
+        let conn = tokio::spawn(handle_conn(d.clone(), daemon_side, "mocka".into()));
+
+        let (mut r, mut w) = plugin_side.into_split();
+        write_frame(&mut w, &PluginToDaemon::Hello {
+            plugin: "mocka".into(), version: "0.1.0".into(),
+            protocol_version: PROTOCOL_VERSION, capabilities: Capabilities::default(),
+        }).await.unwrap();
+        let _ack: DaemonToPlugin = read_frame(&mut r).await.unwrap();
+
+        let before = *d.plugins.lock().unwrap().get("mocka").unwrap().last_seen.lock().unwrap();
+        // a small gap so the refreshed instant is strictly later
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let mut gauges = std::collections::BTreeMap::new();
+        gauges.insert("rssi".to_string(), -70.0);
+        write_frame(&mut w, &PluginToDaemon::Gauges { gauges }).await.unwrap();
+
+        // wait until the daemon has processed the frame and advanced last_seen
+        let mut advanced = false;
+        for _ in 0..200 {
+            let now = *d.plugins.lock().unwrap().get("mocka").unwrap().last_seen.lock().unwrap();
+            if now > before { advanced = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(advanced, "receiving a frame must advance last_seen");
+
+        drop(w);
+        drop(r);
+        let _ = conn.await;
     }
 
     /// Reconnect race (audit finding): after a plugin crashes and a fresh
