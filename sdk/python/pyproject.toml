@@ -1,6 +1,6 @@
 [project]
 name = "relayfabric-sdk"
-version = "0.4.0"
+version = "0.4.1"
 description = "RelayFabric Python plugin SDK: Plugin Protocol v1 frame codec, main-loop scaffold, bridge plumbing, sent-cache, and test harness."
 readme = "README.md"
 license = "Apache-2.0"
