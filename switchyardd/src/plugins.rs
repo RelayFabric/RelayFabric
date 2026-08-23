@@ -3,8 +3,14 @@ use crate::events::Event;
 use chrono::Utc;
 use relay_ipc::{read_frame, write_frame, DaemonToPlugin, PluginToDaemon, PROTOCOL_VERSION};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Monotonic connection-id source. Each accepted plugin connection takes a
+/// fresh id so a stale teardown can tell whether a newer connection has since
+/// replaced it in the handle map (see the reconnect-race guard below).
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -102,12 +108,14 @@ async fn handle_conn(
 
     // bounded outbound channel: backpressure instead of unbounded memory (§45)
     let (tx, mut rx) = mpsc::channel::<DaemonToPlugin>(256);
+    let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
     d.plugins.lock().unwrap().insert(
         plugin.clone(),
         PluginHandle {
             tx,
             capabilities,
             connected: true,
+            conn_id,
         },
     );
     info!(plugin, "plugin connected");
@@ -162,16 +170,31 @@ async fn handle_conn(
             Err(e) => break e,
         }
     };
-    if let Some(h) = d.plugins.lock().unwrap().get_mut(&plugin) {
-        h.connected = false;
-    }
     writer.abort();
-    info!(plugin, "plugin disconnected");
-    d.emit_event(|| Event::Plugin {
-        name: plugin.clone(),
-        up: false,
-        ts: Utc::now(),
-    });
+    // Reconnect-race guard: only clear `connected` (and emit "down") if THIS
+    // connection is still the installed one. If a fresh connection already
+    // replaced us in the map (crash->restart->reconnect), its handle carries
+    // a newer conn_id and must be left alone -- otherwise this stale teardown
+    // would flip the live new connection to "down" and black-hole its routes.
+    let still_current = {
+        match d.plugins.lock().unwrap().get_mut(&plugin) {
+            Some(h) if h.conn_id == conn_id => {
+                h.connected = false;
+                true
+            }
+            _ => false,
+        }
+    };
+    if still_current {
+        info!(plugin, "plugin disconnected");
+        d.emit_event(|| Event::Plugin {
+            name: plugin.clone(),
+            up: false,
+            ts: Utc::now(),
+        });
+    } else {
+        info!(plugin, "stale plugin connection closed (already replaced)");
+    }
     Err(result)
 }
 
@@ -341,6 +364,46 @@ mod tests {
             }
             other => panic!("expected Plugin, got {other:?}"),
         }
+    }
+
+    /// Reconnect race (audit finding): after a plugin crashes and a fresh
+    /// connection reconnects (overwriting the handle), the OLD connection's
+    /// delayed EOF teardown must NOT flip the live new connection to "down".
+    #[tokio::test]
+    async fn stale_teardown_does_not_clobber_a_reconnected_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon(dir.path()));
+
+        async fn connect(d: &Arc<Daemon>) -> (tokio::task::JoinHandle<std::io::Result<()>>,
+                                              tokio::net::unix::OwnedReadHalf,
+                                              tokio::net::unix::OwnedWriteHalf) {
+            let (plugin_side, daemon_side) = UnixStream::pair().unwrap();
+            let conn = tokio::spawn(handle_conn(d.clone(), daemon_side, "mocka".into()));
+            let (mut r, mut w) = plugin_side.into_split();
+            write_frame(&mut w, &PluginToDaemon::Hello {
+                plugin: "mocka".into(), version: "0.1.0".into(),
+                protocol_version: PROTOCOL_VERSION, capabilities: Capabilities::default(),
+            }).await.unwrap();
+            let ack: DaemonToPlugin = read_frame(&mut r).await.unwrap();
+            assert!(matches!(ack, DaemonToPlugin::HelloAck { error: None, .. }));
+            (conn, r, w)
+        }
+
+        // Connection A connects, then B reconnects for the same plugin.
+        let (conn_a, ra, wa) = connect(&d).await;
+        let (_conn_b, _rb, _wb) = connect(&d).await;
+        let b_conn_id = d.plugins.lock().unwrap().get("mocka").unwrap().conn_id;
+
+        // A now tears down (its socket closes -> EOF in its read loop).
+        drop(wa);
+        drop(ra);
+        let _ = conn_a.await;
+
+        // B must still be installed, live, and unchanged by A's stale teardown.
+        let h = d.plugins.lock().unwrap();
+        let handle = h.get("mocka").expect("B's handle must remain installed");
+        assert!(handle.connected, "reconnected plugin must stay connected");
+        assert_eq!(handle.conn_id, b_conn_id, "B's handle must not be replaced or cleared");
     }
 
     /// A Hello claiming a name other than the one this socket is bound to

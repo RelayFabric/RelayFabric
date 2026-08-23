@@ -27,6 +27,13 @@ pub struct PluginHandle {
     pub tx: mpsc::Sender<DaemonToPlugin>,
     pub capabilities: Capabilities,
     pub connected: bool,
+    /// Monotonic id of the connection that installed this handle. On a
+    /// crash->reconnect, a fresh connection overwrites the map entry with a
+    /// new id; the OLD connection's teardown must only clear `connected` if
+    /// this id still matches, or it would flip the live NEW connection to
+    /// "down" (the audit's reconnect-race finding). 0 in tests that install a
+    /// handle directly without going through the connection path.
+    pub conn_id: u64,
 }
 
 /// Result of `Daemon::apply_config` (design §1): names of plugins that were
@@ -3044,6 +3051,7 @@ pub mod tests_support {
                     ..Capabilities::default()
                 },
                 connected: true,
+                conn_id: 0,
             },
         );
         rx
@@ -3063,6 +3071,7 @@ pub mod tests_support {
                     ..Capabilities::default()
                 },
                 connected: true,
+                conn_id: 0,
             },
         );
         rx
@@ -3340,6 +3349,7 @@ mod tests {
                 tx,
                 capabilities: Capabilities::default(),
                 connected: true,
+                conn_id: 0,
             },
         );
 
@@ -4019,6 +4029,7 @@ mod tests {
                     ..Capabilities::default()
                 },
                 connected: true,
+                conn_id: 0,
             },
         );
 
@@ -4071,6 +4082,7 @@ mod tests {
                     ..Capabilities::default()
                 },
                 connected: true,
+                conn_id: 0,
             },
         );
 
