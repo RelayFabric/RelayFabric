@@ -3042,6 +3042,7 @@ pub mod tests_support {
             ttl_default_secs: 3600,
             dedup_ttl_secs: 3600,
             retention_secs: 86_400,
+            alerts: None,
             hop_limit: 8,
             max_attachment_bytes: 8 * 1024 * 1024,
             public_services,

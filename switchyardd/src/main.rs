@@ -1,4 +1,5 @@
 mod admin;
+mod alerts;
 mod alias;
 mod backup;
 mod cas;
@@ -183,6 +184,9 @@ fn main() {
         if let Some(fed_cfg) = daemon.cfg_snapshot(|c| c.federation.clone()) {
             fed::conn::spawn_federation(daemon.clone(), fed_cfg);
         }
+        // Operator self-alerting: watches the event stream and notifies over a
+        // configured plugin when `alerts:` is set (read live; no-op otherwise).
+        alerts::spawn_alerter(daemon.clone());
         let admin_sock = data_dir.join("admin.sock");
         let _ = std::fs::remove_file(&admin_sock);
         let admin_listener =

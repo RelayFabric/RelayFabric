@@ -266,6 +266,30 @@ elsewhere:
 | `public_services` | Named ingress/egress protocol sets a `node.public: true` node advertises. | [Routing & Policy](routing.md) |
 | `limits` | Per-sender, per-route, and global rate/queue limits. All fields default to `0` (unlimited). | [Operations](operations.md) |
 
+## `alerts`
+
+Optional operator self-alerting: when set, the daemon sends a short text
+alert **through one of its own plugins** on notable operational events, so
+you find out your bridge broke over your own fabric — no separate monitoring
+stack. Absent = no alerts. Applied live (a `--check-config`'d edit takes
+effect on the next event; no restart).
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `endpoint` | string | *required* | Where alerts go, as `"plugin:endpoint"` — e.g. `lxmf:bridge` (a channel) or `signal:+15550001111`. The plugin must be configured and enabled. |
+| `events` | list | all | Categories to alert on: `plugin` (a plugin connects/disconnects) and `federation` (a peer comes up/goes down). Empty/omitted means all supported. |
+
+```yaml
+alerts:
+  endpoint: lxmf:bridge
+  events: [plugin, federation]
+```
+
+Alerts are throttled per subject (at most one per minute) so a flapping
+plugin can't spam you, and are best-effort (an alert that can't be sent is
+dropped). A plugin cannot report its own outage — route alerts through a
+**different** plugin than the ones you most want to hear about.
+
 ## Validating configuration
 
 ```bash

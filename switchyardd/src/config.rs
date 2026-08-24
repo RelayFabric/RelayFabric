@@ -109,6 +109,37 @@ pub struct Config {
     /// `discovery`/`node`, which the diff explicitly flags "daemon".
     #[serde(default)]
     pub transports: BTreeMap<String, TransportEntry>,
+    /// Optional operator self-alerting (self-hoster feature): when set, the
+    /// daemon sends a short text alert through one of its own plugins on
+    /// notable operational events (a plugin going down/recovering, a
+    /// federation peer lost/restored). Absent = no alerts. Read live, so a
+    /// `--check-config`'d edit takes effect on the next event with no restart.
+    #[serde(default)]
+    pub alerts: Option<AlertConfig>,
+}
+
+/// `alerts:` config (self-hoster feature). The bridge tells the operator it
+/// broke, over the operator's own fabric — no extra monitoring stack.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AlertConfig {
+    /// Where alerts are delivered: a `"plugin:endpoint"` ref, e.g.
+    /// `"lxmf:bridge"` (a channel) or `"signal:+15550001111"`. The plugin
+    /// must be configured and enabled. Note a plugin can't report its own
+    /// outage — route alerts through a DIFFERENT plugin than the ones you
+    /// most want to hear about.
+    pub endpoint: String,
+    /// Event categories to alert on. Supported: `"plugin"` (connect/
+    /// disconnect) and `"federation"` (peer up/down). Empty = all supported.
+    #[serde(default)]
+    pub events: Vec<String>,
+}
+
+impl AlertConfig {
+    /// Whether this config wants alerts for `category` ("plugin" | "federation").
+    pub fn wants(&self, category: &str) -> bool {
+        self.events.is_empty() || self.events.iter().any(|e| e == category)
+    }
 }
 
 /// One `transports:` config entry (design §2, transport-class cycle task
@@ -879,6 +910,32 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             "retention_secs must be at least 1 (0 would purge terminal deliveries immediately)"
                 .to_string(),
         );
+    }
+    if let Some(a) = &cfg.alerts {
+        let Some((plugin, ep)) = a.endpoint.split_once(':') else {
+            return Err(format!(
+                "alerts.endpoint '{}' must be \"plugin:endpoint\" (e.g. \"lxmf:bridge\")",
+                a.endpoint
+            ));
+        };
+        if plugin.is_empty() || ep.is_empty() {
+            return Err(format!(
+                "alerts.endpoint '{}' needs a non-empty plugin and endpoint",
+                a.endpoint
+            ));
+        }
+        if !cfg.plugins.get(plugin).map(|p| p.enabled).unwrap_or(false) {
+            return Err(format!(
+                "alerts.endpoint names plugin '{plugin}', which is not a configured, enabled plugin"
+            ));
+        }
+        for e in &a.events {
+            if e != "plugin" && e != "federation" {
+                return Err(format!(
+                    "alerts.events entry '{e}' is invalid (expected \"plugin\" or \"federation\")"
+                ));
+            }
+        }
     }
 
     // node.name (final cycle-G review finding): design §1's advert contract
