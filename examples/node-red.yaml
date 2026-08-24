@@ -1,0 +1,47 @@
+# Recipe: automate RelayFabric with Node-RED via MQTT (no custom code).
+# Node-RED speaks MQTT natively, so it plugs straight into the mqtt plugin:
+#   - Node-RED PUBLISHES to  relayfabric/in   -> injected into the fabric
+#   - Node-RED SUBSCRIBES to relayfabric/out  <- fabric traffic reaches flows
+# Here both are bridged to an LXMF channel, so a Node-RED flow can send to /
+# receive from a Reticulum mesh. Point everything at the same broker Node-RED
+# uses. Edit: data_dir, broker, plugin command paths, and the LXMF peer.
+#   switchyardd --config examples/node-red.yaml --check-config
+node:
+  name: nodered-bridge
+  data_dir: /var/lib/relayfabric
+
+plugins:
+  mqtt:
+    enabled: true
+    command: relayfabric-mqtt
+    config:
+      broker: mqtt://127.0.0.1:1883    # the broker Node-RED connects to
+      client_id: relayfabric-nodered
+      topics: ["relayfabric/in"]       # topic Node-RED publishes into
+
+  lxmf:
+    enabled: true
+    command: /opt/relayfabric/.venv/bin/python /opt/relayfabric/plugins/lxmf/relayfabric-lxmf
+    config:
+      display_name: "Node-RED Bridge"
+      storage: /var/lib/relayfabric/lxmf
+      propagation_node: "auto"
+      channels:
+        - name: bridge
+          members: ["309abcbd838a8539d3c9fd56a453a9e5"]  # <- your peer's LXMF hash
+          open: true
+
+routes:
+  # Node-RED -> fabric: an `mqtt out` node publishing to relayfabric/in.
+  - name: from-nodered
+    sources: ["mqtt:relayfabric/in"]
+    destinations: ["lxmf:bridge"]
+  # fabric -> Node-RED: an `mqtt in` node subscribed to relayfabric/out.
+  - name: to-nodered
+    sources: ["lxmf:bridge"]
+    destinations: ["mqtt:relayfabric/out"]
+
+ttl_default_secs: 86400
+dedup_ttl_secs: 86400
+retention_secs: 86400
+hop_limit: 8
