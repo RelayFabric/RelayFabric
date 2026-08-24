@@ -21,8 +21,11 @@ COPY plugins/mqtt ./plugins/mqtt
 # relayfabric-ui is a workspace member, so its manifest must exist for the
 # workspace to resolve — copied even though we don't build its binary here.
 COPY relayfabric-ui ./relayfabric-ui
+# Build each shipped binary by package (-p): relayfabric-ui is excluded from
+# the workspace default-members, and -p scopes --bin to the named packages,
+# so all four are selected explicitly by package.
 RUN cargo build -j2 --release \
-      --bin switchyardd --bin switchyardctl --bin relayfabric-mqtt
+      -p switchyardd -p switchyardctl -p relayfabric-mqtt -p relayfabric-ui
 
 # ---------- Python dependency builder ----------
 FROM python:3.12-slim-bookworm AS py-builder
@@ -56,6 +59,7 @@ COPY --from=rust-builder \
       /build/target/release/switchyardd \
       /build/target/release/switchyardctl \
       /build/target/release/relayfabric-mqtt \
+      /build/target/release/relayfabric-ui \
       /usr/local/bin/
 
 # Plugin executables and the Python SDK they import.
@@ -63,6 +67,8 @@ WORKDIR /opt/relayfabric
 COPY plugins ./plugins
 COPY sdk ./sdk
 COPY docs/relayfabric.example.yaml ./relayfabric.example.yaml
+# Static assets for the optional web UI (relayfabric-ui --web-dir).
+COPY relayfabric-ui/web ./ui-web
 
 ENV PATH="/opt/venv/bin:$PATH"
 # Plugin `command` entries in your config should invoke the venv python and

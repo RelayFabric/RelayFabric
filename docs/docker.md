@@ -72,6 +72,16 @@ docker compose exec switchyardd switchyardctl --socket /data/admin.sock status
 
 Remove the `mosquitto` service if you point the plugins at an external broker.
 
+### Web UI
+
+The compose stack also starts the optional **web admin UI** (`relayfabric-ui`)
+on <http://localhost:8087>, sharing the data volume so it reaches the daemon's
+admin socket. It ships with `--no-auth` for a **local-only** first look
+(published to `127.0.0.1` only). For real or remote use, remove `--no-auth`
+from the service `command`, front it with TLS, and set `--rp-id` /
+`--allowed-host` — see [Web UI notes → Remote access](webui-notes.md). Remove
+the `relayfabric-ui` service if you don't want it.
+
 ## Continuous builds
 
 The `Docker` GitHub Actions workflow builds the image on every commit and pull request, and publishes `ghcr.io/relayfabric/relayfabric:latest` (and a `sha-<commit>` tag) on pushes to `main`. It uses build-layer caching so incremental builds are fast.

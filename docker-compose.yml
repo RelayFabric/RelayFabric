@@ -28,6 +28,30 @@ services:
     # ports:
     #   - "8443:8443"
 
+  # Optional web admin UI — reverse-proxies the daemon's admin socket with
+  # WebAuthn/passkeys + RBAC. Shares the data volume to reach /data/admin.sock.
+  # `--no-auth` here is for a LOCAL first look only (published to 127.0.0.1);
+  # for real/remote use drop it, front it with TLS, and set --rp-id +
+  # --allowed-host (see docs/webui-notes.md "Remote access").
+  relayfabric-ui:
+    image: relayfabric:latest
+    restart: unless-stopped
+    depends_on:
+      - switchyardd
+    entrypoint: ["relayfabric-ui"]
+    command:
+      - "--socket"
+      - "/data/admin.sock"
+      - "--web-dir"
+      - "/opt/relayfabric/ui-web"
+      - "--listen"
+      - "0.0.0.0:8087"
+      - "--no-auth"
+    volumes:
+      - relayfabric-data:/data
+    ports:
+      - "127.0.0.1:8087:8087"
+
   # Optional broker for the MQTT and Meshtastic (MQTT-gateway) plugins.
   # Remove this service if you point the plugins at an external broker.
   mosquitto:
