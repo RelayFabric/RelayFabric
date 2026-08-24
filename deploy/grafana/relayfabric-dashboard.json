@@ -1,0 +1,137 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus scraping the RelayFabric /metrics endpoint",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "title": "RelayFabric",
+  "uid": "relayfabric",
+  "tags": ["relayfabric"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Message throughput (msg/s)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "rate(relayfabric_messages_ingress_total[$__rate_interval])", "legendFormat": "ingress" },
+        { "refId": "B", "expr": "rate(relayfabric_messages_egress_total[$__rate_interval])", "legendFormat": "egress" },
+        { "refId": "C", "expr": "rate(relayfabric_messages_dropped_total[$__rate_interval])", "legendFormat": "dropped" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue depth by state",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "relayfabric_queue_depth", "legendFormat": "{{state}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Delivery latency (avg, s)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "rate(relayfabric_delivery_latency_seconds_sum[$__rate_interval]) / clamp_min(rate(relayfabric_delivery_latency_seconds_count[$__rate_interval]), 1)", "legendFormat": "avg latency" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Drops & rejections (events/s)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "rate(relayfabric_duplicate_messages_total[$__rate_interval])", "legendFormat": "duplicate" },
+        { "refId": "B", "expr": "rate(relayfabric_ratelimited_total[$__rate_interval])", "legendFormat": "ratelimited" },
+        { "refId": "C", "expr": "rate(relayfabric_policy_denials_total[$__rate_interval])", "legendFormat": "policy_denied" },
+        { "refId": "D", "expr": "rate(relayfabric_queue_rejected_total[$__rate_interval])", "legendFormat": "queue_rejected" },
+        { "refId": "E", "expr": "rate(relayfabric_budget_deferred_total[$__rate_interval])", "legendFormat": "budget_deferred" }
+      ]
+    },
+    {
+      "type": "state-timeline",
+      "title": "Plugin connectivity",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "down", "color": "red" }, "1": { "text": "up", "color": "green" } } }
+          ]
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "relayfabric_plugin_up", "legendFormat": "{{plugin}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Federation traffic (events/s)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "rate(relayfabric_federation_ingress_total[$__rate_interval])", "legendFormat": "ingress" },
+        { "refId": "B", "expr": "rate(relayfabric_federation_egress_total[$__rate_interval])", "legendFormat": "egress" },
+        { "refId": "C", "expr": "rate(relayfabric_federation_rejected_total[$__rate_interval])", "legendFormat": "rejected" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Messages by route (msg/s)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 23 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "rate(relayfabric_route_messages_total[$__rate_interval])", "legendFormat": "{{route}}" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Federation peers up",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 23 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ]
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "relayfabric_federation_peer_up", "legendFormat": "{{peer}}" }
+      ]
+    }
+  ]
+}

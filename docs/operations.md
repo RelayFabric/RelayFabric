@@ -262,6 +262,11 @@ The full metric name list is documented on the `/metrics` operation in
 curl --unix-socket <data_dir>/admin.sock http://localhost/metrics | grep dead_letter
 ```
 
+A ready-made Grafana dashboard covering throughput, queue depth, delivery
+latency, drops/rejections, plugin connectivity, and federation is shipped at
+[`deploy/grafana/relayfabric-dashboard.json`](https://github.com/RelayFabric/RelayFabric/blob/main/deploy/grafana/relayfabric-dashboard.json)
+— import it and pick your Prometheus datasource.
+
 ## Logging
 
 `switchyardd` logs via `tracing`, controlled by the standard `RUST_LOG`
