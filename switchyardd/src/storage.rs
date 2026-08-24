@@ -1169,15 +1169,24 @@ mod tests {
         // rack up attempts, then dead-letter it
         s.mark_attempting(id).unwrap();
         s.mark_attempting(id).unwrap();
-        s.mark_terminal(id, "dead_letter", "RETRY_EXHAUSTED").unwrap();
+        s.mark_terminal(id, "dead_letter", "RETRY_EXHAUSTED")
+            .unwrap();
 
         assert!(s.requeue(id).unwrap(), "requeue should move the row");
         let del = s.deliveries_for_id(id).unwrap();
         assert_eq!(del.state, "pending");
-        assert_eq!(del.attempt_count, 0, "attempts must reset so it isn't re-capped");
+        assert_eq!(
+            del.attempt_count, 0,
+            "attempts must reset so it isn't re-capped"
+        );
         assert_eq!(del.reason, None);
         // it's due now
-        assert_eq!(s.due_deliveries(now + Duration::seconds(1), 10).unwrap().len(), 1);
+        assert_eq!(
+            s.due_deliveries(now + Duration::seconds(1), 10)
+                .unwrap()
+                .len(),
+            1
+        );
         // requeue of a non-terminal (now pending) row is a no-op
         assert!(!s.requeue(id).unwrap());
     }
@@ -1194,12 +1203,16 @@ mod tests {
         let live = s
             .insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2)
             .unwrap();
-        s.mark_terminal(dead, "dead_letter", "RETRY_EXHAUSTED").unwrap();
+        s.mark_terminal(dead, "dead_letter", "RETRY_EXHAUSTED")
+            .unwrap();
 
         let (n, _orphans) = s.purge_dead_letters().unwrap();
         assert_eq!(n, 1, "only the dead_letter row is purged");
         assert!(s.deliveries_for_id(dead).is_none());
-        assert!(s.deliveries_for_id(live).is_some(), "the pending row survives");
+        assert!(
+            s.deliveries_for_id(live).is_some(),
+            "the pending row survives"
+        );
     }
 
     #[test]

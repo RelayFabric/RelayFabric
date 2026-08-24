@@ -205,7 +205,9 @@ struct HealthResponse {
     responses((status = 200, description = "Daemon is alive", body = HealthResponse)),
 )]
 async fn healthz() -> impl IntoResponse {
-    Json(HealthResponse { status: "ok".into() })
+    Json(HealthResponse {
+        status: "ok".into(),
+    })
 }
 
 /// `GET /readyz` — readiness. 200 if core storage is reachable (the node can
@@ -226,12 +228,20 @@ async fn healthz() -> impl IntoResponse {
 )]
 async fn readyz(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
     match d.store.lock().unwrap().queue_counts() {
-        Ok(_) => (StatusCode::OK, Json(HealthResponse { status: "ready".into() })).into_response(),
+        Ok(_) => (
+            StatusCode::OK,
+            Json(HealthResponse {
+                status: "ready".into(),
+            }),
+        )
+            .into_response(),
         Err(e) => {
             warn!(error = %e, "readiness check failed: core storage unavailable");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(HealthResponse { status: "unavailable".into() }),
+                Json(HealthResponse {
+                    status: "unavailable".into(),
+                }),
             )
                 .into_response()
         }

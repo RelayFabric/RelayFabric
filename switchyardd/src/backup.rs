@@ -93,8 +93,7 @@ pub fn snapshot(data_dir: &Path, out: &Path) -> Result<(), String> {
         chrono::Utc::now().to_rfc3339(),
         data_dir.display()
     );
-    fs::write(out.join(MANIFEST), manifest)
-        .map_err(|e| format!("write manifest: {e}"))?;
+    fs::write(out.join(MANIFEST), manifest).map_err(|e| format!("write manifest: {e}"))?;
     Ok(())
 }
 
@@ -177,10 +176,8 @@ mod tests {
         fs::create_dir_all(dir).unwrap();
         // a real SQLite DB with a row we can read back after restore
         let conn = rusqlite::Connection::open(dir.join(DB_FILE)).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE t(v TEXT); INSERT INTO t(v) VALUES('hello-backup');",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE t(v TEXT); INSERT INTO t(v) VALUES('hello-backup');")
+            .unwrap();
         drop(conn);
         // a 0600 key file, a CAS blob, transient WAL/SHM, and a socket
         fs::write(dir.join("node.key"), b"secretkey").unwrap();
@@ -210,11 +207,24 @@ mod tests {
         );
         assert!(snap.join(MANIFEST).is_file(), "manifest must be written");
         // excluded: WAL sidecar, sockets, plugins.d
-        assert!(!snap.join("relayfabric.db-wal").exists(), "WAL must be excluded");
-        assert!(!snap.join("admin.sock").exists(), "sockets must be excluded");
-        assert!(!snap.join("plugins.d").exists(), "plugins.d must be excluded");
+        assert!(
+            !snap.join("relayfabric.db-wal").exists(),
+            "WAL must be excluded"
+        );
+        assert!(
+            !snap.join("admin.sock").exists(),
+            "sockets must be excluded"
+        );
+        assert!(
+            !snap.join("plugins.d").exists(),
+            "plugins.d must be excluded"
+        );
         // key perms preserved
-        let mode = fs::metadata(snap.join("node.key")).unwrap().permissions().mode() & 0o777;
+        let mode = fs::metadata(snap.join("node.key"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "key file mode must be preserved");
     }
 
@@ -232,9 +242,7 @@ mod tests {
 
         // DB row survives the VACUUM-INTO -> restore roundtrip
         let conn = rusqlite::Connection::open(data_dir.join(DB_FILE)).unwrap();
-        let v: String = conn
-            .query_row("SELECT v FROM t", [], |r| r.get(0))
-            .unwrap();
+        let v: String = conn.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
         assert_eq!(v, "hello-backup");
         assert_eq!(fs::read(data_dir.join("node.key")).unwrap(), b"secretkey");
         assert_eq!(
@@ -248,6 +256,9 @@ mod tests {
         let notbackup = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();
         let err = restore_into(notbackup.path(), &dest.path().join("d")).unwrap_err();
-        assert!(err.contains("does not look like a relayfabric backup"), "{err}");
+        assert!(
+            err.contains("does not look like a relayfabric backup"),
+            "{err}"
+        );
     }
 }

@@ -106,7 +106,10 @@ fn send_alert(d: &Arc<Daemon>, endpoint: &str, text: &str) {
     };
     match tx.try_send(frame) {
         Ok(()) => info!(target = endpoint, "sent operator alert"),
-        Err(_) => warn!(target = endpoint, "alert not delivered: plugin channel full/closed"),
+        Err(_) => warn!(
+            target = endpoint,
+            "alert not delivered: plugin channel full/closed"
+        ),
     }
 }
 
@@ -126,35 +129,58 @@ mod tests {
     #[test]
     fn plugin_down_and_up_map_to_alerts_when_selected() {
         let c = cfg(&["plugin"]);
-        let down = Event::Plugin { name: "meshcore".into(), up: false, ts: Utc::now() };
+        let down = Event::Plugin {
+            name: "meshcore".into(),
+            up: false,
+            ts: Utc::now(),
+        };
         let (subj, text) = alert_for(&c, &down).unwrap();
         assert_eq!(subj, "plugin:meshcore");
         assert!(text.contains("meshcore") && text.contains("DOWN"), "{text}");
 
-        let up = Event::Plugin { name: "meshcore".into(), up: true, ts: Utc::now() };
+        let up = Event::Plugin {
+            name: "meshcore".into(),
+            up: true,
+            ts: Utc::now(),
+        };
         assert!(alert_for(&c, &up).unwrap().1.contains("recovered"));
     }
 
     #[test]
     fn federation_event_ignored_when_only_plugin_selected() {
         let c = cfg(&["plugin"]);
-        let fed = Event::Federation { peer: "hub".into(), up: false, ts: Utc::now() };
+        let fed = Event::Federation {
+            peer: "hub".into(),
+            up: false,
+            ts: Utc::now(),
+        };
         assert!(alert_for(&c, &fed).is_none());
     }
 
     #[test]
     fn empty_events_means_all_supported_categories() {
         let c = cfg(&[]);
-        let fed = Event::Federation { peer: "hub".into(), up: false, ts: Utc::now() };
+        let fed = Event::Federation {
+            peer: "hub".into(),
+            up: false,
+            ts: Utc::now(),
+        };
         assert!(alert_for(&c, &fed).is_some());
-        let pl = Event::Plugin { name: "x".into(), up: false, ts: Utc::now() };
+        let pl = Event::Plugin {
+            name: "x".into(),
+            up: false,
+            ts: Utc::now(),
+        };
         assert!(alert_for(&c, &pl).is_some());
     }
 
     #[test]
     fn non_alertable_events_are_ignored() {
         let c = cfg(&[]);
-        let cfg_applied = Event::ConfigApplied { restart_required: vec![], ts: Utc::now() };
+        let cfg_applied = Event::ConfigApplied {
+            restart_required: vec![],
+            ts: Utc::now(),
+        };
         assert!(alert_for(&c, &cfg_applied).is_none());
     }
 }
