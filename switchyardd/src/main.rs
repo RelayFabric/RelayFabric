@@ -1,5 +1,6 @@
 mod admin;
 mod alias;
+mod backup;
 mod cas;
 mod config;
 mod dedup;
@@ -48,8 +49,52 @@ fn set_socket_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
+/// `switchyardd backup --out <dir>` / `restore --in <dir>`, both accepting an
+/// optional `--config <path>` (default `/etc/relayfabric/relayfabric.yaml`) to
+/// locate the node's `data_dir`.
+fn run_subcommand(sub: &str, args: &[String]) {
+    let mut config_path = String::from("/etc/relayfabric/relayfabric.yaml");
+    let mut dir: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--config" => config_path = it.next().cloned().unwrap_or_default(),
+            "--out" | "--in" => dir = it.next().cloned(),
+            other => {
+                eprintln!("unknown argument: {other}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let Some(dir) = dir else {
+        eprintln!(
+            "usage: switchyardd {sub} {} <dir> [--config <path>]",
+            if sub == "backup" { "--out" } else { "--in" }
+        );
+        std::process::exit(2);
+    };
+    let result = if sub == "backup" {
+        backup::run_backup(&config_path, std::path::Path::new(&dir))
+    } else {
+        backup::run_restore(&config_path, std::path::Path::new(&dir))
+    };
+    if let Err(e) = result {
+        eprintln!("{sub} failed: {e}");
+        std::process::exit(1);
+    }
+}
+
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    // Subcommands (backup/restore) operate on a node's state offline and then
+    // exit; they share the --config flag but not the daemon run loop.
+    if let Some(sub) = raw.first().map(String::as_str) {
+        if sub == "backup" || sub == "restore" {
+            run_subcommand(sub, &raw[1..]);
+            return;
+        }
+    }
+    let mut args = raw.into_iter();
     let mut config_path = String::from("/etc/relayfabric/relayfabric.yaml");
     let mut check_only = false;
     while let Some(a) = args.next() {
