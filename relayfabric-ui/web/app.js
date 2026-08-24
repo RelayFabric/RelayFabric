@@ -132,9 +132,9 @@ const DEMO = {
     { name: 'alerts-fanout', sources: ['webhook:ingest'], destinations: ['webhook:alerts'], identity_mode: 'pseudonymous', render: { tag: 'alias', max_chars: 0 }, policies: [] },
   ],
   deliveries: [
-    { message_id: '01991f2a-8c41-7b02-b3d1-4e0a92c7715f', route: 'inbound-mail', destination: 'matrix:#ops:fen.example', state: 'pending', reason: '—', attempts: 0, updated_at: new Date(Date.now() - 4000).toISOString() },
-    { message_id: '01991f2a-11d9-7e88-a0c2-90b1f4d6632a', route: 'alerts-fanout', destination: 'webhook:alerts', state: 'retry', reason: 'UPSTREAM_5XX', attempts: 3, updated_at: new Date(Date.now() - 120000).toISOString() },
-    { message_id: '01991f28-a410-7f33-b527-08d1e9c66740', route: 'alerts-fanout', destination: 'webhook:alerts', state: 'dead_letter', reason: 'MAX_ATTEMPTS', attempts: 8, updated_at: new Date(Date.now() - 2280000).toISOString() },
+    { id: 101, message_id: '01991f2a-8c41-7b02-b3d1-4e0a92c7715f', route: 'inbound-mail', destination: 'matrix:#ops:fen.example', state: 'pending', reason: '—', attempts: 0, updated_at: new Date(Date.now() - 4000).toISOString() },
+    { id: 102, message_id: '01991f2a-11d9-7e88-a0c2-90b1f4d6632a', route: 'alerts-fanout', destination: 'webhook:alerts', state: 'retry', reason: 'UPSTREAM_5XX', attempts: 3, updated_at: new Date(Date.now() - 120000).toISOString() },
+    { id: 103, message_id: '01991f28-a410-7f33-b527-08d1e9c66740', route: 'alerts-fanout', destination: 'webhook:alerts', state: 'dead_letter', reason: 'MAX_ATTEMPTS', attempts: 8, updated_at: new Date(Date.now() - 2280000).toISOString() },
   ],
   federation: { peers: [
     { name: 'fen-relay', node_id: 'rf:7fd2…a1', trust: 'pinned', connected: true, last_seen: new Date(Date.now() - 8000).toISOString() },
@@ -254,6 +254,24 @@ class App extends Component {
     try { this.setState({ deliveries: (await api('/v1/queue?state=' + state)).deliveries || [] }); }
     catch (_) { this.setState({ deliveries: [] }); }
   }
+  requeueDelivery = (id) => async () => {
+    if (!this.state.live) { this.toastMsg('POST /v1/queue/' + id + '/requeue → 204 (demo)'); return; }
+    try {
+      await api('/v1/queue/' + id + '/requeue', { method: 'POST' });
+      this.toastMsg('requeued delivery ' + id + ' → pending');
+      this.setState({ sel: null });
+      this.loadQueue(this.state.filter);
+    } catch (e) { this.toastMsg('requeue → ' + (e.status || 'error')); }
+  };
+  purgeDeadLetters = async () => {
+    if (!this.state.live) { this.toastMsg('POST /v1/queue/purge → 200 (demo)'); return; }
+    try {
+      const r = await api('/v1/queue/purge', { method: 'POST' });
+      this.toastMsg('purged ' + (r.purged || 0) + ' dead-lettered deliveries');
+      this.setState({ sel: null });
+      this.loadQueue(this.state.filter);
+    } catch (e) { this.toastMsg('purge → ' + (e.status || 'error')); }
+  };
   async loadConfig() {
     try { this.setState({ cfgText: await api('/v1/config'), cfgMsg: null, viewingPrev: null }); } catch (_) {}
     await this.loadPrev();
@@ -588,6 +606,8 @@ class App extends Component {
         <div style="display:flex;gap:4px">
           ${['pending', 'retry', 'dead_letter', 'expired'].map((f) => html`
             <button onClick=${() => { this.setState({ filter: f, sel: null }); this.loadQueue(f); }} style="border:1px solid ${s.filter === f ? 'var(--color-accent)' : 'var(--color-divider)'};background:transparent;color:${s.filter === f ? 'var(--color-accent)' : 'inherit'};font:inherit;font-size:12px;padding:5px 12px;border-radius:var(--radius-md);cursor:pointer;font-family:ui-monospace,Menlo,monospace">${f} (${counts[f] || 0})</button>`)}
+          ${s.filter === 'dead_letter' && (counts.dead_letter || (s.deliveries || []).length) ? html`
+            <button onClick=${this.purgeDeadLetters} title="Delete all dead-lettered deliveries" style="border:1px solid var(--color-divider);background:transparent;color:inherit;font:inherit;font-size:12px;padding:5px 12px;border-radius:var(--radius-md);cursor:pointer;margin-left:6px"><i class="ph ph-trash" style="font-size:12px"></i> purge</button>` : ''}
         </div>`)}
       <div style="display:flex;gap:18px;align-items:flex-start">
         <div style="flex:1;min-width:0;overflow-x:auto">
@@ -625,6 +645,10 @@ class App extends Component {
               <span class="text-muted">created</span><span>${s.sel.created_at ? new Date(s.sel.created_at).toLocaleString() : '—'}</span>
               <span class="text-muted">updated</span><span>${s.sel.updated_at ? new Date(s.sel.updated_at).toLocaleString() : '—'}</span>
             </div>
+            ${['dead_letter', 'failed', 'expired'].includes(s.sel.state) && s.sel.id != null ? html`
+              <button class="btn btn-secondary" onClick=${this.requeueDelivery(s.sel.id)} style="justify-content:center">
+                <i class="ph ph-arrow-counter-clockwise" style="font-size:14px"></i> Requeue for another attempt
+              </button>` : ''}
             <div class="card-meta">Bodies are never included in any admin response.</div>
           </div>`}
       </div>`;

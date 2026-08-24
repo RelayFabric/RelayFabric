@@ -27,6 +27,11 @@ fn request_for(args: &[String]) -> Result<(&'static str, String, Option<String>)
         Some("identities") => Ok(("GET", "/v1/identities".into(), None)),
         Some("federation") => Ok(("GET", "/v1/federation".into(), None)),
         Some("discovery") => Ok(("GET", "/v1/discovery".into(), None)),
+        Some("requeue") => match args.get(1) {
+            Some(id) => Ok(("POST", format!("/v1/queue/{id}/requeue"), None)),
+            None => Err("usage: switchyardctl requeue <delivery-id>".into()),
+        },
+        Some("purge-dlq") => Ok(("POST", "/v1/queue/purge".into(), None)),
         Some("openapi") => Ok(("GET", "/v1/openapi.json".into(), None)),
         // Readiness: exits non-zero if the daemon isn't ready (503 -> status
         // mismatch -> error), so it's usable directly as a HEALTHCHECK.
@@ -70,7 +75,8 @@ fn request_for(args: &[String]) -> Result<(&'static str, String, Option<String>)
             }
         },
         _ => Err("usage: switchyardctl [--socket <path>] \
-                  status|plugins|routes|queue|trace <id>|identities|federation|discovery|\
+                  status|health|plugins|routes|queue|trace <id>|requeue <id>|purge-dlq|\
+                  identities|federation|discovery|\
                   link <requester> <target> <display_name...>|unlink <id>|\
                   config show|validate <file>|apply <file>|rollback|events|openapi|docs"
             .into()),
@@ -90,6 +96,7 @@ fn read_config_file(path: &str) -> Result<String, String> {
 fn expected_status(method: &str, path: &str) -> &'static str {
     match (method, path) {
         ("POST", "/v1/identities/link") => "202",
+        ("POST", p) if p.ends_with("/requeue") => "204",
         ("DELETE", _) => "204",
         _ => "200",
     }

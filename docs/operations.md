@@ -87,6 +87,8 @@ list, request/response schemas, and status codes.
 | PUT | `/v1/config` | Replace and apply the config (atomic write, `.prev` backup) |
 | POST | `/v1/config/rollback` | Roll back to the previously applied config |
 | GET | `/v1/queue` | Aggregate queue counts by delivery state, or a delivery listing with `?state=` (e.g. `dead_letter`) |
+| POST | `/v1/queue/{id}/requeue` | Move a dead-lettered/failed/expired delivery back to pending for another attempt (`switchyardctl requeue <id>`) |
+| POST | `/v1/queue/purge` | Delete all dead-lettered deliveries and their orphaned attachments (`switchyardctl purge-dlq`) |
 | GET | `/v1/messages/{id}` | Delivery trace for one message |
 | GET | `/v1/federation` | Federation peers and their connection state |
 | GET | `/v1/discovery` | RFDP: this node's advert and known peer adverts |

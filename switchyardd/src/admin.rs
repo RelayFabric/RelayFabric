@@ -76,6 +76,8 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<AdminState>)> {
         ("/v1/config/validate", post(config_validate)),
         ("/v1/config/rollback", post(config_rollback)),
         ("/v1/queue", get(queue)),
+        ("/v1/queue/purge", post(queue_purge)),
+        ("/v1/queue/{id}/requeue", post(queue_requeue)),
         ("/v1/messages/{id}", get(trace)),
         ("/v1/public", get(public)),
         ("/v1/limits", get(limits)),
@@ -1109,6 +1111,7 @@ struct QueueDeliveryItemDoc {
     attempts: u32,
     created_at: DateTime<Utc>,
     destination: String,
+    id: i64,
     message_id: Uuid,
     reason: Option<String>,
     route: String,
@@ -1167,6 +1170,7 @@ async fn queue(
                 del.destination.to_string()
             };
             json!({
+                "id": del.id,
                 "message_id": del.message_id,
                 "route": del.route,
                 "destination": destination,
@@ -1294,6 +1298,73 @@ async fn trace(State(d): State<Arc<Daemon>>, AxPath(id): AxPath<Uuid>) -> impl I
         })),
     )
         .into_response()
+}
+
+/// `POST /v1/queue/{id}/requeue` — move a dead-lettered (or failed/expired)
+/// delivery back to pending for another attempt, attempt_count reset. 404 if
+/// no such delivery is in a requeuable state.
+#[utoipa::path(
+    post,
+    path = "/v1/queue/{id}/requeue",
+    tag = "status",
+    summary = "Requeue a dead-lettered delivery",
+    description = "Moves a dead_letter/failed/expired delivery back to pending (due now, attempt_count reset). 404 if no delivery with that id is in a requeuable state.",
+    params(("id" = i64, Path, description = "Delivery row id (from GET /v1/queue?state=...)")),
+    responses(
+        (status = 204, description = "Requeued"),
+        (status = 404, description = "No requeuable delivery with that id"),
+        (status = 500, description = "Storage error"),
+    ),
+)]
+async fn queue_requeue(State(d): State<Arc<Daemon>>, AxPath(id): AxPath<i64>) -> impl IntoResponse {
+    match d.store.lock().unwrap().requeue(id) {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(e) => {
+            warn!(error = %e, id, "requeue failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// `POST /v1/queue/purge` — delete every dead-lettered delivery (any age) and
+/// unlink any attachments they solely referenced. Operator DLQ cleanup.
+#[utoipa::path(
+    post,
+    path = "/v1/queue/purge",
+    tag = "status",
+    summary = "Purge the dead-letter queue",
+    description = "Deletes all dead_letter deliveries regardless of age, plus any now-orphaned messages/attachments. Returns the number of deliveries removed.",
+    responses(
+        (status = 200, description = "Purged; returns the count", body = PurgeResult),
+        (status = 500, description = "Storage error"),
+    ),
+)]
+async fn queue_purge(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
+    // Hold the store lock across the CAS unlinks, same TOCTOU-safe posture as
+    // the retention purge in the pump.
+    let store = d.store.lock().unwrap();
+    match store.purge_dead_letters() {
+        Ok((n, orphans)) => {
+            for sha in &orphans {
+                if let Err(e) = d.cas.remove(sha) {
+                    warn!(sha = %sha, error = %e, "failed to remove orphaned attachment during DLQ purge");
+                }
+            }
+            drop(store);
+            (StatusCode::OK, Json(PurgeResult { purged: n })).into_response()
+        }
+        Err(e) => {
+            drop(store);
+            storage_error(e)
+        }
+    }
+}
+
+/// `POST /v1/queue/purge` result.
+#[derive(Serialize, ToSchema)]
+struct PurgeResult {
+    purged: usize,
 }
 
 /// `GET /metrics` (Prometheus text exposition format, not JSON): counters
@@ -1995,7 +2066,8 @@ async fn docs_asset(AxPath(rest): AxPath<String>) -> axum::response::Response {
     ),
     paths(
         status, plugins, routes, config_yaml, config_prev, config_put, config_validate, config_rollback,
-        queue, trace, public, limits, identities, create_link, delete_link, challenges,
+        queue, queue_requeue, queue_purge, trace, public, limits, identities, create_link,
+        delete_link, challenges,
         federation, discovery, events_stream, healthz, readyz, metrics_text, openapi_json,
     ),
     components(schemas(
@@ -2007,7 +2079,7 @@ async fn docs_asset(AxPath(rest): AxPath<String>) -> axum::response::Response {
         RoutesResponse, RouteItem, RouteRenderItem,
         ConfigValidateOk, ConfigValidateError, ConfigApplyOk, ConfigWriteError,
         ConfigRollbackNotFound, ConfigRollbackConflict,
-        QueueListingDoc, QueueDeliveryItemDoc,
+        QueueListingDoc, QueueDeliveryItemDoc, PurgeResult,
         TraceResponseDoc, TraceDeliveryItemDoc, TraceNotFound,
         IdentitiesResponse, LinkItem,
         LinkRequest, CreateLinkAccepted, CreateLinkError,

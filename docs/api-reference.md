@@ -22,6 +22,8 @@ can.
 | POST | `/v1/config/validate` | Validate a config document without applying it |
 | POST | `/v1/config/rollback` | Roll back to the previous applied config |
 | GET | `/v1/queue` | Queue counts, or a delivery listing with `?state=` |
+| POST | `/v1/queue/{id}/requeue` | Requeue a dead-lettered/failed/expired delivery |
+| POST | `/v1/queue/purge` | Purge the dead-letter queue |
 | GET | `/v1/messages/{id}` | Delivery trace for one message |
 | GET | `/v1/public` | Publicly exposed services |
 | GET | `/v1/limits` | Configured quotas and transport budgets |

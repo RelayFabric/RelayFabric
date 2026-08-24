@@ -492,6 +492,15 @@ impl Store {
                AND next_attempt < ?1",
             params![ts(older_than)],
         )?;
+        let orphans = self.prune_orphans()?;
+        Ok((deleted, orphans))
+    }
+
+    /// After deliveries are deleted, drop now-unreferenced messages, collect
+    /// the CAS shas that no surviving message references (for the caller to
+    /// unlink under the store lock -- see the pump), and drop dangling
+    /// attachment rows. Shared by `purge_terminal` and `purge_dead_letters`.
+    fn prune_orphans(&self) -> rusqlite::Result<Vec<String>> {
         self.conn.execute(
             "DELETE FROM messages WHERE id NOT IN (SELECT DISTINCT message_id FROM deliveries)",
             [],
@@ -512,6 +521,32 @@ impl Store {
             "DELETE FROM message_attachments WHERE message_id NOT IN (SELECT id FROM messages)",
             [],
         )?;
+        Ok(orphans)
+    }
+
+    /// Requeue a terminal delivery (dead_letter/failed/expired) for another
+    /// attempt: back to pending, due now, with attempt_count reset so the
+    /// retry-exhaustion cap doesn't immediately re-terminate it. Returns
+    /// whether a row moved (false = no such id, or not in a requeuable state).
+    pub fn requeue(&self, id: i64) -> rusqlite::Result<bool> {
+        let now = ts(Utc::now());
+        let n = self.conn.execute(
+            "UPDATE deliveries SET state = 'pending', next_attempt = ?2, attempt_count = 0,
+                 reason = NULL, updated_at = ?2
+             WHERE id = ?1 AND state IN ('dead_letter','failed','expired')",
+            params![id, now],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Purge ALL dead-lettered deliveries regardless of age (operator DLQ
+    /// cleanup), plus any now-orphaned messages/attachments. Returns the
+    /// number of rows deleted and the orphaned CAS shas to unlink.
+    pub fn purge_dead_letters(&self) -> rusqlite::Result<(usize, Vec<String>)> {
+        let deleted = self
+            .conn
+            .execute("DELETE FROM deliveries WHERE state = 'dead_letter'", [])?;
+        let orphans = self.prune_orphans()?;
         Ok((deleted, orphans))
     }
 
@@ -1120,6 +1155,51 @@ mod tests {
         assert_eq!(got.body, "hello");
         assert_eq!(got.id, e.id);
         assert!(s.get_message(uuid::Uuid::now_v7()).unwrap().is_none());
+    }
+
+    #[test]
+    fn requeue_moves_a_dead_letter_back_to_pending_and_resets_attempts() {
+        let (_d, s) = store();
+        let e = env();
+        let now = Utc::now();
+        s.insert_message(&e).unwrap();
+        let id = s
+            .insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2)
+            .unwrap();
+        // rack up attempts, then dead-letter it
+        s.mark_attempting(id).unwrap();
+        s.mark_attempting(id).unwrap();
+        s.mark_terminal(id, "dead_letter", "RETRY_EXHAUSTED").unwrap();
+
+        assert!(s.requeue(id).unwrap(), "requeue should move the row");
+        let del = s.deliveries_for_id(id).unwrap();
+        assert_eq!(del.state, "pending");
+        assert_eq!(del.attempt_count, 0, "attempts must reset so it isn't re-capped");
+        assert_eq!(del.reason, None);
+        // it's due now
+        assert_eq!(s.due_deliveries(now + Duration::seconds(1), 10).unwrap().len(), 1);
+        // requeue of a non-terminal (now pending) row is a no-op
+        assert!(!s.requeue(id).unwrap());
+    }
+
+    #[test]
+    fn purge_dead_letters_removes_only_dead_letter_rows() {
+        let (_d, s) = store();
+        let e = env();
+        let now = Utc::now();
+        s.insert_message(&e).unwrap();
+        let dead = s
+            .insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2)
+            .unwrap();
+        let live = s
+            .insert_delivery(e.id, "general", &dest(), now, e.expires_at, 2)
+            .unwrap();
+        s.mark_terminal(dead, "dead_letter", "RETRY_EXHAUSTED").unwrap();
+
+        let (n, _orphans) = s.purge_dead_letters().unwrap();
+        assert_eq!(n, 1, "only the dead_letter row is purged");
+        assert!(s.deliveries_for_id(dead).is_none());
+        assert!(s.deliveries_for_id(live).is_some(), "the pending row survives");
     }
 
     #[test]
