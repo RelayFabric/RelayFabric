@@ -18,6 +18,12 @@ services:
     volumes:
       - ./config:/config:ro     # your relayfabric.yaml
       - relayfabric-data:/data  # queue db, CAS attachments, admin.sock, plugin identities
+    healthcheck:
+      test: ["CMD", "switchyardctl", "--socket", "/data/admin.sock", "health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
     # Federation listens on a TCP port only if you configure it; publish it here:
     # ports:
     #   - "8443:8443"

@@ -28,6 +28,9 @@ fn request_for(args: &[String]) -> Result<(&'static str, String, Option<String>)
         Some("federation") => Ok(("GET", "/v1/federation".into(), None)),
         Some("discovery") => Ok(("GET", "/v1/discovery".into(), None)),
         Some("openapi") => Ok(("GET", "/v1/openapi.json".into(), None)),
+        // Readiness: exits non-zero if the daemon isn't ready (503 -> status
+        // mismatch -> error), so it's usable directly as a HEALTHCHECK.
+        Some("health") => Ok(("GET", "/readyz".into(), None)),
         Some("link") => {
             let (requester, target, name_parts) = (args.get(1), args.get(2), args.get(3..));
             match (requester, target, name_parts) {

@@ -86,6 +86,8 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<AdminState>)> {
         ("/v1/federation", get(federation)),
         ("/v1/discovery", get(discovery)),
         ("/v1/events", get(events_stream)),
+        ("/healthz", get(healthz)),
+        ("/readyz", get(readyz)),
         ("/metrics", get(metrics_text)),
         ("/v1/openapi.json", get(openapi_json)),
     ]
@@ -179,6 +181,59 @@ struct StatusResponse {
     plugins: BTreeMap<String, bool>,
     public: bool,
     queue: BTreeMap<String, i64>,
+}
+
+/// Liveness/readiness probe body. `status` is `ok` (healthz), `ready`, or
+/// `unavailable` (readyz).
+#[derive(Serialize, ToSchema)]
+struct HealthResponse {
+    status: String,
+}
+
+/// `GET /healthz` — liveness. 200 whenever the daemon is serving requests,
+/// for container HEALTHCHECK / systemd / uptime monitors. Deliberately checks
+/// nothing else (plugin/storage health is `/readyz` and `/v1/status`), so a
+/// hung daemon fails it by not answering at all.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "status",
+    summary = "Liveness probe",
+    description = "200 while the daemon is serving. Checks nothing beyond that — see /readyz for core readiness and /v1/status for plugin state.",
+    responses((status = 200, description = "Daemon is alive", body = HealthResponse)),
+)]
+async fn healthz() -> impl IntoResponse {
+    Json(HealthResponse { status: "ok".into() })
+}
+
+/// `GET /readyz` — readiness. 200 if core storage is reachable (the node can
+/// route), 503 otherwise. A disconnected plugin (e.g. an unplugged radio) is
+/// operational state reported by `/v1/status`, NOT a readiness failure, so it
+/// does not flip a load balancer / orchestrator away from an otherwise-fine
+/// node.
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    tag = "status",
+    summary = "Readiness probe",
+    description = "200 if core storage is reachable (the node can route); 503 if a storage error means it cannot. Plugin connectivity is reported by /v1/status, not here.",
+    responses(
+        (status = 200, description = "Node is ready to route", body = HealthResponse),
+        (status = 503, description = "Core storage unavailable", body = HealthResponse),
+    ),
+)]
+async fn readyz(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
+    match d.store.lock().unwrap().queue_counts() {
+        Ok(_) => (StatusCode::OK, Json(HealthResponse { status: "ready".into() })).into_response(),
+        Err(e) => {
+            warn!(error = %e, "readiness check failed: core storage unavailable");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(HealthResponse { status: "unavailable".into() }),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// `GET /v1/status` (design §Admin API): node identity, public-mode flag,
@@ -1936,10 +1991,11 @@ async fn docs_asset(AxPath(rest): AxPath<String>) -> axum::response::Response {
     paths(
         status, plugins, routes, config_yaml, config_prev, config_put, config_validate, config_rollback,
         queue, trace, public, limits, identities, create_link, delete_link, challenges,
-        federation, discovery, events_stream, metrics_text, openapi_json,
+        federation, discovery, events_stream, healthz, readyz, metrics_text, openapi_json,
     ),
     components(schemas(
         StatusResponse,
+        HealthResponse,
         PublicResponse, PublicServiceItem,
         LimitsResponse, GlobalLimitsItem, PerRouteLimitsItem, PerSenderLimitsItem, TransportBudgetItem,
         PluginsResponseDoc, PluginEntryDoc, PluginGaugeItemDoc,
@@ -2097,6 +2153,17 @@ mod tests {
         let (code, body) = get(router(d), "/v1/status").await;
         assert_eq!(code, 200);
         assert!(body.contains("\"public\":true"), "status was: {body}");
+    }
+
+    #[tokio::test]
+    async fn healthz_is_ok_and_readyz_is_ready_on_a_healthy_daemon() {
+        let d = daemon_with_public(false, vec![]);
+        let (hc, hb) = get(router(d.clone()), "/healthz").await;
+        assert_eq!(hc, 200);
+        assert!(hb.contains("\"status\":\"ok\""), "healthz body: {hb}");
+        let (rc, rb) = get(router(d), "/readyz").await;
+        assert_eq!(rc, 200);
+        assert!(rb.contains("\"status\":\"ready\""), "readyz body: {rb}");
     }
 
     #[tokio::test]

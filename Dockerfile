@@ -71,6 +71,12 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN mkdir -p /data
 VOLUME ["/data", "/config"]
 
+# Liveness/readiness via the admin socket: `switchyardctl health` GETs
+# /readyz and exits non-zero if the daemon isn't ready (503 or unreachable).
+# start-period covers first-boot config load + storage open.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD switchyardctl --socket /data/admin.sock health || exit 1
+
 # The admin API is a Unix socket under the data dir (no TCP). If you enable
 # federation, publish its configured TCP port with -p at run time.
 ENTRYPOINT ["switchyardd"]
