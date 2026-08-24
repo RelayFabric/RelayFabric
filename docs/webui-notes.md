@@ -85,6 +85,66 @@ Remote configuration supports TLS, WebAuthn/passkeys, RBAC, session
 expiration, audit logging. Roles per spec §78; identity-linking permissions
 stay separate from route management (correlation data is more sensitive).
 
+## Remote access (TLS reverse proxy)
+
+The UI binds `127.0.0.1:8087` by default. To reach it from another machine,
+front it with a **TLS reverse proxy** — do not expose the plain HTTP port.
+Two hard requirements come from WebAuthn:
+
+- **HTTPS is mandatory.** Browsers only offer passkeys in a *secure context*
+  (`https://`, or `localhost`). Terminate TLS at the proxy.
+- **The hostname is the passkey identity.** Passkeys are bound to the
+  **RP-ID** (the domain). Serve the UI under one **stable** hostname and set
+  `--rp-id <hostname>` (it defaults to the first non-IP `--allowed-host`).
+  Changing the hostname/RP-ID later invalidates every registered passkey.
+
+Also pass `--allowed-host <hostname>` for the public name: the UI rejects
+requests whose `Host` isn't allow-listed, and Origin-checks every
+state-changing request. The proxy must forward the `Host` header and **not
+buffer responses**, or the `/v1/events` SSE stream won't flow.
+
+**Caddy** (automatic Let's Encrypt TLS):
+
+```caddy
+relay.example.com {
+    reverse_proxy 127.0.0.1:8087 {
+        flush_interval -1   # stream SSE (/v1/events) without buffering
+    }
+}
+```
+Run: `relayfabric-ui --socket <admin.sock> --listen 127.0.0.1:8087 --allowed-host relay.example.com --rp-id relay.example.com`
+
+**nginx**:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name relay.example.com;
+    ssl_certificate     /etc/letsencrypt/live/relay.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/relay.example.com/privkey.pem;
+    location / {
+        proxy_pass http://127.0.0.1:8087;
+        proxy_set_header Host $host;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;          # stream SSE
+    }
+}
+```
+
+**Tailscale** (simplest for a private tailnet — TLS + a stable
+`*.ts.net` name, no public exposure):
+
+```shell
+tailscale serve --bg 8087
+# UI at https://<node>.<tailnet>.ts.net ; run with:
+relayfabric-ui --socket <admin.sock> --allowed-host <node>.<tailnet>.ts.net --rp-id <node>.<tailnet>.ts.net
+```
+
+For a quick one-off without a proxy, an SSH tunnel keeps the loopback bind
+and the `localhost` secure-context exemption:
+`ssh -L 8087:127.0.0.1:8087 user@host`, then browse `http://localhost:8087`.
+
 ## Shipped API surface (v0.2+)
 
 - `GET /v1/config` — raw YAML, secrets unresolved
