@@ -20,6 +20,7 @@ Per-plugin interop coverage (inbound/outbound/replies/attachments/reconnect/dedu
 | Meshtastic plugin (MQTT-JSON, Apache-2.0) | shipped | v0.1 | livetest via MQTT JSON gateway + real-node downlink (interop matrix C-2) |
 | MeshCore plugin | shipped | v0.2 | fake-backend tests + real-hardware livetest (interop matrix C-1) |
 | Nostr plugin | shipped | v0.3 | fake-relay tests; **live-relay validation pending** |
+| XMPP plugin (slixmpp, Apache-2.0) | shipped | v0.5-dev | MUC + 1:1 DMs, text only; fake-backend tests; **live-server validation pending** |
 | Bitchat plugin | shipped | v0.3 | fake tests; **real-client interop unverified** |
 | PotatoMesh feeder plugin | shipped | v0.4-dev | unit tests against the published contract |
 | Federation (Noise XX, signed envelopes, trust levels) | shipped | v0.3 | e2e |

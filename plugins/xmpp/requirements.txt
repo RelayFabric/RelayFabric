@@ -1,0 +1,3 @@
+# slixmpp: MIT license — an in-tree, permissive asyncio XMPP client, so this
+# plugin stays Apache-2.0 (no out-of-process GPL isolation).
+slixmpp>=1.8

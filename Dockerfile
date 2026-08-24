@@ -45,6 +45,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
       "meshcore==2.3.8" \
       paho-mqtt \
       rns \
+      "slixmpp>=1.8" \
       "websockets==17.0.1" \
       Pillow
 

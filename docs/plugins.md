@@ -318,6 +318,52 @@ and moderation therefore all operate at channel granularity, not per-user.
 
 ---
 
+## XMPP
+
+Bridges XMPP **multi-user chat (MUC) rooms** and **1:1 direct messages** via
+the permissive `slixmpp` (MIT) client. A bot account you create on your
+server (Prosody, ejabberd, …) logs in; each configured MUC maps to a channel
+endpoint, and an inbound 1:1 chat surfaces on a synthetic `direct:<jid>`
+endpoint (the `direct_messages` capability, enabling identity-linking).
+
+!!! note "Licensing"
+    Runs on `slixmpp` (MIT) — an in-tree, permissive dependency, so this
+    plugin stays Apache-2.0 with **no** out-of-process GPL isolation (unlike
+    `signal`/`meshtastic-direct`).
+
+!!! warning "Not end-to-end encrypted"
+    Plain XMPP is TLS **to the server** but **server-readable** — a gateway
+    (not E2E) bridge. OMEMO, attachments (XEP-0363), and presence are out of
+    scope this cycle (text only).
+
+| Key | Default | Notes |
+|---|---|---|
+| `jid` | — | The bridge account JID, e.g. `relay@example.com` |
+| `password` | — | Account password — use `${env:...}` / `${file:...}` |
+| `nick` | `relayfabric` | MUC nickname |
+| `max_text_bytes` | `4000` | Outbound text cap |
+| `channels` | — | `muc` (room JID) per named channel |
+
+```yaml
+plugins:
+  xmpp:
+    enabled: true
+    command: /path/to/RelayFabric/.venv/bin/python /path/to/RelayFabric/plugins/xmpp/relayfabric-xmpp
+    config:
+      jid: "relay@example.com"
+      password: ${env:XMPP_PASSWORD}
+      channels:
+        townsquare: { muc: "townsquare@conference.example.com" }
+```
+
+A loop guard drops the room's reflection of our own sends (1h window on
+`(channel, text)`), on top of dropping messages from our own MUC nick.
+`slixmpp` auto-reconnects a dropped link; a hard auth failure exits the
+process for the supervisor to restart. Exercised against a fake backend in
+tests — verify against a real server before production.
+
+---
+
 ## Nostr
 
 Bridges Nostr relays natively over NIP-01 WebSockets — no intermediary
