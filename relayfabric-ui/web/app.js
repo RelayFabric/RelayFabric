@@ -654,10 +654,17 @@ class App extends Component {
       </div>`;
   }
 
+  loadStarter = () => {
+    const cur = (this.state.cfgText || '').trim();
+    if (cur && !confirm('Replace the editor contents with a starter template?')) return;
+    this.setState({ cfgText: STARTER_CONFIG, cfgMsg: 'starter template — customize, Validate, then Apply', viewingPrev: null });
+  };
+
   config(s) {
     return html`
       ${this.header('Config', 'GET /v1/config · byte-verbatim YAML · secret refs never resolved', html`
         ${s.cfgMsg ? html`<span class="tag tag-accent">${s.cfgMsg}</span>` : ''}
+        <button class="btn btn-ghost" onClick=${this.loadStarter} title="Fill the editor with a minimal starter config">Starter template</button>
         <button class="btn btn-secondary" onClick=${this.validateCfg}>Validate</button>
         <button class="btn btn-primary" onClick=${this.applyCfg}>Apply</button>`)}
       <div style="display:grid;grid-template-columns:1fr 300px;gap:16px;align-items:start">
@@ -917,6 +924,36 @@ function gaugeNote(g) {
   if (ent.length === 0) return '';
   return ent.slice(0, 2).map(([k, v]) => k + ' ' + v).join(' · ');
 }
+
+// Starter scaffold for the "Starter template" button (mirrors
+// `switchyardd init`): a minimal, valid config an operator customizes.
+const STARTER_CONFIG = `# RelayFabric config — starter template.
+# Full reference: docs/relayfabric.example.yaml and docs/configuration.md.
+node:
+  name: my-relayfabric
+  # Keep this a SHORT absolute path (socket paths derive from it):
+  data_dir: /var/lib/relayfabric
+
+# Bridges to other networks — each plugin is a separate supervised process
+# (see docs/plugins.md). Enable and configure one:
+plugins: {}
+  # mqtt:
+  #   enabled: true
+  #   command: relayfabric-mqtt
+  #   config:
+  #     broker: mqtt://127.0.0.1:1883
+
+# Routes bridge one plugin's endpoints to another (deny-by-default):
+routes: []
+  # - name: example
+  #   sources: ["mqtt:chat/in"]
+  #   destinations: ["mqtt:chat/out"]
+
+ttl_default_secs: 86400
+dedup_ttl_secs: 86400
+retention_secs: 86400
+hop_limit: 8
+`;
 
 const DEMO_CONFIG = `# relayfabric.yaml (offline sample)
 node:

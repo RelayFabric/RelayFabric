@@ -42,9 +42,14 @@ A plugin's `command` in the config points at `.venv/bin/python …` — see [Con
 
 ## First route: MQTT loopback
 
-1. Validate the shipped example config (adjust `node.data_dir` first):
+1. Generate a starter config (or validate the fully-annotated example). `init`
+   writes a minimal, valid config and never overwrites an existing one; the
+   web UI's Config view has an equivalent **Starter template** button.
 
     ```bash
+    switchyardd init --config ./relayfabric.yaml   # writes a starter, then:
+    switchyardd --config ./relayfabric.yaml --check-config
+    # …or start from the annotated reference:
     switchyardd --config docs/relayfabric.example.yaml --check-config
     ```
 
