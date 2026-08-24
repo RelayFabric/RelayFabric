@@ -213,8 +213,9 @@ set — see [Federation & Discovery](federation.md).
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `ttl_default_secs` | integer | `86400` | Default message time-to-live, in seconds. |
-| `dedup_ttl_secs` | integer | `86400` | How long a delivered message's dedup fingerprint is remembered. |
-| `hop_limit` | integer | `8` | Maximum route hops before a message is dropped. |
+| `dedup_ttl_secs` | integer | `86400` | How long a delivered message's dedup fingerprint is remembered. Must be ≥ 1. |
+| `retention_secs` | integer | `86400` | How long terminal deliveries (delivered/failed/expired/dead_letter) and their orphaned CAS attachments are kept before the hourly purge removes them. Lower it on a small-disk node; raise it for a longer dead-letter/forensic window. Must be ≥ 1. |
+| `hop_limit` | integer | `8` | Maximum route hops before a message is dropped. Must be ≥ 1. |
 | `max_attachment_bytes` | integer | `8000000` (8 MB) | Daemon-wide inbound attachment budget, in bytes. |
 
 `dedup_ttl_secs` applies live (pushed into the dedup store's TTL on reload;
@@ -294,7 +295,7 @@ config. Most blocks apply live; a few require a restart:
 |---|---|
 | `routes`, `policies`, `public_services`, `limits`, `transport_budgets`, `transports`, `privacy` | Live — next read picks up the new value, no restart. |
 | `render`, `identity_mode`, `security_mode`, `allow_gateway_decryption` (route-level) | Live. |
-| `dedup_ttl_secs`, `ttl_default_secs`, `hop_limit`, `max_attachment_bytes` | Live. |
+| `dedup_ttl_secs`, `ttl_default_secs`, `retention_secs`, `hop_limit`, `max_attachment_bytes` | Live. |
 | `plugins.<name>` (`enabled`/`command`/`config` changed, or added/removed) | That plugin's name is reported in `restart_required` — only it needs restarting. |
 | `node` (any field) | Reports `"daemon"` — full daemon restart required. |
 | `federation` (any field) | Reports `"daemon"` — full daemon restart required. |

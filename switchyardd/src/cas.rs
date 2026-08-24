@@ -81,6 +81,13 @@ impl Cas {
         })
     }
 
+    /// Current live blob bytes on disk (best-effort running total; see
+    /// `total_bytes`). Surfaced via `/v1/limits` so an operator can see CAS
+    /// disk pressure against `limits.global.cas_max_bytes`.
+    pub fn bytes_used(&self) -> u64 {
+        self.total_bytes.load(Ordering::Relaxed)
+    }
+
     /// Writes `data` under its sha256 hex digest and returns that digest.
     /// Write-if-absent via temp-file-then-rename: the rename is atomic, so a
     /// crash mid-write never leaves a reader observing a partial blob, and a

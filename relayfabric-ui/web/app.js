@@ -153,7 +153,7 @@ const DEMO = {
     { id: 2, display_name: 'Ops pager', a: 'matrix:@r****mple', b: 'xmpp:pa****.net', verified_at: '2026-07-15' },
   ] },
   challenges: [{ id: 7, target: 'xmpp:pa****.net', expires: 'in 9m' }],
-  limits: { global: { queue_max: 50000, cas_max_bytes: 1073741824 }, per_route: { queue_max: 5000 }, per_sender: { messages_per_minute: 10, bytes_per_hour: 52428800 }, transport_budgets: { xmpp: 30, smtp: 60, webhook: 120 } },
+  limits: { global: { queue_max: 50000, cas_bytes_used: 268435456, cas_max_bytes: 1073741824 }, per_route: { queue_max: 5000 }, per_sender: { messages_per_minute: 10, bytes_per_hour: 52428800 }, transport_budgets: { xmpp: 30, smtp: 60, webhook: 120 } },
 };
 
 const bytes = (n) => {
@@ -826,13 +826,13 @@ class App extends Component {
     const l = s.limits || DEMO.limits;
     const tb = Object.entries(l.transport_budgets || {});
     return html`
-      ${this.header('Limits & metrics', 'GET /v1/limits · a config echo, not live counter state · GET /metrics')}
+      ${this.header('Limits & metrics', 'GET /v1/limits · configured caps + live CAS disk use · GET /metrics')}
       <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;max-width:900px;margin-bottom:14px">
         <div class="card elev-sm" style="gap:var(--space-2)">
           <span class="card-kicker">global</span>
           <div style="display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:12.5px;font-family:ui-monospace,Menlo,monospace">
             <span class="text-muted">queue_max</span><span style="text-align:right">${(l.global.queue_max || 0).toLocaleString()}</span>
-            <span class="text-muted">cas_max_bytes</span><span style="text-align:right">${bytes(l.global.cas_max_bytes)}</span>
+            <span class="text-muted">cas used</span><span style="text-align:right">${bytes(l.global.cas_bytes_used || 0)}${l.global.cas_max_bytes ? ' / ' + bytes(l.global.cas_max_bytes) : ' (unlimited)'}</span>
           </div>
         </div>
         <div class="card elev-sm" style="gap:var(--space-2)">

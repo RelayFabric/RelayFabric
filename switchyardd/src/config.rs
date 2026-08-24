@@ -40,6 +40,12 @@ pub struct Config {
     pub ttl_default_secs: u64,
     #[serde(default = "default_ttl")]
     pub dedup_ttl_secs: u64,
+    /// How long a terminal delivery row (delivered/failed/expired/dead_letter)
+    /// and its orphaned CAS attachments are retained before the hourly purge
+    /// removes them. Default 24h; tune down on a small-disk node, up for a
+    /// longer forensic/DLQ window.
+    #[serde(default = "default_retention")]
+    pub retention_secs: u64,
     #[serde(default = "default_hop_limit")]
     pub hop_limit: u8,
     #[serde(default = "default_max_attachment_bytes")]
@@ -195,6 +201,9 @@ impl Config {
 }
 
 fn default_ttl() -> u64 {
+    86_400
+}
+fn default_retention() -> u64 {
     86_400
 }
 fn default_hop_limit() -> u8 {
@@ -864,6 +873,12 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
     }
     if cfg.dedup_ttl_secs == 0 {
         return Err("dedup_ttl_secs must be at least 1 (0 leaves no dedup window)".to_string());
+    }
+    if cfg.retention_secs == 0 {
+        return Err(
+            "retention_secs must be at least 1 (0 would purge terminal deliveries immediately)"
+                .to_string(),
+        );
     }
 
     // node.name (final cycle-G review finding): design §1's advert contract
@@ -3245,12 +3260,21 @@ federation:
                 Box::new(|c: &mut Config| c.dedup_ttl_secs = 0),
                 "dedup_ttl_secs",
             ),
+            (
+                Box::new(|c: &mut Config| c.retention_secs = 0),
+                "retention_secs",
+            ),
         ] {
             let mut cfg = parse(GOOD).unwrap();
             mutate(&mut cfg);
             let err = validate(&cfg).unwrap_err();
             assert!(err.contains(needle), "error must name {needle}: {err}");
         }
+    }
+
+    #[test]
+    fn retention_secs_defaults_to_24h() {
+        assert_eq!(parse(GOOD).unwrap().retention_secs, 86_400);
     }
 
     #[test]

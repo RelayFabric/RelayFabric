@@ -1820,10 +1820,12 @@ pub async fn pump(d: Arc<Daemon>) {
         }
         if last_purge.elapsed() >= PURGE_INTERVAL {
             last_purge = Instant::now();
-            // retention is hardcoded to 24h; making it configurable
-            // is the upgrade path once there's an actual
-            // disk-pressure signal to tune it by.
-            let cutoff = now - CDuration::hours(24);
+            // Retention window is operator-configurable (config.retention_secs,
+            // default 24h): terminal deliveries and their orphaned CAS blobs
+            // older than this are removed on the hourly purge. Read live so a
+            // --check-config'd edit takes effect on the next purge, no restart.
+            let retention = d.cfg_snapshot(|c| c.retention_secs);
+            let cutoff = now - CDuration::seconds(retention as i64);
             {
                 // Hold the store lock ACROSS the CAS removals (audit TOCTOU):
                 // purge_terminal computes the orphan set under this lock, and
@@ -3039,6 +3041,7 @@ pub mod tests_support {
             policies: vec![],
             ttl_default_secs: 3600,
             dedup_ttl_secs: 3600,
+            retention_secs: 86_400,
             hop_limit: 8,
             max_attachment_bytes: 8 * 1024 * 1024,
             public_services,

@@ -325,5 +325,9 @@ policies:
 # TTLs and limits (seconds)
 ttl_default_secs: 86400
 dedup_ttl_secs: 86400
+retention_secs: 86400            # how long terminal deliveries + orphaned
+                                 # attachments are kept before the hourly
+                                 # purge; lower on a small disk, higher for a
+                                 # longer DLQ/forensic window
 hop_limit: 8
 max_attachment_bytes: 8000000  # daemon-wide inbound attachment budget (bytes); 8 MiB is the default if omitted

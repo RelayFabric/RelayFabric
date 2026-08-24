@@ -320,6 +320,9 @@ async fn public(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
 /// comment for why.
 #[derive(Serialize, ToSchema)]
 struct GlobalLimitsItem {
+    /// Current live CAS (attachment) bytes on disk — disk-pressure signal
+    /// against `cas_max_bytes` (0 budget = unlimited).
+    cas_bytes_used: u64,
     cas_max_bytes: u64,
     queue_max: u32,
 }
@@ -361,6 +364,7 @@ struct LimitsResponse {
     ),
 )]
 async fn limits(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
+    let cas_bytes_used = d.cas.bytes_used();
     Json(d.cfg_snapshot(|c| {
         let transport_budgets: BTreeMap<_, _> = c
             .transport_budgets
@@ -376,6 +380,7 @@ async fn limits(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
             .collect();
         LimitsResponse {
             global: GlobalLimitsItem {
+                cas_bytes_used,
                 cas_max_bytes: c.limits.global.cas_max_bytes,
                 queue_max: c.limits.global.queue_max,
             },
@@ -4623,6 +4628,7 @@ routes:
         );
         let resp = LimitsResponse {
             global: GlobalLimitsItem {
+                cas_bytes_used: 0,
                 cas_max_bytes: 1_000_000_000,
                 queue_max: 50_000,
             },
@@ -4636,7 +4642,7 @@ routes:
         let old = json!({
             "per_sender": { "messages_per_minute": 10u32, "bytes_per_hour": 50_000u64 },
             "per_route": { "queue_max": 5_000u32 },
-            "global": { "queue_max": 50_000u32, "cas_max_bytes": 1_000_000_000u64 },
+            "global": { "queue_max": 50_000u32, "cas_max_bytes": 1_000_000_000u64, "cas_bytes_used": 0u64 },
             "transport_budgets": { "mockb": { "messages_per_minute": 30u32 } },
         });
         assert_eq!(
