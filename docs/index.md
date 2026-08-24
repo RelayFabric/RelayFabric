@@ -23,6 +23,7 @@ Per-plugin interop coverage (inbound/outbound/replies/attachments/reconnect/dedu
 | XMPP plugin (slixmpp, Apache-2.0) | shipped | v0.5-dev | MUC + 1:1 DMs, text only; fake-backend tests; **live-server validation pending** |
 | Bitchat plugin | shipped | v0.3 | fake tests; **real-client interop unverified** |
 | PotatoMesh feeder plugin | shipped | v0.4-dev | unit tests against the published contract |
+| meshtripwire alert plugin (ingest-only, Apache-2.0) | shipped | v0.5-dev | unit tests; relays meshtripwire tripwire alerts off-grid over LXMF/Meshtastic |
 | Federation (Noise XX, signed envelopes, trust levels) | shipped | v0.3 | e2e |
 | RFDP discovery | shipped | v0.3 | e2e |
 | Sealed routing — phase 1, gateway-to-gateway ([§113](SPEC.md)) | shipped | v0.3 | e2e + KAT |

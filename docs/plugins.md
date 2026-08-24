@@ -520,3 +520,50 @@ re-upserted by the next beacon. GPS sentinels (`(0,0)` coordinates,
 `time<=0`) are stripped at source per the PotatoMesh contract; hardware and
 role enum codes are not mapped to names (that would need the GPL protobuf
 tables) and are omitted.
+
+## meshtripwire
+
+Relays [meshtripwire](https://github.com/OutandBack/meshtripwire) tripwire
+alerts into the fabric. meshtripwire is a wireless tripwire — ESP32 sensor
+nodes detect unknown WiFi/BLE MACs and relay them over LoRa to a base station
+that filters (whitelist, RSSI floor, per-MAC cooldown) and alerts. Like the
+PotatoMesh feeder this is **ingest-only**, but in the other direction: it
+subscribes to the MQTT topic meshtripwire publishes alerts on and emits each
+one **inbound** on a single endpoint; routed sends are rejected.
+
+!!! note "Why this exists"
+    meshtripwire's built-in alert channels — ntfy, webhook, Twilio SMS — all
+    need the Internet, the opposite of the remote/no-cellular sites it's
+    designed for. This plugin carries alerts over LXMF/Reticulum or a
+    Meshtastic channel instead. meshtripwire is MIT, so the plugin is
+    in-tree (Apache-2.0).
+
+| Key | Default | Notes |
+|---|---|---|
+| `broker` | — | `mqtt://host:port` — meshtripwire's broker |
+| `topic` | `meshtripwire/alerts` | meshtripwire's `MqttAlertTopic` |
+| `endpoint` | `alerts` | inbound endpoint alerts appear on |
+| `client_id` | `null` | optional MQTT client id |
+
+```yaml
+plugins:
+  meshtripwire:
+    enabled: true
+    config:
+      broker: mqtt://127.0.0.1:1883
+      topic: meshtripwire/alerts
+      endpoint: alerts
+routes:
+  - name: tripwire-to-reticulum
+    sources: ["meshtripwire:alerts"]
+    destinations: ["lxmf:security"]
+```
+
+Enable meshtripwire's MQTT alert output (`[Notifications] EnableMqtt` in its
+`config.ini`) to publish alerts to the broker. The plugin accepts either the
+JSON alert (`{mac, node, rssi, lat, lon, message}`, formatted into a line with
+a maps link when a GPS fix is present) or a plain-text line (forwarded
+verbatim). **Deduplication is meshtripwire's** (its `AlertCooldownSeconds`) —
+the plugin forwards exactly the alerts it raised, adding none of its own
+suppression. For a zero-plugin alternative that relays the same topic with the
+generic `mqtt` plugin, see [`examples/meshtripwire.yaml`](examples.md).

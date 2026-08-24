@@ -23,6 +23,7 @@ template** button.
 | [`multi-network-hub.yaml`](https://github.com/RelayFabric/RelayFabric/blob/main/examples/multi-network-hub.yaml) | A hub fanning several plugins into shared routes — MQTT↔Nostr cross-post, both mirrored one-way into LXMF. Shows real route wiring and deny-by-default. |
 | [`public-federation-node.yaml`](https://github.com/RelayFabric/RelayFabric/blob/main/examples/public-federation-node.yaml) | A public node that advertises services and accepts traffic from trusted federation peers into a local LXMF channel. Shows `node.public` + `public_services` + `limits` + `federation`. |
 | [`node-red.yaml`](https://github.com/RelayFabric/RelayFabric/blob/main/examples/node-red.yaml) | Automate RelayFabric from [Node-RED](https://nodered.org/) via MQTT — flows inject into and react to the fabric. See below. |
+| [`meshtripwire.yaml`](https://github.com/RelayFabric/RelayFabric/blob/main/examples/meshtripwire.yaml) | Relay [meshtripwire](https://github.com/OutandBack/meshtripwire) tripwire alerts off-grid — its MQTT alert topic fanned into LXMF **and** a Meshtastic channel, no custom code. See below. |
 
 ## Node-RED automation (via MQTT)
 
@@ -50,6 +51,30 @@ admin API is deliberately read/control only — message **ingress is via
 plugins**, so MQTT (which Node-RED already speaks) is the injection path. For
 read-only observability you can also point a Node-RED flow at the admin
 `GET /v1/events` SSE stream and `GET /v1/queue`.
+
+## meshtripwire alerts, off-grid (via MQTT)
+
+[meshtripwire](https://github.com/OutandBack/meshtripwire) is a wireless
+tripwire: sensor nodes detect unknown WiFi/BLE MACs and its base station
+alerts on them — but only via ntfy, webhook, or Twilio SMS, all of which need
+the Internet the remote site doesn't have. Enable meshtripwire's MQTT alert
+output (`[Notifications] EnableMqtt`) and it publishes each alert to a broker
+topic; from there RelayFabric carries it somewhere that works with no cellular:
+
+```
+meshtripwire base station  ──MQTT──▶  RelayFabric  ──▶  LXMF/Reticulum + Meshtastic
+```
+
+[`meshtripwire.yaml`](https://github.com/RelayFabric/RelayFabric/blob/main/examples/meshtripwire.yaml)
+does this with the **generic `mqtt` plugin** — the alert topic fanned one-way
+into an LXMF channel and a Meshtastic channel, no custom code. Drop the
+`meshtastic` plugin and its route for LXMF-only delivery.
+
+For a **formatted** alert line (emoji, RSSI, a maps link from the GPS fix) and
+a dedicated `meshtripwire:` endpoint, use the
+[`meshtripwire` plugin](plugins.md#meshtripwire) instead — it parses the JSON
+alert rather than relaying it raw. meshtripwire owns rate-limiting either way
+(its `AlertCooldownSeconds`).
 
 See also [Configuration](configuration.md), [Plugins](plugins.md), and
 [Live & Field Testing](live-testing.md).

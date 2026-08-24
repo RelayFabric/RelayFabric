@@ -1,0 +1,61 @@
+# Recipe: relay meshtripwire tripwire alerts OFF-GRID, with no custom code.
+# meshtripwire (github.com/OutandBack/meshtripwire) detects unknown WiFi/BLE
+# MACs and alerts via ntfy/webhook/Twilio -- all Internet-dependent. Point its
+# MQTT alert output at a broker topic and the generic `mqtt` plugin relays each
+# alert into LXMF/Reticulum AND onto a Meshtastic channel, so the alert reaches
+# a remote site with no cellular. Alerts are one-way (meshtripwire -> fabric).
+#
+# For a formatted alert line + a dedicated meshtripwire: endpoint, use the
+# meshtripwire plugin instead (plugins/meshtripwire). This example is the
+# zero-plugin path.
+#
+# Edit: node.data_dir, the broker, plugin command paths, the LXMF peer hash,
+# and the Meshtastic channel. Then:
+#   switchyardd --config examples/meshtripwire.yaml --check-config
+node:
+  name: tripwire-relay
+  data_dir: /var/lib/relayfabric
+
+plugins:
+  # Subscribe to meshtripwire's MQTT alert topic (its MqttAlertTopic).
+  mqtt:
+    enabled: true
+    command: relayfabric-mqtt
+    config:
+      broker: mqtt://127.0.0.1:1883        # meshtripwire's broker
+      client_id: relayfabric-meshtripwire
+      topics: ["meshtripwire/alerts"]
+
+  lxmf:
+    enabled: true
+    command: /opt/relayfabric/.venv/bin/python /opt/relayfabric/plugins/lxmf/relayfabric-lxmf
+    config:
+      display_name: "Tripwire Relay"
+      storage: /var/lib/relayfabric/lxmf
+      propagation_node: "auto"
+      channels:
+        - name: security
+          members: ["309abcbd838a8539d3c9fd56a453a9e5"]  # <- your phone's LXMF hash
+          open: true
+
+  # Also broadcast the alert onto a LoRa mesh channel (via its MQTT-JSON
+  # gateway). Drop this plugin + route if you only want LXMF delivery.
+  meshtastic:
+    enabled: true
+    command: /opt/relayfabric/.venv/bin/python /opt/relayfabric/plugins/meshtastic/relayfabric-meshtastic
+    config:
+      broker: mqtt://127.0.0.1:1883
+      topic_root: msh/US
+      channels:
+        mesh: { index: 0, topic_channel: "LongFast" }
+
+routes:
+  # meshtripwire alert -> Reticulum inbox + LoRa mesh (one-way).
+  - name: tripwire-fanout
+    sources: ["mqtt:meshtripwire/alerts"]
+    destinations: ["lxmf:security", "meshtastic:mesh"]
+
+ttl_default_secs: 86400
+dedup_ttl_secs: 86400
+retention_secs: 86400
+hop_limit: 8

@@ -119,6 +119,19 @@ plugins:
   #     url: https://potato.example.org # PotatoMesh instance base URL
   #     token: ${env:POTATOMESH_TOKEN}  # its API bearer token
 
+  # meshtripwire:
+  #   enabled: true
+  #   # Ingest-only: relays meshtripwire tripwire alerts into the fabric so
+  #   # they reach an off-grid destination (LXMF/Meshtastic) instead of its
+  #   # Internet-only ntfy/webhook/Twilio channels. Enable meshtripwire's MQTT
+  #   # alert output ([Notifications] EnableMqtt) to publish to the topic.
+  #   #   pip install -r plugins/meshtripwire/requirements.txt
+  #   command: /path/to/RelayFabric/.venv/bin/python /path/to/RelayFabric/plugins/meshtripwire/relayfabric-meshtripwire
+  #   config:
+  #     broker: mqtt://127.0.0.1:1883    # meshtripwire's broker
+  #     topic: meshtripwire/alerts       # meshtripwire's MqttAlertTopic
+  #     endpoint: alerts                 # inbound endpoint alerts appear on
+
   # meshcore:
   #   enabled: true
   #   # Runs under sh -c, so it needs an absolute path and the venv's
