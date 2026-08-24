@@ -2,8 +2,8 @@
 
 **RelayFabric is an open communications routing fabric for interconnecting otherwise incompatible messaging, mesh, radio, and Internet systems.** It provides one common routing, policy, identity, security, and message-processing layer, and delegates every protocol-specific detail to plugins. Bridge a Meshtastic LoRa mesh to Reticulum/LXMF, relay Signal into Nostr, or federate two gateways over an untrusted link — through a single headless daemon.
 
-!!! note "Status — v0.4.0 released"
-    v0.4 was the hardening/proving/packaging release — no new protocols ([roadmap](proposals/v0.4-roadmap.md)): per-plugin isolation, passkey-authenticated UI, the interop matrix, signed packaged releases, and a published SDK. The public federation (cycle G) follows in a v0.4.x point release. The table below is the **single source of truth** for feature status; every other page defers to it.
+!!! note "Status — v0.4.2 released"
+    v0.4 was the hardening/proving/packaging release — no new protocols ([roadmap](proposals/v0.4-roadmap.md)): per-plugin isolation, passkey-authenticated UI, the interop matrix, signed packaged releases, and a published SDK. The v0.4.x point releases add operator/self-hoster features (backup/restore, health probes, retention, self-alerting, DLQ management, Grafana, `init`) and two ingest/bridge plugins (XMPP, meshtripwire). The public federation (cycle G) follows later on the same line. The table below is the **single source of truth** for feature status; every other page defers to it.
 
 ## Feature status
 
@@ -20,10 +20,10 @@ Per-plugin interop coverage (inbound/outbound/replies/attachments/reconnect/dedu
 | Meshtastic plugin (MQTT-JSON, Apache-2.0) | shipped | v0.1 | livetest via MQTT JSON gateway + real-node downlink (interop matrix C-2) |
 | MeshCore plugin | shipped | v0.2 | fake-backend tests + real-hardware livetest (interop matrix C-1) |
 | Nostr plugin | shipped | v0.3 | fake-relay tests; **live-relay validation pending** |
-| XMPP plugin (slixmpp, Apache-2.0) | shipped | v0.5-dev | MUC + 1:1 DMs, text only; fake-backend tests; **live-server validation pending** |
+| XMPP plugin (slixmpp, Apache-2.0) | shipped | v0.4.2 | MUC + 1:1 DMs, text only; fake-backend tests; **live-server validation pending** |
 | Bitchat plugin | shipped | v0.3 | fake tests; **real-client interop unverified** |
 | PotatoMesh feeder plugin | shipped | v0.4-dev | unit tests against the published contract |
-| meshtripwire alert plugin (ingest-only, Apache-2.0) | shipped | v0.5-dev | unit tests; relays meshtripwire tripwire alerts off-grid over LXMF/Meshtastic |
+| meshtripwire alert plugin (ingest-only, Apache-2.0) | shipped | v0.4.2 | unit tests; relays meshtripwire tripwire alerts off-grid over LXMF/Meshtastic |
 | Federation (Noise XX, signed envelopes, trust levels) | shipped | v0.3 | e2e |
 | RFDP discovery | shipped | v0.3 | e2e |
 | Sealed routing — phase 1, gateway-to-gateway ([§113](SPEC.md)) | shipped | v0.3 | e2e + KAT |

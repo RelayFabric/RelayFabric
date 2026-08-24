@@ -11,7 +11,7 @@ plugins. MeshCore uses the native MIT Companion Radio Protocol (spec §8's
 preferred style), while Meshtastic uses MQTT (licensing favors it). Initial
 target networks: Reticulum/LXMF, Signal, Meshtastic, MeshCore, Bitchat, Nostr.
 
-**Status:** [v0.4.1 released](https://github.com/RelayFabric/RelayFabric/releases/tag/v0.4.1)
+**Status:** [v0.4.2 released](https://github.com/RelayFabric/RelayFabric/releases/tag/v0.4.2)
 — the "trustworthy intermesh" release: core fabric, eight plugins,
 federation + RFDP, sealed routing phase 1, transport-class-aware egress,
 plus per-plugin privilege isolation, passkey-authenticated web UI, a
@@ -48,7 +48,7 @@ systemd units:
 
 ```
 # pick your arch from the release assets
-sudo dpkg -i relayfabric_0.4.1-1_amd64.deb
+sudo dpkg -i relayfabric_0.4.2-1_amd64.deb
 sudo systemctl enable --now switchyardd
 ```
 
