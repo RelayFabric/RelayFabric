@@ -20,6 +20,7 @@ nav = [
   {"Federation & Discovery" = "federation.md"},
   {"Operations" = "operations.md"},
   {"Docker" = "docker.md"},
+  {"Raspberry Pi" = "raspberry-pi.md"},
   {"Live & Field Testing" = "live-testing.md"},
   {"Interop Matrix" = "interop-matrix.md"},
   {"Plugin Authoring" = "plugin-authors.md"},
