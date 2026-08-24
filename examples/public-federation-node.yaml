@@ -1,0 +1,65 @@
+# Recipe: a PUBLIC federation node — advertises services to the fabric and
+# accepts traffic from trusted peers, delivering it to a local LXMF channel.
+# A public node MUST declare public_services covering every route's protocols
+# and MUST set at least one limit (both enforced by --check-config).
+# Edit: node name/data_dir, plugin command path, federation.listen + peers
+# (real node_ids/addrs), and publish the listen port. Then:
+#   switchyardd --config examples/public-federation-node.yaml --check-config
+node:
+  name: public-relay
+  data_dir: /var/lib/relayfabric
+  public: true
+
+plugins:
+  lxmf:
+    enabled: true
+    command: /opt/relayfabric/.venv/bin/python /opt/relayfabric/plugins/lxmf/relayfabric-lxmf
+    config:
+      display_name: "Public Relay"
+      storage: /var/lib/relayfabric/lxmf
+      propagation_node: "auto"
+      channels:
+        - name: regional
+          members: []
+          open: true
+
+# What this node exposes publicly. Every route protocol below is covered.
+public_services:
+  - name: lxmf-relay
+    type: relay
+    ingress: [lxmf]
+    egress: [lxmf]
+
+# A public node must bound abuse: set at least one per_sender or global limit.
+limits:
+  per_sender:
+    messages_per_minute: 30
+    bytes_per_hour: 2000000
+  global:
+    queue_max: 100000
+    cas_max_bytes: 2147483648   # 2 GiB CAS budget
+
+federation:
+  listen: "0.0.0.0:47000"       # publish this TCP port so peers can dial in
+  accept_from: verified         # minimum trust for an inbound envelope
+  identity_exposure: pseudonymous
+  max_hops: 6
+  max_ttl_secs: 86400
+  # Local routes trusted peers may inject their traffic into:
+  ingress_routes: [regional]
+  peers:
+    - name: peer-b
+      node_id: "rf:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      addr: "203.0.113.10:47000"   # peer's IP:port (resolve a hostname yourself)
+      trust: verified
+
+routes:
+  # Local + federated `regional` traffic fans out to the public channel.
+  - name: regional
+    sources: ["lxmf:regional"]
+    destinations: ["lxmf:regional-out"]
+
+ttl_default_secs: 86400
+dedup_ttl_secs: 86400
+retention_secs: 86400
+hop_limit: 8

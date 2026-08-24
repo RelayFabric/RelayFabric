@@ -1,0 +1,44 @@
+# Recipe: bridge a Meshtastic radio DIRECTLY over the device API (serial /
+# TCP / BLE) into LXMF — no MQTT broker, no proxy. Simplest bench setup.
+# NOTE: the meshtastic-direct plugin is GPL-3.0 (it links the official
+# meshtastic library, isolated to its own process); see plugins/meshtastic-direct.
+# Edit: data_dir, plugin command paths, the `connection` URL (serial:///...,
+# tcp://host[:4403], or ble://<addr>), and the peer LXMF address.
+#   switchyardd --config examples/meshtastic-direct.yaml --check-config
+node:
+  name: mesh-direct-bridge
+  data_dir: /var/lib/relayfabric
+
+plugins:
+  meshtastic-direct:
+    enabled: true
+    command: /opt/relayfabric/.venv/bin/python /opt/relayfabric/plugins/meshtastic-direct/relayfabric-meshtastic-direct
+    config:
+      connection: serial:///dev/ttyUSB0    # or tcp://10.0.0.5 or ble://AA:BB:CC:DD:EE:FF
+      channels:
+        mesh: { index: 0 }
+
+  lxmf:
+    enabled: true
+    command: /opt/relayfabric/.venv/bin/python /opt/relayfabric/plugins/lxmf/relayfabric-lxmf
+    config:
+      display_name: "Mesh Bridge"
+      storage: /var/lib/relayfabric/lxmf
+      propagation_node: "auto"
+      channels:
+        - name: bridge
+          members: ["309abcbd838a8539d3c9fd56a453a9e5"]  # <- your peer's LXMF hash
+          open: true
+
+routes:
+  - name: mesh-to-lxmf
+    sources: ["meshtastic-direct:mesh"]
+    destinations: ["lxmf:bridge"]
+  - name: lxmf-to-mesh
+    sources: ["lxmf:bridge"]
+    destinations: ["meshtastic-direct:mesh"]
+
+ttl_default_secs: 86400
+dedup_ttl_secs: 86400
+retention_secs: 86400
+hop_limit: 8

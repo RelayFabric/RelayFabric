@@ -11,6 +11,7 @@ nav = [
   {"Getting Started" = "getting-started.md"},
   {"Architecture" = "architecture.md"},
   {"Configuration" = "configuration.md"},
+  {"Example Configs" = "examples.md"},
   {"Plugins" = "plugins.md"},
   {"Routing & Policy" = "routing.md"},
   {"Identity & Privacy" = "identity.md"},

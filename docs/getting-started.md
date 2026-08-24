@@ -53,6 +53,10 @@ A plugin's `command` in the config points at `.venv/bin/python …` — see [Con
     switchyardd --config docs/relayfabric.example.yaml --check-config
     ```
 
+    For a task-focused starting point (Meshtastic↔LXMF, a public federation
+    node, a multi-network hub, MQTT↔Signal, …) copy one of the
+    [example configs](examples.md) and edit the few fields its header names.
+
 2. Run a broker, the daemon, and a subscriber, then publish:
 
     ```bash

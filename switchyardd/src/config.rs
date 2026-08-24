@@ -3334,6 +3334,31 @@ federation:
         assert_eq!(parse(GOOD).unwrap().retention_secs, 86_400);
     }
 
+    /// Every shipped `examples/*.yaml` must parse and pass validation, so a
+    /// copy-paste starting point is never a broken one as the config schema
+    /// evolves (parity with `switchyardd --check-config`, minus secret-ref
+    /// resolution which needs real env/files).
+    #[test]
+    fn shipped_example_configs_all_validate() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("examples/ dir must exist") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let cfg = load_from_str(&text)
+                .unwrap_or_else(|e| panic!("{}: parse failed: {e}", path.display()));
+            validate(&cfg).unwrap_or_else(|e| panic!("{}: validate failed: {e}", path.display()));
+            checked += 1;
+        }
+        assert!(
+            checked >= 5,
+            "expected >= 5 example configs, checked {checked}"
+        );
+    }
+
     #[test]
     fn zero_federation_bounds_are_rejected() {
         for (field, needle) in [

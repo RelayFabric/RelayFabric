@@ -1,0 +1,44 @@
+# Recipe: bridge a Meshtastic LoRa mesh <-> Reticulum/LXMF.
+# Edit: node.data_dir, the MQTT broker/topic_root, the plugin command paths,
+# and the peer LXMF address in the bridge channel. Then:
+#   switchyardd --config examples/meshtastic-lxmf.yaml --check-config
+node:
+  name: mesh-lxmf-bridge
+  data_dir: /var/lib/relayfabric
+
+plugins:
+  # Meshtastic over the node's MQTT-JSON gateway (permissive; needs a broker).
+  # For a broker-less serial/BLE setup use examples/meshtastic-direct.yaml.
+  meshtastic:
+    enabled: true
+    command: /opt/relayfabric/.venv/bin/python /opt/relayfabric/plugins/meshtastic/relayfabric-meshtastic
+    config:
+      broker: mqtt://127.0.0.1:1883
+      topic_root: msh/US
+      channels:
+        mesh: { index: 0, topic_channel: "LongFast" }
+
+  lxmf:
+    enabled: true
+    command: /opt/relayfabric/.venv/bin/python /opt/relayfabric/plugins/lxmf/relayfabric-lxmf
+    config:
+      display_name: "Mesh Bridge"
+      storage: /var/lib/relayfabric/lxmf
+      propagation_node: "auto"
+      channels:
+        - name: bridge
+          members: ["309abcbd838a8539d3c9fd56a453a9e5"]  # <- your peer's LXMF hash
+          open: true
+
+routes:
+  - name: mesh-to-lxmf
+    sources: ["meshtastic:mesh"]
+    destinations: ["lxmf:bridge"]
+  - name: lxmf-to-mesh
+    sources: ["lxmf:bridge"]
+    destinations: ["meshtastic:mesh"]
+
+ttl_default_secs: 86400
+dedup_ttl_secs: 86400
+retention_secs: 86400
+hop_limit: 8

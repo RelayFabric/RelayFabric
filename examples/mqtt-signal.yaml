@@ -1,0 +1,42 @@
+# Recipe: bridge an MQTT topic <-> a Signal group/thread.
+# Signal runs through the out-of-process signal-cli sidecar (GPL isolated to
+# that process); see docs/plugins.md for signal-cli setup + linking.
+# Edit: data_dir, plugin command paths, the broker, and the Signal
+# account/recipient details in the signal plugin config.
+#   switchyardd --config examples/mqtt-signal.yaml --check-config
+node:
+  name: mqtt-signal-bridge
+  data_dir: /var/lib/relayfabric
+
+plugins:
+  mqtt:
+    enabled: true
+    command: relayfabric-mqtt
+    config:
+      broker: mqtt://127.0.0.1:1883
+      client_id: relayfabric-signal
+
+  signal:
+    enabled: true
+    command: /opt/relayfabric/.venv/bin/python /opt/relayfabric/plugins/signal/relayfabric-signal
+    config:
+      # signal-cli JSON-RPC endpoint + the linked account (see docs/plugins.md)
+      rpc_url: http://127.0.0.1:8080
+      account: "+15550001111"
+      channels:
+        ops:
+          # a Signal group id or recipient to bridge
+          recipient: "group.EXAMPLEBASE64GROUPID="
+
+routes:
+  - name: mqtt-to-signal
+    sources: ["mqtt:ops/in"]
+    destinations: ["signal:ops"]
+  - name: signal-to-mqtt
+    sources: ["signal:ops"]
+    destinations: ["mqtt:ops/out"]
+
+ttl_default_secs: 86400
+dedup_ttl_secs: 86400
+retention_secs: 86400
+hop_limit: 8
