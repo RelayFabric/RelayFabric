@@ -1,6 +1,6 @@
 # Getting Started
 
-This walks you from a fresh checkout to a message routed end-to-end through `switchyardd`. The quickest path — an MQTT loopback — needs only the Rust toolchain and a local broker; the protocol plugins add a Python virtualenv.
+This walks you from a fresh checkout to a message routed end-to-end through `switchyardd`. The quickest path (an MQTT loopback) needs only the Rust toolchain and a local broker; the protocol plugins add a Python virtualenv.
 
 !!! tip "Packaged releases (v0.4+)"
     Version tags publish x86-64/aarch64 tarballs, a `.deb` (daemon + CLI +
@@ -19,7 +19,7 @@ This walks you from a fresh checkout to a message routed end-to-end through `swi
 | Python 3.12 virtualenv | the Python plugins (LXMF, Signal, Meshtastic, MeshCore, Nostr, Bitchat) | One `.venv`; install each plugin's `requirements.txt` as needed. |
 
 !!! note "License"
-    RelayFabric is Apache-2.0, and every dependency is chosen under a permissive-only policy — no AGPL or other copyleft. This drives some plugin design choices (see [Plugins](plugins.md)).
+    RelayFabric is Apache-2.0, and every dependency is chosen under a permissive-only policy: no AGPL or other copyleft. This drives some plugin design choices (see [Plugins](plugins.md)).
 
 ## Build
 
@@ -38,7 +38,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r plugins/lxmf/requirements.txt   # e.g. for the LXMF plugin
 ```
 
-A plugin's `command` in the config points at `.venv/bin/python …` — see [Configuration](configuration.md).
+A plugin's `command` in the config points at `.venv/bin/python …`. See [Configuration](configuration.md).
 
 ## First route: MQTT loopback
 
@@ -87,6 +87,6 @@ See [Operations](operations.md) for the full admin surface (metrics, config hot-
 
 ## Going further
 
-- **Add a real network.** Enable a plugin in your config and add a route to it — see [Plugins](plugins.md) and [Configuration](configuration.md).
-- **Test against real hardware/networks.** The `livetest/` kit is a copy-paste runbook for MQTT, then LXMF over Reticulum, then Signal, then real Meshtastic — see [Live & Field Testing](live-testing.md).
+- **Add a real network.** Enable a plugin in your config and add a route to it. See [Plugins](plugins.md) and [Configuration](configuration.md).
+- **Test against real hardware/networks.** The `livetest/` kit is a copy-paste runbook for MQTT, then LXMF over Reticulum, then Signal, then real Meshtastic. See [Live & Field Testing](live-testing.md).
 - **Understand the model.** [Architecture](architecture.md) explains the daemon, plugins, and the message envelope; [Routing & Policy](routing.md) covers dedup, TTL, retry, and the dead-letter queue.

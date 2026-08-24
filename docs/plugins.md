@@ -1,7 +1,7 @@
 # Plugins
 
 RelayFabric never speaks a native protocol itself. Each bridged network is
-owned by a **plugin** — a separate process the `switchyardd` daemon spawns,
+owned by a **plugin**: a separate process the `switchyardd` daemon spawns,
 supervises, and talks to over a small IPC. This page covers the plugin
 model shared by every bridge, then one section per shipped plugin: what
 network it bridges, its config keys, its licensing posture, and (where the
@@ -14,7 +14,7 @@ exercised against real infrastructure, see
 ## The plugin model
 
 **Separate, supervised processes.** A plugin is whatever the daemon's
-`command:` spawns — a Rust binary, a Python script, anything that speaks
+`command:` spawns: a Rust binary, a Python script, anything that speaks
 the wire protocol. The daemon restarts a plugin that dies unexpectedly with
 bounded backoff (1s, 5s, 30s, 2m, ...); a plugin that keeps crashing is
 marked unhealthy rather than restarted forever.
@@ -22,7 +22,7 @@ marked unhealthy rather than restarted forever.
 **CBOR-over-Unix-socket IPC.** Every enabled plugin gets its own socket at
 `<data_dir>/plugins.d/<name>.sock` (v0.4): a connection can only become the
 plugin its socket is bound to (a Hello claiming another name is rejected),
-and each socket carries its own peer-credential policy — with `peer_uid`
+and each socket carries its own peer-credential policy: with `peer_uid`
 configured, exactly that UID may attach, checked via `SO_PEERCRED` before a
 single frame is parsed. The daemon spawns each plugin with
 `RELAYFABRIC_SOCKET` (its socket path), `RELAYFABRIC_PLUGIN_NAME`,
@@ -43,20 +43,20 @@ one `Hello { plugin, version, protocol_version, capabilities }` frame and
 waits for `HelloAck`; a non-null `error` means the daemon rejected it and it
 must exit rather than proceed. Capabilities (`text`, `direct_messages`,
 `groups`, `attachments`, `location`, `reactions`, `receipts`, `presence`,
-`max_payload`) aren't cosmetic — the daemon uses them to route and to gate
+`max_payload`) aren't cosmetic: the daemon uses them to route and to gate
 features. `direct_messages` in particular gates whether a plugin ever
 receives a `send_direct` frame (used today for identity-link challenge
 delivery).
 
 **Deny-by-default.** A plugin only subscribes to, and only accepts sends
-for, the channels/topics/filters explicitly present in its config —
-unconfigured native traffic is never bridged. Several plugins add a second,
+for, the channels/topics/filters explicitly present in its config.
+Unconfigured native traffic is never bridged. Several plugins add a second,
 protocol-specific layer of this: Nostr and Bitchat recompute and verify
 every inbound event's signature before bridging it, since a relay is
 untrusted infrastructure.
 
 **Content never logged.** Default daemon logs carry operational metadata
-(message id, route, source protocol) and never message bodies — privacy
+(message id, route, source protocol) and never message bodies. Privacy
 tests assert this holds even with linked identities and location data in
 play.
 
@@ -67,7 +67,7 @@ play.
 The in-tree Rust reference plugin (`relayfabric-mqtt`), and also a useful
 integration/testing transport in its own right (spec §8). Bridges arbitrary
 MQTT topics over MQTT v5: each subscribed topic doubles as the fabric
-endpoint name, and there is no separate channel-mapping layer — `topics`
+endpoint name, and there is no separate channel-mapping layer: `topics`
 *is* the config. Delivery results are reported only once the broker's QoS 1
 PUBACK arrives, not merely on local enqueue. Loop prevention here is
 transport-level: subscriptions set MQTT v5's `No Local` flag so the broker
@@ -133,11 +133,11 @@ plugins:
 
 !!! note "Licensing"
     Depends on the official `rns`/`lxmf` Python packages and rides
-    Reticulum's open mesh transport — no proprietary or copyleft coupling
+    Reticulum's open mesh transport: no proprietary or copyleft coupling
     in the bridge itself.
 
 Optional extras (Pillow for image downscaling; ffmpeg + `pycodec2` for
-voice-to-codec2 transcoding) degrade gracefully when absent — oversize
+voice-to-codec2 transcoding) degrade gracefully when absent. Oversize
 images or untranscoded voice fall back to plain file attachments rather
 than failing the send.
 
@@ -179,7 +179,7 @@ plugins:
 If the account is a linked device, sync-message echoes of the gateway's
 own posts are filtered and bare DMs (no group) are dropped; if
 `allowed_users` is set, the account's own UUID must be included or its
-posts are dropped by the ACL. Attachments cross as opaque bytes — no
+posts are dropped by the ACL. Attachments cross as opaque bytes. No
 downscaling or transcoding happens here (that lives in the LXMF plugin,
 for messages routed onward there).
 
@@ -188,7 +188,7 @@ for messages routed onward there).
 ## Meshtastic (direct)
 
 Bridges Meshtastic radios by talking to the device **directly over the
-device API** — serial, TCP, or BLE — with no MQTT broker. One of **two**
+device API** (serial, TCP, or BLE) with no MQTT broker. One of **two**
 Meshtastic plugins (see [Meshtastic (MQTT-JSON)](#meshtastic-mqtt-json)
 below for the broker-based alternative; run whichever suits you, not both
 against one radio).
@@ -214,7 +214,7 @@ plugins:
 ```
 
 Text only (constrained-LoRa transport class caps payload, demotes media).
-Supports channel broadcasts **and direct messages** — it advertises
+Supports channel broadcasts **and direct messages**. It advertises
 `direct_messages`, so it can deliver identity-link challenges to a node and
 bridge the reply back, unlike the MQTT-JSON plugin.
 
@@ -222,7 +222,7 @@ bridge the reply back, unlike the MQTT-JSON plugin.
 
 ## Meshtastic (MQTT-JSON)
 
-Bridges Meshtastic device channels over the node's **MQTT-JSON** gateway —
+Bridges Meshtastic device channels over the node's **MQTT-JSON** gateway:
 the broker-based alternative to [Meshtastic (direct)](#meshtastic-direct)
 above, and the **permissive (Apache-2.0) default**. Each configured channel
 maps to a RelayFabric channel: text uplinks arrive over the node's MQTT JSON
@@ -231,7 +231,7 @@ topic per Meshtastic channel).
 
 !!! note "Licensing"
     Meshtastic's official Python/protobuf client libraries are GPL-3.0.
-    This plugin never links or imports them — it consumes the device's
+    This plugin never links or imports them. It consumes the device's
     **native MQTT JSON integration** instead, an interface the node
     operator enables and controls independently. The `meshtastic` CLI used
     to configure the device (`meshtastic --set mqtt.json_enabled true`)
@@ -263,7 +263,7 @@ and the next matching uplink is dropped instead of re-bridged.
 !!! warning "Known field-test risks"
     - Some firmware validates the downlink `from` field; this plugin
       always sends `from: 0`. `delivered: true` only means the broker
-      accepted the publish, not that the node transmitted it — verify one
+      accepted the publish, not that the node transmitted it. Verify one
       real downlink per firmware. See
       [Live & Field Testing](live-testing.md).
     - `payload.timestamp` is assumed to already be epoch seconds.
@@ -275,14 +275,14 @@ and the next matching uplink is dropped instead of re-bridged.
 
 ## MeshCore
 
-Bridges MeshCore (Companion Radio Protocol) devices directly — no
+Bridges MeshCore (Companion Radio Protocol) devices directly. No
 intermediary broker. Each configured channel maps to a RelayFabric channel;
 text uplinks land on the channel, sent messages go back over the radio.
 Requires companion-mode firmware.
 
 !!! note "Licensing"
-    Uses the native `meshcore` library (2.3.8, MIT) — spec §8's preferred
-    Companion Radio Protocol backend — talking directly to a companion-mode
+    Uses the native `meshcore` library (2.3.8, MIT), spec §8's preferred
+    Companion Radio Protocol backend, talking directly to a companion-mode
     radio rather than wrapping a user-facing app.
 
 | Key | Default | Notes |
@@ -302,17 +302,17 @@ plugins:
 ```
 
 **Sender identity is channel-scoped, not per-node:** MeshCore PSK channels
-carry no per-node identity, so the plugin keys sender on `(channel index)` —
-every message on a channel maps to the same sender. Rate limits, aliases,
+carry no per-node identity, so the plugin keys sender on `(channel index)`.
+Every message on a channel maps to the same sender. Rate limits, aliases,
 and moderation therefore all operate at channel granularity, not per-user.
 
 !!! warning "Known field-test risks"
-    - The library API is exercised only against fakes — verify end-to-end
+    - The library API is exercised only against fakes. Verify end-to-end
       on hardware: one inbound channel message reaching the daemon, and
       one max-length send. See [Live & Field Testing](live-testing.md).
     - Re-verify per connection kind when switching serial/tcp/ble.
     - Alias prefix collision with Meshtastic: both alias as `MESH-XXXX`
-      (first four protocol-name chars) — cosmetic, aliases stay distinct
+      (first four protocol-name chars): cosmetic, aliases stay distinct
       per sender.
     - `ts` timestamp units are assumed to be epoch seconds.
 
@@ -327,19 +327,19 @@ endpoint, and an inbound 1:1 chat surfaces on a synthetic `direct:<jid>`
 endpoint (the `direct_messages` capability, enabling identity-linking).
 
 !!! note "Licensing"
-    Runs on `slixmpp` (MIT) — an in-tree, permissive dependency, so this
+    Runs on `slixmpp` (MIT): an in-tree, permissive dependency, so this
     plugin stays Apache-2.0 with **no** out-of-process GPL isolation (unlike
     `signal`/`meshtastic-direct`).
 
 !!! warning "Not end-to-end encrypted"
-    Plain XMPP is TLS **to the server** but **server-readable** — a gateway
+    Plain XMPP is TLS **to the server** but **server-readable**: a gateway
     (not E2E) bridge. OMEMO, attachments (XEP-0363), and presence are out of
     scope this cycle (text only).
 
 | Key | Default | Notes |
 |---|---|---|
 | `jid` | — | The bridge account JID, e.g. `relay@example.com` |
-| `password` | — | Account password — use `${env:...}` / `${file:...}` |
+| `password` | — | Account password: use `${env:...}` / `${file:...}` |
 | `nick` | `relayfabric` | MUC nickname |
 | `max_text_bytes` | `4000` | Outbound text cap |
 | `channels` | — | `muc` (room JID) per named channel |
@@ -360,21 +360,21 @@ A loop guard drops the room's reflection of our own sends (1h window on
 `(channel, text)`), on top of dropping messages from our own MUC nick.
 `slixmpp` auto-reconnects a dropped link; a hard auth failure exits the
 process for the supervisor to restart. Exercised against a fake backend in
-tests — verify against a real server before production.
+tests. Verify against a real server before production.
 
 ---
 
 ## Nostr
 
-Bridges Nostr relays natively over NIP-01 WebSockets — no intermediary
+Bridges Nostr relays natively over NIP-01 WebSockets. No intermediary
 broker. Each channel is a `(relay-set, filter)` pair for inbound plus a
-publish target. **Scope: kind-1 public text notes only** — encrypted DMs,
+publish target. **Scope: kind-1 public text notes only**. Encrypted DMs,
 attachments, and profile/contact-list management are out of scope this
 cycle.
 
 !!! note "Licensing"
     NIP-01 crypto and relay I/O run on `coincurve` + `websockets`
-    (MIT/BSD-3) — never the GPL `strfry` relay, which is reference-only per
+    (MIT/BSD-3), never the GPL `strfry` relay, which is reference-only per
     project policy.
 
 | Key | Default | Notes |
@@ -398,12 +398,12 @@ plugins:
 ```
 
 Every inbound event's id is recomputed and its schnorr signature verified
-against the claimed pubkey before bridging — a relay is untrusted; bad
+against the claimed pubkey before bridging. A relay is untrusted; bad
 id/sig events are dropped, never bridged.
 
 !!! warning "Known field-test risks"
     - No cross-relay dedup: an event seen from two subscribed relays isn't
-      deduplicated. Exercised only against fakes so far — see
+      deduplicated. Exercised only against fakes so far. See
       [Live & Field Testing](live-testing.md).
     - An unscoped filter (e.g. bare `{"kinds":[1]}`) bridges relay-wide
       traffic as spam; the operator is responsible for scoping it.
@@ -417,15 +417,15 @@ id/sig events are dropped, never bridged.
 ## Bitchat
 
 Bridges Bitchat's **public geohash channels** over the Internet/Nostr
-transport only — ephemeral kind-20000 events, channel = `["g", <geohash>]`
+transport only: ephemeral kind-20000 events, channel = `["g", <geohash>]`
 tag. Reuses the shipped Nostr NIP-01 crypto and relay machinery. **BLE mesh
-is out of scope, deferred** — Bitchat's direct Bluetooth-LE mesh is a
+is out of scope, deferred**. Bitchat's direct Bluetooth-LE mesh is a
 separate mechanism not built here. DMs and attachments are out of scope
 too.
 
 !!! note "Licensing"
-    Same crypto stack as the Nostr plugin — `coincurve` + `websockets`
-    (MIT/BSD-3) — never the GPL `strfry` relay or the AGPL `NYM`
+    Same crypto stack as the Nostr plugin: `coincurve` + `websockets`
+    (MIT/BSD-3), never the GPL `strfry` relay or the AGPL `NYM`
     Bitchat-Nostr bridge, both reference-only per project policy.
 
 | Key | Default | Notes |
@@ -454,16 +454,16 @@ configured geohashes are subscribed).
 
 !!! warning "Known field-test risks"
     - Pre-1.0 protocol: kind 20000 and the `g`-tag geohash are stable, but
-      nickname/teleport semantics are not — expect churn.
-    - Events are ephemeral and unstored — bridging only works with a live
+      nickname/teleport semantics are not. Expect churn.
+    - Events are ephemeral and unstored. Bridging only works with a live
       relay connection at publish time.
     - One key per gateway means the same pubkey appears on every geohash
       it posts to, cross-geohash-linkable to anyone watching a relay. Real
       Bitchat clients avoid this with per-geohash ephemeral keys, deferred
       here pending a documented derivation.
-    - Interop with real Bitchat clients is **unverified** — fakes only, no
+    - Interop with real Bitchat clients is **unverified**. Fakes only, no
       live cross-check yet. See [Live & Field Testing](live-testing.md).
-    - A coarser (shorter) geohash is a wider channel — more traffic
+    - A coarser (shorter) geohash is a wider channel: more traffic
       bridged.
 
 ---
@@ -472,7 +472,7 @@ configured geohashes are subscribed).
 
 Feeds a [PotatoMesh](https://github.com/l5yth/potato-mesh) community
 dashboard from the Meshtastic MQTT JSON stream. Unlike every other plugin
-this one bridges no channel traffic into the fabric — it is **ingest-only**:
+this one bridges no channel traffic into the fabric. It is **ingest-only**:
 it subscribes to the same `<root>/2/json/#` topics the Meshtastic
 (MQTT-JSON) plugin uses, maps `text` / `position` / `telemetry` / `nodeinfo` events onto
 PotatoMesh's documented ingest contract, and POSTs them with a bearer
@@ -480,7 +480,7 @@ token (`/api/messages`, `/api/positions`, `/api/telemetry`, `/api/nodes`).
 Routed sends are rejected.
 
 !!! note "Why this exists"
-    PotatoMesh's own ingestors attach to a radio directly — their project
+    PotatoMesh's own ingestors attach to a radio directly. Their project
     charter bans MQTT. RelayFabric fills the complementary niche: an
     operator already running the Meshtastic MQTT JSON stream gets the
     community map and dashboard with no extra radio connection and no
@@ -493,12 +493,12 @@ Routed sends are rejected.
 | `topic_root` | — | Node's full MQTT root incl. region, e.g. `msh/US` |
 | `gateway_id` | `null` | `null` = accept all gateways; else filter by hex ID |
 | `url` | — | PotatoMesh instance base URL |
-| `token` | — | API bearer token — use `${env:...}` or `${file:...}` |
+| `token` | — | API bearer token: use `${env:...}` or `${file:...}` |
 
 !!! warning "Keep the feed local"
     PotatoMesh's premise is a dashboard fed by radios its community
     operates. Pointing this plugin at a shared or public broker (e.g.
-    `mqtt.meshtastic.org`) pipes worldwide traffic into the dashboard —
+    `mqtt.meshtastic.org`) pipes worldwide traffic into the dashboard:
     exactly what PotatoMesh exists to avoid. On any broker carrying more
     than your own gateway, set `gateway_id` to your node's hex ID; the
     plugin logs a startup warning when it is null.
@@ -515,7 +515,7 @@ plugins:
 ```
 
 Delivery is best-effort: HTTP failures are logged and counted (`posted` /
-`http_failures` gauges), never retried — node and position rows are
+`http_failures` gauges), never retried. Node and position rows are
 re-upserted by the next beacon. GPS sentinels (`(0,0)` coordinates,
 `time<=0`) are stripped at source per the PotatoMesh contract; hardware and
 role enum codes are not mapped to names (that would need the GPL protobuf
@@ -524,7 +524,7 @@ tables) and are omitted.
 ## meshtripwire
 
 Relays [meshtripwire](https://github.com/OutandBack/meshtripwire) tripwire
-alerts into the fabric. meshtripwire is a wireless tripwire — ESP32 sensor
+alerts into the fabric. meshtripwire is a wireless tripwire: ESP32 sensor
 nodes detect unknown WiFi/BLE MACs and relay them over LoRa to a base station
 that filters (whitelist, RSSI floor, per-MAC cooldown) and alerts. Like the
 PotatoMesh feeder this is **ingest-only**, but in the other direction: it
@@ -532,7 +532,7 @@ subscribes to the MQTT topic meshtripwire publishes alerts on and emits each
 one **inbound** on a single endpoint; routed sends are rejected.
 
 !!! note "Why this exists"
-    meshtripwire's built-in alert channels — ntfy, webhook, Twilio SMS — all
+    meshtripwire's built-in alert channels (ntfy, webhook, Twilio SMS) all
     need the Internet, the opposite of the remote/no-cellular sites it's
     designed for. This plugin carries alerts over LXMF/Reticulum or a
     Meshtastic channel instead. meshtripwire is MIT, so the plugin is
@@ -540,7 +540,7 @@ one **inbound** on a single endpoint; routed sends are rejected.
 
 | Key | Default | Notes |
 |---|---|---|
-| `broker` | — | `mqtt://host:port` — meshtripwire's broker |
+| `broker` | — | `mqtt://host:port`, meshtripwire's broker |
 | `topic` | `meshtripwire/alerts` | meshtripwire's `MqttAlertTopic` |
 | `endpoint` | `alerts` | inbound endpoint alerts appear on |
 | `client_id` | `null` | optional MQTT client id |
@@ -563,7 +563,7 @@ Enable meshtripwire's MQTT alert output (`[Notifications] EnableMqtt` in its
 `config.ini`) to publish alerts to the broker. The plugin accepts either the
 JSON alert (`{mac, node, rssi, lat, lon, message}`, formatted into a line with
 a maps link when a GPS fix is present) or a plain-text line (forwarded
-verbatim). **Deduplication is meshtripwire's** (its `AlertCooldownSeconds`) —
-the plugin forwards exactly the alerts it raised, adding none of its own
+verbatim). **Deduplication is meshtripwire's** (its `AlertCooldownSeconds`).
+The plugin forwards exactly the alerts it raised, adding none of its own
 suppression. For a zero-plugin alternative that relays the same topic with the
 generic `mqtt` plugin, see [`examples/meshtripwire.yaml`](examples.md).

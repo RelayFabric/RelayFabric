@@ -8,7 +8,7 @@ parses and validates it, and which parts of a running daemon pick up an
 edited file live versus need a restart.
 
 The canonical, fully annotated reference is
-[`docs/relayfabric.example.yaml`](relayfabric.example.yaml) — every field on
+[`docs/relayfabric.example.yaml`](relayfabric.example.yaml): every field on
 this page appears there with the same defaults and commentary. Copy it as a
 starting point rather than writing a config from scratch.
 
@@ -21,7 +21,7 @@ starting point rather than writing a config from scratch.
 | `public` | bool | `false` | When `true`, every route's source/destination protocols must be covered by `public_services` ingress/egress lists (see below); `--check-config` rejects an uncovered route. |
 
 !!! warning "Restart required"
-    Any change to `node` — including `data_dir` — requires a daemon
+    Any change to `node`, including `data_dir`, requires a daemon
     restart. The plugin and admin socket paths are derived from `data_dir`
     once at startup and never re-bound.
 
@@ -33,18 +33,18 @@ used in route endpoints (`mqtt:chat/a`, `lxmf:pasadena`, ...).
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | bool | *required* | Whether the daemon treats this plugin as active. Routes referencing a disabled or unknown plugin fail `--check-config`. |
-| `command` | string \| null | `null` | Shell command `switchyardd` spawns (via `sh -c`) and supervises. Omit to run the plugin yourself (e.g. under the hardened systemd template) — it connects to `<data_dir>/plugins.d/<name>.sock` using the `RELAYFABRIC_SOCKET` env var. |
+| `command` | string \| null | `null` | Shell command `switchyardd` spawns (via `sh -c`) and supervises. Omit to run the plugin yourself (e.g. under the hardened systemd template); it connects to `<data_dir>/plugins.d/<name>.sock` using the `RELAYFABRIC_SOCKET` env var. |
 | `peer_uid` | int \| null | `null` | Plugin isolation (v0.4): when set, **exactly** this UID may connect to the plugin's socket, verified via `SO_PEERCRED` before any frame is parsed; the socket file opens to 0666 so the foreign UID can reach it (the credential check is the gate). When unset, only the daemon's own UID may connect. Pair with `deploy/systemd/relayfabric-plugin@.service`. |
 | `config` | map | `{}` | Arbitrary per-plugin settings, forwarded to the plugin process over `RELAYFABRIC_PLUGIN_CONFIG` at spawn. Any string value may be a [secret reference](#secret-references). |
 
 Python plugins run under a venv and need an absolute interpreter path
-(`command: /path/to/.venv/bin/python /path/to/relayfabric-lxmf`) — a bare
+(`command: /path/to/.venv/bin/python /path/to/relayfabric-lxmf`): a bare
 `relayfabric-lxmf` isn't on `PATH` under `sh -c`, and the script's shebang
 won't see the venv's dependencies.
 
 !!! note "Live vs. restart"
     Adding, removing, or changing a plugin's `enabled`/`command`/`config`
-    reports that plugin's name in `restart_required` — the daemon doesn't
+    reports that plugin's name in `restart_required`: the daemon doesn't
     restart itself, but that one plugin process needs to be
     stopped/restarted for the change to take effect. Unrelated plugins are
     unaffected.
@@ -57,7 +57,7 @@ won't see the venv's dependencies.
 | `sources` | list of `"protocol:endpoint"` | *required* | Inbound endpoints this route accepts from. Must reference enabled plugins; `fed` is never a valid source protocol. |
 | `destinations` | list of `"protocol:endpoint"` | *required* | Outbound endpoints this route fans a message out to. `fed:<peer_name>/<remote_route>` is valid here (see [federation](#federation)). |
 | `identity_mode` | `pseudonymous` \| `linked` | `pseudonymous` | `linked` renders a verified identity link's `display_name` at egress instead of the route's HMAC alias, when one exists for the sender. Linking itself is always an explicit operator/user action (`switchyardctl link`/`unlink`/`identities`, or the admin API), never implicit. |
-| `render` | map | see below | Per-route rendering knobs — see [Render knobs](#render-knobs). |
+| `render` | map | see below | Per-route rendering knobs (see [Render knobs](#render-knobs)). |
 | `security_mode` | `gateway` \| `sealed` | `gateway` | `sealed` end-to-end AEAD-seals the payload between federation gateways; see [Security & Sealed Routing](security.md). Rejected below the node's `privacy.minimum_security` floor. |
 | `allow_gateway_decryption` | bool \| null | `null` | Per-route override of `privacy.allow_gateway_decryption`. `null` defers to the node-level floor. |
 
@@ -68,7 +68,7 @@ won't see the venv's dependencies.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `tag` | `alias` \| `none` | `alias` | `alias` renders the `[tag]` sender prefix (pseudonym, or a linked `display_name`). `none` suppresses it entirely, including a linked display name. |
-| `max_chars` | integer | `0` | `0` disables route-level truncation. `16` or greater truncates the message **body** to that many Unicode characters — the sender tag is never shortened by this. Values `1`–`15` are rejected. The transport's own byte cap still applies afterward to the whole assembled message as a hard floor, and unlike `max_chars` it may still truncate into the tag. |
+| `max_chars` | integer | `0` | `0` disables route-level truncation. `16` or greater truncates the message **body** to that many Unicode characters; the sender tag is never shortened by this. Values `1`–`15` are rejected. The transport's own byte cap still applies afterward to the whole assembled message as a hard floor, and unlike `max_chars` it may still truncate into the tag. |
 
 ```yaml
 routes:
@@ -87,8 +87,8 @@ and `public_services`.
 
 A map of plugin name → transport class and optional policy overrides,
 distinct from the plugin's wire protocol. This drives egress payload caps
-and image/video allow/disallow — see [Transport Classes](transport-classes.md)
-for the full class list and built-in policy defaults.
+and image/video allow/disallow (see [Transport Classes](transport-classes.md)
+for the full class list and built-in policy defaults).
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -109,7 +109,7 @@ frame limit, images and video allowed).
 At egress, the composed policy caps payload to `min(plugin cap, transport
 cap)`; an attachment the class forbids is dropped and replaced with a body
 note (e.g. `[image 'photo.jpg' omitted — constrained transport]`) rather
-than sent. Sealed routes are exempt — no transform ever touches a sealed
+than sent. Sealed routes are exempt: no transform ever touches a sealed
 payload.
 
 ```yaml
@@ -118,7 +118,7 @@ transports:
   mqtt:       { class: satellite_internet, max_payload_bytes: 32768, allow_images: false }
 ```
 
-Takes effect live — no restart needed.
+Takes effect live: no restart needed.
 
 ## `transport_budgets`
 
@@ -127,7 +127,7 @@ Rate limits per egress protocol.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | *(map key)* | plugin name | — | Must name an enabled plugin. |
-| `messages_per_minute` | integer | *required per entry* | `0` is rejected at `--check-config` (it would block all egress) — omit the entry instead to leave that protocol unlimited. |
+| `messages_per_minute` | integer | *required per entry* | `0` is rejected at `--check-config` (it would block all egress); omit the entry instead to leave that protocol unlimited. |
 
 ```yaml
 transport_budgets:
@@ -148,7 +148,7 @@ Node-level sealed-routing privacy floor.
 |---|---|---|---|
 | `minimum_security` | `gateway` \| `sealed` | `gateway` | Minimum `security_mode` any route may declare. A route below the floor is rejected at `--check-config`, never silently downgraded. |
 | `allow_gateway_decryption` | bool | `true` | Whether this node may terminate a sealed inbound envelope by decrypting it for delivery to a plaintext leg. `false` refuses that role. |
-| `allow_protocol_downgrade` | bool | `true` | Parsed and stored; not yet separately enforced — `allow_gateway_decryption` is today's actual downgrade-refusal gate. |
+| `allow_protocol_downgrade` | bool | `true` | Parsed and stored; not yet separately enforced. `allow_gateway_decryption` is today's actual downgrade-refusal gate. |
 
 ```yaml
 privacy:
@@ -162,7 +162,7 @@ live rather than forcing a restart. See
 
 ## `federation`
 
-Absent entirely — as in every pre-federation config — means the feature is
+Absent entirely (as in every pre-federation config) means the feature is
 off: no Noise listener, no fed egress/ingress, no trust seeding.
 
 | Field | Type | Default | Meaning |
@@ -182,7 +182,7 @@ Each `peers[]` entry:
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `name` | string | *required* | Local label for the peer. |
-| `node_id` | string | *required* | `"rf:"` + 64 hex chars — the peer's Ed25519 public key. |
+| `node_id` | string | *required* | `"rf:"` + 64 hex chars: the peer's Ed25519 public key. |
 | `addr` | string | *required* | `host:port` to dial. |
 | `trust` | `verified` \| `trusted` | `verified` | Trust level seeded at boot. |
 | `messages_per_minute` | integer | `0` (unlimited) | Aggregate egress budget for this peer's fed link. |
@@ -199,14 +199,14 @@ federation:
 ```
 
 !!! warning "Restart required"
-    Any change to `federation` — including a single peer added, removed,
-    or edited — reports the `"daemon"` restart entry. Live fed reconfig
+    Any change to `federation` (including a single peer added, removed,
+    or edited) reports the `"daemon"` restart entry. Live fed reconfig
     (rebinding the listener, renegotiating already-connected peers) is not
     yet implemented; the block only takes effect on the next daemon start.
 
 RFDP discovery (node adverts describing `public_services`) is a related,
 separately-versioned `discovery:` block that requires `federation` to be
-set — see [Federation & Discovery](federation.md).
+set; see [Federation & Discovery](federation.md).
 
 ## Top-level TTLs and limits
 
@@ -228,12 +228,12 @@ they also take effect on the next config apply with no restart.
 Any **string** value inside a plugin's `config:` block may be, in its
 entirety, one of two forms:
 
-- `${env:NAME}` — the named environment variable, resolved once at config
+- `${env:NAME}`: the named environment variable, resolved once at config
   load. Errors at load if unset or empty.
-- `${file:/abs/path}` — a file's trimmed contents, resolved once at config
+- `${file:/abs/path}`: a file's trimmed contents, resolved once at config
   load. The path **must be absolute**; a relative `${file:...}` is
   rejected. Errors at load if unreadable or empty after trimming. A
-  group/world-readable secret file triggers a warning (still resolves —
+  group/world-readable secret file triggers a warning (still resolves,
   not a hard error).
 
 ```yaml
@@ -243,7 +243,7 @@ config:
 ```
 
 !!! note "Whole-value only"
-    There's no interpolation inside a longer string — a value is either
+    There's no interpolation inside a longer string: a value is either
     exactly `${env:...}`/`${file:...}` or it's ordinary literal text, never
     a mix. `prefix ${env:TOKEN}` is treated as a literal string, not
     resolved.
@@ -252,7 +252,7 @@ Resolved values are passed to the plugin process via the
 `RELAYFABRIC_PLUGIN_CONFIG` env var at spawn (the plugin scrubs it from its
 own environment immediately after parsing, so children it spawns don't
 inherit it). Resolved secret values **never** appear in admin API
-responses, logs, or `--check-config` output — those always show the
+responses, logs, or `--check-config` output: those always show the
 unresolved `${...}` form.
 
 ## Other top-level blocks
@@ -270,13 +270,13 @@ elsewhere:
 
 Optional operator self-alerting: when set, the daemon sends a short text
 alert **through one of its own plugins** on notable operational events, so
-you find out your bridge broke over your own fabric — no separate monitoring
+you find out your bridge broke over your own fabric: no separate monitoring
 stack. Absent = no alerts. Applied live (a `--check-config`'d edit takes
 effect on the next event; no restart).
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `endpoint` | string | *required* | Where alerts go, as `"plugin:endpoint"` — e.g. `lxmf:bridge` (a channel) or `signal:+15550001111`. The plugin must be configured and enabled. |
+| `endpoint` | string | *required* | Where alerts go, as `"plugin:endpoint"`, e.g. `lxmf:bridge` (a channel) or `signal:+15550001111`. The plugin must be configured and enabled. |
 | `events` | list | all | Categories to alert on: `plugin` (a plugin connects/disconnects) and `federation` (a peer comes up/goes down). Empty/omitted means all supported. |
 
 ```yaml
@@ -287,7 +287,7 @@ alerts:
 
 Alerts are throttled per subject (at most one per minute) so a flapping
 plugin can't spam you, and are best-effort (an alert that can't be sent is
-dropped). A plugin cannot report its own outage — route alerts through a
+dropped). A plugin cannot report its own outage: route alerts through a
 **different** plugin than the ones you most want to hear about.
 
 ## Validating configuration
@@ -317,13 +317,13 @@ config. Most blocks apply live; a few require a restart:
 
 | Block / field | Effect |
 |---|---|
-| `routes`, `policies`, `public_services`, `limits`, `transport_budgets`, `transports`, `privacy` | Live — next read picks up the new value, no restart. |
+| `routes`, `policies`, `public_services`, `limits`, `transport_budgets`, `transports`, `privacy` | Live: next read picks up the new value, no restart. |
 | `render`, `identity_mode`, `security_mode`, `allow_gateway_decryption` (route-level) | Live. |
 | `dedup_ttl_secs`, `ttl_default_secs`, `retention_secs`, `hop_limit`, `max_attachment_bytes` | Live. |
-| `plugins.<name>` (`enabled`/`command`/`config` changed, or added/removed) | That plugin's name is reported in `restart_required` — only it needs restarting. |
-| `node` (any field) | Reports `"daemon"` — full daemon restart required. |
-| `federation` (any field) | Reports `"daemon"` — full daemon restart required. |
-| `discovery` (any field) | Reports `"daemon"` — full daemon restart required. |
+| `plugins.<name>` (`enabled`/`command`/`config` changed, or added/removed) | That plugin's name is reported in `restart_required`: only it needs restarting. |
+| `node` (any field) | Reports `"daemon"`: full daemon restart required. |
+| `federation` (any field) | Reports `"daemon"`: full daemon restart required. |
+| `discovery` (any field) | Reports `"daemon"`: full daemon restart required. |
 
 ## Minimal working example
 
@@ -358,18 +358,18 @@ switchyardd --config docs/relayfabric.example.yaml --check-config
 switchyardd --config docs/relayfabric.example.yaml
 ```
 
-For the complete, heavily annotated reference — every plugin's config
+For the complete, heavily annotated reference (every plugin's config
 shape, `policies`, `public_services`, `limits`, `federation`, `discovery`,
-and `privacy` all shown together — see
+and `privacy` all shown together), see
 [`docs/relayfabric.example.yaml`](relayfabric.example.yaml).
 
 ## See also
 
-- [Routing & Policy](routing.md) — how `routes`, `policies`, and
+- [Routing & Policy](routing.md): how `routes`, `policies`, and
   `public_services` combine to decide what's allowed to cross.
-- [Security & Sealed Routing](security.md) — `security_mode`, the
+- [Security & Sealed Routing](security.md): `security_mode`, the
   `privacy` floor, and sealed federation routing in depth.
-- [Transport Classes](transport-classes.md) — the full class list and
+- [Transport Classes](transport-classes.md): the full class list and
   built-in `TransportPolicy` defaults behind `transports`.
-- [Operations](operations.md) — the admin API, `limits`, and running a
+- [Operations](operations.md): the admin API, `limits`, and running a
   daemon in production.

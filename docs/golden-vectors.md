@@ -1,4 +1,4 @@
-# Plugin Protocol v1 — Golden Wire Vectors
+# Plugin Protocol v1: Golden Wire Vectors
 
 Language-neutral, byte-exact vectors for the CBOR-over-Unix-socket plugin
 IPC (v0.4 cycle F). A new-language implementation is conformant when it
@@ -6,12 +6,12 @@ reproduces these frames byte-for-byte AND passes
 `switchyardctl plugin test "<your plugin command>"`.
 
 Frame format: 4-byte big-endian body length, then a CBOR map whose `t` key
-names the frame. **Key order matters** — CBOR maps encode in declaration
+names the frame. **Key order matters**: CBOR maps encode in declaration
 order and these bytes are locked; both reference implementations
 (`crates/relay-ipc`, `sdk/python/relayfabric_sdk/ipc.py`) assert them in
 their test suites.
 
-## Vector 1 — `hello`
+## Vector 1: `hello`
 
 `Hello { plugin: "lxmf", version: "0.1.0", protocol_version: 1, capabilities:
 { text: true, direct_messages: true, groups: true, attachments: false,
@@ -26,7 +26,7 @@ max_payload: null } }`
 726573656e6365f46b6d61785f7061796c6f6164f6
 ```
 
-## Vector 2 — `inbound` with one attachment
+## Vector 2: `inbound` with one attachment
 
 `Inbound { endpoint: "chan", sender: "s", kind: "text", body: "hi",
 created_at: null, attachments: [{ filename: "a.bin", mime:
@@ -41,7 +41,7 @@ created_at: null, attachments: [{ filename: "a.bin", mime:
 
 Sources of truth (assert these in the same bytes):
 
-- Rust: `crates/relay-ipc/src/lib.rs` — `canonical_hello_frame_bytes_are_stable`,
-  `canonical_inbound_attachment_frame_bytes_are_stable`
-- Python: `sdk/python/tests/test_ipc.py` — `CANONICAL_HELLO_HEX`,
-  `CANONICAL_INBOUND_ATTACHMENT_HEX`
+- Rust: `crates/relay-ipc/src/lib.rs` (`canonical_hello_frame_bytes_are_stable`,
+  `canonical_inbound_attachment_frame_bytes_are_stable`)
+- Python: `sdk/python/tests/test_ipc.py` (`CANONICAL_HELLO_HEX`,
+  `CANONICAL_INBOUND_ATTACHMENT_HEX`)

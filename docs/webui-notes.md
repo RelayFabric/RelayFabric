@@ -1,6 +1,6 @@
 # RelayFabric WebUI — Design Notes
 
-Status: the UI and its reverse-proxy are built — see `relayfabric-ui/`. What
+Status: the UI and its reverse-proxy are built: see `relayfabric-ui/`. What
 remains deferred is authentication/RBAC on the proxy; today it binds to
 loopback with no auth of its own. The administrative API was designed for the
 WebUI from day one, and these notes capture that architecture and the deferred
@@ -34,27 +34,27 @@ into `switchyardd`. One source of truth: UI → authenticated API → daemon.
 * policy configuration
 * radio dashboard (frequency, SF, bandwidth, TX power, RSSI, SNR, RF peers)
 * message tracing (ID, size, source, destination, transforms, timing,
-  delivery status — no content when content logging is disabled)
+  delivery status: no content when content logging is disabled)
 * logs, metrics, configuration validation
 
 ## Security boundary visibility
 
-The UI must make trust boundaries visually obvious — show that a route's
+The UI must make trust boundaries visually obvious: show that a route's
 `security_mode: gateway` (SPEC §113.1's renamed `TRANSLATE`, the default)
 means the gateway reads plaintext, and `security_mode: sealed` (renamed
 `OPAQUE`) means ciphertext-only transit: the origin edge AEAD-seals the
-payload for the destination edge's key, and every intermediate node —
-including this one, for traffic it merely relays — carries opaque ciphertext
+payload for the destination edge's key, and every intermediate node
+(including this one, for traffic it merely relays) carries opaque ciphertext
 it cannot read. This prevents operators from misunderstanding what the
 bridge guarantees.
 
-**Claim discipline (SPEC §113.6 — MUST be honored in every UI string):**
-sealed mode is **zero-knowledge / blind payload routing, NOT anonymity** —
+**Claim discipline (SPEC §113.6, MUST be honored in every UI string):**
+sealed mode is **zero-knowledge / blind payload routing, NOT anonymity**:
 nodes still observe timing, sizes, interfaces, and addresses. The UI must
 never describe sealed mode as anonymous, hidden, or untraceable; label it
 as payload confidentiality only. `allow_protocol_downgrade` is parsed and
 stored (design cycle H) but phase-1's actual downgrade-refusal enforcement
-runs through `allow_gateway_decryption` — a route/node that sets it `false`
+runs through `allow_gateway_decryption`: a route/node that sets it `false`
 refuses to terminate a sealed inbound message into a plaintext leg
 (`SECURITY_DOWNGRADE_REFUSED`), rather than silently downgrading it.
 
@@ -63,7 +63,7 @@ refuses to terminate a sealed inbound message into a plaintext leg
 * dedicated identity-handling page (default: route-scoped pseudonyms)
 * linked identities listed with verification state and an unlink control,
   plus a correlation warning
-* never display phone numbers or full native identifiers by default —
+* never display phone numbers or full native identifiers by default:
   masked (`****921A`, `!****cd34`, `82ad…1172`) with privileged reveal
 
 ## Configuration workflow
@@ -88,7 +88,7 @@ stay separate from route management (correlation data is more sensitive).
 ## Remote access (TLS reverse proxy)
 
 The UI binds `127.0.0.1:8087` by default. To reach it from another machine,
-front it with a **TLS reverse proxy** — do not expose the plain HTTP port.
+front it with a **TLS reverse proxy**: do not expose the plain HTTP port.
 Two hard requirements come from WebAuthn:
 
 - **HTTPS is mandatory.** Browsers only offer passkeys in a *secure context*
@@ -132,7 +132,7 @@ server {
 }
 ```
 
-**Tailscale** (simplest for a private tailnet — TLS + a stable
+**Tailscale** (simplest for a private tailnet, TLS + a stable
 `*.ts.net` name, no public exposure):
 
 ```shell
@@ -147,16 +147,16 @@ and the `localhost` secure-context exemption:
 
 ## Shipped API surface (v0.2+)
 
-- `GET /v1/config` — raw YAML, secrets unresolved
-- `POST /v1/config/validate` — dry-run validation, 422 on error
-- `PUT /v1/config` — apply a new config; writes + one-revision `.prev` history
-- `POST /v1/config/rollback` — restore previous config; 404 (none) / 409 (env drift)
-- `GET /v1/events` — SSE: ingress, delivery, plugin, link_verified, config_applied
-- `GET /v1/routes` — per-route identity_mode, render knobs, matched policies
-- `GET /v1/plugins` — per-plugin connection state, capabilities, gauges
-- `GET /v1/federation` — peers: name, node_id, trust, connected, last_seen (no addr)
-- `GET /v1/discovery` — mode, our_advert, peers: node_id/name/services/protocols/security/expires/received_at
-- `GET /v1/openapi.json` — generated OpenAPI 3.1 document for this whole API
-- `GET /docs` — self-contained Swagger UI (no CDN), browsable via `socat`/SSH
+- `GET /v1/config`: raw YAML, secrets unresolved
+- `POST /v1/config/validate`: dry-run validation, 422 on error
+- `PUT /v1/config`: apply a new config; writes + one-revision `.prev` history
+- `POST /v1/config/rollback`: restore previous config; 404 (none) / 409 (env drift)
+- `GET /v1/events`: SSE: ingress, delivery, plugin, link_verified, config_applied
+- `GET /v1/routes`: per-route identity_mode, render knobs, matched policies
+- `GET /v1/plugins`: per-plugin connection state, capabilities, gauges
+- `GET /v1/federation`: peers: name, node_id, trust, connected, last_seen (no addr)
+- `GET /v1/discovery`: mode, our_advert, peers: node_id/name/services/protocols/security/expires/received_at
+- `GET /v1/openapi.json`: generated OpenAPI 3.1 document for this whole API
+- `GET /docs`: self-contained Swagger UI (no CDN), browsable via `socat`/SSH
   tunnel over the admin socket; see `docs/api-reference.md`
-- `switchyardctl openapi` — dumps `/v1/openapi.json` to stdout for headless use
+- `switchyardctl openapi`: dumps `/v1/openapi.json` to stdout for headless use

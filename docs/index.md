@@ -1,9 +1,9 @@
 # RelayFabric
 
-**RelayFabric is an open communications routing fabric for interconnecting otherwise incompatible messaging, mesh, radio, and Internet systems.** It provides one common routing, policy, identity, security, and message-processing layer, and delegates every protocol-specific detail to plugins. Bridge a Meshtastic LoRa mesh to Reticulum/LXMF, relay Signal into Nostr, or federate two gateways over an untrusted link — through a single headless daemon.
+**RelayFabric is an open communications routing fabric for interconnecting otherwise incompatible messaging, mesh, radio, and Internet systems.** It provides one common routing, policy, identity, security, and message-processing layer, and delegates every protocol-specific detail to plugins. Bridge a Meshtastic LoRa mesh to Reticulum/LXMF, relay Signal into Nostr, or federate two gateways over an untrusted link, through a single headless daemon.
 
-!!! note "Status — v0.4.2 released"
-    v0.4 was the hardening/proving/packaging release — no new protocols ([roadmap](proposals/v0.4-roadmap.md)): per-plugin isolation, passkey-authenticated UI, the interop matrix, signed packaged releases, and a published SDK. The v0.4.x point releases add operator/self-hoster features (backup/restore, health probes, retention, self-alerting, DLQ management, Grafana, `init`) and two ingest/bridge plugins (XMPP, meshtripwire). The public federation (cycle G) follows later on the same line. The table below is the **single source of truth** for feature status; every other page defers to it.
+!!! note "Status: v0.4.2 released"
+    v0.4 was the hardening/proving/packaging release, no new protocols ([roadmap](proposals/v0.4-roadmap.md)): per-plugin isolation, passkey-authenticated UI, the interop matrix, signed packaged releases, and a published SDK. The v0.4.x point releases add operator/self-hoster features (backup/restore, health probes, retention, self-alerting, DLQ management, Grafana, `init`) and two ingest/bridge plugins (XMPP, meshtripwire). The public federation (cycle G) follows later on the same line. The table below is the **single source of truth** for feature status; every other page defers to it.
 
 ## Feature status
 
@@ -26,8 +26,8 @@ Per-plugin interop coverage (inbound/outbound/replies/attachments/reconnect/dedu
 | meshtripwire alert plugin (ingest-only, Apache-2.0) | shipped | v0.4.2 | unit tests; relays meshtripwire tripwire alerts off-grid over LXMF/Meshtastic |
 | Federation (Noise XX, signed envelopes, trust levels) | shipped | v0.3 | e2e |
 | RFDP discovery | shipped | v0.3 | e2e |
-| Sealed routing — phase 1, gateway-to-gateway ([§113](SPEC.md)) | shipped | v0.3 | e2e + KAT |
-| Sealed routing — user-to-user (X3DH/ratchet), MLS groups | not built | planned v0.5+ | — |
+| Sealed routing: phase 1, gateway-to-gateway ([§113](SPEC.md)) | shipped | v0.3 | e2e + KAT |
+| Sealed routing: user-to-user (X3DH/ratchet), MLS groups | not built | planned v0.5+ | — |
 | Transport-class egress (phase 1, static classes) | shipped | v0.3 | SHA-locked regression e2e |
 | Transport-class phase 2 (core extraction, Android) | not built | [proposed](proposals/transport-class-phase2.md) | — |
 | Web admin UI (`relayfabric-ui`) | shipped | v0.2 | passkey (WebAuthn) auth + scoped roles since v0.4-dev; ceremony suite in `auth.rs` |
@@ -74,7 +74,7 @@ Plugins are separate, supervised processes that speak a small CBOR-over-Unix-soc
 | Capability | Summary |
 |---|---|
 | **Protocol bridging** | One route can span Reticulum, Signal, Meshtastic, MeshCore, Nostr, Bitchat, and MQTT. See [Plugins](plugins.md). |
-| **Capability-aware transforms** | Messages are adapted to each destination's real capabilities — text, attachments, media — at egress. See [Architecture](architecture.md). |
+| **Capability-aware transforms** | Messages are adapted to each destination's real capabilities (text, attachments, media) at egress. See [Architecture](architecture.md). |
 | **Transport-class routing** | Egress degrades to the *link's* characteristics: payload capped, images demoted to a note on constrained transports. See [Transport Classes](transport-classes.md). |
 | **Identity privacy** | Anonymous, route-scoped pseudonymous, or verified-linked identities. See [Identity & Privacy](identity.md). |
 | **Sealed routing** | Blind, gateway-to-gateway end-to-end encryption of the payload. See [Security & Sealed Routing](security.md). |
@@ -84,9 +84,9 @@ Plugins are separate, supervised processes that speak a small CBOR-over-Unix-soc
 
 ## Components
 
-- **`switchyardd`** — the core daemon: routing, deduplication, policy enforcement, persistence, and an admin API, all headless.
-- **`switchyardctl`** — a CLI client for the admin API (status, plugins, routes, queue, trace, config, events).
-- **Plugins** — one supervised process per protocol, speaking CBOR over a Unix socket.
+- **`switchyardd`**, the core daemon: routing, deduplication, policy enforcement, persistence, and an admin API, all headless.
+- **`switchyardctl`**: a CLI client for the admin API (status, plugins, routes, queue, trace, config, events).
+- **Plugins**: one supervised process per protocol, speaking CBOR over a Unix socket.
 
 ## Get started
 
@@ -98,4 +98,4 @@ switchyardd --config docs/relayfabric.example.yaml --check-config
 Then follow [Getting Started](getting-started.md) for a full end-to-end route, or jump to the [Configuration](configuration.md) reference.
 
 !!! warning "Honest claims"
-    RelayFabric is scrupulous about what it does *not* provide. Sealed routing hides payloads from intermediary gateways but **not** the metadata of who is talking to whom; pseudonyms provide cross-route unlinkability, **not** anonymity from the gateway operator. Each page states its guarantees — and their limits — plainly.
+    RelayFabric is scrupulous about what it does *not* provide. Sealed routing hides payloads from intermediary gateways but **not** the metadata of who is talking to whom; pseudonyms provide cross-route unlinkability, **not** anonymity from the gateway operator. Each page states its guarantees (and their limits) plainly.

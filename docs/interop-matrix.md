@@ -1,7 +1,7 @@
 # Interoperability Matrix
 
-The v0.4 cycle-C deliverable: for the five focus plugins — **LXMF,
-Meshtastic, MeshCore, MQTT, Signal** — every interop dimension is either
+The v0.4 cycle-C deliverable: for the five focus plugins (**LXMF,
+Meshtastic, MeshCore, MQTT, Signal**) every interop dimension is either
 backed by a named automated test or verified against live infrastructure.
 No cell is assumed.
 
@@ -25,5 +25,5 @@ indirectly).
 
 The daemon-side dimensions (offline queue, restart recovery, priority
 ordering, rate limits, transport-class demotion) are protocol-independent
-and covered once in `switchyardd/tests/e2e.rs` — every plugin inherits
+and covered once in `switchyardd/tests/e2e.rs`: every plugin inherits
 them through the same IPC surface.

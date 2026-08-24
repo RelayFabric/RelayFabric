@@ -16,17 +16,17 @@ docker pull ghcr.io/relayfabric/relayfabric:latest
 docker build -t relayfabric:latest .
 ```
 
-The build is multi-stage — a Rust builder compiles the release binaries, a Python builder assembles the plugin virtualenv, and a slim runtime stage carries only what's needed to run.
+The build is multi-stage: a Rust builder compiles the release binaries, a Python builder assembles the plugin virtualenv, and a slim runtime stage carries only what's needed to run.
 
 !!! note "Optional codec2 voice"
-    `pycodec2` (codec2 voice transcoding) is **not** in the image — it needs the `libcodec2` system library and is an optional feature. Everything else (MQTT, LXMF, Signal, Meshtastic, MeshCore, Nostr, Bitchat, and image-attachment downscaling) is included.
+    `pycodec2` (codec2 voice transcoding) is **not** in the image: it needs the `libcodec2` system library and is an optional feature. Everything else (MQTT, LXMF, Signal, Meshtastic, MeshCore, Nostr, Bitchat, and image-attachment downscaling) is included.
 
 ## Configuration
 
 Mount your config at `/config/relayfabric.yaml` and a data volume at `/data`. Two things must match the container's layout:
 
-- **`node.data_dir: /data`** — the queue database, CAS attachments, the admin socket, and plugin identities live here (mount a named volume so they persist).
-- **Plugin `command` paths** — invoke the in-image virtualenv and plugin scripts:
+- **`node.data_dir: /data`**, the queue database, CAS attachments, the admin socket, and plugin identities live here (mount a named volume so they persist).
+- **Plugin `command` paths**: invoke the in-image virtualenv and plugin scripts:
 
     ```yaml
     plugins:
@@ -47,7 +47,7 @@ docker run -d --name relayfabric \
   ghcr.io/relayfabric/relayfabric:latest
 ```
 
-The admin API is a **Unix socket** under `/data` (no TCP, no auth — see [Security & Sealed Routing](security.md)), so there are no ports to publish for it. Inspect the running gateway by exec-ing `switchyardctl` inside the container:
+The admin API is a **Unix socket** under `/data` (no TCP, no auth, see [Security & Sealed Routing](security.md)), so there are no ports to publish for it. Inspect the running gateway by exec-ing `switchyardctl` inside the container:
 
 ```bash
 docker exec relayfabric switchyardctl --socket /data/admin.sock status
@@ -79,7 +79,7 @@ on <http://localhost:8087>, sharing the data volume so it reaches the daemon's
 admin socket. It ships with `--no-auth` for a **local-only** first look
 (published to `127.0.0.1` only). For real or remote use, remove `--no-auth`
 from the service `command`, front it with TLS, and set `--rp-id` /
-`--allowed-host` — see [Web UI notes → Remote access](webui-notes.md). Remove
+`--allowed-host`. See [Web UI notes → Remote access](webui-notes.md). Remove
 the `relayfabric-ui` service if you don't want it.
 
 ## Continuous builds

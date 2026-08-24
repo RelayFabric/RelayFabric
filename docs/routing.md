@@ -41,7 +41,7 @@ routes:
 
 When a message ingresses from a source plugin, the daemon fans it out to
 **every destination on every route whose `sources` list contains that exact
-`protocol:endpoint`** — minus the ingress endpoint itself. Route matching in
+`protocol:endpoint`**, minus the ingress endpoint itself. Route matching in
 v0.1 keys on the exact source endpoint; there is no per-route toggle yet to
 re-include the origin, so echo suppression is unconditional today (spec §24
 allows an explicit override; it isn't wired up).
@@ -68,7 +68,7 @@ Spec §26 lists the vocabulary a route *could* match on: source protocol,
 source instance, source endpoint, sender, pseudonym, message type, security
 mode, priority, destination, content metadata, radio metadata, time of day,
 route health, network availability, message size. In v0.1, **route
-selection itself** matches only on source `protocol:endpoint` — the fields
+selection itself** matches only on source `protocol:endpoint`, the fields
 shown in the YAML above. The richer per-message criteria (priority, size,
 destination protocol, attachment handling) are applied one layer down, by
 **policy**, after a route has already selected a destination.
@@ -95,7 +95,7 @@ stripped before the destination sees them), `attachments` (`allow` or
 `reject`), `max_attachment_bytes`. A `Deny` decision dead-letters the
 delivery with reason `POLICY_DENIED` before it ever reaches a plugin; an
 `Allow` decision's limits combine with the destination plugin's own
-advertised capabilities — the tighter of the two wins. See
+advertised capabilities. The tighter of the two wins. See
 [Configuration](configuration.md) for the full policy schema and
 [Transport Classes](transport-classes.md) for the separate, link-level caps
 that apply on top of this (payload size and media allow/deny by transport
@@ -118,11 +118,11 @@ routes:
 
 | Field | Values | Effect |
 |---|---|---|
-| `tag` | `alias` (default) \| `none` | `alias` prefixes the body with the sender's per-route pseudonym, or — under `identity_mode: linked` with a verified link — that link's `display_name`. `none` suppresses the prefix entirely, including a linked display name. |
+| `tag` | `alias` (default) \| `none` | `alias` prefixes the body with the sender's per-route pseudonym, or (under `identity_mode: linked` with a verified link) that link's `display_name`. `none` suppresses the prefix entirely, including a linked display name. |
 | `max_chars` | `0` (disabled) or `>= 16` | Truncates the message **body** to that many Unicode characters, ellipsis appended at the boundary. The tag is never counted or shortened by this, even a long linked display name. |
 
 The transport's own byte cap (`max_payload`, from policy and/or transport
-class) still applies afterward as the hard floor — and unlike `max_chars`,
+class) still applies afterward as the hard floor, and unlike `max_chars`,
 it *may* truncate into the tag.
 
 ## Loop prevention and deduplication
@@ -136,11 +136,11 @@ protocol | native_sender | endpoint | timestamp | body | sorted(attachment_sha25
 
 Attachment hashes are sorted before hashing so the same set of attachments
 resent in a different order still dedups against the original. Checking is
-a pure peek — a message that fails the sender rate limit is never recorded
+a pure peek: a message that fails the sender rate limit is never recorded
 as seen, so a legitimate retransmission after the rate-limit window rolls
 over isn't silently swallowed.
 
-- **Dedup TTL** is configurable (`dedup_ttl_secs`, default `86400` — 24h in
+- **Dedup TTL** is configurable (`dedup_ttl_secs`, default `86400`, 24h in
   the example config) and applies per-entry: tightening the TTL via
   hot-reload only affects entries recorded *after* the change.
 - **Loop prevention proper** is the combination of deny-by-default routing
@@ -162,8 +162,8 @@ over isn't silently swallowed.
 Every envelope carries `hop_count`/`hop_limit`, defaulting to `hop_limit:
 8` at the node level and independent of any radio-layer hop limit a
 protocol like Meshtastic enforces on its own (spec §29). Federation has its
-own, separate ceiling — `federation.max_hops` (`4` in the example config)
-— checked on inbound federated envelopes; a message at or over that limit
+own, separate ceiling: `federation.max_hops` (`4` in the example config),
+checked on inbound federated envelopes; a message at or over that limit
 is dead-lettered with reason `HOP_LIMIT` rather than forwarded further.
 
 ## Message priority
@@ -181,10 +181,10 @@ Five classes, ranked in scheduling order (`0` first):
 An unrecognized or missing class name folds to `normal` (rank 2); class
 names are case-sensitive, not fuzzy-matched (`"EMERGENCY"` is not
 `"emergency"`). The due-delivery query orders `priority ASC, next_attempt
-ASC` — an emergency message queued after a backlog of bulk traffic is still
+ASC`: an emergency message queued after a backlog of bulk traffic is still
 scheduled first. Locally-originated `emergency` sends also bypass the
 per-transport rate budget at egress (never over federation, and a federated
-peer cannot forge `emergency` to claim that bypass — inbound federated
+peer cannot forge `emergency` to claim that bypass: inbound federated
 priority is reset to the default rank); see
 [Transport Classes](transport-classes.md) for the budget mechanics.
 
@@ -209,7 +209,7 @@ pending → dead-letter       (policy denial, queue full, exhausted retries, …
 
 ### Persistence
 
-Messages and deliveries are stored in SQLite (`relayfabric.db`, spec §50) —
+Messages and deliveries are stored in SQLite (`relayfabric.db`, spec §50):
 the queue survives a daemon restart; a `pending` delivery is picked up on
 the next scheduler tick exactly as if the restart hadn't happened. This is
 distinct from the dedup cache above, which does not survive a restart.
@@ -226,25 +226,25 @@ with growing backoff, capped at one hour:
 | 3 | 2m |
 | 4 | 10m |
 | 5, 6, 7 | 1h (repeats) |
-| 8 (`MAX_ATTEMPTS`) | none — dead-lettered (`RETRY_EXHAUSTED`) |
+| 8 (`MAX_ATTEMPTS`) | none: dead-lettered (`RETRY_EXHAUSTED`) |
 
 That's up to eight real delivery attempts, spread over roughly three hours,
 before a message is given up on. Radio transports may need a different
-policy entirely (spec §42) — this schedule is the daemon-wide default, not
+policy entirely (spec §42). This schedule is the daemon-wide default, not
 a per-protocol one.
 
 ### Expiration
 
-Every message carries a TTL; `ttl_default_secs` (default `86400` — 24h) is
+Every message carries a TTL; `ttl_default_secs` (default `86400`, 24h) is
 the daemon-wide knob in v0.1. The spec sketches per-message-kind TTLs
-(`emergency: 6h`, `telemetry: 10m`, spec §43) as a future refinement — only
+(`emergency: 6h`, `telemetry: 10m`, spec §43) as a future refinement. Only
 the single global default is implemented today. A delivery whose `expires_at`
 has passed by the time it's picked up is marked `expired` (reason
 `TTL_EXPIRED`) and is never sent, regardless of how many attempts remain.
 
 ### Dead-letter queue
 
-A dead-lettered delivery is permanent — v0.1 has no automatic or
+A dead-lettered delivery is permanent: v0.1 has no automatic or
 admin-triggered replay. Reason codes actually emitted include:
 
 | Reason | Meaning |
@@ -304,8 +304,8 @@ flowchart TD
 
 !!! warning "At-least-once, not exactly-once"
     RelayFabric is a store-and-forward relay, not a transactional message
-    bus. `delivered: true` from a plugin is terminal on the daemon side —
-    it stops retrying — but the daemon cannot detect a plugin that reports
+    bus. `delivered: true` from a plugin is terminal on the daemon side
+    (it stops retrying), but the daemon cannot detect a plugin that reports
     failure after actually delivering, and a retried delivery may reach the
     destination network more than once. The system does not fabricate
     delivery guarantees a protocol doesn't actually provide (spec §70): not
@@ -317,18 +317,18 @@ flowchart TD
   any recipient succeeds, with individual failures folded into a free-text
   `detail` string rather than retried per-recipient.
 - Duplicate suppression on the *destination* network (if the destination
-  protocol offers any) is that plugin's own concern — the fabric's dedup
+  protocol offers any) is that plugin's own concern: the fabric's dedup
   cache only protects against loops and retransmits within RelayFabric
   itself, and only for the configured TTL, and only since the last restart.
-- A dead-lettered message is not silently retried by anything — it sits in
+- A dead-lettered message is not silently retried by anything: it sits in
   the DLQ until an operator investigates. There is no queue-flush or
   automatic replay button in v0.1.
 
 ## See also
 
-- [Configuration](configuration.md) — full `routes:`, `policies:`,
+- [Configuration](configuration.md): full `routes:`, `policies:`,
   `limits:`, and TTL/hop-limit/dedup-TTL schema.
-- [Transport Classes](transport-classes.md) — link-level payload caps and
+- [Transport Classes](transport-classes.md): link-level payload caps and
   media policy applied on top of route/policy limits at egress.
-- [Operations](operations.md) — the admin API's `/v1/queue` surface,
+- [Operations](operations.md): the admin API's `/v1/queue` surface,
   metrics, and what to watch for DLQ growth or queue backpressure.

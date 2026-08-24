@@ -1,6 +1,6 @@
 # Architecture
 
-RelayFabric is a protocol-independent communications routing fabric: a headless Rust daemon, `switchyardd`, that routes canonical messages between out-of-process protocol plugins according to policy, while a CLI, `switchyardctl`, drives it through an administrative API. The daemon never speaks a native protocol itself — every network-specific concern (Reticulum/LXMF, Signal, Meshtastic, MeshCore, Bitchat, Nostr, MQTT, and future adapters) lives in a plugin process, and the daemon only ever handles a single internal representation of a message.
+RelayFabric is a protocol-independent communications routing fabric: a headless Rust daemon, `switchyardd`, that routes canonical messages between out-of-process protocol plugins according to policy, while a CLI, `switchyardctl`, drives it through an administrative API. The daemon never speaks a native protocol itself. Every network-specific concern (Reticulum/LXMF, Signal, Meshtastic, MeshCore, Bitchat, Nostr, MQTT, and future adapters) lives in a plugin process, and the daemon only ever handles a single internal representation of a message.
 
 ## Design principles
 
@@ -8,7 +8,7 @@ The architecture follows directly from a small set of principles (SPEC §4). Eve
 
 ### Route messages, not identities
 
-`switchyardd` does not assume `Signal user A == Meshtastic user A == LXMF user A`. Protocol identities remain independent unless an operator or user explicitly links them. The router's job is moving a message from one endpoint to another — not building a cross-network identity graph.
+`switchyardd` does not assume `Signal user A == Meshtastic user A == LXMF user A`. Protocol identities remain independent unless an operator or user explicitly links them. The router's job is moving a message from one endpoint to another, not building a cross-network identity graph.
 
 ### Protocol independence
 
@@ -16,11 +16,11 @@ The core contains no protocol-specific routing logic. Everything that knows abou
 
 ### Least information disclosure
 
-RelayFabric discloses only the information required to route and represent a message on the destination network. Native identifiers do not automatically cross protocol boundaries — a Meshtastic node ID is not exposed to a Signal recipient just because both plugins happen to be enabled.
+RelayFabric discloses only the information required to route and represent a message on the destination network. Native identifiers do not automatically cross protocol boundaries: a Meshtastic node ID is not exposed to a Signal recipient just because both plugins happen to be enabled.
 
 ### Explicit trust boundaries
 
-RelayFabric distinguishes transport encryption, gateway-visible plaintext, signed messages, and application-level end-to-end encrypted messages. Operators and users must be able to determine when a gateway can actually read content — this is what the [security modes](security.md) exist to make explicit rather than implicit.
+RelayFabric distinguishes transport encryption, gateway-visible plaintext, signed messages, and application-level end-to-end encrypted messages. Operators and users must be able to determine when a gateway can actually read content. This is what the [security modes](security.md) exist to make explicit rather than implicit.
 
 ### Store-and-forward first
 
@@ -28,7 +28,7 @@ Networks may be intermittent, slow, partitioned, offline, or high-latency. Persi
 
 ### Capability-aware routing
 
-The router never assumes every destination supports every feature. A Signal attachment routed toward Meshtastic does not attempt to push several megabytes over LoRa — it degrades, per policy, to something like `[attachment omitted]`. This is the job of the [transform pipeline](#transform-pipeline).
+The router never assumes every destination supports every feature. A Signal attachment routed toward Meshtastic does not attempt to push several megabytes over LoRa. It degrades, per policy, to something like `[attachment omitted]`. This is the job of the [transform pipeline](#transform-pipeline).
 
 ### Failure isolation
 
@@ -88,7 +88,7 @@ flowchart TB
     CLI[switchyardctl] -. admin API .-> Daemon
 ```
 
-Plugins are symmetric — the diagram splits ingress/egress plugin groups only to show data flow for one hop; in practice every plugin can both receive from and send to `switchyardd` over the same socket connection (SPEC §5, §9).
+Plugins are symmetric: the diagram splits ingress/egress plugin groups only to show data flow for one hop; in practice every plugin can both receive from and send to `switchyardd` over the same socket connection (SPEC §5, §9).
 
 ### `switchyardd`
 
@@ -115,7 +115,7 @@ Internally, a message moves through five stages (SPEC §5): **Ingress → Normal
 
 ### Plugin processes
 
-Plugins are separate OS processes, one per protocol, following the naming convention `relayfabric-<protocol>` (e.g. `relayfabric-lxmf`, `relayfabric-signal`, `relayfabric-meshtastic`). Each plugin owns everything protocol-specific: talking to `signal-cli`, a Meshtastic radio, an LXMF/Reticulum stack, an MQTT broker, and so on. See [Plugins](plugins.md) for the supported backend styles and the preference order for integrating a new network (native API first, reverse-engineered protocol only as a last resort — SPEC §7).
+Plugins are separate OS processes, one per protocol, following the naming convention `relayfabric-<protocol>` (e.g. `relayfabric-lxmf`, `relayfabric-signal`, `relayfabric-meshtastic`). Each plugin owns everything protocol-specific: talking to `signal-cli`, a Meshtastic radio, an LXMF/Reticulum stack, an MQTT broker, and so on. See [Plugins](plugins.md) for the supported backend styles and the preference order for integrating a new network (native API first, reverse-engineered protocol only as a last resort; SPEC §7).
 
 ### `switchyardctl`
 
@@ -139,7 +139,7 @@ Plugins run out-of-process and communicate with `switchyardd` over a Unix domain
 CBOR is the preferred encoding for constrained deployments; MessagePack and protobuf were considered as alternative candidate encodings.
 
 !!! note "Deferred transports"
-    TCP, QUIC, gRPC, and authenticated remote plugin connections are called out in the spec as optional *later* transports (SPEC §9) — the initial IPC target is the local Unix socket only.
+    TCP, QUIC, gRPC, and authenticated remote plugin connections are called out in the spec as optional *later* transports (SPEC §9). The initial IPC target is the local Unix socket only.
 
 Conceptually, a plugin implements a small async interface toward the daemon (SPEC §10):
 
@@ -160,7 +160,7 @@ trait RelayPlugin {
 }
 ```
 
-Plugins asynchronously emit received messages to `switchyardd` as they arrive from the native network — the relationship is not strictly request/response.
+Plugins asynchronously emit received messages to `switchyardd` as they arrive from the native network. The relationship is not strictly request/response.
 
 ## Canonical message envelope
 
@@ -197,7 +197,7 @@ Every inbound message is converted into a RelayFabric envelope before routing (S
 | `version` | Envelope schema version |
 | `id` | Internal message ID (see [Message IDs](#message-ids)) |
 | `source` | Protocol, plugin instance, and native endpoint the message arrived on |
-| `sender` | Opaque native reference plus a privacy-preserving alias — never the raw native identity by default |
+| `sender` | Opaque native reference plus a privacy-preserving alias, never the raw native identity by default |
 | `type` | One of the [message types](#message-types) |
 | `body` | Primary content, if any |
 | `created_at` | Timestamp assigned by the origin network, if known |
@@ -211,7 +211,7 @@ Every inbound message is converted into a RelayFabric envelope before routing (S
 
 ### Message IDs
 
-`switchyardd` assigns a globally unique internal message ID to every message — UUIDv7 preferred, ULID acceptable (SPEC §13). This internal ID must remain stable as the message passes through RelayFabric, regardless of how many networks or gateways it transits. Protocol-native IDs are additionally retained inside the gateway trust boundary, but the fabric-internal ID is what dedup, provenance, and tracing key on.
+`switchyardd` assigns a globally unique internal message ID to every message: UUIDv7 preferred, ULID acceptable (SPEC §13). This internal ID must remain stable as the message passes through RelayFabric, regardless of how many networks or gateways it transits. Protocol-native IDs are additionally retained inside the gateway trust boundary, but the fabric-internal ID is what dedup, provenance, and tracing key on.
 
 ### Message types
 
@@ -229,7 +229,7 @@ The canonical envelope's `type` field draws from an initial fixed set (SPEC §14
 | `receipt` | Delivery or read receipt |
 | `presence` | Presence/online status |
 
-Plugins may advertise additional native message types beyond this set. Unknown types must not cause router failure — the router treats an unrecognized type as opaque data to route, not a fatal condition.
+Plugins may advertise additional native message types beyond this set. Unknown types must not cause router failure. The router treats an unrecognized type as opaque data to route, not a fatal condition.
 
 ### Native metadata
 
@@ -245,7 +245,7 @@ Protocol-specific information that doesn't fit the canonical fields may be retai
 }
 ```
 
-Native metadata is **not** automatically forwarded across a route. Policy determines which, if any, native metadata fields may cross a boundary — this is the same least-information-disclosure principle applied field by field.
+Native metadata is **not** automatically forwarded across a route. Policy determines which, if any, native metadata fields may cross a boundary. This is the same least-information-disclosure principle applied field by field.
 
 ## Capability model
 
@@ -299,7 +299,7 @@ transform
 protocol adapter
 ```
 
-This is where capability-aware routing (SPEC §4.6) is actually enforced. A Signal message with a photo attachment routed toward Meshtastic does not get resized and forced onto LoRa — policy and the destination's `attachments: false` / `max_payload` capability combine to produce a degraded result instead:
+This is where capability-aware routing (SPEC §4.6) is actually enforced. A Signal message with a photo attachment routed toward Meshtastic does not get resized and forced onto LoRa. Policy and the destination's `attachments: false` / `max_payload` capability combine to produce a degraded result instead:
 
 ```text
 [SIG-A921]
@@ -310,11 +310,11 @@ Look at this
 The same pipeline stage is responsible for any other capability-driven adaptation: truncating to `max_payload`, stripping location data, or reformatting a reply chain for a plugin that has no native reply concept. See [Transport Classes](transport-classes.md) for how constrained links factor into this decision, and [Routing & Policy](routing.md) for how policy rules select the transform to apply.
 
 !!! warning "Sealed routing is out of scope for the transform pipeline"
-    SPEC §113's *sealed* security mode — payload end-to-end encrypted between gateways, untransformable by the fabric — **shipped in v0.3 (phase 1, gateway-to-gateway)**; see [Security & Sealed Routing](security.md). Sealed routes are structurally exempt from this transform pipeline: no downscaling, no truncation, no attachment stripping. The pipeline described here applies to `native`/`gateway` mode messages, where the gateway can read and adapt plaintext.
+    SPEC §113's *sealed* security mode (payload end-to-end encrypted between gateways, untransformable by the fabric) **shipped in v0.3 (phase 1, gateway-to-gateway)**; see [Security & Sealed Routing](security.md). Sealed routes are structurally exempt from this transform pipeline: no downscaling, no truncation, no attachment stripping. The pipeline described here applies to `native`/`gateway` mode messages, where the gateway can read and adapt plaintext.
 
 ## See also
 
-* [Plugins](plugins.md) — supported backend styles, the plugin descriptor, and IPC lifecycle detail
-* [Routing & Policy](routing.md) — how routes are matched and policy actions are selected
-* [Configuration](configuration.md) — daemon and plugin configuration format
-* [Transport Classes](transport-classes.md) — bandwidth-class-aware egress behavior
+* [Plugins](plugins.md): supported backend styles, the plugin descriptor, and IPC lifecycle detail
+* [Routing & Policy](routing.md): how routes are matched and policy actions are selected
+* [Configuration](configuration.md): daemon and plugin configuration format
+* [Transport Classes](transport-classes.md): bandwidth-class-aware egress behavior

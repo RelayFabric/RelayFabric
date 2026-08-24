@@ -2772,7 +2772,7 @@ The defining design principle is:
 
 *Added 2026-08-15 as a first-class future component, pairing with federation (§30, §85–87). Target: groundwork alongside federation (v0.3).*
 
-`switchyardd` SHOULD advertise what protocols and services it supports — but discovery MUST be **capability-based, scoped, and optional**, never a broadcast of full inventory.
+`switchyardd` SHOULD advertise what protocols and services it supports, but discovery MUST be **capability-based, scoped, and optional**, never a broadcast of full inventory.
 
 ## 111.1 Node Advertisement
 
@@ -2842,7 +2842,7 @@ reachability:
     via: [meshtastic, mqtt]
 ```
 
-This enables service-layer intermesh routing: a gateway needing Signal delivery discovers a peer advertising `signal/chat available` and routes through it — without knowing the Signal account behind it.
+This enables service-layer intermesh routing: a gateway needing Signal delivery discovers a peer advertising `signal/chat available` and routes through it, without knowing the Signal account behind it.
 
 Discovery SHALL NOT initially advertise full route tables (A→B→C→Signal chains). Scope stays limited to node capabilities + directly attached protocols + available services; federation calculates reachable paths.
 
@@ -2874,7 +2874,7 @@ discovery:
 |---|---|
 | `disabled` | advertise nothing (sensitive gateways) |
 | `local` | local RelayFabric peers only (LAN / local RNS neighborhood) |
-| `federation` | authenticated RelayFabric peers only — **recommended default** |
+| `federation` | authenticated RelayFabric peers only, **recommended default** |
 | `public` | deliberately limited service advertisement for community gateways |
 
 ## 111.6 Cost metrics (later)
@@ -2899,9 +2899,9 @@ Signed advertisements flowing between `switchyardd` peers give the decentralized
 
 *Added 2026-08-15. Pairs with RFDP (§111) and federation (§30, §85–87). Target: profile definition alongside v0.3 federation; quotas build on §45/§79.*
 
-Public-node operation SHALL be a first-class RelayFabric deployment mode — but a **public federation node** is not a **public open relay**. The first is desirable. The second is an abuse magnet.
+Public-node operation SHALL be a first-class RelayFabric deployment mode, but a **public federation node** is not a **public open relay**. The first is desirable. The second is an abuse magnet.
 
-"Public" means: *other RelayFabric nodes and users may discover and use explicitly published services* — never "any anonymous person can route anything anywhere."
+"Public" means: *other RelayFabric nodes and users may discover and use explicitly published services*, never "any anonymous person can route anything anywhere."
 
 ## 112.1 Public-node roles
 
@@ -3022,7 +3022,7 @@ transport_budgets:
   lxmf: { messages_per_minute: 200 }
 ```
 
-`limits` and `transport_budgets` are siblings at the top of the config, not nested inside each other. Every `limits` field defaults to 0, meaning unlimited — a PRIVATE node MAY ship with no quotas configured at all, but if `node.public` is true and both `per_sender` and `global` are left entirely at 0, config validation REJECTS the config (hardened from a startup warning, 2026-08-20: an unlimited public node is an amplification/exhaustion hazard to the fabric, not just to itself — setting any one quota field satisfies the rule). `transport_budgets` keys must name enabled plugins; a configured budget of 0 is rejected at load rather than silently meaning unlimited, so omit the entry instead. These ship in v0.1+ config (`switchyardd`'s `Config::limits` / `Config::transport_budgets`).
+`limits` and `transport_budgets` are siblings at the top of the config, not nested inside each other. Every `limits` field defaults to 0, meaning unlimited. A PRIVATE node MAY ship with no quotas configured at all, but if `node.public` is true and both `per_sender` and `global` are left entirely at 0, config validation REJECTS the config (hardened from a startup warning, 2026-08-20: an unlimited public node is an amplification/exhaustion hazard to the fabric, not just to itself; setting any one quota field satisfies the rule). `transport_budgets` keys must name enabled plugins; a configured budget of 0 is rejected at load rather than silently meaning unlimited, so omit the entry instead. These ship in v0.1+ config (`switchyardd`'s `Config::limits` / `Config::transport_budgets`).
 
 Transport classes carry different budgets: Reticulum/IP generous, LoRa constrained, Signal controlled, satellite extremely restricted (extends §45, §46, §79).
 
@@ -3038,7 +3038,7 @@ under hard airtime/rate budgets (extends §39).
 
 ## 112.10 Store-and-forward
 
-A public node MAY advertise `store_forward: { enabled: true, max_ttl: 24h }` — queueing for currently-unreachable destinations (mobile Reticulum/LoRa users) per §40–44.
+A public node MAY advertise `store_forward: { enabled: true, max_ttl: 24h }`: queueing for currently-unreachable destinations (mobile Reticulum/LoRa users) per §40–44.
 
 ## 112.11 Public privacy defaults
 
@@ -3070,7 +3070,7 @@ switchyardctl public enable     # wizard: name, services, identity exposure
 
 ## 112.13 The larger model
 
-Communities contribute whatever connectivity they have — one node brings Reticulum + LoRa, another MeshCore + fiber, another Meshtastic + Nostr, another satellite + Reticulum. RelayFabric doesn't require everyone to deploy the same network; **people contribute capabilities rather than joining one monolithic system.** The Public Node Profile exists so that doing this is safe by default: discovery, federation, pseudonymity, quotas, RF airtime, store-and-forward, and service publishing all ship with safe defaults.
+Communities contribute whatever connectivity they have: one node brings Reticulum + LoRa, another MeshCore + fiber, another Meshtastic + Nostr, another satellite + Reticulum. RelayFabric doesn't require everyone to deploy the same network; **people contribute capabilities rather than joining one monolithic system.** The Public Node Profile exists so that doing this is safe by default: discovery, federation, pseudonymity, quotas, RF airtime, store-and-forward, and service publishing all ship with safe defaults.
 
 ---
 
@@ -3085,7 +3085,7 @@ Alice → encrypt for Bob → [ sealed envelope: opaque dest, ciphertext, auth, 
       → any transports → switchyardd nodes (ciphertext only) → Bob → decrypt
 ```
 
-`switchyardd` answers only *"where does this ciphertext go?"* — never *"what does it say?"*
+`switchyardd` answers only *"where does this ciphertext go?"*, never *"what does it say?"*
 
 ## 113.1 Naming and modes
 
@@ -3094,8 +3094,8 @@ Alice → encrypt for Bob → [ sealed envelope: opaque dest, ciphertext, auth, 
 | Mode (config) | Was | Privacy | Compatibility |
 |---|---|---|---|
 | `native` | (per-protocol bridge) | low–medium | excellent |
-| `gateway` | TRANSLATE | medium — gateway reads plaintext | excellent |
-| `sealed` | OPAQUE | excellent — infrastructure cannot read content | requires RelayFabric-aware endpoints |
+| `gateway` | TRANSLATE | medium: gateway reads plaintext | excellent |
+| `sealed` | OPAQUE | excellent: infrastructure cannot read content | requires RelayFabric-aware endpoints |
 
 All three are supported; their security characteristics MUST be explicit to operators and users (§4.4).
 
@@ -3117,7 +3117,7 @@ and a sealed envelope arriving at a route that would require decryption is dead-
 ## 113.3 The honest limitation: legacy edges
 
 Traffic originating from an unmodified native client (Signal, Sideband, Meshtastic…) is plaintext at
-its ingress gateway — unavoidably. Sealed mode therefore protects, in adoption order:
+its ingress gateway, unavoidably. Sealed mode therefore protects, in adoption order:
 
 1. **Gateway-to-gateway (v0.3, with federation):** the origin edge gateway encrypts to the destination
    edge gateway; every intermediate/public transit node carries ciphertext only. Requires ZERO client
@@ -3140,7 +3140,7 @@ A sealed payload CANNOT be transformed by the fabric: no image downscaling, no t
 `max_payload`, no attachment stripping, no drop-notes (§17; §81's content-inspection impossibility
 applies to ALL content operations). Consequences, stated plainly:
 
-- Capability-aware degradation happens at the ORIGIN edge or not at all — destination capability
+- Capability-aware degradation happens at the ORIGIN edge or not at all. Destination capability
   information must flow end-to-end before send, and oversized sealed payloads for constrained
   transports are rejected at origin, not shrunk in transit.
 - Content filtering, spam heuristics, and body-dependent policy are unavailable on sealed legs by
@@ -3148,7 +3148,7 @@ applies to ALL content operations). Consequences, stated plainly:
 
 ## 113.5 Interactions with fabric machinery
 
-- Dedup and replay protection key on the envelope's unique message ID + expiry (not sender) — sealed
+- Dedup and replay protection key on the envelope's unique message ID + expiry (not sender). Sealed
   and ephemeral-sender traffic remain replay-protected.
 - Per-sender quotas key on the presented (possibly ephemeral) routing identity per epoch; rotation
   bounds correlation, quotas still bind within an epoch.
@@ -3156,7 +3156,7 @@ applies to ALL content operations). Consequences, stated plainly:
 
 ## 113.6 Claim discipline
 
-This is **zero-knowledge payload routing / blind E2EE routing** — not traffic anonymity. Nodes still
+This is **zero-knowledge payload routing / blind E2EE routing**, not traffic anonymity. Nodes still
 observe timing, sizes, interfaces, addresses, and RF activity (§34's traffic-analysis statement
 stands). RelayFabric SHALL NOT describe sealed mode as anonymity.
 
