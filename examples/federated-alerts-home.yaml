@@ -1,0 +1,52 @@
+# Recipe: private federation, HOME side (listener) -- receive a remote node's
+# alerts over an authenticated link and deliver them to an XMPP room. Pairs with
+# examples/federated-alerts-remote.yaml.
+#
+# The remote (cabin) node forwards its meshtripwire alerts across a Noise link
+# into this node's `xmpp-in` route (listed in federation.ingress_routes, so the
+# peer is allowed to inject into it); the route delivers them to an XMPP MUC.
+# Your XMPP credentials live here, at home, not on the exposed remote box.
+#
+# Private to you: this is NOT a public node (no public_services, nothing is
+# advertised), and `accept_from: verified` plus the single-entry peer list means
+# only the cabin node can inject. Run the link inside WireGuard/Tailscale --
+# `listen` on the tunnel IP, never 0.0.0.0 -- so no public port is exposed;
+# federation-over-Tor/I2P is not built yet.
+#
+# Edit: node.data_dir, the plugin command path, the XMPP jid/password/room, the
+# peer's node_id (its rf:<64 hex> identity; see docs/federation.md), and the
+# listen/peer addrs. Then:
+#   switchyardd --config examples/federated-alerts-home.yaml --check-config
+node:
+  name: home-relay
+  data_dir: /var/lib/relayfabric
+
+plugins:
+  xmpp:
+    enabled: true
+    command: /opt/relayfabric/.venv/bin/python /opt/relayfabric/plugins/xmpp/relayfabric-xmpp
+    config:
+      jid: alerts@example.org
+      password: "changeme"                 # replace; prefer ${env:...}/${file:...} in production
+      channels:
+        alerts:
+          muc: alerts@conference.example.org   # the MUC room alerts are posted to
+
+routes:
+  # Federated alerts are injected here (see ingress_routes) and delivered to XMPP.
+  # No local `sources`: this route exists only to receive the remote node's feed.
+  - name: xmpp-in
+    sources: []
+    destinations: ["xmpp:alerts"]
+
+federation:
+  listen: "10.9.0.1:47000"                 # WireGuard/Tailscale interface IP, not 0.0.0.0
+  accept_from: verified                    # minimum trust to accept an inbound envelope
+  ingress_routes: [xmpp-in]                # routes a peer is allowed to inject into
+  peers:
+    - name: cabin
+      # cabin's rf:<64 hex> identity (its <data_dir>/identity/node.key); see
+      # docs/federation.md. Placeholder below -- replace with the real value.
+      node_id: "rf:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      addr: "10.9.0.2:47000"               # cabin's tunnel IP:port (only needed to dial it)
+      trust: verified

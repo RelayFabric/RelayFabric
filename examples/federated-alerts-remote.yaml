@@ -1,0 +1,47 @@
+# Recipe: private federation, REMOTE side (cabin) -- forward a remote site's
+# meshtripwire alerts to a home node over an authenticated link, which then
+# delivers them to XMPP. Pairs with examples/federated-alerts-home.yaml.
+#
+# LoRa devices running meshtripwire (github.com/OutandBack/meshtripwire) publish
+# alerts to the local broker; the meshtripwire plugin ingests them and this node
+# forwards them across federation to peer "home", targeting its `xmpp-in` route
+# (the `fed:home/xmpp-in` destination). Dial-only: no `listen`, so this box
+# (often behind NAT at a remote site) needs NO inbound port. If the home link is
+# down, alerts queue in the persistent store and deliver on reconnect.
+#
+# Private to you: this is not a public node (no public_services), and it only
+# talks to the one peer you list. Run the link inside WireGuard/Tailscale (dial
+# the peer's tunnel IP); federation-over-Tor/I2P is not built yet.
+#
+# Edit: node.data_dir, the plugin command path, and the peer's node_id + addr
+# (home's tunnel IP:port). Then:
+#   switchyardd --config examples/federated-alerts-remote.yaml --check-config
+node:
+  name: cabin-relay
+  data_dir: /var/lib/relayfabric
+
+plugins:
+  meshtripwire:
+    enabled: true
+    command: /opt/relayfabric/.venv/bin/python /opt/relayfabric/plugins/meshtripwire/relayfabric-meshtripwire
+    config:
+      broker: mqtt://127.0.0.1:1883       # meshtripwire's broker (its MqttAlertTopic)
+      topic: meshtripwire/alerts
+      endpoint: alerts
+
+routes:
+  # meshtripwire alert -> across the federation link to home's `xmpp-in` route.
+  - name: alerts-to-home
+    sources: ["meshtripwire:alerts"]
+    destinations: ["fed:home/xmpp-in"]
+
+federation:
+  # Dial-only (no `listen`): this node connects out to home, needs no open port.
+  identity_exposure: pseudonymous          # route-scoped alias, not the raw ref
+  peers:
+    - name: home
+      # home's rf:<64 hex> identity (its <data_dir>/identity/node.key); see
+      # docs/federation.md. Placeholder below -- replace with the real value.
+      node_id: "rf:abababababababababababababababababababababababababababababababab"
+      addr: "10.9.0.1:47000"               # home's WireGuard/Tailscale IP:port
+      trust: verified

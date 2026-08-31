@@ -24,6 +24,8 @@ template** button.
 | [`public-federation-node.yaml`](https://github.com/RelayFabric/RelayFabric/blob/main/examples/public-federation-node.yaml) | A public node that advertises services and accepts traffic from trusted federation peers into a local LXMF channel. Shows `node.public` + `public_services` + `limits` + `federation`. |
 | [`node-red.yaml`](https://github.com/RelayFabric/RelayFabric/blob/main/examples/node-red.yaml) | Automate RelayFabric from [Node-RED](https://nodered.org/) via MQTT: flows inject into and react to the fabric. See below. |
 | [`meshtripwire.yaml`](https://github.com/RelayFabric/RelayFabric/blob/main/examples/meshtripwire.yaml) | Relay [meshtripwire](https://github.com/OutandBack/meshtripwire) tripwire alerts off-grid: its MQTT alert topic fanned into LXMF **and** a Meshtastic channel, no custom code. See below. |
+| [`federated-alerts-remote.yaml`](https://github.com/RelayFabric/RelayFabric/blob/main/examples/federated-alerts-remote.yaml) | Private federation, **remote** side: a remote site forwards its meshtripwire alerts over an authenticated link to a home node. Dial-only, no open port. See below. |
+| [`federated-alerts-home.yaml`](https://github.com/RelayFabric/RelayFabric/blob/main/examples/federated-alerts-home.yaml) | Private federation, **home** side: receives the remote node's alerts and delivers them to an XMPP room. Pairs with the remote config above. See below. |
 
 ## Node-RED automation (via MQTT)
 
@@ -75,6 +77,50 @@ a dedicated `meshtripwire:` endpoint, use the
 [`meshtripwire` plugin](plugins.md#meshtripwire) instead: it parses the JSON
 alert rather than relaying it raw. meshtripwire owns rate-limiting either way
 (its `AlertCooldownSeconds`).
+
+## Private federation: remote alerts to XMPP (two nodes)
+
+A common real deployment: LoRa devices at a remote site run
+[meshtripwire](https://github.com/OutandBack/meshtripwire) and send alerts to a
+RelayFabric node there; you want those alerts to reach a RelayFabric node at
+home, in another state, which forwards them to XMPP, and you want the link
+**private to you**. That is exactly what federation is for.
+
+```
+LoRa/meshtripwire  ->  cabin RelayFabric  ══fed══>  home RelayFabric  ->  XMPP
+   (remote site)      (meshtripwire plugin)  (Noise link)  (xmpp plugin)
+```
+
+Two configs make the pair:
+
+- [`federated-alerts-remote.yaml`](https://github.com/RelayFabric/RelayFabric/blob/main/examples/federated-alerts-remote.yaml)
+  runs at the remote site. The `meshtripwire` plugin ingests alerts, and a route
+  forwards them across the federation link with a `fed:home/xmpp-in` destination,
+  which delivers to the peer named `home`, targeting its route `xmpp-in`. It is
+  **dial-only** (no `listen`), so a box behind NAT needs no inbound port.
+- [`federated-alerts-home.yaml`](https://github.com/RelayFabric/RelayFabric/blob/main/examples/federated-alerts-home.yaml)
+  runs at home. It `listen`s for the peer, lists `xmpp-in` in
+  `federation.ingress_routes` (so the peer may inject into it), and that route
+  delivers to `xmpp:alerts`. Your XMPP credentials stay here, not on the exposed
+  remote box.
+
+**Why it is private.** Neither node is public: there is no `node.public`, no
+`public_services`, and nothing is advertised anywhere. Peers authenticate each
+other by `node_id` (an `rf:<64 hex>` Ed25519 identity) over a `Noise_XX` link,
+and `accept_from: verified` plus a single-entry peer list means only the node
+you name can connect or inject. Set each node's real `node_id` from its
+`<data_dir>/identity/node.key` (see [Federation & Discovery](federation.md)).
+
+**Transport.** Federation is a plain TCP link today (Tor/I2P transport is
+proposed, not built). To keep it private over the Internet, run it inside
+WireGuard or Tailscale: the home node's `listen` and the peer `addr`s are tunnel
+IPs, so no public port is exposed and the link is encrypted at the network layer
+on top of Noise.
+
+**Reliability.** If the home link is down, the remote node queues alerts in its
+persistent store (retry, backoff, TTL) and delivers them on reconnect, which
+suits a flaky remote site. See [Federation & Discovery](federation.md) for the
+trust model, attestation chains, and `fed:` route egress.
 
 See also [Configuration](configuration.md), [Plugins](plugins.md), and
 [Live & Field Testing](live-testing.md).
