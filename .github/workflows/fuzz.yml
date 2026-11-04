@@ -20,9 +20,11 @@ jobs:
       matrix:
         target: [frame_decode, envelope_decode]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly, 2026-10-16
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: crates/relay-ipc/fuzz
           key: fuzz-${{ matrix.target }}
@@ -30,11 +32,41 @@ jobs:
         run: cargo install cargo-fuzz --locked
       - name: Fuzz ${{ matrix.target }} (10 minutes)
         working-directory: crates/relay-ipc
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600
-      - name: Upload crash artifacts
-        if: failure()
-        uses: actions/upload-artifact@v4
+        # Tracked seeds (fuzz/seeds/<target>) are fed alongside the cached
+        # corpus so forward-compat cases such as an unknown frame tag stay
+        # in the explored set; the corpus dir itself is cache-only.
+        #
+        # This is a public repository, so the job log and its artifacts are
+        # public too, and a crashing input is a ready-made exploit against
+        # every deployed node until the fix ships. The fuzzer's output goes
+        # to a file; only the crash class reaches the log, never the input
+        # bytes cargo-fuzz would otherwise print.
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          seeds=""
+          [ -d fuzz/seeds/${{ matrix.target }} ] && seeds=fuzz/seeds/${{ matrix.target }}
+          status=0
+          cargo +nightly fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} $seeds -- -max_total_time=600 > fuzz.log 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "fuzz target ${{ matrix.target }} failed (exit $status); crash class:"
+            grep -E -A1 'panicked at|ERROR: libFuzzer|SUMMARY:|Test unit written to' fuzz.log || true
+          else
+            grep -E 'Done [0-9]+ runs' fuzz.log | tail -n 1 || true
+          fi
+          exit "$status"
+      - name: Encrypt crash artifacts for the maintainer
+        # Set the FUZZ_AGE_RECIPIENT repository variable to an age public key
+        # (age1...) to receive reproducers; without it nothing is uploaded.
+        if: failure() && vars.FUZZ_AGE_RECIPIENT != ''
+        env:
+          AGE_RECIPIENT: ${{ vars.FUZZ_AGE_RECIPIENT }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq age
+          tar -C crates/relay-ipc/fuzz -cf - artifacts | age -r "$AGE_RECIPIENT" -o fuzz-crashes.tar.age
+      - name: Upload encrypted crash artifacts
+        if: failure() && vars.FUZZ_AGE_RECIPIENT != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-crashes-${{ matrix.target }}
-          path: crates/relay-ipc/fuzz/artifacts/
+          path: fuzz-crashes.tar.age
           if-no-files-found: ignore

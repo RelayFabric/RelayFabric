@@ -4,12 +4,35 @@
 # cannot read the daemon's keys, open admin.sock, or impersonate another
 # plugin (v0.4 cycle B).
 #
-# Setup:
+# Setup (the .deb installs the binaries and these units but has no
+# maintainer scripts, so the user, state dir, and config are yours to make):
 #   useradd --system --home /var/lib/relayfabric --shell /usr/sbin/nologin relayfabric
 #   # 0711 (not 0700): per-plugin users must be able to TRAVERSE into
 #   # plugins.d/ to reach their sockets; everything sensitive inside
-#   # (identity/, storage, admin.sock) keeps its own 0700/0600 modes.
+#   # (identity/, storage, admin.sock) keeps its own 0700/0600 modes. The
+#   # daemon keeps data_dir at 0700 unless some plugin sets peer_uid, in
+#   # which case it uses 0711 itself, matching this.
 #   install -d -o relayfabric -g relayfabric -m 0711 /var/lib/relayfabric
+#   install -d -m 0755 /etc/relayfabric
+#   cp /etc/relayfabric/relayfabric.yaml.example /etc/relayfabric/relayfabric.yaml
+#   # edit it for your plugins (node.data_dir is already /var/lib/relayfabric), then
+#   switchyardd --check-config --config /etc/relayfabric/relayfabric.yaml
+#   systemctl enable --now switchyardd
+#
+# Plugins the daemon spawns itself (`command:` in relayfabric.yaml) run
+# INSIDE this unit's sandbox, as this user: PrivateDevices=yes hides every
+# /dev/tty* and BLE device, MemoryDenyWriteExecute=yes breaks CPython
+# extensions that need W^X exceptions (ctypes/cffi, e.g. coincurve), and the
+# seccomp filter and empty capability set apply too. Serial/BLE plugins
+# (meshcore, meshtastic-direct) and anything cffi-based therefore belong
+# in relayfabric-plugin@.service (own user + peer_uid; preferred), or this
+# unit needs a drop-in (/etc/systemd/system/switchyardd.service.d/override.conf)
+# that punches exactly the holes required:
+#   [Service]
+#   PrivateDevices=no
+#   DeviceAllow=/dev/ttyUSB0 rw
+#   SupplementaryGroups=dialout
+#   MemoryDenyWriteExecute=no
 
 [Unit]
 Description=RelayFabric switchyardd
@@ -19,7 +42,10 @@ Wants=network-online.target
 [Service]
 User=relayfabric
 Group=relayfabric
-ExecStart=/usr/local/bin/switchyardd --config /etc/relayfabric/relayfabric.yaml
+# No absolute path on purpose: the .deb installs to /usr/bin, a tarball or
+# source install usually lands in /usr/local/bin, and systemd (>= 239)
+# resolves a bare name on its fixed search path, which covers both.
+ExecStart=switchyardd --config /etc/relayfabric/relayfabric.yaml
 Restart=on-failure
 RestartSec=5
 
@@ -28,6 +54,10 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/relayfabric
+# PUT /v1/config and POST /v1/config/rollback rewrite the config file in
+# place (atomic <config>.tmp + rename, plus the rotated .prev copies), which
+# ProtectSystem=strict would otherwise refuse with EROFS.
+ReadWritePaths=/etc/relayfabric
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes

@@ -29,9 +29,20 @@ services:
     #   - "8443:8443"
 
   # Optional web admin UI — reverse-proxies the daemon's admin socket with
-  # WebAuthn/passkeys + RBAC. Shares the data volume to reach /data/admin.sock.
-  # `--no-auth` here is for a LOCAL first look only (published to 127.0.0.1);
-  # for real/remote use drop it, front it with TLS, and set --rp-id +
+  # WebAuthn/passkeys + RBAC. Shares the data volume to reach /data/admin.sock
+  # (both services run as the image's `relayfabric` user, so the 0700 data
+  # dir is open to the UI and nothing else).
+  #
+  # `--no-auth` here is for a LOCAL first look only: the port is published
+  # on 127.0.0.1, but `--no-auth` means ANY client that reaches the listener
+  # has full admin. That is why the service sits on its own `ui` network
+  # that no other container joins: it needs no network path to the daemon
+  # (the admin socket is on the shared volume), so mosquitto, the daemon,
+  # and any container you add later cannot reach it with a forged Host
+  # header. Only the host's loopback can.
+  # For real/remote use drop --no-auth (the first-run setup token is then
+  # written to /data/ui-state/setup-token: `docker compose exec relayfabric-ui
+  # cat /data/ui-state/setup-token`), front it with TLS, and set --rp-id +
   # --allowed-host (see docs/webui-notes.md "Remote access").
   relayfabric-ui:
     image: relayfabric:latest
@@ -44,22 +55,38 @@ services:
       - "/data/admin.sock"
       - "--web-dir"
       - "/opt/relayfabric/ui-web"
+      - "--state-dir"
+      - "/data/ui-state"
       - "--listen"
       - "0.0.0.0:8087"
       - "--no-auth"
     volumes:
       - relayfabric-data:/data
+    networks:
+      - ui
     ports:
       - "127.0.0.1:8087:8087"
 
   # Optional broker for the MQTT and Meshtastic (MQTT-gateway) plugins.
   # Remove this service if you point the plugins at an external broker.
+  # The bundled no-auth config accepts anonymous publish/subscribe from
+  # every container on the default network and from the host's loopback;
+  # fine for this demo, but for anything else mount your own mosquitto.conf
+  # with `allow_anonymous false` + a password_file and set the plugins'
+  # broker credentials.
   mosquitto:
     image: eclipse-mosquitto:2
     restart: unless-stopped
     command: mosquitto -c /mosquitto-no-auth.conf
     ports:
       - "127.0.0.1:1883:1883"
+
+networks:
+  # The UI's private network: no other service is attached to it, so the
+  # unauthenticated listener is reachable only through the published
+  # loopback port. (Not `internal: true` — Docker does not publish ports
+  # for internal-only networks.)
+  ui: {}
 
 volumes:
   relayfabric-data:

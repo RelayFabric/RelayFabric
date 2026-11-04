@@ -18,7 +18,44 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # CI runs on branch pushes, not tags, so nothing else checks the exact
+  # commit being packaged. Same gate as ci.yml's rust job (fmt, clippy with
+  # warnings denied, the workspace test suite), plus the tag/version
+  # consistency check: tarballs, the .deb, and the registry publishes all
+  # take the version from Cargo.toml, so a tag that disagrees with it would
+  # produce mislabeled artifacts. -j2 is the repo-wide cargo convention.
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, 2026-10-16
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Tag must match the workspace version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[0].version')"
+          echo "workspace version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy (warnings are errors)
+        run: cargo clippy -j2 --locked --workspace --all-targets -- -D warnings
+      - name: tests
+        run: cargo test -j2 --locked --workspace
+
   binaries:
+    needs: test
     strategy:
       matrix:
         include:
@@ -28,23 +65,26 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, 2026-10-16
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
 
       - name: Build release binaries
         run: |
-          cargo build --release --target ${{ matrix.target }}
-          cargo build --release --target ${{ matrix.target }} -p relayfabric-ui
+          cargo build -j2 --locked --release --target ${{ matrix.target }}
+          cargo build -j2 --locked --release --target ${{ matrix.target }} -p relayfabric-ui
 
       - name: Package tarball
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          # the same version the .deb and the registry publishes use (the
+          # test job already asserted the tag agrees with it)
+          VERSION="${{ needs.test.outputs.version }}"
           PKG="relayfabric-${VERSION}-${{ matrix.target }}"
           mkdir -p "dist/$PKG"
           for bin in switchyardd switchyardctl relayfabric-mqtt relayfabric-ui; do
@@ -68,7 +108,7 @@ jobs:
           done
           cargo deb -p switchyardd --no-build --no-strip --output dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binaries-${{ matrix.target }}
           path: dist/*
@@ -82,7 +122,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
           pattern: binaries-*
@@ -95,7 +135,7 @@ jobs:
           cat checksums.txt
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
 
       - name: Sign artifacts with cosign (keyless)
         working-directory: artifacts
@@ -112,7 +152,7 @@ jobs:
             --output-signature checksums.txt.sig --output-certificate checksums.txt.pem
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
             artifacts/*.tar.gz

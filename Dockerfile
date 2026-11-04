@@ -8,9 +8,16 @@
 # Run:    docker run -v "$PWD/config:/config:ro" -v relayfabric-data:/data relayfabric:latest
 #         (mount a config at /config/relayfabric.yaml; see docs/docker.md)
 
+# Base images are pinned by digest so a build is reproducible and a
+# re-tagged upstream image cannot change what ships; Dependabot's docker
+# ecosystem bumps the digests.
+
 # ---------- Rust builder ----------
-FROM rust:1-slim-bookworm AS rust-builder
+FROM rust:1-slim-bookworm@sha256:ed2c95ca377d6571b124b05e75e01207973ded639dce7d5542eb7bcd797e32aa AS rust-builder
 WORKDIR /build
+# The MQTT plugin's TLS comes from the platform OpenSSL (native-tls).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 # Copy every workspace member so the workspace resolves, then build only the
 # three shipped binaries in release mode.
 COPY Cargo.toml Cargo.lock ./
@@ -28,7 +35,7 @@ RUN cargo build -j2 --release \
       -p switchyardd -p switchyardctl -p relayfabric-mqtt -p relayfabric-ui
 
 # ---------- Python dependency builder ----------
-FROM python:3.12-slim-bookworm AS py-builder
+FROM python:3.12-slim-bookworm@sha256:e697c81897302a4c4333bade000d98038fbb21eb064f8ee1fd42d02ebcd9d337 AS py-builder
 # build tools cover any dependency without a prebuilt wheel for this platform
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential libffi-dev && rm -rf /var/lib/apt/lists/*
@@ -37,22 +44,35 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Union of the plugins' requirements (plus Pillow for image-attachment
 # downscaling). pycodec2 (codec2 voice transcoding) is intentionally omitted:
 # it needs the libcodec2 system library and is an optional feature.
+# Every package is pinned to an exact release so an image rebuild is
+# reproducible and a fresh upstream release can't change plugin behavior
+# unreviewed; Dependabot (.github/dependabot.yml) proposes the bumps.
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
-      cbor2 \
+      "cbor2==6.1.5" \
       "coincurve==21.0.0" \
-      lxmf \
+      "lxmf==1.2.1" \
       "meshcore==2.3.8" \
-      paho-mqtt \
-      rns \
-      "slixmpp>=1.8" \
+      "paho-mqtt==2.1.0" \
+      "rns==1.5.7" \
+      "slixmpp==1.17.0" \
       "websockets==17.0.1" \
-      Pillow
+      "Pillow==13.0.0"
 
 # ---------- Runtime ----------
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.12-slim-bookworm@sha256:e697c81897302a4c4333bade000d98038fbb21eb064f8ee1fd42d02ebcd9d337 AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates && rm -rf /var/lib/apt/lists/*
+      ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
+
+# Everything runs unprivileged: the daemon, every plugin it spawns, and the
+# optional relayfabric-ui service (same image, same uid, so it can open the
+# admin socket under /data). Fixed uid/gid so a bind-mounted /data can be
+# chown'd to it from the host (`chown -R 10001:10001 ./data`). The home
+# directory is /data so anything a plugin keeps under `~` (e.g. Reticulum's
+# ~/.reticulum when `rns_configdir` is unset) lands on the persistent volume.
+RUN groupadd --system --gid 10001 relayfabric && \
+    useradd --system --uid 10001 --gid relayfabric --home-dir /data \
+      --no-create-home --shell /usr/sbin/nologin relayfabric
 
 # Python venv (self-contained manylinux wheels) and the Rust binaries.
 COPY --from=py-builder /opt/venv /opt/venv
@@ -75,8 +95,12 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Plugin `command` entries in your config should invoke the venv python and
 # the in-image plugin paths, e.g.:
 #   /opt/venv/bin/python /opt/relayfabric/plugins/lxmf/relayfabric-lxmf
-RUN mkdir -p /data
+# /data is created owned by the service user; a NEW named volume mounted
+# here inherits that ownership on first use. An existing volume from an
+# image that ran as root must be re-owned once (see docs/docker.md).
+RUN install -d -o relayfabric -g relayfabric -m 0700 /data
 VOLUME ["/data", "/config"]
+USER relayfabric
 
 # Liveness/readiness via the admin socket: `switchyardctl health` GETs
 # /readyz and exits non-zero if the daemon isn't ready (503 or unreachable).

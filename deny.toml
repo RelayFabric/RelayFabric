@@ -20,8 +20,10 @@ allow = [
 confidence-threshold = 0.9
 
 [advisories]
-# unmaintained/yanked warnings surface in the report but do not fail the
-# gate; security vulnerabilities do.
+# cargo-deny >= 0.16 fails the gate on vulnerabilities AND on unmaintained
+# crates (there is no "warn" tier for the latter any more); only yanked
+# versions are downgraded to a warning here. If an unmaintained advisory
+# ever has to be carried, add it to `ignore` with a reason and a date.
 yanked = "warn"
 
 [bans]

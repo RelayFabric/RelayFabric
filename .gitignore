@@ -11,3 +11,8 @@ __pycache__/
 # zensical documentation build output
 /site/
 /.cache/
+
+# Python SDK build output (publish.yml builds sdist/wheel fresh from source)
+/sdk/python/dist/
+/sdk/python/build/
+/sdk/python/*.egg-info/
