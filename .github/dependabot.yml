@@ -12,13 +12,23 @@ updates:
     schedule:
       interval: weekly
     ignore:
-      # Both follow ed25519-dalek 2, snow 0.10, and crypto_box, which still
-      # take rand_core 0.6 RNGs and curve25519-dalek 4; bumping either on its
-      # own splits the tree into two copies. Lift once those crates move.
+      # The dalek and rand set moves together: ed25519-dalek 3 and
+      # curve25519-dalek 5 are the new rand_core generation, while snow 0.10
+      # and crypto_box still sit on curve25519-dalek 4 and rand_core 0.6, so
+      # bumping any one of them alone splits the tree into two copies. Lift
+      # once snow moves.
       - dependency-name: rand
         versions: [">=0.9"]
       - dependency-name: curve25519-dalek
         versions: [">=5"]
+      - dependency-name: ed25519-dalek
+        versions: [">=3"]
+      # sha2 0.11 and hmac 0.13 are the digest 0.11 generation; p256 0.14 and
+      # ed25519-dalek 2 still build on digest 0.10, so these move with them.
+      - dependency-name: sha2
+        versions: [">=0.11"]
+      - dependency-name: hmac
+        versions: [">=0.13"]
   - package-ecosystem: docker
     directory: /
     schedule:
