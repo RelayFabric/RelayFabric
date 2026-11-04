@@ -51,6 +51,16 @@ untrusted (spec §80); bad id/sig events are dropped, never bridged. Only
 configured channels' filters are subscribed, and only configured channels
 accept outbound sends.
 
+## Resubscribe without replay
+
+Every REQ the plugin sends carries a `since`: on a fresh subscription it is
+`now - 60s`, and on every reconnect it is the newest `created_at` the plugin
+has already bridged for that subscription, so a relay's stored history is
+not replayed into every routed network each time the link drops. Events
+dated more than 15 minutes into the future never advance that mark. If your
+channel `filter` sets its own `since`, it is sent as-is (and relay history
+back to that point replays on every reconnect).
+
 ## Loop guard
 
 Consume-on-match cache keyed on `(channel, text)`: a successful publish

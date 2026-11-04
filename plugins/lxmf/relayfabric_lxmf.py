@@ -46,13 +46,26 @@ def load_config(raw):
     cfg.setdefault("image_max_bytes", None)
     cfg.setdefault("voice_to_codec2", None)
     cfg.setdefault("lxmf_delivery_limit_kb", 8192)
+    # Cap on members per channel (configured + /join'ed): membership is
+    # persisted and every channel message fans out one send per member.
+    cfg.setdefault("max_members", 64)
+    _validate_max_members("max_members", cfg["max_members"])
     cfg["channels"] = [dict(ch) for ch in cfg.get("channels", [])]
     for ch in cfg["channels"]:
         if not ch.get("name"):
             raise ValueError("every channel requires a 'name'")
         ch["members"] = [m.lower() for m in ch.get("members", [])]
         ch.setdefault("open", False)
+        ch.setdefault("max_members", cfg["max_members"])
+        _validate_max_members(f"channel '{ch['name']}' max_members", ch["max_members"])
     return cfg
+
+
+def _validate_max_members(field, value):
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{field} must be int, got {type(value).__name__}")
+    if value < 1:
+        raise ValueError(f"{field} must be >= 1, got {value}")
 
 
 def channel_by_name(cfg, name):
@@ -104,6 +117,8 @@ def command_reply(cfg, dynamic, sender, text):
             return f"Already a member of {arg}", False
         if not ch["open"]:
             return f"Channel {arg} is closed; ask the operator", False
+        if len(channel_members(ch, dynamic)) >= ch["max_members"]:
+            return f"Channel {arg} is full ({ch['max_members']} members)", False
         dynamic.setdefault(arg, []).append(sender)
         return f"Joined {arg}", True
 
@@ -189,34 +204,65 @@ def attachment_fields(loaded, max_bytes, voice_codec2_bitrate=None,
     return fields, notes
 
 
+def _payload(entry):
+    """The bytes of a `[meta, data]` LXMF field entry, or None when the
+    entry is malformed or `data` is not a byte payload. A str here would
+    be encoded as a CBOR text string where the daemon expects bytes: the
+    frame fails decode, the connection is torn down, and the whole RNS
+    stack restarts with it -- so the sender's type is never trusted."""
+    if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+        return None
+    data = entry[1]
+    if isinstance(data, bytearray):
+        data = bytes(data)
+    if not isinstance(data, bytes) or not data:
+        return None
+    return data
+
+
 def lxmf_attachments(message_fields, max_bytes):
     """Extract [(filename, bytes), ...] plus drop notes from LXMF fields."""
     out, notes = [], []
     fields = message_fields or {}
+
+    def _drop_non_bytes(name):
+        notes.append(f"[dropped {os.path.basename(name)}: not a byte payload]")
+
     image = fields.get(media.FIELD_IMAGE)
     if isinstance(image, (list, tuple)) and len(image) >= 2 and image[1]:
-        name, data = f"image.{image[0]}", image[1]
-        if len(data) > max_bytes:
-            shrunk = media.shrink_image(data, max_bytes)
-            if shrunk is not None:
-                name, data = "image.webp", shrunk
-        out.append((name, data))
+        name, data = f"image.{image[0]}", _payload(image)
+        if data is None:
+            _drop_non_bytes(name)
+        else:
+            if len(data) > max_bytes:
+                shrunk = media.shrink_image(data, max_bytes)
+                if shrunk is not None:
+                    name, data = "image.webp", shrunk
+            out.append((name, data))
     audio = fields.get(media.FIELD_AUDIO)
     if isinstance(audio, (list, tuple)) and len(audio) >= 2 and audio[1]:
-        if audio[0] >= media.AM_OPUS_OGG:
+        data = _payload(audio)
+        if data is None:
+            _drop_non_bytes("voice")
+        elif audio[0] >= media.AM_OPUS_OGG:
             # opus modes are ogg containers, played natively downstream
-            out.append(("voice.ogg", audio[1]))
+            out.append(("voice.ogg", data))
         else:
             # codec2: raw low-bitrate radio audio; transcode to WAV if
             # pycodec2 is installed, else forward raw
-            decoded = media.codec2_to_wav(audio[0], audio[1])
+            decoded = media.codec2_to_wav(audio[0], data)
             if decoded is not None:
                 out.append(("voice.wav", decoded))
             else:
-                out.append(("voice.c2", audio[1]))
+                out.append(("voice.c2", data))
     for att in fields.get(media.FIELD_FILE_ATTACHMENTS) or []:
         if isinstance(att, (list, tuple)) and len(att) >= 2 and att[1]:
-            out.append((str(att[0]) or "file", att[1]))
+            name = str(att[0]) or "file"
+            data = _payload(att)
+            if data is None:
+                _drop_non_bytes(name)
+            else:
+                out.append((name, data))
     kept = []
     for name, data in out:
         if len(data) > max_bytes:
@@ -604,11 +650,36 @@ class Bridge:
         tracker.timer.daemon = True
         tracker.timer.start()
         for member in members:
+            if not self._identity_known(member):
+                # No announce seen: no Destination can be built, so a send
+                # would only burn send_lxmf's 15s path wait before failing.
+                # Fail this member now (_identity_known requested its path,
+                # which brings the announce for next time) and let the rest
+                # decide.
+                self._fanout_done(tracker, member, False, "failed")
+                continue
             self.pool.submit(
                 self.send_lxmf, member, text,
                 lambda success, kind=None, m=member:
                     self._fanout_done(tracker, m, success, kind),
                 fields=fields or None)
+
+    def _identity_known(self, dest_hex):
+        """True iff RNS can recall `dest_hex`'s identity. When it cannot,
+        requests the path (non-blocking) so the announce arrives for a
+        later send."""
+        import RNS
+
+        try:
+            dest_hash = bytes.fromhex(dest_hex)
+        except ValueError:
+            return False
+        if RNS.Identity.recall(dest_hash) is not None:
+            return True
+        RNS.Transport.request_path(dest_hash)
+        RNS.log(f"No identity known for channel member {dest_hex}; skipping this "
+                 f"send and requesting its path", RNS.LOG_VERBOSE)
+        return False
 
     def _fanout_done(self, tracker, member, success, kind=None):
         result = tracker.member_done(member[:8], success, kind)
@@ -757,6 +828,17 @@ class Bridge:
 
     # ----- announce loop -----
 
+    def stop(self):
+        """Daemon shutdown: persist LXMF router state and tear down links;
+        abandon pending fan-out work. Never raises -- run_plugin exits
+        right after this."""
+        try:
+            self.router.exit_handler()
+        except Exception as e:  # noqa: BLE001 - best-effort teardown
+            import RNS
+            RNS.log(f"LXMF router teardown error: {e}", RNS.LOG_ERROR)
+        self.pool.shutdown(wait=False)
+
     def announce_loop(self):
         import RNS
 
@@ -787,8 +869,16 @@ class _RunnerBridge:
     def handle_send_direct(self, frame):
         self.bridge.handle_send_direct(frame["corr"], frame["native_ref"], frame["body"])
 
+    def _send_frame(self, obj):
+        # run_plugin answers pings through this so the pong goes out under
+        # Bridge's write lock, never interleaved with an inbound frame.
+        self.bridge._send_frame(obj)
+
     def start(self):
         threading.Thread(target=self.bridge.announce_loop, daemon=True).start()
+
+    def stop(self):
+        self.bridge.stop()
 
 
 def _make_bridge(raw_cfg, sock):

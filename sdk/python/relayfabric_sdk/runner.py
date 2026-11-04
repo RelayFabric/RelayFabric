@@ -27,7 +27,62 @@ import socket
 import sys
 import threading
 
-from .ipc import hello, pong, read_frame, write_frame
+from .ipc import delivery_result, hello, pong, read_frame, write_frame
+
+# Bound on queued (not yet started) sends; see the module docstring.
+SEND_QUEUE_MAX = 256
+
+
+class _SendQueue:
+    """Bounded FIFO of (kind, frame) send work with corr dedup.
+
+    `offer` returns "queued", "duplicate" (a send for that corr is already
+    queued or in flight) or "full". A frame with no (or an unhashable)
+    corr is never deduped. `release(corr)` after the send reaches its
+    result lets a later re-dispatch of the same corr through again.
+    """
+
+    def __init__(self, maxsize=SEND_QUEUE_MAX):
+        self._q = queue.Queue(maxsize=maxsize)
+        self._pending = set()
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(frame):
+        corr = frame.get("corr") if isinstance(frame, dict) else None
+        try:
+            hash(corr)
+        except TypeError:
+            return None
+        return corr
+
+    def offer(self, kind, frame):
+        corr = self._key(frame)
+        with self._lock:
+            if corr is not None and corr in self._pending:
+                return "duplicate"
+            try:
+                self._q.put_nowait((kind, frame))
+            except queue.Full:
+                return "full"
+            if corr is not None:
+                self._pending.add(corr)
+            return "queued"
+
+    def release(self, corr):
+        try:
+            hash(corr)
+        except TypeError:
+            return
+        with self._lock:
+            self._pending.discard(corr)
+
+    def get(self):
+        return self._q.get()
+
+    def close(self):
+        # Shutdown sentinel; bypasses the bound so shutdown can never block.
+        self._q.put(None)
 
 
 def _connect_socket(sock_path):
@@ -56,6 +111,9 @@ def run_plugin(plugin_name, version, bridge_factory, capabilities, *,
       bridge.handle_send_direct(frame) if present, else ignored; "shutdown"
       -> bridge.stop() if present, then exit 0; unknown "t" -> ignored;
       (EOFError, OSError, ValueError) while reading -> stderr line + exit 1.
+    - Sends queue on a bounded, corr-deduped worker queue (SEND_QUEUE_MAX):
+      a re-dispatch of a queued/in-flight corr is dropped, and an overflow
+      is answered with delivery_result(corr, False, "plugin busy").
     """
     try:
         sock_path = os.environ[socket_env]
@@ -95,7 +153,28 @@ def run_plugin(plugin_name, version, bridge_factory, capabilities, *,
     # Send/send_direct run on this worker, off the read loop (see module
     # docstring). One worker => sends stay ordered and the backend is touched
     # from a single thread, exactly as when they ran inline.
-    send_q = queue.Queue()
+    send_q = _SendQueue(maxsize=SEND_QUEUE_MAX)
+
+    def _send_frame(obj):
+        # Through the bridge's locked writer when it has one (never
+        # interleave with a frame its reader thread is writing); else direct.
+        send_frame = getattr(bridge, "_send_frame", None)
+        if send_frame is not None:
+            send_frame(obj)
+        else:
+            write_frame(sock, obj)
+
+    def _enqueue(kind, frame):
+        outcome = send_q.offer(kind, frame)
+        if outcome == "duplicate":
+            print(f"{plugin_name}: ignoring re-dispatched {kind} for in-flight corr "
+                  f"{frame.get('corr')!r}", file=sys.stderr)
+        elif outcome == "full":
+            corr = frame.get("corr")
+            print(f"{plugin_name}: send queue full ({SEND_QUEUE_MAX}), refusing corr "
+                  f"{corr!r}", file=sys.stderr)
+            if corr is not None:
+                _send_frame(delivery_result(corr, False, "plugin busy"))
 
     def _dispatch(kind, frame):
         # A malformed frame (missing corr/endpoint/body) must not kill the
@@ -115,7 +194,11 @@ def run_plugin(plugin_name, version, bridge_factory, capabilities, *,
             item = send_q.get()
             if item is None:  # shutdown sentinel
                 return
-            _dispatch(*item)
+            kind, frame = item
+            try:
+                _dispatch(kind, frame)
+            finally:
+                send_q.release(frame.get("corr") if isinstance(frame, dict) else None)
 
     sender = threading.Thread(target=_sender_loop, name=f"{plugin_name}-sender", daemon=True)
     sender.start()
@@ -137,20 +220,16 @@ def run_plugin(plugin_name, version, bridge_factory, capabilities, *,
             # the bridge's locked writer so this never interleaves with a frame
             # the bridge's reader thread or the sender worker is writing; fall
             # back to a direct write for a bridge that isn't a FrameWriter.
-            send_frame = getattr(bridge, "_send_frame", None)
-            if send_frame is not None:
-                send_frame(pong())
-            else:
-                write_frame(sock, pong())
+            _send_frame(pong())
         elif kind == "send":
-            send_q.put(("send", frame))
+            _enqueue("send", frame)
         elif kind == "send_direct":
-            send_q.put(("send_direct", frame))
+            _enqueue("send_direct", frame)
         elif kind == "shutdown":
             # Let already-queued sends drain (bounded) before tearing down, so
             # a send accepted just before shutdown still goes out; a wedged
             # send is abandoned at the join timeout rather than hanging exit.
-            send_q.put(None)
+            send_q.close()
             sender.join(timeout=2.0)
             stop = getattr(bridge, "stop", None)
             if stop is not None:

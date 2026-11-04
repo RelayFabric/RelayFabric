@@ -55,10 +55,29 @@ Via the `direct_messages` capability the daemon can deliver a DM to a bare
 JID (`switchyardd`'s identity-link challenge, and any route targeting
 `direct:<jid>`), and an inbound DM is surfaced on `direct:<sender-jid>`.
 
+## Sender identity
+
+- A **DM** sender is the bare JID (`dana@example.com`).
+- A **MUC** sender is the occupant's real bare JID when the room exposes it
+  (non-anonymous rooms, or the bridge holds moderator rights in a
+  semi-anonymous one). Otherwise it is the occupant id
+  `room@conference.host/nick`. A bare nick is never used as the sender: nicks
+  are chosen by whoever joins and may legally contain `@`, so a nick of
+  `victim@example.com` would otherwise share identity links, the HMAC alias,
+  the rate-limit bucket and link-challenge matching with the real DM sender
+  `victim@example.com`.
+- In an **anonymous room the nick identity is unverified**: anyone can take a
+  free nick, and the same person gets a new occupant id after a nick change.
+  Treat `room/nick` senders as unauthenticated.
+
 ## Limitations
 
 - **Text only** this cycle (see scope above).
 - `slixmpp` auto-reconnects a dropped link; a hard **auth failure** exits the
   process for the supervisor to restart (bad credentials never self-heal).
+- While no XMPP session is up (before the first `session_start`, or after a
+  disconnect) sends are refused with `delivered: false` so the daemon retries
+  them instead of marking a message delivered that slixmpp would have parked
+  or discarded.
 - Exercised against a fake backend in unit tests; verify against a real
   server before production (one inbound MUC message, one max-length send).

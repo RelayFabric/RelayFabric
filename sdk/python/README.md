@@ -11,4 +11,13 @@ plugin against the daemon-side contract with:
 
     switchyardctl plugin test "python my_plugin.py"
 
+Types at the trust boundary: the daemon decodes an `inbound` frame into
+typed structs, and a wrong-typed field (an int `sender`, a str attachment
+`data`) fails that decode, drops the plugin connection and restarts the
+plugin — a crash loop if the triggering event is retained or stored.
+`ipc.inbound()` therefore raises `ValueError` on a mistyped field; treat
+that as "drop this message". `run_plugin` dedups re-dispatched sends by
+`corr` and bounds its send queue (`runner.SEND_QUEUE_MAX`), answering an
+overflow with `delivery_result(corr, false, "plugin busy")`.
+
 Docs: https://docs.relayfabric.org/plugin-authors/

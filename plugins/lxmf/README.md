@@ -42,6 +42,7 @@ plugins:
         - name: pasadena
           members: ["a91d00aa..."] # lowercase LXMF destination hashes
           open: false              # closed: operator-managed membership only
+          max_members: 64          # per-channel cap (configured + /join'ed); default 64
 ```
 
 ## Finding the gateway address
@@ -59,6 +60,11 @@ Sent as LXMF message text to the gateway address:
 
 `open: false` channel membership is operator-managed via
 `config.channels[].members`; dynamic joins persist to `<storage>/members.json`.
+`/join` is refused once a channel holds `max_members` members (configured
+plus joined; default 64, settable globally or per channel), since every
+channel message fans out one LXMF send per member. A member whose announce
+the gateway has never seen is skipped on each fan-out (its path is requested
+so the next send can reach it) rather than holding the send for a path wait.
 
 ## Identity linking
 

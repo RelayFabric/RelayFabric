@@ -11,6 +11,7 @@ main()). Attachment bytes are never logged, only names/sizes/counts.
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -27,6 +28,23 @@ PLUGIN_VERSION = "0.1.0"
 # separately by cap_attachments() against the smaller, configurable
 # max_attachment_bytes.
 ATTACHMENT_LOAD_CAP = 32_000_000
+
+
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
+_MAX_NAME_LEN = 128
+
+
+def safe_attachment_name(name):
+    """A safe file name for an outbound attachment, written under a scratch
+    dir for signal-cli to read. The name comes from another network's users:
+    take the basename, keep only [A-Za-z0-9._-], strip leading dots, bound
+    the length (keeping the tail, so the extension survives), and fall back
+    to "file" for anything degenerate ("", ".", "..", "x/") -- those would
+    otherwise resolve to a directory and fail the send forever.
+    """
+    base = os.path.basename(str(name or ""))
+    safe = _SAFE_NAME.sub("_", base)[-_MAX_NAME_LEN:].lstrip(".")
+    return safe or "file"
 
 
 def load_config(raw):
@@ -308,10 +326,13 @@ class Bridge:
             paths = []
             if kept:
                 tmpdir = tempfile.mkdtemp(prefix="relayfabric-signal-att-")
-                # same-basename attachments overwrite; prefix an
-                # index if that ever matters
-                for att in kept:
-                    path = os.path.join(tmpdir, os.path.basename(att["filename"]))
+                # one subdir per attachment: same-named attachments never
+                # overwrite each other, and the recipient still sees the
+                # (sanitized) original name
+                for i, att in enumerate(kept):
+                    att_dir = os.path.join(tmpdir, str(i))
+                    os.mkdir(att_dir)
+                    path = os.path.join(att_dir, safe_attachment_name(att["filename"]))
                     with open(path, "wb") as f:
                         f.write(att["data"])
                     paths.append(path)

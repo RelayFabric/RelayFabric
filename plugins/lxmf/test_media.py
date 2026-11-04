@@ -101,6 +101,56 @@ class LXMFConstantTests(unittest.TestCase):
         self.assertEqual(media.AM_FOR_BITRATE, expected_am_for_bitrate)
 
 
+class FfmpegDecodeArgvTests(unittest.TestCase):
+    """The decode runs with capture_output=True, so without an output bound
+    a long (or crafted) input makes ffmpeg produce unbounded PCM into
+    memory. `-t` caps the decoded duration as an output option."""
+
+    def test_argv_bounds_output_duration(self):
+        argv = media.ffmpeg_decode_argv(max_secs=30)
+        self.assertEqual(argv[0], "ffmpeg")
+        self.assertEqual(argv[argv.index("-t") + 1], "30")
+        # an output option: after the input, before the output target
+        self.assertLess(argv.index("-i"), argv.index("-t"))
+        self.assertEqual(argv[-1], "pipe:1")
+        self.assertEqual(argv[argv.index("-f") + 1], "s16le")
+
+    def test_default_bound_is_ten_minutes(self):
+        self.assertEqual(media.MAX_AUDIO_SECS, 600)
+        argv = media.ffmpeg_decode_argv()
+        self.assertEqual(argv[argv.index("-t") + 1], "600")
+
+    def test_audio_to_codec2_runs_the_bounded_argv(self):
+        import subprocess
+        import sys
+        import types
+        from unittest import mock
+
+        class _Codec:
+            def __init__(self, bitrate):
+                pass
+
+            def samples_per_frame(self):
+                return 160
+
+            def encode(self, samples):
+                return b"c2"
+
+        fake_pycodec2 = types.SimpleNamespace(Codec2=_Codec)
+        fake_numpy = types.SimpleNamespace(frombuffer=lambda buf, dtype: buf, int16="int16")
+        runs = []
+
+        def fake_run(argv, **kw):
+            runs.append(argv)
+            return types.SimpleNamespace(stdout=b"\x00" * 320)
+
+        with mock.patch.dict(sys.modules, {"pycodec2": fake_pycodec2, "numpy": fake_numpy}), \
+                mock.patch.object(subprocess, "run", fake_run):
+            out = media.audio_to_codec2(b"input", 1200)
+        self.assertEqual(out, b"c2")
+        self.assertEqual(runs, [media.ffmpeg_decode_argv(media.MAX_AUDIO_SECS)])
+
+
 class TranscodeTests(unittest.TestCase):
     @unittest.skipUnless(
         HAVE_PYCODEC2 and HAVE_FFMPEG, "pycodec2 and/or ffmpeg not available")

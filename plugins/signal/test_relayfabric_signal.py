@@ -379,6 +379,31 @@ class CapFrameBudgetTests(unittest.TestCase):
                                  "[dropped c: 6 B over frame budget]"])
 
 
+class SafeAttachmentNameTests(unittest.TestCase):
+    """Outbound attachment names come from another network's users and are
+    used as a path under a scratch dir: a degenerate basename ("", ".",
+    "..", "x/") opens a directory and the send fails forever."""
+
+    def test_degenerate_names_fall_back_to_file(self):
+        for bad in ["", ".", "..", "x/", "/", "...", None]:
+            with self.subTest(name=bad):
+                self.assertEqual(plug.safe_attachment_name(bad), "file")
+
+    def test_traversal_and_separators_stripped(self):
+        self.assertEqual(plug.safe_attachment_name("../../etc/evil.sh"), "evil.sh")
+
+    def test_non_whitelist_chars_replaced(self):
+        self.assertEqual(plug.safe_attachment_name("we ird$na\x00me.jpg"), "we_ird_na_me.jpg")
+
+    def test_leading_dots_stripped(self):
+        self.assertEqual(plug.safe_attachment_name(".hidden"), "hidden")
+
+    def test_overlong_names_truncated_keeping_the_tail(self):
+        name = plug.safe_attachment_name("a" * 300 + ".jpg")
+        self.assertLessEqual(len(name), 128)
+        self.assertTrue(name.endswith(".jpg"))
+
+
 class BridgeEgressAttachmentTests(unittest.TestCase):
     def setUp(self):
         self.cfg = plug.load_config(
@@ -433,6 +458,22 @@ class BridgeEgressAttachmentTests(unittest.TestCase):
         self.bridge.handle_send(frame)
         self.assertTrue(captured_dirs)
         self.assertFalse(os.path.isdir(captured_dirs[0]))
+
+    def test_degenerate_filenames_still_send(self):
+        atts = [{"filename": name, "mime": "application/octet-stream", "data": data}
+                for name, data in (("", b"a"), (".", b"b"), ("..", b"c"), ("x/", b"d"))]
+        self.bridge.handle_send({"corr": 1, "endpoint": "pas", "body": "x", "attachments": atts})
+        self.assertEqual(len(self.backend.sent), 1)
+        _, _, captured = self.backend.sent[0]
+        self.assertEqual(captured, [("file", b"a"), ("file", b"b"), ("file", b"c"), ("file", b"d")])
+        self.assertTrue(self.sock.frames()[-1]["delivered"])
+
+    def test_same_basename_attachments_do_not_overwrite_each_other(self):
+        atts = [{"filename": "a.txt", "mime": "text/plain", "data": b"1"},
+                {"filename": "dir/a.txt", "mime": "text/plain", "data": b"2"}]
+        self.bridge.handle_send({"corr": 1, "endpoint": "pas", "body": "x", "attachments": atts})
+        _, _, captured = self.backend.sent[0]
+        self.assertEqual(captured, [("a.txt", b"1"), ("a.txt", b"2")])
 
     def test_no_attachments_sends_empty_captured(self):
         frame = {"corr": 1, "endpoint": "pas", "body": "x"}

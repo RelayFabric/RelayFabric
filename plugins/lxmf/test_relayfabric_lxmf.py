@@ -88,6 +88,25 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             plug.load_config({"storage": "/x", "channels": [{"members": []}]})
 
+    def test_max_members_default(self):
+        cfg = plug.load_config(CFG)
+        self.assertEqual(cfg["max_members"], 64)
+        self.assertEqual([ch["max_members"] for ch in cfg["channels"]], [64, 64])
+
+    def test_max_members_overridable_globally_and_per_channel(self):
+        cfg = plug.load_config(dict(
+            CFG, max_members=10,
+            channels=[{"name": "a", "open": True, "max_members": 3},
+                      {"name": "b", "open": True}]))
+        self.assertEqual([ch["max_members"] for ch in cfg["channels"]], [3, 10])
+
+    def test_max_members_rejects_bad_values(self):
+        for bad in (0, -1, "64", True, None):
+            with self.subTest(bad=bad), self.assertRaises((ValueError, TypeError)):
+                plug.load_config(dict(CFG, max_members=bad))
+        with self.assertRaises((ValueError, TypeError)):
+            plug.load_config(dict(CFG, channels=[{"name": "a", "max_members": 0}]))
+
 
 class ChannelTests(unittest.TestCase):
     def setUp(self):
@@ -146,6 +165,28 @@ class CommandTests(unittest.TestCase):
         self.assertIn("lounge (open)", reply)
         reply, _ = plug.command_reply(self.cfg, self.dyn, "a91d00aa", "/bogus")
         self.assertIn("/join", reply)
+
+    def test_join_refused_when_channel_is_full(self):
+        # Membership is persisted and every member costs a send on each
+        # channel message, so an open channel cannot grow without bound.
+        cfg = plug.load_config(dict(
+            CFG, channels=[{"name": "lounge", "open": True, "max_members": 2}]))
+        dyn = {}
+        for who in ("c1", "c2"):
+            reply, changed = plug.command_reply(cfg, dyn, who, "/join lounge")
+            self.assertTrue(changed, reply)
+        reply, changed = plug.command_reply(cfg, dyn, "c3", "/join lounge")
+        self.assertIn("full", reply)
+        self.assertFalse(changed)
+        self.assertEqual(dyn["lounge"], ["c1", "c2"])
+
+    def test_configured_members_count_toward_the_cap(self):
+        cfg = plug.load_config(dict(
+            CFG, channels=[{"name": "lounge", "open": True,
+                            "members": ["aa", "bb"], "max_members": 2}]))
+        reply, changed = plug.command_reply(cfg, {}, "c3", "/join lounge")
+        self.assertIn("full", reply)
+        self.assertFalse(changed)
 
 
 class FanoutTests(unittest.TestCase):
@@ -459,6 +500,26 @@ class LxmfAttachmentsTests(unittest.TestCase):
             {media.FIELD_AUDIO: [media.AM_CODEC2_1200, frame]}, 100000)
         self.assertEqual(kept[0][0], "voice.wav")
 
+    def test_non_bytes_payloads_are_dropped_not_forwarded(self):
+        # A str payload would be encoded as a CBOR text string where the
+        # daemon expects bytes: decode failure, connection torn down, and
+        # the whole RNS stack restarts with it.
+        kept, notes = plug.lxmf_attachments(
+            {media.FIELD_IMAGE: ["png", "hello"],
+             media.FIELD_AUDIO: [media.AM_OPUS_OGG, "hello"],
+             media.FIELD_FILE_ATTACHMENTS: [["f", "hello"], ["g", 12345], ["h", ["x"]]]},
+            100)
+        self.assertEqual(kept, [])
+        self.assertEqual(len(notes), 5)
+        for note in notes:
+            self.assertIn("not a byte payload", note)
+
+    def test_bytearray_payloads_are_accepted(self):
+        kept, notes = plug.lxmf_attachments(
+            {media.FIELD_FILE_ATTACHMENTS: [["f.bin", bytearray(b"x")]]}, 100)
+        self.assertEqual(kept, [("f.bin", b"x")])
+        self.assertEqual(notes, [])
+
 
 class _ImmediatePool:
     """Stand-in for ThreadPoolExecutor that runs submissions synchronously."""
@@ -480,6 +541,9 @@ def _bare_bridge(cfg):
     bridge.pool = _ImmediatePool()
     bridge.inflight_corrs = set()
     bridge.inflight_lock = threading.Lock()
+    # no RNS stack: treat every member as announced (IdentityKnownTests
+    # covers the real lookup)
+    bridge._identity_known = lambda dest_hex: True
     return bridge
 
 
@@ -495,6 +559,7 @@ def _bare_bridge_with_sock(cfg):
     bridge.pool = _ImmediatePool()
     bridge.inflight_corrs = set()
     bridge.inflight_lock = threading.Lock()
+    bridge._identity_known = lambda dest_hex: True
     sock = FakeSock()
     bridge.wfile = sock
     return bridge, sock
@@ -682,6 +747,103 @@ class BridgeFanoutTimeoutTests(unittest.TestCase):
         self.assertIn("bbbbbbbb", frames[0]["detail"])
 
 
+class IdentityKnownTests(unittest.TestCase):
+    """_identity_known: RNS.Identity.recall decides; an unknown member gets
+    a non-blocking path request so a later send can reach it."""
+
+    def _probe(self, dest_hex, known):
+        bridge, _sock = _bare_bridge_with_sock(plug.load_config(CFG))
+        del bridge._identity_known  # the real method, against a fake RNS
+        requested = []
+        fake_rns = types.SimpleNamespace(
+            Identity=types.SimpleNamespace(
+                recall=lambda h: object() if h.hex() in known else None),
+            Transport=types.SimpleNamespace(
+                request_path=lambda h: requested.append(h.hex())),
+            log=lambda *a, **k: None, LOG_ERROR=3, LOG_WARNING=4, LOG_NOTICE=4,
+            LOG_INFO=5, LOG_VERBOSE=6)
+        with mock.patch.dict(sys.modules, {"RNS": fake_rns}):
+            result = bridge._identity_known(dest_hex)
+        return result, requested
+
+    def test_recalled_identity_is_known(self):
+        result, requested = self._probe("aaaaaaaa", known={"aaaaaaaa"})
+        self.assertTrue(result)
+        self.assertEqual(requested, [])
+
+    def test_unknown_identity_requests_its_path(self):
+        result, requested = self._probe("bbbbbbbb", known=set())
+        self.assertFalse(result)
+        self.assertEqual(requested, ["bbbbbbbb"])
+
+    def test_non_hex_ref_is_unknown_without_a_request(self):
+        result, requested = self._probe("not-hex", known=set())
+        self.assertFalse(result)
+        self.assertEqual(requested, [])
+
+
+class BridgeFanoutUnknownIdentityTests(unittest.TestCase):
+    """A channel member whose identity has never been seen cannot be sent
+    to at all (no Destination can be built from it), so a fan-out must not
+    spend send_lxmf's 15s path wait on it: report that member failed at
+    once and let the known members' results decide the delivery_result."""
+
+    def _run_send(self, members, known, corr):
+        cfg = plug.load_config(dict(
+            CFG, channels=[{"name": "pasadena", "members": members, "open": False}]))
+        bridge, sock = _bare_bridge_with_sock(cfg)
+        bridge._identity_known = lambda dest_hex: dest_hex in known
+        sends = []
+
+        def fake_send(dest_hex, text, on_result=None, method=None, fields=None):
+            sends.append(dest_hex)
+            if on_result:
+                on_result(True, "direct")
+
+        bridge.send_lxmf = fake_send
+        bridge.handle_send(corr, "pasadena", "hi")
+        frames = [f for f in sock.frames() if f["t"] == "delivery_result"]
+        return bridge, sends, frames
+
+    def test_unknown_member_skipped_without_a_send(self):
+        bridge, sends, frames = self._run_send(
+            ["aaaaaaaa", "bbbbbbbb"], known={"aaaaaaaa"}, corr=21)
+        self.assertEqual(sends, ["aaaaaaaa"])
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["corr"], 21)
+        self.assertTrue(frames[0]["delivered"])
+        self.assertIn("bbbbbbbb", frames[0]["detail"])
+        self.assertNotIn(21, bridge.inflight_corrs)
+
+    def test_all_members_unknown_reports_failure_immediately(self):
+        bridge, sends, frames = self._run_send(
+            ["bbbbbbbb", "cccccccc"], known=set(), corr=22)
+        self.assertEqual(sends, [])
+        self.assertEqual(len(frames), 1)
+        self.assertFalse(frames[0]["delivered"])
+        self.assertNotIn(22, bridge.inflight_corrs)
+
+
+class BridgeStopTests(unittest.TestCase):
+    def test_stop_tears_down_router_and_pool(self):
+        bridge, _sock = _bare_bridge_with_sock(plug.load_config(CFG))
+        calls = []
+        bridge.router = types.SimpleNamespace(exit_handler=lambda: calls.append("router"))
+        bridge.pool = types.SimpleNamespace(shutdown=lambda wait: calls.append(("pool", wait)))
+        bridge.stop()
+        self.assertEqual(calls, ["router", ("pool", False)])
+
+    def test_stop_never_raises(self):
+        bridge, _sock = _bare_bridge_with_sock(plug.load_config(CFG))
+
+        def boom():
+            raise RuntimeError("router down")
+
+        bridge.router = types.SimpleNamespace(exit_handler=boom)
+        bridge.pool = types.SimpleNamespace(shutdown=lambda wait: None)
+        bridge.stop()
+
+
 class OutboundStampTests(unittest.TestCase):
     """send_lxmf passes the configured outbound delivery stamp cost to the
     LXMessage, so a stamp-enforcing recipient (e.g. Sideband) accepts and
@@ -853,6 +1015,20 @@ class RunnerBridgeTests(unittest.TestCase):
         adapter.start()
 
         self.assertTrue(started.wait(timeout=2))
+
+    def test_send_frame_delegates_to_the_bridges_locked_writer(self):
+        # run_plugin answers pings through bridge._send_frame when present;
+        # without the delegation its pong bypasses Bridge's write lock.
+        sent = []
+        stub = types.SimpleNamespace(_send_frame=sent.append)
+        plug._RunnerBridge(stub)._send_frame({"t": "pong"})
+        self.assertEqual(sent, [{"t": "pong"}])
+
+    def test_stop_delegates_to_bridge_stop(self):
+        stopped = []
+        stub = types.SimpleNamespace(stop=lambda: stopped.append(True))
+        plug._RunnerBridge(stub).stop()
+        self.assertEqual(stopped, [True])
 
 
 class MakeBridgeTests(unittest.TestCase):

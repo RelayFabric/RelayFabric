@@ -3,6 +3,7 @@ import math
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "sdk", "python"))
@@ -295,6 +296,38 @@ class MapperNodeinfoTests(unittest.TestCase):
         entry = posts["/api/nodes"]["!7efeee00"]
         self.assertEqual(entry["user"]["shortName"], "BA0")
         self.assertIn("position", entry)
+
+
+class MapperNodeCapTests(unittest.TestCase):
+    """Mapper.nodes is keyed by the remote-controlled `from`, so a flood of
+    distinct node numbers must not grow it without bound: past the cap the
+    node with the oldest lastHeard is evicted."""
+
+    def _nodeinfo(self, num, ts):
+        return {"type": "nodeinfo", "from": num, "timestamp": ts,
+                "payload": {"shortname": f"N{num:x}"}}
+
+    def test_default_cap(self):
+        self.assertEqual(plug.MAX_NODES, 4096)
+
+    def test_oldest_last_heard_evicted_past_the_cap(self):
+        mapper = plug.Mapper(plug.load_config(base_cfg()), now_fn=lambda: 1700000000)
+        with mock.patch.object(plug, "MAX_NODES", 3):
+            for i in range(5):
+                mapper.handle(TOPIC, self._nodeinfo(0x1000 + i, 1000 + i))
+        self.assertEqual(sorted(mapper.nodes),
+                         [plug.canonical_node_id(0x1000 + i) for i in (2, 3, 4)])
+
+    def test_refreshed_node_survives_eviction(self):
+        mapper = plug.Mapper(plug.load_config(base_cfg()), now_fn=lambda: 1700000000)
+        with mock.patch.object(plug, "MAX_NODES", 3):
+            for i in range(3):
+                mapper.handle(TOPIC, self._nodeinfo(0x1000 + i, 1000 + i))
+            mapper.handle(TOPIC, self._nodeinfo(0x1000, 2000))  # heard again
+            mapper.handle(TOPIC, self._nodeinfo(0x1003, 1003))  # one over the cap
+        self.assertEqual(sorted(mapper.nodes),
+                         [plug.canonical_node_id(n) for n in (0x1000, 0x1002, 0x1003)])
+        self.assertEqual(len(mapper.nodes), 3)
 
 
 class PosterTests(unittest.TestCase):

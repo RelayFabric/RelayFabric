@@ -156,6 +156,58 @@ class VerifyEventRejectsTests(unittest.TestCase):
                 self.assertFalse(result)
 
 
+class VerifyEventTypeEnforcementTests(unittest.TestCase):
+    """verify_event must enforce NIP-01 field types BEFORE hashing: the
+    canonical serialization happily signs a non-string content or a
+    string created_at, so a correctly-signed but mistyped event would
+    otherwise verify, reach the daemon as the wrong CBOR type, fail decode
+    there and restart the plugin -- and a stored event replays on every
+    resubscribe."""
+
+    def _event(self, created_at=1700000040, kind=1, tags=None, content="typed"):
+        return nip01.sign_event(GOLDEN_PRIVKEY_HEX, created_at, kind,
+                                [] if tags is None else tags, content)
+
+    def test_well_typed_event_still_verifies(self):
+        self.assertTrue(nip01.verify_event(self._event(tags=[["t", "x"], ["p", "a", "b"]])))
+
+    def test_non_string_content_rejected_even_when_signed(self):
+        for content in [123, None, ["x"], {"a": 1}, True]:
+            with self.subTest(content=content):
+                self.assertFalse(nip01.verify_event(self._event(content=content)))
+
+    def test_non_int_created_at_rejected_even_when_signed(self):
+        for created_at in ["1700000040", 1700000040.0, True, None]:
+            with self.subTest(created_at=created_at):
+                self.assertFalse(nip01.verify_event(self._event(created_at=created_at)))
+
+    def test_non_int_kind_rejected_even_when_signed(self):
+        for kind in ["1", 1.0, True, None]:
+            with self.subTest(kind=kind):
+                self.assertFalse(nip01.verify_event(self._event(kind=kind)))
+
+    def test_tags_must_be_a_list_of_lists_of_str(self):
+        for tags in [["t", "x"], [["t", 1]], [("t", "x")], [["t"], "x"], "tx", {"t": "x"}]:
+            with self.subTest(tags=tags):
+                self.assertFalse(nip01.verify_event(self._event(tags=tags)))
+
+    def test_uppercase_hex_fields_rejected(self):
+        # NIP-01 ids/pubkeys/sigs are lowercase hex; bytes.fromhex would
+        # accept uppercase, so this has to be an explicit check.
+        for field in ("id", "pubkey", "sig"):
+            with self.subTest(field=field):
+                event = self._event()
+                event[field] = event[field].upper()
+                self.assertFalse(nip01.verify_event(event))
+
+    def test_wrong_length_hex_fields_rejected(self):
+        for field, length in (("id", 64), ("pubkey", 64), ("sig", 128)):
+            with self.subTest(field=field):
+                event = self._event()
+                event[field] = "0" * (length - 2)
+                self.assertFalse(nip01.verify_event(event))
+
+
 class LoadOrCreateIdentityTests(unittest.TestCase):
     """Moved verbatim from plugins/nostr/test_relayfabric_nostr.py (cycle J
     Task 4): load_or_create_identity is a NIP-01 identity primitive, not

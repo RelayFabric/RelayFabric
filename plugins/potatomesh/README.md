@@ -73,4 +73,7 @@ Every record is stamped `protocol: "meshtastic"` and `ingestor: <gateway id>`.
   PSK-encrypted packets; decoding needs the GPL protobufs. Deliberately not
   implemented — the MQTT JSON stream is the license-clean interface.
 - The node aggregate is in-memory: after a restart, node rows rebuild as
-  beacons arrive (PotatoMesh keeps its own history regardless).
+  beacons arrive (PotatoMesh keeps its own history regardless). It holds at
+  most 4096 nodes; past that the node with the oldest `lastHeard` is evicted
+  (it is keyed by the broker-supplied `from`, so a flood of made-up node
+  numbers cannot grow it without bound).

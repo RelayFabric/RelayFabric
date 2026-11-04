@@ -78,11 +78,26 @@ AM_FOR_BITRATE = {
 }
 
 
-def audio_to_codec2(data, bitrate):
+# Longest audio the ffmpeg decode will produce: the decode is captured in
+# memory, and a long or crafted input would otherwise expand without bound
+# (8 kHz s16 mono is 16 KB per second; ten minutes is 9.6 MB).
+MAX_AUDIO_SECS = 600
+
+
+def ffmpeg_decode_argv(max_secs=MAX_AUDIO_SECS):
+    """ffmpeg argv decoding stdin to 8 kHz s16le mono PCM on stdout, with
+    the output duration bounded by `-t` (an output option: after `-i`)."""
+    return ["ffmpeg", "-v", "quiet", "-i", "pipe:0",
+            "-t", str(max_secs),
+            "-f", "s16le", "-ar", "8000", "-ac", "1", "pipe:1"]
+
+
+def audio_to_codec2(data, bitrate, max_secs=MAX_AUDIO_SECS):
     """Transcode any ffmpeg-readable audio to raw codec2 frames.
 
     Optional feature: requires ffmpeg and pycodec2. Returns None on any
     failure so callers can fall back to passing the original through.
+    Decodes at most `max_secs` of audio (see MAX_AUDIO_SECS).
     """
     if bitrate not in AM_FOR_BITRATE:
         return None
@@ -90,8 +105,7 @@ def audio_to_codec2(data, bitrate):
         import numpy as np
         import pycodec2
         pcm = subprocess.run(
-            ["ffmpeg", "-v", "quiet", "-i", "pipe:0",
-             "-f", "s16le", "-ar", "8000", "-ac", "1", "pipe:1"],
+            ffmpeg_decode_argv(max_secs),
             input=data, capture_output=True, check=True, timeout=60).stdout
         codec = pycodec2.Codec2(bitrate)
         frame_len = codec.samples_per_frame() * 2

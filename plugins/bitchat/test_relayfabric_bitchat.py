@@ -293,6 +293,16 @@ class NormalizeEventTests(unittest.TestCase):
             GOLDEN_PRIVKEY_HEX, kwargs["geohash"], kwargs["nickname"],
             kwargs["text"], kwargs["now"])
 
+    def test_non_string_content_dropped_even_when_verify_passes(self):
+        # Belt and braces with nip01.verify_event's own type check: a
+        # non-str content would fail CBOR decode daemon-side and restart
+        # the plugin.
+        event = self._signed(text="x")
+        event["content"] = 123
+        with mock.patch("relayfabric_sdk.nip01.verify_event", return_value=True):
+            self.assertIsNone(
+                plug.normalize_event(event, "sub-regional", self.subid_to_channel))
+
     def test_valid_event_normalizes(self):
         event = self._signed()
         result = plug.normalize_event(event, "sub-regional", self.subid_to_channel)
@@ -596,6 +606,16 @@ class HandleMessageTests(unittest.TestCase):
 
     def test_notice_frame_ignored_not_queued(self):
         self.backend._handle_message(json.dumps(["NOTICE", "rate limited"]))
+        self.assertEqual(self.backend._queue.qsize(), 0)
+
+    def test_deeply_nested_json_does_not_raise(self):
+        # json.loads raises RecursionError (not ValueError) on this; letting
+        # it escape kills the relay task, permanently if the relay re-sends.
+        raw = "[" * 100000 + "]" * 100000
+        try:
+            self.backend._handle_message(raw)
+        except RecursionError as e:
+            self.fail(f"_handle_message raised {e!r}")
         self.assertEqual(self.backend._queue.qsize(), 0)
 
     def test_garbage_json_does_not_raise(self):

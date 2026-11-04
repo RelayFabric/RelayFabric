@@ -6,6 +6,15 @@ plugin directories.
 
 Dict key order matters: frames must be byte-identical to the Rust
 relay-ipc encoding (locked by canonical_hello_frame_bytes_are_stable).
+
+Field types matter just as much: the daemon decodes an `inbound` frame
+into typed Rust structs, and a wrong-typed field (an int `sender`, a str
+attachment `data`) fails that decode, which tears down the plugin
+connection -- the plugin sees EOF, exits, and is restarted, and whatever
+triggered the bad frame (a retained broker message, a stored relay event)
+re-triggers it on the next start: a permanent crash loop. `inbound()`
+therefore raises ValueError on a mistyped field so a bad network event
+costs one dropped message, never the connection.
 """
 
 from datetime import datetime, timezone
@@ -70,15 +79,40 @@ def attachment(filename, mime, data):
     return {"filename": filename, "mime": mime, "data": data}
 
 
+def _require_str(name, value):
+    if not isinstance(value, str):
+        raise ValueError(f"inbound {name} must be str, got {type(value).__name__}")
+
+
 def inbound(endpoint, sender, body, created_at_epoch=None, *, attachments=None, priority=None):
+    """Build an Inbound frame.
+
+    Raises ValueError when `endpoint`/`sender`/`body` is not a str or an
+    attachment is not a dict of str `filename`, str `mime` and bytes-like
+    `data`: the daemon would fail to decode such a frame and drop the
+    plugin connection (see the module docstring), so a caller passing
+    network-derived values must treat this as "drop this message".
+    """
+    _require_str("endpoint", endpoint)
+    _require_str("sender", sender)
+    _require_str("body", body)
+    for att in attachments or []:
+        if not isinstance(att, dict):
+            raise ValueError(f"inbound attachment must be a dict, got {type(att).__name__}")
+        _require_str("attachment filename", att.get("filename"))
+        _require_str("attachment mime", att.get("mime"))
+        if not isinstance(att.get("data"), (bytes, bytearray)):
+            raise ValueError("inbound attachment data must be bytes, got "
+                             f"{type(att.get('data')).__name__}")
     created = None
     if created_at_epoch is not None:
         try:
             created = (datetime.fromtimestamp(created_at_epoch, timezone.utc)
                        .isoformat().replace("+00:00", "Z"))
-        except (OverflowError, OSError, ValueError):
-            # sender-controlled timestamp out of range (e.g. 1e300); bridge
-            # the message anyway and let the daemon stamp receive time.
+        except (OverflowError, OSError, ValueError, TypeError):
+            # sender-controlled timestamp out of range (e.g. 1e300) or not a
+            # number at all; bridge the message anyway and let the daemon
+            # stamp receive time.
             created = None
     return {"t": "inbound", "endpoint": endpoint, "sender": sender,
             "kind": "text", "body": body, "created_at": created,

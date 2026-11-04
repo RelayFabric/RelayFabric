@@ -1,3 +1,4 @@
+import io
 import os
 import threading
 import time
@@ -6,6 +7,7 @@ from unittest import mock
 
 from relayfabric_sdk import FakeSock, run_plugin
 from relayfabric_sdk import ipc as relay_ipc
+from relayfabric_sdk import runner
 
 HELLO_ACK_OK = {"t": "hello_ack", "error": None}
 
@@ -356,6 +358,163 @@ class PingTests(unittest.TestCase):
                        connect=lambda path: sock)
         self.assertTrue(any(f.get("t") == "pong" for f in holder["b"].sent),
                         f"pong must go through the bridge's locked writer: {holder['b'].sent}")
+
+
+class SendQueueTests(unittest.TestCase):
+    """The daemon re-dispatches a delivery whose result has not arrived
+    within its reclaim window, so a backlog longer than that gets its tail
+    queued twice. The queue dedups on corr (queued or in flight) and is
+    bounded so the daemon is told to back off instead of growing an
+    unbounded duplicate-laden backlog."""
+
+    def test_duplicate_corr_is_dropped_until_released(self):
+        q = runner._SendQueue(maxsize=8)
+        self.assertEqual(q.offer("send", {"corr": 1}), "queued")
+        self.assertEqual(q.offer("send", {"corr": 1}), "duplicate")
+        self.assertEqual(q.get(), ("send", {"corr": 1}))
+        # still in flight: the worker has taken it but not finished
+        self.assertEqual(q.offer("send", {"corr": 1}), "duplicate")
+        q.release(1)
+        self.assertEqual(q.offer("send", {"corr": 1}), "queued")
+
+    def test_send_and_send_direct_share_the_corr_namespace(self):
+        q = runner._SendQueue(maxsize=8)
+        self.assertEqual(q.offer("send", {"corr": 5}), "queued")
+        self.assertEqual(q.offer("send_direct", {"corr": 5}), "duplicate")
+
+    def test_frames_without_a_corr_are_never_deduped(self):
+        q = runner._SendQueue(maxsize=8)
+        self.assertEqual(q.offer("send", {}), "queued")
+        self.assertEqual(q.offer("send", {}), "queued")
+
+    def test_unhashable_corr_is_queued_not_raised(self):
+        q = runner._SendQueue(maxsize=8)
+        self.assertEqual(q.offer("send", {"corr": ["x"]}), "queued")
+        q.release(["x"])  # must not raise either
+
+    def test_overflow_reports_full_and_keeps_existing_entries(self):
+        q = runner._SendQueue(maxsize=2)
+        self.assertEqual(q.offer("send", {"corr": 1}), "queued")
+        self.assertEqual(q.offer("send", {"corr": 2}), "queued")
+        self.assertEqual(q.offer("send", {"corr": 3}), "full")
+        # a refused corr is not reserved: the daemon's retry must be accepted
+        self.assertEqual(q.get(), ("send", {"corr": 1}))
+        self.assertEqual(q.offer("send", {"corr": 3}), "queued")
+
+    def test_default_bound_is_256(self):
+        self.assertEqual(runner.SEND_QUEUE_MAX, 256)
+
+
+class _BlockingBridge(_MinimalBridge):
+    """handle_send blocks on `release` for the first frame; records every
+    frame it is given."""
+    started = threading.Event()
+    release = threading.Event()
+
+    def __init__(self, cfg, s):
+        super().__init__(cfg, s)
+        self.sent = []
+
+    def _send_frame(self, obj):
+        self.sent.append(obj)
+
+    def handle_send(self, frame):
+        self.send_calls.append(frame)
+        if len(self.send_calls) == 1:
+            _BlockingBridge.started.set()
+            _BlockingBridge.release.wait(5)
+
+
+class _GatedSock(FakeSock):
+    """FakeSock whose reads past the first `gate_after` queued frames wait
+    for `gate` -- lets a test hand the worker its first send and only then
+    let the read loop see the rest, so queue occupancy is deterministic."""
+
+    def __init__(self, queued_frames, gate, gate_after):
+        super().__init__(queued_frames)
+        buf = io.BytesIO()
+        for obj in queued_frames[:gate_after]:
+            relay_ipc.write_frame(buf, obj)
+        self._gate_at = buf.tell()
+        self._gate = gate
+
+    def read(self, n):
+        if self._in.tell() >= self._gate_at:
+            self._gate.wait(5)
+        return super().read(n)
+
+
+def _run_blocking(frames, holder):
+    """Run run_plugin on a thread with a _BlockingBridge. The first send is
+    handed to the worker before any later frame is read; returns the thread."""
+    _BlockingBridge.started.clear()
+    _BlockingBridge.release.clear()
+    sock = _GatedSock([HELLO_ACK_OK, *frames, {"t": "ping"}],
+                      _BlockingBridge.started, gate_after=2)
+
+    def factory(cfg, s):
+        holder["b"] = _BlockingBridge(cfg, s)
+        return holder["b"]
+
+    def run():
+        with mock.patch.dict(os.environ, _env(**{CONFIG_ENV: "{}"}), clear=True):
+            try:
+                run_plugin("p", "1.0", factory, relay_ipc.capabilities(),
+                           socket_env=SOCKET_ENV, config_env=CONFIG_ENV,
+                           connect=lambda path: sock)
+            except SystemExit:
+                pass
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
+
+
+def _wait_for_pong(bridge):
+    deadline = time.time() + 5
+    while time.time() < deadline and not any(f.get("t") == "pong" for f in bridge.sent):
+        time.sleep(0.01)
+    return any(f.get("t") == "pong" for f in bridge.sent)
+
+
+def _wait_for_sends(bridge, count):
+    deadline = time.time() + 5
+    while time.time() < deadline and len(bridge.send_calls) < count:
+        time.sleep(0.01)
+    return [f["corr"] for f in bridge.send_calls]
+
+
+class SendDedupIntegrationTests(unittest.TestCase):
+    def test_redispatch_of_an_in_flight_corr_is_dispatched_once(self):
+        holder = {}
+        t = _run_blocking([
+            {"t": "send", "corr": 1, "endpoint": "x", "body": "a"},
+            {"t": "send", "corr": 1, "endpoint": "x", "body": "a"},  # daemon re-dispatch
+            {"t": "send", "corr": 2, "endpoint": "x", "body": "b"},
+        ], holder)
+        self.assertTrue(_BlockingBridge.started.wait(5))
+        self.assertTrue(_wait_for_pong(holder["b"]), "read loop must keep answering pings")
+        _BlockingBridge.release.set()
+        t.join(5)
+        corrs = _wait_for_sends(holder["b"], 2)
+        self.assertEqual(corrs, [1, 2], "the duplicate corr 1 must not be sent twice")
+
+    def test_overflow_answers_delivery_result_plugin_busy(self):
+        holder = {}
+        with mock.patch.object(runner, "SEND_QUEUE_MAX", 1):
+            t = _run_blocking([
+                {"t": "send", "corr": 1, "endpoint": "x", "body": "a"},  # in flight (blocked)
+                {"t": "send", "corr": 2, "endpoint": "x", "body": "b"},  # queued (fills the bound)
+                {"t": "send", "corr": 3, "endpoint": "x", "body": "c"},  # overflow
+            ], holder)
+            self.assertTrue(_BlockingBridge.started.wait(5))
+            self.assertTrue(_wait_for_pong(holder["b"]))
+            busy = [f for f in holder["b"].sent if f.get("t") == "delivery_result"]
+            self.assertEqual(busy, [relay_ipc.delivery_result(3, False, "plugin busy")])
+            _BlockingBridge.release.set()
+            t.join(5)
+        corrs = _wait_for_sends(holder["b"], 2)
+        self.assertEqual(corrs, [1, 2])
 
 
 if __name__ == "__main__":

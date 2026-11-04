@@ -87,6 +87,57 @@ class CodecTests(unittest.TestCase):
         self.assertEqual(decoded["attachments"], [att])
         self.assertEqual(decoded["body"], "hi")
 
+    def test_inbound_non_numeric_timestamp_falls_back_to_none(self):
+        # datetime.fromtimestamp("abc") raises TypeError, not ValueError;
+        # a sender-controlled timestamp must never drop the whole message.
+        for ts in ["abc", b"1", [1], {"t": 1}]:
+            with self.subTest(ts=ts):
+                msg = relay_ipc.inbound("chan", "s", "hi", ts)
+                self.assertIsNone(msg["created_at"])
+                self.assertEqual(msg["body"], "hi")
+
+    def test_inbound_rejects_non_str_sender(self):
+        # A wrong-typed field fails CBOR decode daemon-side, which drops the
+        # connection and restarts the plugin: fail here (one dropped
+        # message) instead.
+        for sender in [123, None, b"s", ["s"], 1.5, True]:
+            with self.subTest(sender=sender):
+                with self.assertRaises(ValueError):
+                    relay_ipc.inbound("chan", sender, "hi")
+
+    def test_inbound_rejects_non_str_body(self):
+        for body in [123, None, b"hi", ["hi"], {"b": 1}]:
+            with self.subTest(body=body):
+                with self.assertRaises(ValueError):
+                    relay_ipc.inbound("chan", "s", body)
+
+    def test_inbound_rejects_non_str_endpoint(self):
+        with self.assertRaises(ValueError):
+            relay_ipc.inbound(7, "s", "hi")
+
+    def test_inbound_rejects_non_bytes_attachment_data(self):
+        for data in ["text", 123, None, [1, 2], 1.5]:
+            with self.subTest(data=data):
+                att = relay_ipc.attachment("a.bin", "application/octet-stream", data)
+                with self.assertRaises(ValueError):
+                    relay_ipc.inbound("chan", "s", "hi", attachments=[att])
+
+    def test_inbound_accepts_bytearray_attachment_data(self):
+        att = relay_ipc.attachment("a.bin", "application/octet-stream", bytearray(b"\x01"))
+        msg = relay_ipc.inbound("chan", "s", "hi", attachments=[att])
+        self.assertEqual(msg["attachments"][0]["data"], bytearray(b"\x01"))
+
+    def test_inbound_rejects_non_str_attachment_filename_or_mime(self):
+        with self.assertRaises(ValueError):
+            relay_ipc.inbound("chan", "s", "hi",
+                              attachments=[relay_ipc.attachment(None, "text/plain", b"x")])
+        with self.assertRaises(ValueError):
+            relay_ipc.inbound("chan", "s", "hi",
+                              attachments=[relay_ipc.attachment("a.txt", 5, b"x")])
+        with self.assertRaises(ValueError):
+            relay_ipc.inbound("chan", "s", "hi", attachments=["not a dict"])
+
+
     def test_send_direct_frame_roundtrips(self):
         # SendDirect is daemon->plugin only; plugins never build/emit it
         # (no relay_ipc helper for it), only read it off the wire.

@@ -111,8 +111,9 @@ def parse_uplink(topic, event, by_index, gateway_id):
 
     Channel mapping: event["channel"] is looked up in by_index; unmapped returns None.
 
-    Sender resolution: prefers event.get("sender"), falls back to f"!{event['from']:08x}" if
-    'from' field is present, else None (drops message).
+    Sender resolution: f"!{event['from'] & 0xFFFFFFFF:08x}" when 'from' is an int (the
+    originating node), else event["sender"] if it is a non-empty str (the uplinking
+    gateway), else None (drops message).
 
     Text validation: event["type"] must be "text", and payload["text"] must be
     non-empty string, else None.
@@ -137,14 +138,16 @@ def parse_uplink(topic, event, by_index, gateway_id):
         return None
     name = by_index[channel_idx]
 
-    # Sender resolution
+    # Sender resolution: "from" is the originating node number; "sender" is
+    # the uplinking gateway's id, only a fallback. Both come from whoever can
+    # publish on the broker, so enforce types -- a non-str sender would fail
+    # CBOR decode daemon-side and crash-loop the plugin on a retained message.
+    from_val = event.get("from")
     sender = event.get("sender")
-    if sender is None:
-        from_val = event.get("from")
-        if from_val is not None:
-            sender = f"!{from_val:08x}"
-        else:
-            return None
+    if isinstance(from_val, int) and not isinstance(from_val, bool):
+        sender = f"!{from_val & 0xFFFFFFFF:08x}"
+    elif not (isinstance(sender, str) and sender):
+        return None
 
     # Gateway filter (if gateway_id is set, check last topic segment)
     if gateway_id is not None:

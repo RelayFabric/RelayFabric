@@ -47,8 +47,10 @@ plugins:
 ```
 
 Set `gateway_id` when more than one node on the mesh uplinks to this broker; otherwise each
-message arrives once per gateway node (each with a different `sender`) — bounded duplicates,
-not a loop.
+message arrives once per gateway node — bounded duplicates, not a loop. The bridged `sender`
+is the originating node (`!<from node number, hex>`); the JSON `sender` field (the uplinking
+gateway) is only used when `from` is absent, and a message carrying neither as a usable value
+is dropped.
 
 ## Loop guard
 

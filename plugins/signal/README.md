@@ -71,8 +71,12 @@ decode, downscale, or transcode anything itself.
   (daemon -> Signal) attachments over this size are dropped with a
   `[dropped <name>: N B over M B limit]` note appended to the message body.
 - Outbound attachments are written to a fresh `tempfile.mkdtemp()`
-  directory (basename-sanitized filenames), referenced by signal-cli's
-  JSON-RPC `send`, and the directory is removed once the send returns.
+  directory, one subdirectory per attachment so same-named files never
+  overwrite each other, referenced by signal-cli's JSON-RPC `send`, and the
+  directory is removed once the send returns. File names are reduced to
+  `[A-Za-z0-9._-]` (basename only, no leading dots, at most 128 chars) and a
+  degenerate name (`""`, `.`, `..`, `x/`) becomes `file`, so a crafted
+  filename cannot make the send fail on every retry.
 
 No optional dependencies (Pillow/pycodec2/ffmpeg) are needed by this
 plugin — it forwards attachment bytes as-is. Those matter on the LXMF side:

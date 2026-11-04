@@ -220,7 +220,9 @@ def normalize_event(event, sub_id, subid_to_channel):
         return None
 
     content = event.get("content")
-    if not content:
+    # verify_event already enforces str; keep the check here too, so a
+    # non-str content can never reach the daemon as a wrong CBOR type.
+    if not content or not isinstance(content, str):
         return None
 
     sender = f"bitchat:{event['pubkey']}"
@@ -352,7 +354,8 @@ class BitchatBackend:
         """
         try:
             msg = json.loads(raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
+            # RecursionError: a deeply nested payload (json's recursion guard)
             return
         if not isinstance(msg, list) or not msg:
             return

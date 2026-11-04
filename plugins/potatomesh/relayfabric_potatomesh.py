@@ -95,6 +95,11 @@ DEVICE_METRICS_CAMEL = {
 
 BROADCAST_NUM = 0xFFFFFFFF
 
+# Cap on Mapper's per-node aggregate: it is keyed by the remote-controlled
+# `from`, so a flood of node numbers would otherwise grow it without bound.
+# Past the cap the node with the oldest lastHeard is evicted.
+MAX_NODES = 4096
+
 
 def load_config(raw):
     """Load and validate PotatoMesh plugin configuration.
@@ -221,7 +226,11 @@ class Mapper:
     def _node_upsert(self, event, from_num, **fields):
         """Update the per-node aggregate and build the /api/nodes post."""
         node_id = canonical_node_id(from_num)
-        entry = self.nodes.setdefault(node_id, {"num": from_num & 0xFFFFFFFF})
+        entry = self.nodes.get(node_id)
+        if entry is None:
+            if len(self.nodes) >= MAX_NODES:
+                self._evict_oldest()
+            entry = self.nodes[node_id] = {"num": from_num & 0xFFFFFFFF}
         entry["lastHeard"] = self._rx_time(event)
         if _finite(event.get("snr")):
             entry["snr"] = event["snr"]
@@ -235,6 +244,11 @@ class Mapper:
         if isinstance(sender, str) and sender:
             wrapper["ingestor"] = sender
         return ("/api/nodes", wrapper)
+
+    def _evict_oldest(self):
+        # O(n) once per new node at the cap -- fine at mesh scale.
+        oldest = min(self.nodes, key=lambda k: self.nodes[k].get("lastHeard", 0))
+        del self.nodes[oldest]
 
     # ----- per-type mapping -----
 

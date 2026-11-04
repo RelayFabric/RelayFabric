@@ -210,6 +210,15 @@ class NormalizeEventTests(unittest.TestCase):
         self.assertIsNone(
             plug.normalize_event(event, "sub-unknown", self.channels_by_sub))
 
+    def test_non_string_content_dropped_even_when_verify_passes(self):
+        # Belt and braces with nip01.verify_event's own type check: a
+        # non-str content would fail CBOR decode daemon-side and restart
+        # the plugin, with a stored kind-1 event replaying it forever.
+        event = self._signed(content=123)
+        with mock.patch("relayfabric_sdk.nip01.verify_event", return_value=True):
+            self.assertIsNone(
+                plug.normalize_event(event, "sub-regional", self.channels_by_sub))
+
     def test_malformed_event_dropped_not_raised(self):
         try:
             result = plug.normalize_event({"kind": 1}, "sub-regional",
@@ -439,6 +448,31 @@ class HandleMessageTests(unittest.TestCase):
             self.fail(f"_handle_message raised {e!r}")
         self.assertEqual(self.backend._queue.qsize(), 0)
 
+    def test_deeply_nested_json_does_not_raise(self):
+        # json.loads raises RecursionError (not ValueError) on this; letting
+        # it escape kills the relay task, permanently if the relay re-sends.
+        raw = "[" * 100000 + "]" * 100000
+        try:
+            self.backend._handle_message(raw)
+        except RecursionError as e:
+            self.fail(f"_handle_message raised {e!r}")
+        self.assertEqual(self.backend._queue.qsize(), 0)
+
+    def test_good_event_advances_last_seen_for_its_subscription(self):
+        event = self._signed_event(created_at=1700000150)
+        self.backend._handle_message(json.dumps(["EVENT", "rf-regional", event]))
+        self.assertEqual(self.backend._last_seen["rf-regional"], 1700000150)
+        older = self._signed_event(created_at=1700000120)
+        self.backend._handle_message(json.dumps(["EVENT", "rf-regional", older]))
+        self.assertEqual(self.backend._last_seen["rf-regional"], 1700000150)
+
+    def test_far_future_created_at_does_not_advance_last_seen(self):
+        # A relay (or any author) could otherwise push `since` past "now"
+        # and blind the subscription to every later real event.
+        event = self._signed_event(created_at=int(time.time()) + 86400)
+        self.backend._handle_message(json.dumps(["EVENT", "rf-regional", event]))
+        self.assertNotIn("rf-regional", self.backend._last_seen)
+
     def test_non_list_frame_does_not_raise(self):
         try:
             self.backend._handle_message(json.dumps({"not": "a list"}))
@@ -469,6 +503,28 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(self.backend._queue.qsize(), 1)
         _channel, _sender, text, _ts = self.backend._queue.get_nowait()
         self.assertEqual(text, "first")
+
+
+class SubscriptionSinceTests(unittest.TestCase):
+    """Every (re)subscribe REQ carries `since`: without it a relay replays
+    its stored history into every routed network on each reconnect."""
+
+    def test_fresh_subscription_overlaps_a_little_before_now(self):
+        filt = plug.subscription_filter({"kinds": [1]}, None, now=1700001000)
+        self.assertEqual(filt, {"kinds": [1], "since": 1700001000 - plug.SUBSCRIBE_OVERLAP_SECS})
+
+    def test_resubscribe_resumes_from_last_seen(self):
+        filt = plug.subscription_filter({"kinds": [1]}, 1700000900, now=1700001000)
+        self.assertEqual(filt["since"], 1700000900)
+
+    def test_operator_since_is_left_alone(self):
+        filt = plug.subscription_filter({"kinds": [1], "since": 5}, 1700000900, now=1700001000)
+        self.assertEqual(filt["since"], 5)
+
+    def test_input_filter_is_not_mutated(self):
+        base = {"kinds": [1]}
+        plug.subscription_filter(base, None, now=1700001000)
+        self.assertEqual(base, {"kinds": [1]})
 
 
 class FakeSendOnlyWs:
@@ -616,11 +672,31 @@ class NostrBackendStartIntegrationTests(unittest.TestCase):
         req = json.loads(fake_ws.sent[0])
         self.assertEqual(req[0], "REQ")
         self.assertEqual(req[1], "rf-regional")
+        since = req[2].pop("since")
         self.assertEqual(req[2], {"kinds": [1], "#t": ["pasadena"]})
+        self.assertAlmostEqual(since, int(time.time()) - plug.SUBSCRIBE_OVERLAP_SECS, delta=5)
 
         channel, _sender, text, _ts = backend._queue.get_nowait()
         self.assertEqual(channel, "regional")
         self.assertEqual(text, "integration hello")
+
+    def test_resubscribe_req_resumes_from_the_last_seen_created_at(self):
+        cfg = loaded_cfg()
+        fake_ws = FakeWebSocket(scripted_frames=[])
+        fake_module = types.ModuleType("websockets")
+        fake_module.connect = lambda url, **kw: fake_ws
+
+        backend = plug.NostrBackend(cfg["relays"], cfg["channels"], IDENTITY)
+        backend._last_seen["rf-regional"] = 1700000300  # as left by a prior connection
+        with mock.patch.dict(sys.modules, {"websockets": fake_module}):
+            backend.start()
+        self.addCleanup(_stop_and_close_loop, backend._loop)
+
+        deadline = time.time() + 2
+        while not fake_ws.sent and time.time() < deadline:
+            time.sleep(0.01)
+        req = json.loads(fake_ws.sent[0])
+        self.assertEqual(req[2]["since"], 1700000300)
 
 
 class FakeBackend:

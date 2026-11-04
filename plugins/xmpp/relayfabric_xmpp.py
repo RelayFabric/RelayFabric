@@ -99,6 +99,23 @@ def looks_like_jid(ref):
     return bool(local) and bool(domain) and not any(c.isspace() for c in ref)
 
 
+def muc_sender(room, nick, occupant_jid=None):
+    """Sender id for a MUC message.
+
+    A nick is attacker-chosen and may legally contain '@', so a bare nick is
+    never emitted: nick `victim@example.com` would share the identity
+    namespace (links, HMAC alias, rate-limit bucket, link-challenge match)
+    with the real DM sender `victim@example.com`. Prefer the occupant's real
+    bare JID when the room exposes it (non-anonymous rooms); otherwise use
+    the occupant id `room@conf/nick`, whose '/' a bare JID can never carry.
+    """
+    if occupant_jid:
+        bare = str(occupant_jid).split("/", 1)[0]
+        if bare:
+            return bare
+    return f"{room}/{nick}"
+
+
 class XmppBackend:
     """slixmpp transport on a private asyncio loop thread.
 
@@ -124,6 +141,10 @@ class XmppBackend:
         self._loop = None
         self._xmpp = None
         self._start_error = None
+        # Set on session_start, cleared on disconnect: a stanza handed to
+        # slixmpp while no session is up is parked or discarded, so sends
+        # are refused (-> delivered:false, daemon retries) until it is back.
+        self._session_up = False
 
     def start(self):
         import slixmpp  # lazy: keeps module import stdlib-only (see module docstring)
@@ -139,6 +160,7 @@ class XmppBackend:
                 xmpp.register_plugin("xep_0045")  # multi-user chat
                 xmpp.register_plugin("xep_0199")  # ping (keepalive)
                 xmpp.add_event_handler("session_start", self._on_session_start)
+                xmpp.add_event_handler("disconnected", self._on_disconnected)
                 xmpp.add_event_handler("groupchat_message", self._on_muc_message)
                 xmpp.add_event_handler("message", self._on_message)
                 xmpp.add_event_handler("failed_auth", self._on_failed_auth)
@@ -163,20 +185,35 @@ class XmppBackend:
         muc = self._xmpp.plugin["xep_0045"]
         for room in self._rooms:
             muc.join_muc(room, self._nick)
+        self._session_up = True
         log.info(f"XMPP session started; joined {len(self._rooms)} room(s)")
+
+    def _on_disconnected(self, reason):
+        self._session_up = False
+        log.warning(f"XMPP disconnected ({reason}); refusing sends until the session is back")
+
+    def _occupant_jid(self, room, nick):
+        # Only present when the room is non-anonymous (or we are a moderator
+        # in a semi-anonymous one); None otherwise.
+        try:
+            return self._xmpp.plugin["xep_0045"].get_jid_property(room, nick, "jid")
+        except Exception:  # noqa: BLE001 - lookup is best-effort
+            return None
 
     def _on_muc_message(self, msg):
         # Drop our own reflected messages; the bridge's SentCache is a second
         # echo guard on (channel, text).
-        if msg["mucnick"] == self._nick:
+        nick = msg["mucnick"]
+        if nick == self._nick:
             return
         body = msg["body"]
         if not body:
             return
+        room = msg["from"].bare
         self._enqueue({
             "kind": "muc",
-            "room": msg["from"].bare,
-            "sender": msg["mucnick"],
+            "room": room,
+            "sender": muc_sender(room, nick, self._occupant_jid(room, nick)),
             "text": body,
         })
 
@@ -211,15 +248,19 @@ class XmppBackend:
     def queue_depth(self):
         return self._queue.qsize()
 
-    def send_muc(self, room, text):
+    def _require_session(self):
         if self._loop is None or self._xmpp is None:
             raise RuntimeError("xmpp backend not started")
+        if not self._session_up:
+            raise RuntimeError("xmpp session not established")
+
+    def send_muc(self, room, text):
+        self._require_session()
         self._loop.call_soon_threadsafe(
             lambda: self._xmpp.send_message(mto=room, mbody=text, mtype="groupchat"))
 
     def send_chat(self, jid, text):
-        if self._loop is None or self._xmpp is None:
-            raise RuntimeError("xmpp backend not started")
+        self._require_session()
         self._loop.call_soon_threadsafe(
             lambda: self._xmpp.send_message(mto=jid, mbody=text, mtype="chat"))
 

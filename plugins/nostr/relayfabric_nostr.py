@@ -36,6 +36,15 @@ PLUGIN_VERSION = "0.1.0"
 # max_text_bytes.
 NOSTR_MAX_PAYLOAD = 280
 
+# Every (re)subscribe REQ carries `since` (unless the operator's filter sets
+# one): a relay otherwise replays its stored history into every routed
+# network on each reconnect. A fresh subscription overlaps this many seconds
+# before "now"; a resubscribe resumes from the newest created_at seen.
+SUBSCRIBE_OVERLAP_SECS = 60
+# created_at further than this past "now" is not tracked as last-seen, so a
+# far-future event cannot push `since` past the present and blind us.
+FUTURE_SKEW_SECS = 900
+
 
 def load_config(raw):
     """Load and validate Nostr plugin configuration (design Sec2).
@@ -136,13 +145,26 @@ def normalize_event(event, sub_id, channels_by_sub):
     if not verify_event(event):
         return None
     content = event.get("content")
-    if not content:
+    # verify_event already enforces str; keep the check here too, so a
+    # non-str content can never reach the daemon as a wrong CBOR type.
+    if not content or not isinstance(content, str):
         return None
     channel = channels_by_sub.get(sub_id)
     if channel is None:
         return None
     sender = f"nostr:{event['pubkey']}"
     return channel, sender, content, event["created_at"]
+
+
+def subscription_filter(base_filter, last_seen, now=None):
+    """The REQ filter for one (re)subscribe: `base_filter` plus `since`
+    (see SUBSCRIBE_OVERLAP_SECS) unless the operator already set one.
+    Never mutates `base_filter`."""
+    filt = dict(base_filter)
+    if "since" not in filt:
+        now = int(time.time()) if now is None else now
+        filt["since"] = last_seen if last_seen is not None else now - SUBSCRIBE_OVERLAP_SECS
+    return filt
 
 
 def hello_max_payload(cfg):
@@ -172,7 +194,8 @@ class NostrBackend:
 
     Inbound: on each (re)connect, sends `["REQ", subid, filter]` for every
     channel whose relay set includes that relay (subid = "rf-<channel>", a
-    stable per-channel id -- see __init__); the read loop parses each
+    stable per-channel id -- see __init__; the filter gets a `since`, see
+    subscription_filter, so a reconnect does not replay relay history); the read loop parses each
     incoming frame via _handle_message, which normalizes `["EVENT", subid,
     event]` frames (verifying the event's schnorr sig -- design Sec80, a
     relay is untrusted) into a bounded queue.Queue(256), drop-newest with a
@@ -203,6 +226,8 @@ class NostrBackend:
         self._subid_to_channel = {f"rf-{name}": name for name in self.channels}
         self._channel_to_subid = {name: subid for subid, name in
                                    self._subid_to_channel.items()}
+        # subid -> newest created_at bridged; the `since` of its next REQ.
+        self._last_seen = {}
         self._relay_channels = {}
         for name, spec in self.channels.items():
             for relay_url in (spec.get("relays") or self.relays):
@@ -239,7 +264,8 @@ class NostrBackend:
                     backoff = 1
                     for name in self._relay_channels[relay_url]:
                         subid = self._channel_to_subid[name]
-                        filt = self.channels[name]["filter"]
+                        filt = subscription_filter(self.channels[name]["filter"],
+                                                   self._last_seen.get(subid))
                         await ws.send(json.dumps(["REQ", subid, filt]))
                     async for raw in ws:
                         self._handle_message(raw)
@@ -258,7 +284,8 @@ class NostrBackend:
         """
         try:
             msg = json.loads(raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
+            # RecursionError: a deeply nested payload (json's recursion guard)
             return
         if not isinstance(msg, list) or not msg:
             return
@@ -275,6 +302,7 @@ class NostrBackend:
                 return
             if parsed is None:
                 return
+            self._note_seen(sub_id, parsed[3])
             try:
                 self._queue.put_nowait(parsed)
             except queue.Full:
@@ -286,6 +314,14 @@ class NostrBackend:
         elif kind == "NOTICE":
             log.debug(f"nostr NOTICE: {msg[1:]}")
         # unknown message kind: ignore
+
+    def _note_seen(self, sub_id, created_at):
+        # created_at is a verified int (nip01.verify_event); clamp against
+        # the future so no author can push the next `since` past "now".
+        if created_at > int(time.time()) + FUTURE_SKEW_SECS:
+            return
+        if created_at > self._last_seen.get(sub_id, -1):
+            self._last_seen[sub_id] = created_at
 
     def events(self):
         """Yield normalized (channel, sender, text, ts) tuples from the

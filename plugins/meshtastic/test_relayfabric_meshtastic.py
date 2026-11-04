@@ -328,6 +328,47 @@ class ParserTests(unittest.TestCase):
         )
         self.assertIsNone(result)
 
+    def _parse(self, event):
+        cfg = plug.load_config({
+            "broker": "localhost",
+            "topic_root": "msh",
+            "channels": {"primary": {"index": 0, "topic_channel": "ch-0"}}
+        })
+        base = {"type": "text", "payload": {"text": "hello"}, "channel": 0}
+        base.update(event)
+        return plug.parse_uplink("msh/2/json/ch-0/!12345678", base,
+                                 plug.channels_by_index(cfg), "!12345678")
+
+    def test_sender_derived_from_originating_node_not_gateway(self):
+        # Meshtastic's JSON "sender" is the uplinking gateway, not the
+        # message originator; "from" is the originator's node number.
+        result = self._parse({"from": 0xabcdef01, "sender": "!12345678"})
+        self.assertIsNotNone(result)
+        self.assertEqual(result[1], "!abcdef01")
+
+    def test_from_is_masked_to_32_bits(self):
+        result = self._parse({"from": 0x1_abcdef01})
+        self.assertEqual(result[1], "!abcdef01")
+
+    def test_non_string_sender_without_from_dropped(self):
+        # A publisher on a shared broker can send any JSON type; a non-str
+        # sender would fail CBOR decode daemon-side and crash-loop the plugin
+        # (a retained message re-triggers it on every restart).
+        for bad in [123, 1.5, None, True, [], {}, ""]:
+            with self.subTest(sender=bad):
+                self.assertIsNone(self._parse({"sender": bad}))
+
+    def test_non_int_from_falls_back_to_string_sender(self):
+        result = self._parse({"from": "!abcdef01", "sender": "!12345678"})
+        self.assertIsNotNone(result)
+        self.assertEqual(result[1], "!12345678")
+
+    def test_bool_from_is_not_a_node_number(self):
+        self.assertIsNone(self._parse({"from": True}))
+
+    def test_non_int_from_without_string_sender_dropped(self):
+        self.assertIsNone(self._parse({"from": "abc", "sender": 7}))
+
     def test_textless_dropped(self):
         cfg = plug.load_config({
             "broker": "localhost",

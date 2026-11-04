@@ -18,8 +18,38 @@ import hashlib
 import json
 import logging
 import os
+import re
 
 log = logging.getLogger(__name__)
+
+_HEX32 = re.compile(r"[0-9a-f]{64}")
+_HEX64 = re.compile(r"[0-9a-f]{128}")
+
+
+def _is_int(value):
+    # bool is an int subclass but serializes as true/false, never a NIP-01 int
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _well_typed(event):
+    """NIP-01 field types, checked BEFORE hashing: the canonical
+    serialization signs a non-string content or a string created_at just as
+    happily, so a correctly-signed but mistyped event would otherwise verify
+    and reach the daemon as the wrong CBOR type (decode failure there drops
+    the connection and restarts the plugin, and a stored event replays on
+    every resubscribe). Hex fields are lowercase per NIP-01."""
+    return (
+        isinstance(event, dict)
+        and isinstance(event.get("id"), str) and _HEX32.fullmatch(event["id"]) is not None
+        and isinstance(event.get("pubkey"), str) and _HEX32.fullmatch(event["pubkey"]) is not None
+        and isinstance(event.get("sig"), str) and _HEX64.fullmatch(event["sig"]) is not None
+        and _is_int(event.get("created_at"))
+        and _is_int(event.get("kind"))
+        and isinstance(event.get("tags"), list)
+        and all(isinstance(tag, list) and all(isinstance(v, str) for v in tag)
+                for tag in event["tags"])
+        and isinstance(event.get("content"), str)
+    )
 
 
 def event_id(pubkey_hex, created_at, kind, tags, content):
@@ -39,6 +69,10 @@ def verify_event(event):
     """True iff event's id matches the recomputed NIP-01 sha256 AND its
     schnorr sig verifies (BIP-340) over that id, under event['pubkey'].
 
+    Field types are enforced first (see _well_typed): a signed event whose
+    content is not a str, whose created_at/kind is not an int, or whose tags
+    are not a list of lists of str is invalid regardless of its signature.
+
     MUST NOT raise: a relay sends arbitrary dicts (design Sec80 -- a relay
     is untrusted), so any KeyError/TypeError/ValueError from a malformed or
     adversarial event (missing keys, wrong types, non-hex/wrong-length
@@ -46,6 +80,8 @@ def verify_event(event):
     invalid event, never propagated.
     """
     try:
+        if not _well_typed(event):
+            return False
         pubkey_hex = event["pubkey"]
         created_at = event["created_at"]
         kind = event["kind"]
