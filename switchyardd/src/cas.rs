@@ -116,7 +116,15 @@ impl Cas {
                 "cas budget exceeded",
             ));
         }
-        let tmp = self.dir.join(format!(".{sha}.{}.tmp", std::process::id()));
+        // Unique per writer: two tasks putting the same bytes at once must
+        // not share a tmp name, or one's rename could publish the other's
+        // half-written file under a valid sha.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let tmp = self.dir.join(format!(
+            ".{sha}.{}.{}.tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::write(&tmp, data)?;
         std::fs::rename(&tmp, &dest)?;
         self.total_bytes.fetch_add(size, Ordering::Relaxed);
@@ -136,7 +144,17 @@ impl Cas {
     /// Rehydrates a blob's bytes for egress (`engine::load_attachments`
     /// reads accepted attachments back out here to build an outgoing Send).
     pub fn get(&self, sha: &str) -> io::Result<Vec<u8>> {
-        std::fs::read(self.path_for(sha)?)
+        let data = std::fs::read(self.path_for(sha)?)?;
+        // Content-addressed means the name IS the integrity check; a blob
+        // that no longer hashes to its name (torn write, disk fault) must
+        // not be handed out as if it did.
+        if hex::encode(Sha256::digest(&data)) != sha {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cas blob does not match its sha256",
+            ));
+        }
+        Ok(data)
     }
 
     /// Idempotent: removing a sha that is already gone (e.g. a duplicate GC
@@ -146,7 +164,7 @@ impl Cas {
     /// remove-then-trust-the-old-size, so a size read that fails (already
     /// gone) simply skips the decrement instead of risking an underflow.
     ///
-    /// The decrement itself is a saturating subtract (via `fetch_update`,
+    /// The decrement itself is a saturating subtract (via `try_update`,
     /// not a plain `fetch_sub`): if `total_bytes` were ever undercounted —
     /// e.g. `existing_bytes`'s startup dir-walk missed a blob, or two
     /// `remove`s raced on the same size — a bare `fetch_sub` could wrap a
@@ -160,11 +178,11 @@ impl Cas {
         match std::fs::remove_file(path) {
             Ok(()) => {
                 if let Some(size) = size {
-                    let _ = self.total_bytes.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |cur| Some(cur.saturating_sub(size)),
-                    );
+                    let _ =
+                        self.total_bytes
+                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                                Some(cur.saturating_sub(size))
+                            });
                 }
                 Ok(())
             }
@@ -191,6 +209,15 @@ mod tests {
         let sha = c.put(b"hello world").unwrap();
         assert_eq!(sha, hex::encode(Sha256::digest(b"hello world")));
         assert_eq!(c.get(&sha).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn get_refuses_a_blob_that_no_longer_matches_its_sha() {
+        let (_d, c) = cas();
+        let sha = c.put(b"intact").unwrap();
+        std::fs::write(c.dir.join(&sha), b"torn").unwrap();
+        let err = c.get(&sha).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

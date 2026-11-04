@@ -305,6 +305,27 @@ pub struct FedChannel<S> {
     /// tolerated for robustness) a Noise message happened to carry the tail
     /// of one frame and the head of the next.
     rx_buf: Vec<u8>,
+    /// The Noise message currently being pulled off the wire, kept here
+    /// rather than in `pull_chunk`'s locals so a `recv_frame` future that
+    /// is dropped mid-message (it runs inside `fed::conn::run_conn`'s
+    /// `tokio::select!`, whose other branches win at arbitrary byte
+    /// boundaries) resumes exactly where it left off on the next call.
+    partial: PartialRead,
+}
+
+/// Resumable partial-read state for one length-prefixed Noise message:
+/// `hdr`/`hdr_filled` for the 2-byte BE length prefix, then `body`
+/// (sized from it once complete)/`body_filled` for the ciphertext. Each
+/// `AsyncReadExt::read` into these is individually cancel-safe (tokio's
+/// own guarantee: a dropped `read` has consumed nothing), so dropping the
+/// future between reads loses no bytes -- unlike `read_exact`, which
+/// surrenders its partial progress on drop.
+#[derive(Default)]
+struct PartialRead {
+    hdr: [u8; 2],
+    hdr_filled: usize,
+    body: Vec<u8>,
+    body_filled: usize,
 }
 
 impl<S> FedChannel<S>
@@ -316,6 +337,7 @@ where
             stream,
             transport,
             rx_buf: Vec::new(),
+            partial: PartialRead::default(),
         }
     }
 
@@ -363,7 +385,7 @@ where
     }
 
     async fn pull_chunk(&mut self) -> io::Result<()> {
-        let ct = read_noise_msg(&mut self.stream).await?;
+        let ct = self.read_noise_msg_resumable().await?;
         let mut pt = vec![0u8; ct.len()];
         let n = self
             .transport
@@ -372,6 +394,40 @@ where
         pt.truncate(n);
         self.rx_buf.extend_from_slice(&pt);
         Ok(())
+    }
+
+    /// The transport-phase counterpart to `read_noise_msg` (which stays
+    /// `read_exact`-based for the handshake, where each read runs to
+    /// completion with nothing racing it): one 2-byte-BE-length-prefixed
+    /// Noise message, read through `self.partial` so progress survives
+    /// the future being dropped at any point -- see `PartialRead`. The
+    /// state is reset only once a whole message has been handed back.
+    async fn read_noise_msg_resumable(&mut self) -> io::Result<Vec<u8>> {
+        while self.partial.hdr_filled < 2 {
+            let filled = self.partial.hdr_filled;
+            let n = self.stream.read(&mut self.partial.hdr[filled..]).await?;
+            if n == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            self.partial.hdr_filled += n;
+            if self.partial.hdr_filled == 2 {
+                let len = u16::from_be_bytes(self.partial.hdr) as usize;
+                self.partial.body = vec![0u8; len];
+                self.partial.body_filled = 0;
+            }
+        }
+        let len = self.partial.body.len();
+        while self.partial.body_filled < len {
+            let filled = self.partial.body_filled;
+            let n = self.stream.read(&mut self.partial.body[filled..]).await?;
+            if n == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            self.partial.body_filled += n;
+        }
+        let ct = std::mem::take(&mut self.partial.body);
+        self.partial = PartialRead::default();
+        Ok(ct)
     }
 }
 
@@ -517,6 +573,39 @@ mod tests {
         responder_task.await.unwrap();
     }
 
+    /// A genuine signature under a NON-canonical (uppercase-hex) spelling
+    /// of the signer's own node_id must be refused at the handshake. The
+    /// key bytes are identical either way, but the trust store/config/
+    /// advert checks downstream all compare node_id strings exactly -- a
+    /// blocked peer presenting `rf:ABCD...` would otherwise sail past the
+    /// `blocked` lookup as an unknown node (`node_identity::verify` is
+    /// where the canonical-form rule lives; this proves the handshake
+    /// inherits it).
+    #[tokio::test]
+    async fn non_canonical_uppercase_node_id_in_payload_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (init_key, init_id) = identity_pair(dir.path()).await;
+        let (resp_key, resp_id) = identity_pair(dir.path()).await;
+
+        let upper = resp_id.node_id().to_uppercase().replace("RF:", "rf:");
+        assert_ne!(upper, resp_id.node_id());
+        let payload = IdentityPayload {
+            node_id: upper,
+            sig: resp_id.sign(&domain_separated_static_pub(&resp_key.public_bytes())),
+        };
+        let payload_bytes = encode_payload(&payload).unwrap();
+
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let responder_task =
+            tokio::spawn(
+                async move { fake_responder_with_payload(b, &resp_key, payload_bytes).await },
+            );
+
+        let result = handshake_initiator(a, &init_key, &init_id, None).await;
+        assert!(matches!(result, Err(NoiseError::BadSignature)));
+        responder_task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn expected_node_id_mismatch_is_dropped() {
         let dir = tempfile::tempdir().unwrap();
@@ -600,5 +689,62 @@ mod tests {
 
         let result = b.recv_frame().await;
         assert!(result.is_err());
+    }
+
+    /// `recv_frame` under `tokio::select!` -- the exact shape `fed::conn::
+    /// run_conn` drives it in, where a housekeeping tick or an outbound
+    /// frame can win the select and DROP the in-flight receive future at
+    /// any byte boundary. The frame's bytes trickle in one at a time with a
+    /// pause between them while a competing timer branch keeps canceling
+    /// the receive; the frame must still decode. A `read_exact`-based read
+    /// lost whatever it had read into its local buffers on every cancel,
+    /// so the next attempt misparsed the stream from mid-message, the
+    /// decrypt failed, and the whole link was torn down -- for large or
+    /// bidirectional traffic, that redial + retry was a livelock.
+    #[tokio::test]
+    async fn recv_frame_resumes_after_cancellation_mid_message() {
+        let (mut a, mut b) = duplex_handshake_pair().await;
+
+        // The exact on-wire bytes `send_frame` would produce for this
+        // payload, so they can be written piecemeal below.
+        let payload = b"hello federation";
+        let mut logical = (payload.len() as u32).to_be_bytes().to_vec();
+        logical.extend_from_slice(payload);
+        let mut ct = vec![0u8; logical.len() + NOISE_TAG_LEN];
+        let n = a.transport.write_message(&logical, &mut ct).unwrap();
+        ct.truncate(n);
+        let mut wire = (ct.len() as u16).to_be_bytes().to_vec();
+        wire.extend_from_slice(&ct);
+
+        let writer = tokio::spawn(async move {
+            for byte in wire {
+                a.stream.write_all(&[byte]).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            a // keep the duplex open until the reader is done
+        });
+
+        // Bounded: against a non-resumable read the lost bytes misalign
+        // the stream and the next length prefix is garbage, so the receive
+        // never completes rather than erroring -- a hang, not a failure.
+        let mut cancellations = 0u32;
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    r = b.recv_frame() => break r.unwrap(),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
+                        cancellations += 1;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("recv_frame must resume across cancellations, not wedge");
+        assert_eq!(got, payload);
+        assert!(
+            cancellations > 0,
+            "the competing branch must have canceled at least one partial read"
+        );
+        writer.await.unwrap();
     }
 }

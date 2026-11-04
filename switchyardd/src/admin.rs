@@ -985,15 +985,42 @@ async fn config_put(State(state): State<AdminState>, body: Bytes) -> impl IntoRe
             .map(|(k, v)| (k.clone(), v.command.clone()))
             .collect()
     });
+    let mut errors = Vec::new();
     let rejected = rejected_command_changes(&current_commands, &new_cfg);
     if !rejected.is_empty() {
+        errors.push(format!(
+            "plugin command may not be set or changed via the admin API \
+             (edit the config file and restart the daemon instead): {}",
+            rejected.join(", ")
+        ));
+    }
+    // `node.data_dir` is restart-required, so the API could never apply
+    // it -- and the next start would chmod the new dir and mint fresh
+    // identity keys there. Same refusal as a command change.
+    let current_data_dir = state.daemon.cfg_snapshot(|c| c.node.data_dir.clone());
+    if new_cfg.node.data_dir != current_data_dir {
+        errors.push(
+            "node.data_dir may not be changed via the admin API \
+             (edit the config file and restart the daemon instead)"
+                .to_string(),
+        );
+    }
+    // A new `${file:..}`/`${env:..}` reference would let the API read any
+    // file the daemon can and hand it to a plugin -- see
+    // `rejected_secret_ref_changes`.
+    let current_refs = state.daemon.cfg_snapshot(|c| c.secret_refs());
+    let rejected = rejected_secret_ref_changes(&current_refs, &new_cfg);
+    if !rejected.is_empty() {
+        errors.push(format!(
+            "secret references may not be introduced or moved via the admin API \
+             (edit the config file and restart the daemon instead): {}",
+            rejected.join(", ")
+        ));
+    }
+    if !errors.is_empty() {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"valid": false, "errors": [format!(
-                "plugin command may not be set or changed via the admin API \
-                 (edit the config file and restart the daemon instead): {}",
-                rejected.join(", ")
-            )]})),
+            Json(json!({"valid": false, "errors": errors})),
         );
     }
     let _write_guard = state.write_lock.lock().unwrap();
@@ -1008,6 +1035,27 @@ async fn config_put(State(state): State<AdminState>, body: Bytes) -> impl IntoRe
         StatusCode::OK,
         Json(json!({"applied": true, "restart_required": outcome.restart_required})),
     )
+}
+
+/// Secret references (`${file:..}`/`${env:..}`) an admin-API config write
+/// is trying to introduce, relative to the currently-running config, as
+/// `"<plugin>: ${..}"` entries. A reference is resolved by the daemon and
+/// handed to the plugin process, which presents it to whatever network peer
+/// its config names -- so a config writer who can add `password:
+/// "${file:/var/lib/relayfabric/alias.key}"` to a plugin pointed at a host
+/// they control has a file-read-to-network primitive. Keyed per plugin (not
+/// a global set) so an existing reference can't be moved to a plugin whose
+/// endpoint the writer controls either. Keeping a reference where it is,
+/// or dropping one, is allowed; only the on-disk config file, edited out of
+/// band, may add one -- same posture as `rejected_command_changes`.
+fn rejected_secret_ref_changes(
+    current: &BTreeSet<(String, String)>,
+    new: &crate::config::Config,
+) -> Vec<String> {
+    new.secret_refs()
+        .difference(current)
+        .map(|(plugin, r)| format!("{plugin}: {r}"))
+        .collect()
 }
 
 /// `POST /v1/config/rollback` (design §3): 404 if no `<path>.prev` exists.
@@ -1251,12 +1299,16 @@ struct TraceNotFound {
 )]
 async fn trace(State(d): State<Arc<Daemon>>, AxPath(id): AxPath<Uuid>) -> impl IntoResponse {
     let store = d.store.lock().unwrap();
-    let Ok(Some(env)) = store.get_message(id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "unknown message"})),
-        )
-            .into_response();
+    let env = match store.get_message(id) {
+        Ok(Some(env)) => env,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "unknown message"})),
+            )
+                .into_response();
+        }
+        Err(e) => return storage_error(e),
     };
     // spec §Security invariants: refs masked in every API response, full
     // refs never in GET responses. Ordinary routes' `destination` is a route
@@ -1519,6 +1571,12 @@ async fn create_link(State(d): State<Arc<Daemon>>, body: Bytes) -> impl IntoResp
         Ok(e) => e,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))),
     };
+    // The display name is rendered as a `[tag]\n` prefix on every message
+    // the link covers, so it gets `node.name`'s shape rules: non-empty,
+    // <=64 chars, no control or bidi/invisible spoofing characters.
+    if let Err(e) = validate_display_name(&req.display_name) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e})));
+    }
     match engine::initiate_link(&d, requester, target, &req.display_name) {
         Ok(challenge_id) => (
             StatusCode::ACCEPTED,
@@ -1526,6 +1584,28 @@ async fn create_link(State(d): State<Arc<Daemon>>, body: Bytes) -> impl IntoResp
         ),
         Err(e) => (StatusCode::CONFLICT, Json(json!({"error": e}))),
     }
+}
+
+fn validate_display_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("display_name must not be empty".to_string());
+    }
+    let len = name.chars().count();
+    if len > 64 {
+        return Err(format!(
+            "display_name is {len} characters, over the 64-character limit"
+        ));
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|&c| crate::config::is_unsafe_advert_name_char(c))
+    {
+        return Err(format!(
+            "display_name contains an unsafe character ({c:?}): no control characters, \
+             newlines, or Unicode bidi-control/default-ignorable codepoints allowed"
+        ));
+    }
+    Ok(())
 }
 
 /// `DELETE /v1/identities/link/{id}` (design §Admin API / §22): 204 on
@@ -2148,6 +2228,50 @@ mod tests {
         assert!(rejected_command_changes(&current, &new).is_empty());
     }
 
+    #[test]
+    fn admin_config_write_rejects_introducing_or_moving_a_secret_reference() {
+        std::env::set_var("RF_ADMIN_TEST_REF_X", "x-value");
+        let secret_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(secret_file.path(), "s").unwrap();
+        let file_ref = format!("${{file:{}}}", secret_file.path().display());
+
+        // currently running: only plugin "a" references ${env:RF_ADMIN_TEST_REF_X}
+        let mut current = BTreeSet::new();
+        current.insert(("a".to_string(), "${env:RF_ADMIN_TEST_REF_X}".to_string()));
+
+        // "a" keeps the same reference (fine); "b" picks up the SAME reference
+        // (moved to a plugin whose network endpoint the writer controls) and
+        // "c" introduces a new file reference -- both rejected.
+        let new = cfg_with_plugins(&format!(
+            "  a:\n    enabled: true\n    config:\n      token: \"${{env:RF_ADMIN_TEST_REF_X}}\"\n\
+             \x20 b:\n    enabled: true\n    config:\n      token: \"${{env:RF_ADMIN_TEST_REF_X}}\"\n\
+             \x20 c:\n    enabled: true\n    config:\n      nested:\n        key: \"{file_ref}\"\n",
+        ));
+        let rejected = rejected_secret_ref_changes(&current, &new);
+        assert_eq!(
+            rejected,
+            vec![
+                "b: ${env:RF_ADMIN_TEST_REF_X}".to_string(),
+                format!("c: {file_ref}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn admin_config_write_allows_unchanged_secret_references_and_removals() {
+        std::env::set_var("RF_ADMIN_TEST_REF_Y", "y-value");
+        let mut current = BTreeSet::new();
+        current.insert(("a".to_string(), "${env:RF_ADMIN_TEST_REF_Y}".to_string()));
+        current.insert(("b".to_string(), "${env:RF_ADMIN_TEST_REF_Y}".to_string()));
+
+        // "a" keeps its reference, "b" drops it, a literal value is not a reference.
+        let new = cfg_with_plugins(
+            "  a:\n    enabled: false\n    config:\n      token: \"${env:RF_ADMIN_TEST_REF_Y}\"\n\
+             \x20 b:\n    enabled: true\n    config:\n      token: literal\n",
+        );
+        assert!(rejected_secret_ref_changes(&current, &new).is_empty());
+    }
+
     /// Shadows `super::router` (now `fn(Arc<Daemon>, PathBuf) -> Router`)
     /// for the pre-Task-3 call sites in this module, none of which exercise
     /// a config_path-reading endpoint — a path that's guaranteed not to
@@ -2389,6 +2513,25 @@ mod tests {
         assert!(body.contains("\"deliveries\""));
         let (code, _) = get(router(d), &format!("/v1/messages/{}", uuid::Uuid::now_v7())).await;
         assert_eq!(code, 404);
+    }
+
+    /// A storage failure on the message lookup must be a 500, not a 404
+    /// that reads as "no such message" (audit: fail-quiet control plane).
+    #[tokio::test]
+    async fn trace_returns_500_not_404_when_storage_fails() {
+        let d = daemon();
+        // Break the store from outside: rename the table under the daemon's
+        // own connection so the next lookup errors instead of finding nothing.
+        let db = d
+            .cfg_snapshot(|c| c.node.data_dir.clone())
+            .join("relayfabric.db");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("ALTER TABLE messages RENAME TO messages_broken")
+            .unwrap();
+        let (code, body) = get(router(d), &format!("/v1/messages/{}", uuid::Uuid::now_v7())).await;
+        assert_eq!(code, 500, "body was: {body}");
+        assert!(body.contains("storage error"), "body was: {body}");
     }
 
     /// Each delivery in a trace must carry its numeric priority rank (spec
@@ -2909,6 +3052,52 @@ policies:
             !resp_body.contains("target-secret"),
             "target ref must never leak in the 409 body: {resp_body}"
         );
+    }
+
+    /// `display_name` is rendered as a `[tag]\n` prefix on every message
+    /// the link covers, so it gets the same shape rules as `node.name`:
+    /// non-empty after trim, at most 64 chars, no control or bidi/
+    /// invisible spoofing characters. 400, never forwarded to the engine.
+    #[tokio::test]
+    async fn post_identities_link_returns_400_for_an_invalid_display_name() {
+        let d = daemon();
+        let _rx_a = crate::engine::tests_support::register_direct_plugin(&d, "mocka");
+        for bad in [
+            "",
+            "   ",
+            &"x".repeat(65),
+            "a\nb",
+            "a\u{202E}b",
+            "tab\there",
+        ] {
+            let body = serde_json::json!({
+                "requester": "mockb:!req",
+                "target": "mocka:!target",
+                "display_name": bad,
+            })
+            .to_string();
+            let (code, resp_body) = req(
+                router(d.clone()),
+                "POST",
+                "/v1/identities/link",
+                Some(&body),
+            )
+            .await;
+            assert_eq!(code, 400, "{bad:?}: body was: {resp_body}");
+            assert!(
+                resp_body.contains("display_name"),
+                "{bad:?}: body was: {resp_body}"
+            );
+        }
+        // the boundary value is accepted and reaches the engine
+        let body = serde_json::json!({
+            "requester": "mockb:!req",
+            "target": "mocka:!target",
+            "display_name": "x".repeat(64),
+        })
+        .to_string();
+        let (code, resp_body) = req(router(d), "POST", "/v1/identities/link", Some(&body)).await;
+        assert_eq!(code, 202, "body was: {resp_body}");
     }
 
     /// RULING 1 (Task 3/4), surfaced through the HTTP layer: a global-queue-
@@ -3921,6 +4110,156 @@ routes:
         assert_eq!(d.cfg_snapshot(|c| c.raw_yaml.clone()), new_yaml);
     }
 
+    /// Like `daemon_with_config_file`, but with a caller-supplied `plugins:`
+    /// block body (two-space indented entries) so the running config can
+    /// carry e.g. a secret reference.
+    fn daemon_with_config_plugins(plugins_block: &str) -> (Arc<Daemon>, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let cfg_path = dir.path().join("relayfabric.yaml");
+        let yaml = format!(
+            "node:\n  name: t\n  data_dir: {}\nplugins:\n{plugins_block}\
+             routes:\n  - name: general\n    sources: [\"mocka:chan\", \"mockb:chan\"]\n    destinations: [\"mocka:chan\", \"mockb:chan\"]\n",
+            data_dir.display()
+        );
+        std::fs::write(&cfg_path, &yaml).unwrap();
+        let cfg = crate::config::load(&cfg_path).unwrap();
+        let d = Daemon::new(cfg, &data_dir).unwrap();
+        std::mem::forget(dir);
+        (Arc::new(d), cfg_path)
+    }
+
+    /// `node.data_dir` is restart-required, so the API can never apply it;
+    /// worse, the next start would chmod the new dir and mint fresh keys
+    /// there. Refused the same way a plugin `command` change is.
+    #[tokio::test]
+    async fn config_put_returns_422_and_makes_no_changes_for_a_node_data_dir_change() {
+        let (d, cfg_path) = daemon_with_config_file();
+        let original_text = std::fs::read_to_string(&cfg_path).unwrap();
+        let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
+        let new_yaml = format!(
+            "node:\n  name: t\n  data_dir: {}-elsewhere\nplugins:\n  mocka:\n    enabled: true\n  mockb:\n    enabled: true\n",
+            data_dir.display()
+        );
+        let (code, body) = req(
+            super::router(d.clone(), cfg_path.clone()),
+            "PUT",
+            "/v1/config",
+            Some(&new_yaml),
+        )
+        .await;
+        assert_eq!(code, 422, "body was: {body}");
+        assert!(body.contains("\"valid\":false"), "body was: {body}");
+        assert!(
+            body.contains("node.data_dir may not be changed via the admin API"),
+            "body was: {body}"
+        );
+        assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), original_text);
+        assert!(!super::prev_path_for(&cfg_path).exists());
+        assert_eq!(d.cfg_snapshot(|c| c.node.data_dir.clone()), data_dir);
+    }
+
+    /// A config writer must not be able to point a plugin at an arbitrary
+    /// file on the daemon's filesystem (`${file:...}`) or env var and have
+    /// the plugin ship it to a network peer it controls. Introducing or
+    /// moving a reference is refused; an unchanged one is fine.
+    #[tokio::test]
+    async fn config_put_returns_422_and_makes_no_changes_when_a_secret_reference_is_introduced() {
+        std::env::set_var("RF_ADMIN_TEST_PUT_NEW_REF", "resolvable-so-validate-passes");
+        let (d, cfg_path) = daemon_with_config_file();
+        let original_text = std::fs::read_to_string(&cfg_path).unwrap();
+        let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
+        let new_yaml = format!(
+            "node:\n  name: t\n  data_dir: {}\nplugins:\n  mocka:\n    enabled: true\n    config:\n      password: \"${{env:RF_ADMIN_TEST_PUT_NEW_REF}}\"\n  mockb:\n    enabled: true\n",
+            data_dir.display()
+        );
+        let (code, body) = req(
+            super::router(d.clone(), cfg_path.clone()),
+            "PUT",
+            "/v1/config",
+            Some(&new_yaml),
+        )
+        .await;
+        assert_eq!(code, 422, "body was: {body}");
+        assert!(body.contains("\"valid\":false"), "body was: {body}");
+        assert!(
+            body.contains("secret reference")
+                && body.contains("mocka: ${env:RF_ADMIN_TEST_PUT_NEW_REF}"),
+            "body was: {body}"
+        );
+        assert!(
+            !body.contains("resolvable-so-validate-passes"),
+            "resolved value must never be echoed: {body}"
+        );
+        assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), original_text);
+        assert!(!super::prev_path_for(&cfg_path).exists());
+    }
+
+    #[tokio::test]
+    async fn config_put_accepts_a_config_whose_secret_references_are_unchanged() {
+        std::env::set_var("RF_ADMIN_TEST_PUT_SAME_REF", "same-ref-value");
+        let plugins = "  mocka:\n    enabled: true\n    config:\n      password: \"${env:RF_ADMIN_TEST_PUT_SAME_REF}\"\n  mockb:\n    enabled: true\n";
+        let (d, cfg_path) = daemon_with_config_plugins(plugins);
+        let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
+        // same reference, plus an unrelated route rename
+        let new_yaml = format!(
+            "node:\n  name: t\n  data_dir: {}\nplugins:\n{plugins}routes:\n  - name: renamed\n    sources: [\"mocka:chan\"]\n    destinations: [\"mockb:chan\"]\n",
+            data_dir.display()
+        );
+        let (code, body) = req(
+            super::router(d.clone(), cfg_path.clone()),
+            "PUT",
+            "/v1/config",
+            Some(&new_yaml),
+        )
+        .await;
+        assert_eq!(code, 200, "body was: {body}");
+        assert_eq!(d.cfg_snapshot(|c| c.raw_yaml.clone()), new_yaml);
+    }
+
+    /// The 422 body is visible to any config-validate caller, so the
+    /// `${file:...}` failure text must not say WHY the read failed
+    /// (missing vs. directory vs. denied) -- that is a file-existence
+    /// oracle over the daemon's whole filesystem.
+    #[tokio::test]
+    async fn config_validate_422_for_an_unreadable_file_secret_is_generic_not_an_existence_oracle()
+    {
+        let (d, cfg_path) = daemon_with_config_file();
+        let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
+        let mut bodies = Vec::new();
+        for path in ["/nonexistent-rf-admin-test/secret", "/"] {
+            let yaml = format!(
+                "node:\n  name: t\n  data_dir: {}\nplugins:\n  mocka:\n    enabled: true\n    config:\n      token: \"${{file:{path}}}\"\n  mockb:\n    enabled: true\n",
+                data_dir.display()
+            );
+            let (code, body) = req(
+                super::router(d.clone(), cfg_path.clone()),
+                "POST",
+                "/v1/config/validate",
+                Some(&yaml),
+            )
+            .await;
+            assert_eq!(code, 422, "body was: {body}");
+            assert!(
+                body.contains(&format!("${{file:{path}}} could not be read")),
+                "body was: {body}"
+            );
+            for leak in [
+                "No such file",
+                "Is a directory",
+                "Permission denied",
+                "os error",
+            ] {
+                assert!(!body.contains(leak), "{leak} leaked: {body}");
+            }
+            bodies.push(body.replace(path, "<path>"));
+        }
+        assert_eq!(
+            bodies[0], bodies[1],
+            "missing vs. directory must be indistinguishable"
+        );
+    }
+
     #[tokio::test]
     async fn config_put_keeps_five_previous_revisions_and_drops_the_oldest() {
         let (d, cfg_path) = daemon_with_config_file();
@@ -4280,11 +4619,16 @@ routes:
     async fn config_rollback_returns_409_on_env_drift_with_files_untouched() {
         let var = "RF_ADMIN_TEST_ROLLBACK_DRIFT";
         std::env::set_var(var, "sentinel-rollback-drift-value");
-        let (d, cfg_path) = daemon_with_config_file();
+        // The running config must already carry the reference: the admin
+        // API refuses to INTRODUCE one (`rejected_secret_ref_changes`).
+        let (d, cfg_path) = daemon_with_config_plugins(&format!(
+            "  mocka:\n    enabled: true\n    config:\n      token: \"${{env:{var}}}\"\n  mockb:\n    enabled: true\n"
+        ));
         let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
 
         // First PUT (var set): puts a config referencing the env var into
-        // CURRENT, pushing the fixture's plain original into `.prev`.
+        // CURRENT (the same reference as the running config, so it is
+        // allowed), pushing the fixture's original into `.prev`.
         let secret_yaml = format!(
             r#"
 node:
@@ -4395,7 +4739,11 @@ routes:
         let var = "RF_ADMIN_TEST_MUTATION_SECRET";
         let sentinel = "sentinel-mutation-secret-4c1d";
         std::env::set_var(var, sentinel);
-        let (d, cfg_path) = daemon_with_config_file();
+        // Seeded from disk: the PUT below may keep this reference but
+        // could not introduce it (`rejected_secret_ref_changes`).
+        let (d, cfg_path) = daemon_with_config_plugins(&format!(
+            "  mocka:\n    enabled: true\n    config:\n      token: \"${{env:{var}}}\"\n  mockb:\n    enabled: true\n"
+        ));
         let data_dir = d.cfg_snapshot(|c| c.node.data_dir.clone());
         let secret_yaml = format!(
             r#"

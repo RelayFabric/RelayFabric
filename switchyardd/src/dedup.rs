@@ -20,9 +20,16 @@ pub fn key(
     let mut sorted: Vec<&str> = attachment_shas.iter().map(String::as_str).collect();
     sorted.sort_unstable();
     let shas = sorted.join(",");
-    hex::encode(Sha256::digest(
-        format!("{protocol}|{sender}|{endpoint}|{ts}|{body}|{shas}").as_bytes(),
-    ))
+    // Each field is length-prefixed rather than joined with a separator:
+    // `sender`/`endpoint`/`body` are sender- or plugin-controlled and may
+    // themselves contain any separator, so a plain join lets two different
+    // (sender, endpoint) pairs collide on one key.
+    let mut h = Sha256::new();
+    for field in [protocol, sender, endpoint, &ts, body, &shas] {
+        h.update((field.len() as u64).to_le_bytes());
+        h.update(field.as_bytes());
+    }
+    hex::encode(h.finalize())
 }
 
 pub struct Dedup {
@@ -202,6 +209,20 @@ mod tests {
         assert!(
             dedup.is_duplicate(key_b, t1),
             "the accepted retry is now recorded as seen"
+        );
+    }
+
+    #[test]
+    fn key_fields_cannot_shift_into_each_other() {
+        // sender/endpoint/body are sender-controlled; moving bytes across a
+        // field boundary must change the key (no separator ambiguity).
+        assert_ne!(
+            key("p", "a|b", "c", "d", None, &[]),
+            key("p", "a", "b|c", "d", None, &[])
+        );
+        assert_ne!(
+            key("p", "s", "e", "b|x", None, &[]),
+            key("p", "s", "e", "b", None, &["x".to_string()])
         );
     }
 

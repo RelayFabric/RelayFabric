@@ -41,10 +41,16 @@ use hyper_util::rt::TokioIo;
 struct AppState {
     socket: PathBuf,
     web_dir: PathBuf,
-    /// Lower-cased host names/IPs (no port) permitted in the Host and Origin
-    /// headers. Anything else is rejected — this is the DNS-rebinding and
-    /// CSRF boundary in front of an unauthenticated admin API.
+    /// Lower-cased host names/IPs (no port) permitted in the Host header.
+    /// Anything else is rejected — this is the DNS-rebinding boundary in
+    /// front of an unauthenticated admin API.
     allowed_hosts: Vec<String>,
+    /// Lower-cased full origins (`scheme://host[:port]`) permitted in the
+    /// Origin header of state-changing requests — the CSRF boundary. Full
+    /// origins, not hosts: `SameSite` cookies ignore the port, so a page on
+    /// another port of an allowed host could otherwise POST with the
+    /// session cookie attached.
+    allowed_origins: Vec<String>,
     /// Passkey auth + roles (v0.4 cycle E). `None` only with `--no-auth`.
     auth: Option<std::sync::Arc<auth::Auth>>,
 }
@@ -52,6 +58,19 @@ struct AppState {
 /// Headers that must not be forwarded to the upstream (RFC 7230 §6.1) plus
 /// the framing headers hyper recomputes itself — forwarding a client-supplied
 /// Content-Length / Transfer-Encoding is a request-smuggling vector.
+/// See `forward`: how long one proxied `/v1/events` stream may live before
+/// the client has to reconnect (and be re-authenticated).
+const SSE_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Applied to the UI's own HTML only (the proxied Swagger UI under /docs
+/// needs inline script). Styles stay 'unsafe-inline' because the app sets
+/// inline `style=` attributes; the two CDNs are the icon font and web font.
+const CSP: &str = "default-src 'self'; script-src 'self'; \
+    style-src 'self' 'unsafe-inline' https://unpkg.com https://fonts.googleapis.com; \
+    font-src 'self' https://unpkg.com https://fonts.gstatic.com; \
+    img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; \
+    base-uri 'none'; form-action 'self'";
+
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -77,6 +96,7 @@ async fn main() {
     let mut listen = "127.0.0.1:8087".to_string();
     let mut web_dir = PathBuf::from("relayfabric-ui/web");
     let mut extra_hosts: Vec<String> = Vec::new();
+    let mut extra_origins: Vec<String> = Vec::new();
     let mut state_dir = PathBuf::from("relayfabric-ui-state");
     let mut rp_id: Option<String> = None;
     let mut no_auth = false;
@@ -94,11 +114,27 @@ async fn main() {
                     extra_hosts.push(h.to_ascii_lowercase());
                 }
             }
+            "--origin" => {
+                if let Some(o) = args.next() {
+                    let o = o.trim_end_matches('/').to_ascii_lowercase();
+                    if !o.contains("://") {
+                        eprintln!("relayfabric-ui: --origin wants scheme://host[:port], got {o}");
+                        std::process::exit(2);
+                    }
+                    extra_origins.push(o);
+                }
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "relayfabric-ui --socket <admin.sock> [--listen 127.0.0.1:8087] \
                      [--web-dir DIR] [--state-dir DIR] [--rp-id NAME] [--no-auth] \
-                     [--allowed-host NAME]..."
+                     [--allowed-host NAME]... [--origin scheme://host[:port]]..."
+                );
+                eprintln!(
+                    "  --allowed-host NAME   accept Host: NAME and https://NAME origins \
+                     (the TLS proxy's public name)\n  --origin ORIGIN       \
+                     additionally accept this exact browser origin (e.g. a \
+                     non-default https port)"
                 );
                 return;
             }
@@ -123,9 +159,26 @@ async fn main() {
         "[::1]".to_string(),
     ];
     allowed_hosts.push(host_of(&listen).to_ascii_lowercase());
-    allowed_hosts.extend(extra_hosts);
+    allowed_hosts.extend(extra_hosts.iter().cloned());
     allowed_hosts.sort();
     allowed_hosts.dedup();
+    // Origins are exact: plain HTTP only on the loopback names at the port
+    // we listen on; HTTPS (default port) for every operator-named host;
+    // anything else must be spelled out with --origin.
+    let port = listen.rsplit_once(':').map(|(_, p)| p).unwrap_or("80");
+    let http_port = if port == "80" {
+        String::new()
+    } else {
+        format!(":{port}")
+    };
+    let mut allowed_origins: Vec<String> = ["localhost", "127.0.0.1", "[::1]"]
+        .iter()
+        .map(|h| format!("http://{h}{http_port}"))
+        .collect();
+    allowed_origins.extend(extra_hosts.iter().map(|h| format!("https://{h}")));
+    allowed_origins.extend(extra_origins);
+    allowed_origins.sort();
+    allowed_origins.dedup();
 
     let auth_state = if no_auth {
         tracing::warn!(
@@ -143,15 +196,16 @@ async fn main() {
                 .cloned()
                 .unwrap_or_else(|| "localhost".to_string())
         });
-        let a = auth::Auth::open(state_dir, rp, allowed_hosts.clone()).unwrap_or_else(|e| {
+        let a = auth::Auth::open(state_dir, rp, allowed_origins.clone()).unwrap_or_else(|e| {
             eprintln!("relayfabric-ui: cannot open auth state: {e}");
             std::process::exit(1);
         });
         if !a.has_credentials() {
             tracing::warn!(
-                setup_token = %a.setup_token,
+                setup_token_file = %a.setup_token_path.display(),
                 "no passkeys registered yet — open the UI and register the \
-                 first (administrator) passkey with this one-time setup token"
+                 first (administrator) passkey with the one-time setup token \
+                 in this file"
             );
         }
         Some(std::sync::Arc::new(a))
@@ -161,6 +215,7 @@ async fn main() {
         socket,
         web_dir,
         allowed_hosts,
+        allowed_origins,
         auth: auth_state,
     };
 
@@ -193,6 +248,7 @@ async fn main() {
         socket = %state.socket.display(),
         web_dir = %state.web_dir.display(),
         allowed_hosts = ?state.allowed_hosts,
+        allowed_origins = ?state.allowed_origins,
         "relayfabric-ui serving"
     );
     axum::serve(listener, app).await.expect("serve");
@@ -202,8 +258,14 @@ async fn main() {
 /// admin UI is same-origin only; framing it or content-sniffing its types
 /// serves no legitimate purpose.
 async fn security_headers(req: Request, next: axum::middleware::Next) -> Response {
+    let p = req.uri().path();
+    let api = p.starts_with("/v1/") || p.starts_with("/auth/") || p == "/metrics";
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
+    if api {
+        // Config YAML and session responses must not land in a disk cache.
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     h.insert("x-frame-options", HeaderValue::from_static("DENY"));
     h.insert(
         "x-content-type-options",
@@ -221,7 +283,7 @@ async fn auth_endpoint(State(st): State<AppState>, req: Request) -> Response {
     if !host_allowed(req.headers(), &st.allowed_hosts) {
         return (StatusCode::FORBIDDEN, "host not allowed").into_response();
     }
-    if is_state_changing(req.method()) && !origin_allowed(req.headers(), &st.allowed_hosts) {
+    if is_state_changing(req.method()) && !origin_allowed(req.headers(), &st.allowed_origins) {
         return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
     }
     let Some(a) = st.auth.clone() else {
@@ -241,6 +303,11 @@ async fn auth_endpoint(State(st): State<AppState>, req: Request) -> Response {
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let token = session_token(req.headers());
+    let secure = if cookie_secure(req.headers()) {
+        "; Secure"
+    } else {
+        ""
+    };
 
     let body = match axum::body::to_bytes(req.into_body(), 1 << 20).await {
         Ok(b) => b,
@@ -288,11 +355,8 @@ async fn auth_endpoint(State(st): State<AppState>, req: Request) -> Response {
             };
             match a.login(&l.challenge_token, &l.id, &cdj, &ad, &sig) {
                 Ok((token, role)) => {
-                    // Secure: browsers exempt localhost from the TLS
-                    // requirement, so the loopback dev flow still works;
-                    // everywhere else the cookie only rides HTTPS.
                     let cookie = format!(
-                        "{}={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200",
+                        "{}={token}; HttpOnly{secure}; SameSite=Strict; Path=/; Max-Age=43200",
                         auth::SESSION_COOKIE
                     );
                     (
@@ -364,7 +428,7 @@ async fn auth_endpoint(State(st): State<AppState>, req: Request) -> Response {
                 a.logout(&t);
             }
             let clear = format!(
-                "{}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0",
+                "{}=; HttpOnly{secure}; SameSite=Strict; Path=/; Max-Age=0",
                 auth::SESSION_COOKIE
             );
             ([(header::SET_COOKIE, clear)], StatusCode::NO_CONTENT).into_response()
@@ -385,10 +449,13 @@ async fn auth_endpoint(State(st): State<AppState>, req: Request) -> Response {
                 return (StatusCode::FORBIDDEN, "administrator only").into_response();
             }
             let id = p2.trim_start_matches("/auth/credentials/");
-            if a.remove_credential(id) {
-                StatusCode::NO_CONTENT.into_response()
-            } else {
-                StatusCode::NOT_FOUND.into_response()
+            match a.remove_credential(id) {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err("unknown credential") => StatusCode::NOT_FOUND.into_response(),
+                Err(e @ "cannot persist credential store") => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+                }
+                Err(e) => (StatusCode::CONFLICT, e).into_response(),
             }
         }
         _ => StatusCode::NOT_FOUND.into_response(),
@@ -411,7 +478,7 @@ async fn proxy(State(st): State<AppState>, req: Request) -> Response {
         return (StatusCode::FORBIDDEN, "host not allowed").into_response();
     }
     // CSRF: a state-changing request carrying a cross-site Origin is refused.
-    if is_state_changing(req.method()) && !origin_allowed(req.headers(), &st.allowed_hosts) {
+    if is_state_changing(req.method()) && !origin_allowed(req.headers(), &st.allowed_origins) {
         return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
     }
     // Path canonicality (audit finding): the role gate matches the raw path,
@@ -463,7 +530,7 @@ async fn forward(
 
     let stream = tokio::net::UnixStream::connect(socket).await?;
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-    tokio::spawn(async move {
+    let driver = tokio::spawn(async move {
         let _ = conn.await;
     });
 
@@ -484,6 +551,22 @@ async fn forward(
 
     let upstream = sender.send_request(out_req).await?;
     let (rparts, rbody) = upstream.into_parts();
+    // A long-lived event stream is gated only once, at request time. Cap
+    // its lifetime so a session revoked mid-stream (logout, credential
+    // deletion) stops receiving events within a bounded window; the
+    // browser's EventSource reconnects and is re-gated. Aborting the
+    // connection driver drops the upstream socket, which ends the body.
+    let sse = rparts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"));
+    if sse {
+        tokio::spawn(async move {
+            tokio::time::sleep(SSE_MAX_LIFETIME).await;
+            driver.abort();
+        });
+    }
     let mut resp = Response::new(Body::new(rbody));
     *resp.status_mut() = rparts.status;
     *resp.headers_mut() = rparts.headers;
@@ -507,13 +590,22 @@ async fn static_file(State(st): State<AppState>, req: Request) -> Response {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let full = st.web_dir.join(rel);
+    let html = |bytes: Vec<u8>| {
+        (
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CONTENT_SECURITY_POLICY, CSP),
+            ],
+            bytes,
+        )
+            .into_response()
+    };
     match tokio::fs::read(&full).await {
+        Ok(bytes) if content_type(&full).starts_with("text/html") => html(bytes),
         Ok(bytes) => ([(header::CONTENT_TYPE, content_type(&full))], bytes).into_response(),
         Err(_) if !rel.contains('.') => {
             match tokio::fs::read(st.web_dir.join("index.html")).await {
-                Ok(bytes) => {
-                    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], bytes).into_response()
-                }
+                Ok(bytes) => html(bytes),
                 Err(_) => StatusCode::NOT_FOUND.into_response(),
             }
         }
@@ -566,27 +658,39 @@ fn host_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
     }
 }
 
-/// CSRF check: if an Origin header is present, its host must be allowed; a
-/// missing Origin (same-origin navigations, `switchyardctl`, curl) passes.
+/// CSRF check: if an Origin header is present it must equal one of the
+/// allowed origins exactly (scheme, host and port); a missing Origin
+/// (same-origin navigations, `switchyardctl`, curl) passes. Browsers that
+/// send `Sec-Fetch-Site` get a second, independent check: anything but
+/// same-origin (or a user-initiated navigation) is refused, which covers
+/// the same-site-different-port and scheme-downgrade cases regardless of
+/// how the origin list was configured.
 fn origin_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|h| h.to_str().ok()) {
+        if site != "same-origin" && site != "none" {
+            return false;
+        }
+    }
     match headers.get(header::ORIGIN).and_then(|h| h.to_str().ok()) {
         None => true,
         Some("null") => false,
-        Some(o) => match origin_host(o) {
-            Some(host) => allowed.iter().any(|a| a.as_str() == host),
-            None => false,
-        },
+        Some(o) => {
+            let o = o.trim_end_matches('/').to_ascii_lowercase();
+            allowed.contains(&o)
+        }
     }
 }
 
-/// Extract the lower-cased host from an Origin like `http://127.0.0.1:8087`.
-fn origin_host(origin: &str) -> Option<String> {
-    let after_scheme = origin.split_once("://").map(|(_, rest)| rest)?;
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    Some(host_of(authority).to_ascii_lowercase())
+/// `Secure` on the session cookie, except for a plain-http origin: Safari
+/// (unlike Chrome and Firefox) refuses a Secure cookie from http://localhost,
+/// which would break the documented SSH-tunnel flow. A plain-http origin only
+/// reaches the auth handlers when it is loopback or explicitly `--origin`
+/// listed, so the flag is dropped exactly where it could never bite.
+fn cookie_secure(headers: &HeaderMap) -> bool {
+    !headers
+        .get(header::ORIGIN)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|o| o.to_ascii_lowercase().starts_with("http://"))
 }
 
 fn content_type(path: &Path) -> &'static str {
@@ -637,11 +741,39 @@ mod tests {
         assert!(!host_allowed(&hdrs(&[]), &allowed));
     }
 
+    /// Safari refuses a `Secure` cookie from http://localhost (Chrome and
+    /// Firefox exempt loopback), so the SSH-tunnel flow drops the flag for a
+    /// plain-http origin; every https origin, and a request with no Origin
+    /// at all, keeps it.
+    #[test]
+    fn session_cookie_is_secure_unless_the_origin_is_plain_http() {
+        assert!(!cookie_secure(&hdrs(&[(
+            "origin",
+            "http://localhost:8087"
+        )])));
+        assert!(cookie_secure(&hdrs(&[(
+            "origin",
+            "https://relay.example.com"
+        )])));
+        assert!(cookie_secure(&hdrs(&[(
+            "origin",
+            "HTTPS://relay.example.com"
+        )])));
+        assert!(cookie_secure(&hdrs(&[])));
+    }
+
     #[test]
     fn origin_check_blocks_cross_site_and_allows_same_and_missing() {
-        let allowed = vec!["127.0.0.1".to_string()];
+        let allowed = vec!["http://127.0.0.1:8087".to_string()];
         assert!(origin_allowed(
             &hdrs(&[("origin", "http://127.0.0.1:8087")]),
+            &allowed
+        ));
+        assert!(origin_allowed(
+            &hdrs(&[
+                ("origin", "HTTP://127.0.0.1:8087/"),
+                ("sec-fetch-site", "same-origin")
+            ]),
             &allowed
         ));
         assert!(origin_allowed(&hdrs(&[]), &allowed)); // no Origin (curl/ctl)
@@ -650,5 +782,27 @@ mod tests {
             &allowed
         ));
         assert!(!origin_allowed(&hdrs(&[("origin", "null")]), &allowed));
+        // same host, other port: SameSite=Strict would still attach the cookie
+        assert!(!origin_allowed(
+            &hdrs(&[("origin", "http://127.0.0.1:3000")]),
+            &allowed
+        ));
+        // scheme downgrade of an allowed host
+        assert!(!origin_allowed(
+            &hdrs(&[("origin", "http://relay.example")]),
+            &["https://relay.example".to_string()]
+        ));
+        // Sec-Fetch-Site is an independent veto even when Origin matches
+        assert!(!origin_allowed(
+            &hdrs(&[
+                ("origin", "http://127.0.0.1:8087"),
+                ("sec-fetch-site", "same-site")
+            ]),
+            &allowed
+        ));
+        assert!(!origin_allowed(
+            &hdrs(&[("sec-fetch-site", "cross-site")]),
+            &allowed
+        ));
     }
 }

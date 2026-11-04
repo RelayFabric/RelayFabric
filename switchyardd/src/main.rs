@@ -226,6 +226,12 @@ fn main() {
             .any(|p| p.enabled && p.peer_uid.is_some())
         {
             set_socket_mode(&plugin_sock_dir, 0o711).expect("open plugin socket dir for traversal");
+            // `Daemon::new` just re-asserted 0700 on data_dir; without
+            // this the foreign uid cannot reach plugins.d at all and the
+            // isolation layout is dead on arrival. Everything inside is
+            // its own boundary (DB/keys 0600, attachments 0700, admin
+            // socket 0600) so search-only on the parent exposes nothing.
+            set_socket_mode(&data_dir, 0o711).expect("open data dir for traversal");
         }
         for (name, pc) in &plugin_configs {
             if !pc.enabled {

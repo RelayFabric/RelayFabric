@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub node: NodeConfig,
     #[serde(default)]
@@ -18,7 +19,7 @@ pub struct Config {
     /// the resolved `plugins[_].config` (it forwards it to the plugin
     /// process over the `RELAYFABRIC_PLUGIN_CONFIG` env var).
     #[serde(skip)]
-    pub raw_plugin_configs: BTreeMap<String, serde_yaml::Value>,
+    pub raw_plugin_configs: BTreeMap<String, serde_norway::Value>,
     /// Verbatim text of the config file, captured by `load`/`load_from_str`
     /// BEFORE parsing/secret resolution touch anything (design §1/§2).
     /// Skipped by serde (empty by default, e.g. for every hand-built
@@ -151,12 +152,13 @@ impl AlertConfig {
 /// `#[serde(flatten)]`-ing a nested overrides struct: flatten's
 /// `#[serde(default)]` interaction is unreliable when the outer type is a
 /// `BTreeMap` value (the map's own per-key deserialization doesn't compose
-/// cleanly with a flattened struct's field defaults in `serde_yaml`), so
+/// cleanly with a flattened struct's field defaults in `serde_norway`), so
 /// explicit fields on `TransportEntry` itself is the shape that parses
 /// cleanly and predictably from
 /// `transports: { plugin: { class: satellite_internet, max_payload_bytes:
 /// 32768, allow_images: false } }`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransportEntry {
     pub class: relay_core::TransportClass,
     #[serde(default)]
@@ -229,11 +231,57 @@ impl Config {
         }
         policy
     }
+
+    /// Every `${env:..}`/`${file:..}` reference in each plugin's `config:`
+    /// block, as `(plugin name, canonical reference form)` pairs -- read
+    /// from the unresolved `raw_plugin_configs` snapshot, never from the
+    /// resolved values. `admin.rs`'s `PUT /v1/config` compares the running
+    /// set against the candidate's to refuse a write that would point a
+    /// plugin at a new file or env var.
+    pub fn secret_refs(&self) -> BTreeSet<(String, String)> {
+        let mut out = BTreeSet::new();
+        for (name, raw) in &self.raw_plugin_configs {
+            collect_secret_refs(raw, name, &mut out);
+        }
+        out
+    }
+}
+
+fn collect_secret_refs(
+    v: &serde_norway::Value,
+    plugin: &str,
+    out: &mut BTreeSet<(String, String)>,
+) {
+    match v {
+        serde_norway::Value::String(s) => {
+            if let Some(r) = secrets::parse_ref(s) {
+                out.insert((plugin.to_string(), r.display_form()));
+            }
+        }
+        serde_norway::Value::Sequence(items) => {
+            for i in items {
+                collect_secret_refs(i, plugin, out);
+            }
+        }
+        serde_norway::Value::Mapping(map) => {
+            for val in map.values() {
+                collect_secret_refs(val, plugin, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn default_ttl() -> u64 {
     86_400
 }
+
+/// Ceiling for every `*_secs` lifecycle knob that feeds a chrono
+/// `DateTime + Duration` (`ttl_default_secs`, `retention_secs`,
+/// `federation.max_ttl_secs`) or a dedup window: 10 years. Anything larger
+/// is a typo, and past ~292 years the `u64 -> i64` cast wraps negative so
+/// every envelope would expire on arrival (or the addition panics).
+pub const MAX_LIFECYCLE_SECS: u64 = 315_360_000;
 fn default_retention() -> u64 {
     86_400
 }
@@ -255,6 +303,7 @@ pub const IDENTITY_ROUTE: &str = "@identity";
 /// (design §1): any change to `node.*` is restart-only (the plugin/admin
 /// socket paths are derived from `data_dir` and bound once at startup).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     pub name: String,
     pub data_dir: PathBuf,
@@ -263,6 +312,7 @@ pub struct NodeConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicService {
     pub name: String,
     pub r#type: String, // echoed verbatim by GET /v1/public
@@ -271,6 +321,7 @@ pub struct PublicService {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     #[serde(default)]
     pub per_sender: PerSender,
@@ -281,23 +332,27 @@ pub struct Limits {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PerSender {
     pub messages_per_minute: u32,
     pub bytes_per_hour: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PerRoute {
     pub queue_max: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GlobalLimits {
     pub queue_max: u32,
     pub cas_max_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Budget {
     pub messages_per_minute: u32,
 }
@@ -307,11 +362,12 @@ pub struct Budget {
 /// (never actually restarted by apply itself -- `supervise` keeps the old
 /// one running) when `{enabled, command, config}` changes.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginConfig {
     pub enabled: bool,
     pub command: Option<String>,
     #[serde(default)]
-    pub config: serde_yaml::Value,
+    pub config: serde_norway::Value,
     /// Expected peer UID on this plugin's socket (v0.4 cycle B, plugin
     /// isolation): when set, EXACTLY that UID may attach (the daemon's own
     /// UID is not grandfathered in -- fail closed), checked via
@@ -325,6 +381,7 @@ pub struct PluginConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     pub name: String,
     #[serde(deserialize_with = "endpoints")]
@@ -386,6 +443,7 @@ fn default_security_mode() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RenderConfig {
     /// "alias" (default): render the sender tag as today -- the HMAC alias,
     /// or in `identity_mode: linked` with a verified link, that link's
@@ -432,6 +490,7 @@ fn default_render_tag() -> String {
 /// anywhere in here -- including a peer added/removed/edited -- trips the
 /// `"daemon"` restart entry.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FederationConfig {
     /// Optional: absent means outbound-only (no Noise listener bound).
     #[serde(default)]
@@ -484,6 +543,7 @@ fn default_identity_exposure() -> String {
 
 /// One configured federation peer (design §4 YAML `federation.peers[]`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerConfig {
     pub name: String,
     /// `"rf:" + 64 hex chars` -- the peer's Ed25519 public key, cycle-A
@@ -529,6 +589,7 @@ fn default_peer_trust() -> String {
 /// (see `Config::discovery`'s doc comment): any field change trips the
 /// `"daemon"` restart entry, same as `federation`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscoveryConfig {
     /// "disabled" (default) | "federation" | "public" -- SPEC §111.5's
     /// four scopes minus "local" (DEFERRED this cycle: no LAN transport
@@ -575,6 +636,7 @@ fn default_advert_ttl_secs() -> u64 {
 /// diff (see `Config::privacy`), so nothing ever needs to compare two
 /// `PrivacyConfig` values for that purpose.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrivacyConfig {
     /// "gateway" (default) or "sealed" -- the minimum `RouteConfig::
     /// security_mode` this node accepts; `validate()` rejects any route
@@ -639,6 +701,7 @@ fn endpoints<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Endpoint>, D:
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     pub name: String,
     #[serde(rename = "match")]
@@ -647,12 +710,14 @@ pub struct Policy {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyMatch {
     #[serde(default)]
     pub destination_protocol: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRules {
     #[serde(default)]
     pub max_payload: Option<usize>,
@@ -685,7 +750,7 @@ pub fn load(path: &Path) -> Result<Config, String> {
 /// `resolve_secrets` mutates `plugins[_].config` in place -- so it always
 /// holds exactly what the caller supplied, secrets un-resolved.
 pub fn load_from_str(raw: &str) -> Result<Config, String> {
-    let mut cfg: Config = serde_yaml::from_str(raw).map_err(|e| e.to_string())?;
+    let mut cfg: Config = serde_norway::from_str(raw).map_err(|e| e.to_string())?;
     cfg.raw_yaml = raw.to_string();
     validate(&cfg)?;
     resolve_secrets(&mut cfg)?;
@@ -725,18 +790,18 @@ fn resolve_secrets(cfg: &mut Config) -> Result<(), String> {
     }
 }
 
-/// Recursively walks a `serde_yaml::Value`, replacing any string leaf that
+/// Recursively walks a `serde_norway::Value`, replacing any string leaf that
 /// is entirely a secret reference with its resolved value. Non-reference
 /// strings and non-string values pass through unchanged. Resolution
 /// failures are appended to `errors` (naming the `${...}` form, never a
 /// value -- see `secrets::resolve`) and the original reference string is
 /// left in place for that leaf, since the overall load fails regardless
 /// once any error is recorded.
-fn resolve_value(v: &serde_yaml::Value, errors: &mut Vec<String>) -> serde_yaml::Value {
+fn resolve_value(v: &serde_norway::Value, errors: &mut Vec<String>) -> serde_norway::Value {
     match v {
-        serde_yaml::Value::String(s) => match secrets::parse_ref(s) {
+        serde_norway::Value::String(s) => match secrets::parse_ref(s) {
             Some(r) => match secrets::resolve(&r) {
-                Ok(resolved) => serde_yaml::Value::String(resolved),
+                Ok(resolved) => serde_norway::Value::String(resolved),
                 Err(e) => {
                     errors.push(e);
                     v.clone()
@@ -753,15 +818,15 @@ fn resolve_value(v: &serde_yaml::Value, errors: &mut Vec<String>) -> serde_yaml:
                 v.clone()
             }
         },
-        serde_yaml::Value::Sequence(items) => {
-            serde_yaml::Value::Sequence(items.iter().map(|i| resolve_value(i, errors)).collect())
+        serde_norway::Value::Sequence(items) => {
+            serde_norway::Value::Sequence(items.iter().map(|i| resolve_value(i, errors)).collect())
         }
-        serde_yaml::Value::Mapping(map) => {
-            let mut out = serde_yaml::Mapping::new();
+        serde_norway::Value::Mapping(map) => {
+            let mut out = serde_norway::Mapping::new();
             for (k, val) in map {
                 out.insert(k.clone(), resolve_value(val, errors));
             }
-            serde_yaml::Value::Mapping(out)
+            serde_norway::Value::Mapping(out)
         }
         other => other.clone(),
     }
@@ -851,6 +916,16 @@ fn bound_socket_paths(cfg: &Config) -> Vec<std::path::PathBuf> {
 }
 
 pub fn validate(cfg: &Config) -> Result<(), String> {
+    // A relative data_dir would resolve against whatever CWD the daemon
+    // happens to start in (systemd vs. a shell), and the admin API refuses
+    // to change it (see admin.rs) -- so the one on disk must be unambiguous.
+    if !cfg.node.data_dir.is_absolute() {
+        return Err(format!(
+            "node.data_dir '{}' must be an absolute path",
+            cfg.node.data_dir.display()
+        ));
+    }
+
     // Socket-path length (live-test finding): reject an over-long data_dir
     // at load with a clear error rather than panicking at bind time.
     for path in bound_socket_paths(cfg) {
@@ -888,6 +963,17 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             "plugin name '{FED_PROTOCOL}' is reserved for federation (design §4/§5) and cannot be used as a plugin name"
         ));
     }
+    // A plugin name becomes a socket path component (`plugins.d/<name>.sock`
+    // -- `../x` or `a/b` would bind outside the dir or fail to bind at all)
+    // and an unescaped-at-source metrics label, so it is restricted to a
+    // plain identifier charset.
+    for name in cfg.plugins.keys() {
+        if !is_valid_component_name(name) {
+            return Err(format!(
+                "plugin name {name:?} is invalid (expected 1-64 chars of [A-Za-z0-9_-])"
+            ));
+        }
+    }
 
     // Core lifecycle scalars (audit finding): a zero here isn't a valid
     // "unlimited"/"disabled" mode, it's a silent total-message-loss footgun
@@ -910,6 +996,20 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             "retention_secs must be at least 1 (0 would purge terminal deliveries immediately)"
                 .to_string(),
         );
+    }
+    // The same scalars have a ceiling (see `MAX_LIFECYCLE_SECS`): a huge
+    // value is a typo, and far enough out the `u64 -> i64` cast behind
+    // `DateTime + Duration` wraps negative or the addition panics.
+    for (name, value) in [
+        ("ttl_default_secs", cfg.ttl_default_secs),
+        ("dedup_ttl_secs", cfg.dedup_ttl_secs),
+        ("retention_secs", cfg.retention_secs),
+    ] {
+        if value > MAX_LIFECYCLE_SECS {
+            return Err(format!(
+                "{name} {value} is above the maximum of {MAX_LIFECYCLE_SECS} (10 years)"
+            ));
+        }
     }
     if let Some(a) = &cfg.alerts {
         let Some((plugin, ep)) = a.endpoint.split_once(':') else {
@@ -976,6 +1076,14 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         if r.name == IDENTITY_ROUTE {
             return Err(format!(
                 "route name '{IDENTITY_ROUTE}' is reserved for identity-link delivery and cannot be used as a user route name"
+            ));
+        }
+        // Same charset rule as plugin names: a route name is a metrics
+        // label and a queue/trace key, never free text.
+        if !is_valid_component_name(&r.name) {
+            return Err(format!(
+                "route name {:?} is invalid (expected 1-64 chars of [A-Za-z0-9_-])",
+                r.name
             ));
         }
         if !names.insert(&r.name) {
@@ -1342,6 +1450,12 @@ fn validate_federation(cfg: &Config) -> Result<(), String> {
                 .to_string(),
         );
     }
+    if fed.max_ttl_secs > MAX_LIFECYCLE_SECS {
+        return Err(format!(
+            "federation.max_ttl_secs {} is above the maximum of {MAX_LIFECYCLE_SECS} (10 years)",
+            fed.max_ttl_secs
+        ));
+    }
     if fed.identity_exposure != "pseudonymous" && fed.identity_exposure != "full" {
         return Err(format!(
             "federation.identity_exposure '{}' is invalid (expected \"pseudonymous\" or \"full\")",
@@ -1382,6 +1496,13 @@ fn validate_federation(cfg: &Config) -> Result<(), String> {
                 p.name, p.node_id
             ));
         }
+        if !is_lowercase_rf_node_id(&p.node_id) {
+            return Err(format!(
+                "federation peer '{}' has node_id '{}' with uppercase hex; node ids are compared \
+                 byte-for-byte against the lowercase form a peer presents, so lowercase it",
+                p.name, p.node_id
+            ));
+        }
         if p.addr.parse::<std::net::SocketAddr>().is_err() {
             return Err(format!(
                 "federation peer '{}' has invalid addr '{}' (expected host:port)",
@@ -1401,6 +1522,13 @@ fn validate_federation(cfg: &Config) -> Result<(), String> {
                     p.name, sealed_key
                 ));
             }
+            if sealed_key.bytes().any(|b| b.is_ascii_uppercase()) {
+                return Err(format!(
+                    "federation peer '{}' has sealed_key with uppercase hex; the pin is compared \
+                     byte-for-byte against the lowercase form adverts carry, so lowercase it",
+                    p.name
+                ));
+            }
         }
     }
 
@@ -1408,6 +1536,12 @@ fn validate_federation(cfg: &Config) -> Result<(), String> {
         if !is_valid_rf_node_id(node_id) {
             return Err(format!(
                 "federation node_id '{node_id}' is invalid (expected \"rf:\" + 64 hex chars)"
+            ));
+        }
+        if !is_lowercase_rf_node_id(node_id) {
+            return Err(format!(
+                "federation node_id '{node_id}' has uppercase hex; node ids are compared \
+                 byte-for-byte against the lowercase form a peer presents, so lowercase it"
             ));
         }
     }
@@ -1454,6 +1588,18 @@ fn validate_fed_destination(cfg: &Config, route_name: &str, endpoint: &str) -> R
     Ok(())
 }
 
+/// Plugin and route name check: 1-64 chars of `[A-Za-z0-9_-]`. Wide enough
+/// for every shipped plugin (`meshtastic-direct`) and example route, tight
+/// enough that a name can be a socket-path component and a metrics label
+/// without escaping.
+fn is_valid_component_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// DNS-label-ish peer name check (design §4: "names unique + DNS-label-ish"):
 /// 1-32 chars, each an ASCII lowercase letter, digit, or hyphen. No regex
 /// dependency needed for a character class this small.
@@ -1478,7 +1624,7 @@ fn is_valid_peer_name(name: &str) -> bool {
 /// `\u{202A}`-`\u{202E}`, `\u{2066}`-`\u{2069}`) and default-ignorable
 /// (`\u{200B}`-`\u{200D}`, `\u{FEFF}`, `\u{2060}`) codepoints
 /// `is_display_spoofing` blocks.
-fn is_unsafe_advert_name_char(c: char) -> bool {
+pub(crate) fn is_unsafe_advert_name_char(c: char) -> bool {
     c.is_control()
         || matches!(c,
             '\u{061C}'
@@ -1499,6 +1645,14 @@ fn is_valid_rf_node_id(s: &str) -> bool {
         Some(hex_part) => hex_part.len() == 64 && hex_part.chars().all(|c| c.is_ascii_hexdigit()),
         None => false,
     }
+}
+
+/// The daemon mints node ids as lowercase hex (`node_identity::node_id`)
+/// and matches configured ids against a peer's by exact string comparison
+/// (`fed::conn`, `Store::trust_level`), so an uppercase id here would
+/// silently never match: not a peer, not trusted, not even blocked.
+fn is_lowercase_rf_node_id(s: &str) -> bool {
+    !s.bytes().any(|b| b.is_ascii_uppercase())
 }
 
 /// Bare 64-hex-char format check, no `"rf:"` prefix (design §1, cycle H):
@@ -1537,7 +1691,7 @@ routes:
 "#;
 
     fn parse(s: &str) -> Result<Config, String> {
-        let cfg: Config = serde_yaml::from_str(s).map_err(|e| e.to_string())?;
+        let cfg: Config = serde_norway::from_str(s).map_err(|e| e.to_string())?;
         validate(&cfg)?;
         Ok(cfg)
     }
@@ -2254,8 +2408,8 @@ routes:
         // zero errors, and `raw_plugin_configs` mirrors the (unchanged)
         // resolved config exactly.
         let cfg = parse_and_resolve(GOOD).unwrap();
-        assert_eq!(cfg.plugins["mocka"].config, serde_yaml::Value::Null);
-        assert_eq!(cfg.raw_plugin_configs["mocka"], serde_yaml::Value::Null);
+        assert_eq!(cfg.plugins["mocka"].config, serde_norway::Value::Null);
+        assert_eq!(cfg.raw_plugin_configs["mocka"], serde_norway::Value::Null);
     }
 
     #[test]
@@ -2440,7 +2594,7 @@ routes:
         let cfg = load(&cfg_path).unwrap();
         assert_eq!(
             cfg.plugins["mqtt"].config["broker"],
-            serde_yaml::Value::String("mqtt://127.0.0.1:1883".into())
+            serde_norway::Value::String("mqtt://127.0.0.1:1883".into())
         );
     }
 
@@ -2737,6 +2891,22 @@ federation:
     }
 
     #[test]
+    fn uppercase_peer_sealed_keys_are_rejected_with_a_lowercase_hint() {
+        // The pin is compared byte-for-byte against the lowercase hex an
+        // advert carries, so an uppercase pin would "disagree" with the
+        // very key it names.
+        let yaml = format!(
+            "{FED_BASE}\nfederation:\n  peers:\n    - name: phoenix\n      node_id: \"{a}\"\n      addr: \"10.0.0.2:47000\"\n      sealed_key: \"{}\"\n",
+            "AB".repeat(32), a = node_id_a(),
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(
+            err.contains("sealed_key") && err.contains("lowercase"),
+            "err was: {err}"
+        );
+    }
+
+    #[test]
     fn federation_rejects_malformed_trusted_entry() {
         let yaml = format!("{FED_BASE}\nfederation:\n  trusted: [\"not-rf\"]\n");
         let err = parse(&yaml).unwrap_err();
@@ -3009,7 +3179,7 @@ federation:
                 .join("../docs/relayfabric.example.yaml"),
         )
         .unwrap();
-        let cfg: Config = serde_yaml::from_str(&raw).unwrap();
+        let cfg: Config = serde_norway::from_str(&raw).unwrap();
         assert!(cfg.federation.is_none());
         assert!(validate(&cfg).is_ok());
     }
@@ -3031,7 +3201,7 @@ federation:
                 .join("../docs/relayfabric.example.yaml"),
         )
         .unwrap();
-        let cfg: Config = serde_yaml::from_str(&raw).unwrap();
+        let cfg: Config = serde_norway::from_str(&raw).unwrap();
         assert_eq!(cfg.discovery.mode, "disabled");
         assert!(validate(&cfg).is_ok());
     }
@@ -3562,7 +3732,7 @@ federation:
                 .join("../docs/relayfabric.example.yaml"),
         )
         .unwrap();
-        let cfg: Config = serde_yaml::from_str(&raw).unwrap();
+        let cfg: Config = serde_norway::from_str(&raw).unwrap();
         assert_eq!(cfg.privacy.minimum_security, "gateway");
         assert!(cfg.privacy.allow_gateway_decryption);
         assert!(cfg.privacy.allow_protocol_downgrade);
@@ -3764,7 +3934,7 @@ routes:
                 .join("../docs/relayfabric.example.yaml"),
         )
         .unwrap();
-        let cfg: Config = serde_yaml::from_str(&raw).unwrap();
+        let cfg: Config = serde_norway::from_str(&raw).unwrap();
         assert!(cfg.transports.is_empty());
         assert!(validate(&cfg).is_ok());
 
@@ -3776,5 +3946,198 @@ routes:
         assert!(policy.max_payload_bytes >= 16 * 1024 * 1024);
         assert!(policy.allow_images);
         assert!(policy.allow_video);
+    }
+
+    // ---- lifecycle ceilings ---------------------------------------------
+
+    #[test]
+    fn oversized_lifecycle_secs_are_rejected_and_the_ceiling_itself_is_accepted() {
+        for (mutate, needle) in [
+            (
+                Box::new(|c: &mut Config, v: u64| c.ttl_default_secs = v)
+                    as Box<dyn Fn(&mut Config, u64)>,
+                "ttl_default_secs",
+            ),
+            (
+                Box::new(|c: &mut Config, v: u64| c.dedup_ttl_secs = v),
+                "dedup_ttl_secs",
+            ),
+            (
+                Box::new(|c: &mut Config, v: u64| c.retention_secs = v),
+                "retention_secs",
+            ),
+        ] {
+            for huge in [MAX_LIFECYCLE_SECS + 1, u64::MAX] {
+                let mut cfg = parse(GOOD).unwrap();
+                mutate(&mut cfg, huge);
+                let err = validate(&cfg).unwrap_err();
+                assert!(
+                    err.contains(needle) && err.contains("maximum"),
+                    "error must name {needle} and the ceiling: {err}"
+                );
+            }
+            let mut cfg = parse(GOOD).unwrap();
+            mutate(&mut cfg, MAX_LIFECYCLE_SECS);
+            validate(&cfg).unwrap_or_else(|e| panic!("{needle} at the ceiling must pass: {e}"));
+        }
+    }
+
+    #[test]
+    fn oversized_federation_max_ttl_secs_is_rejected() {
+        for huge in [MAX_LIFECYCLE_SECS + 1, u64::MAX] {
+            let raw = format!("{GOOD}\nfederation:\n  max_ttl_secs: {huge}\n");
+            let err = parse(&raw).unwrap_err();
+            assert!(
+                err.contains("max_ttl_secs") && err.contains("maximum"),
+                "error must name federation.max_ttl_secs and the ceiling: {err}"
+            );
+        }
+        let raw = format!("{GOOD}\nfederation:\n  max_ttl_secs: {MAX_LIFECYCLE_SECS}\n");
+        parse(&raw).unwrap_or_else(|e| panic!("ceiling must pass: {e}"));
+    }
+
+    // ---- plugin / route name charset ------------------------------------
+
+    #[test]
+    fn plugin_names_outside_the_safe_charset_are_rejected() {
+        for bad in [
+            "../admin",
+            "a/b",
+            "a\"b",
+            "with space",
+            "a.b",
+            "a\nb",
+            "x".repeat(65).as_str(),
+        ] {
+            let mut cfg = parse(GOOD).unwrap();
+            cfg.plugins
+                .insert(bad.to_string(), cfg.plugins["mocka"].clone());
+            let err = validate(&cfg).unwrap_err();
+            assert!(
+                err.contains("plugin name") && err.contains("A-Za-z0-9_-"),
+                "plugin name {bad:?} must be rejected naming the charset: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_names_in_the_safe_charset_are_accepted() {
+        for good in [
+            "meshtastic-direct",
+            "mock_a",
+            "Mqtt1",
+            "x".repeat(64).as_str(),
+        ] {
+            let mut cfg = parse(GOOD).unwrap();
+            cfg.plugins
+                .insert(good.to_string(), cfg.plugins["mocka"].clone());
+            validate(&cfg).unwrap_or_else(|e| panic!("plugin name {good:?} must pass: {e}"));
+        }
+    }
+
+    #[test]
+    fn route_names_outside_the_safe_charset_are_rejected() {
+        for bad in [
+            "a/b",
+            "a\"b",
+            "with space",
+            "a.b",
+            "",
+            "x".repeat(65).as_str(),
+        ] {
+            let mut cfg = parse(GOOD).unwrap();
+            cfg.routes[0].name = bad.to_string();
+            let err = validate(&cfg).unwrap_err();
+            assert!(
+                err.contains("route name") && err.contains("A-Za-z0-9_-"),
+                "route name {bad:?} must be rejected naming the charset: {err}"
+            );
+        }
+        // The reserved name keeps its own, more specific message.
+        let mut cfg = parse(GOOD).unwrap();
+        cfg.routes[0].name = IDENTITY_ROUTE.to_string();
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.contains("reserved"), "{err}");
+    }
+
+    // ---- data_dir must be absolute --------------------------------------
+
+    #[test]
+    fn relative_data_dir_is_rejected() {
+        let mut cfg = parse(GOOD).unwrap();
+        cfg.node.data_dir = PathBuf::from("var/lib/relayfabric");
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.contains("data_dir") && err.contains("absolute"),
+            "{err}"
+        );
+    }
+
+    // ---- federation node ids must be lowercase --------------------------
+
+    #[test]
+    fn uppercase_federation_node_ids_are_rejected_with_a_lowercase_hint() {
+        let upper = format!("rf:{}", "AB".repeat(32));
+        let lower = format!("rf:{}", "ab".repeat(32));
+        for block in [
+            format!(
+                "  peers:\n    - name: phoenix\n      node_id: \"{upper}\"\n      addr: \"10.0.0.2:47000\"\n"
+            ),
+            format!("  trusted: [\"{upper}\"]\n"),
+            format!("  blocked: [\"{upper}\"]\n"),
+        ] {
+            let raw = format!("{GOOD}\nfederation:\n{block}");
+            let err = parse(&raw).unwrap_err();
+            assert!(
+                err.contains(&upper) && err.contains("lowercase"),
+                "uppercase node_id must be rejected with a lowercase hint: {err}"
+            );
+            let raw = raw.replace(&upper, &lower);
+            parse(&raw).unwrap_or_else(|e| panic!("lowercase node_id must pass: {e}"));
+        }
+    }
+
+    // ---- unknown fields fail loudly -------------------------------------
+
+    #[test]
+    fn unknown_fields_are_rejected_at_every_typed_level() {
+        for (label, raw) in [
+            ("top level", format!("{GOOD}\nhop_limt: 3\n")),
+            (
+                "node",
+                GOOD.replace("  name: test-node\n", "  name: test-node\n  pubic: true\n"),
+            ),
+            (
+                "plugin",
+                GOOD.replace(
+                    "  mocka:\n    enabled: true\n",
+                    "  mocka:\n    enabeld: true\n",
+                ),
+            ),
+            (
+                "route",
+                GOOD.replace(
+                    "  - name: general\n",
+                    "  - name: general\n    identity_mod: linked\n",
+                ),
+            ),
+            ("federation", format!("{GOOD}\nfederation:\n  max_hop: 3\n")),
+            (
+                "limits",
+                format!("{GOOD}\nlimits:\n  per_sender:\n    messages_per_min: 3\n"),
+            ),
+        ] {
+            let err = parse(&raw).unwrap_err();
+            assert!(
+                err.contains("unknown field"),
+                "{label}: a typo'd key must be an unknown-field error, got: {err}"
+            );
+        }
+        // A plugin's `config:` block stays free-form.
+        let raw = GOOD.replace(
+            "  mocka:\n    enabled: true\n",
+            "  mocka:\n    enabled: true\n    config:\n      anything: goes\n      nested: {deep: 1}\n",
+        );
+        parse(&raw).unwrap_or_else(|e| panic!("plugin config must stay free-form: {e}"));
     }
 }

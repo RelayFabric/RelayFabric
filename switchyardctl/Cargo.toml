@@ -7,6 +7,4 @@ license.workspace = true
 [dependencies]
 serde_json.workspace = true
 ciborium.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true

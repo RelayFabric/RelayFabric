@@ -27,7 +27,10 @@ target/release/relayfabric-ui \
 ```
 
 Flags: `--socket <admin.sock>` (required), `--listen` (default
-`127.0.0.1:8087`), `--web-dir` (default `relayfabric-ui/web`).
+`127.0.0.1:8087`), `--web-dir` (default `relayfabric-ui/web`),
+`--state-dir` (default `relayfabric-ui-state` in the working directory),
+`--rp-id`, `--allowed-host`, `--origin`, `--no-auth` — the last five are
+described under Authentication.
 
 The UI has eight screens — Overview, Queue, Config (validate / apply /
 rollback, with the last five revisions viewable), Identities, Federation &
@@ -39,28 +42,39 @@ sample data so the interface stays browsable.
 ## Authentication (v0.4)
 
 Passkeys (WebAuthn) with scoped roles. On first start with no registered
-credentials, the console logs a one-time `setup_token`; open the UI, paste
-it, and register the first passkey — it becomes the `administrator`
-credential. Further credentials are added by an administrator
+credentials, the service writes a one-time setup token to
+`<state-dir>/setup-token` (mode 0600) and logs that path — never the token
+itself. Read the file (`cat relayfabric-ui-state/setup-token`), open the
+UI, paste it, and register the first passkey — it becomes the
+`administrator` credential; the file is deleted once that registration
+succeeds. Further credentials are added by an administrator
 (`/auth/credentials`), each with a role: `viewer`, `operator`,
 `route-admin`, `identity-admin`, `security-admin`, or `administrator`.
 Every proxied admin request is gated per method + path; identity-link data
 requires identity-admin. Sessions are HttpOnly `SameSite=Strict` cookies
-(12 h). Flags: `--state-dir` (credential store, 0600), `--rp-id` (WebAuthn
-RP id, defaults to the first DNS-name allowed host or `localhost`),
-`--no-auth` (loopback development only; logged loudly). Remote use
-requires fronting TLS — browsers only offer WebAuthn in a secure context.
+(12 h). Flags: `--state-dir` (credential store + setup token, 0600),
+`--rp-id` (WebAuthn RP id, defaults to the first DNS-name allowed host or
+`localhost`), `--allowed-host <name>` (repeatable: accept `Host: <name>`
+and the `https://<name>` origin — the TLS proxy's public name),
+`--origin scheme://host[:port]` (repeatable: additionally accept exactly
+this browser origin, needed when the UI is served on a non-default port,
+e.g. `--origin https://relay.example.com:8443`, since origins are
+port-specific while `--allowed-host` only admits the default-port
+`https://` origin), `--no-auth` (loopback development only; logged loudly).
+Remote use requires fronting TLS — browsers only offer WebAuthn in a
+secure context.
 
 ## Security
 
-!!! this proxy adds NO authentication of its own yet.
-
-It binds to loopback by default. The admin API grants full control to anyone
-who can reach the socket (same-UID = full admin), and this proxy extends that
-boundary to whoever can reach its TCP listener. **Do not expose it to a
-network without an authenticating reverse proxy in front.** Real auth (TLS,
-passkeys, RBAC, audit) is the deferred work this service is the seam for —
-see `docs/webui-notes.md`.
+This service is the authentication boundary for the admin API: the daemon's
+socket grants full control to anyone who can reach it (same-UID = full
+admin), and the proxy gates every request with the passkey session and
+role checks above. It binds to loopback by default; it does **no** TLS of
+its own, so for any non-localhost use front it with a TLS reverse proxy
+and set `--allowed-host`/`--rp-id` (see `docs/webui-notes.md`, "Remote
+access"). With `--no-auth` the proxy extends the socket's full-admin
+boundary to whoever can reach its listener — keep that to loopback
+development only.
 
 ## Front end
 

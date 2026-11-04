@@ -20,7 +20,9 @@ async function passkeyLogin() {
     publicKey: {
       challenge: b64u.dec(opts.challenge),
       rpId: opts.rp_id,
-      userVerification: 'preferred',
+      // the server requires UV on both ceremonies; ask the browser to
+      // enforce it up front instead of failing after the touch
+      userVerification: 'required',
     },
   });
   return api('/auth/login', {
@@ -49,6 +51,7 @@ async function passkeyRegister(setupToken, role, label) {
         displayName: label || 'RelayFabric admin',
       },
       pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -8 }],
+      authenticatorSelection: { userVerification: 'required' },
       attestation: 'none',
     },
   });

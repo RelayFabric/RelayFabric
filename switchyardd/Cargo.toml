@@ -11,7 +11,7 @@ relay-ipc.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
+serde_norway.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 tokio.workspace = true
@@ -41,8 +41,8 @@ libc.workspace = true
 # UI in sandboxed environments where network access ... is not possible").
 # Confirmed empirically: `cargo build -p switchyardd --offline` succeeds
 # after `cargo fetch`, which a build-time network fetch would not survive.
-utoipa = { version = "5.5.0", features = ["axum_extras", "chrono", "uuid"] }
-utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"] }
+utoipa = { version = "6.0.0", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "10.0.2", features = ["axum", "vendored"] }
 # Task 1 (design §1, cycle H sealed routing) license gate, PASSED: the only
 # two NET-NEW crates this pulls in -- `crypto_box` itself and its
 # `crypto_secretbox` dependency -- are both `Apache-2.0 OR MIT` (recorded

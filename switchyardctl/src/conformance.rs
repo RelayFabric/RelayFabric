@@ -81,10 +81,16 @@ fn kill(mut child: Child) {
 
 /// Runs the conformance ladder; returns process exit code (0 = all pass).
 pub fn run(command: &str, config_json: &str, endpoint: &str) -> i32 {
-    let dir = std::env::temp_dir().join(format!("rf-conformance-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let sock_path = dir.join("plugin.sock");
-    let _ = std::fs::remove_file(&sock_path);
+    // A fresh private directory (not a predictable `$TMPDIR/rf-conformance-
+    // <pid>` that another user could pre-create and squat the socket in).
+    let dir = match tempfile::Builder::new().prefix("rf-conformance-").tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("cannot create temp dir: {e}");
+            return 1;
+        }
+    };
+    let sock_path = dir.path().join("plugin.sock");
     let listener = match UnixListener::bind(&sock_path) {
         Ok(l) => l,
         Err(e) => {
@@ -232,7 +238,7 @@ pub fn run(command: &str, config_json: &str, endpoint: &str) -> i32 {
         kill(child);
     }
 
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(dir); // removes the socket and its directory
     report(&checks)
 }
 

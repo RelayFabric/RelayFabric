@@ -47,6 +47,16 @@ pub fn verify(node_id: &str, msg: &[u8], sig: &[u8]) -> bool {
         return false;
     };
 
+    // Only the canonical spelling (`node_id()`'s own lowercase output)
+    // verifies. `hex::decode` accepts either case, but every policy lookup
+    // keyed on a node_id -- the trust store, configured-peer matching,
+    // advert/attestation binding -- is an exact string compare, so a case
+    // variant that verified here would be a fresh, unknown identity to all
+    // of them: a blocked peer's way back in.
+    if hex::encode(&bytes) != hex_part {
+        return false;
+    }
+
     let Ok(verifying_key_bytes): Result<[u8; 32], _> = bytes.try_into() else {
         return false;
     };
@@ -147,6 +157,29 @@ mod tests {
         let node_id2 = identity2.node_id();
 
         assert!(!verify(&node_id2, msg, &sig));
+    }
+
+    /// `hex::decode` is case-insensitive, so without an explicit check an
+    /// `rf:ABCD...` spelling verifies against the same key as `rf:abcd...`
+    /// -- while every policy lookup keyed on a node_id (the trust store,
+    /// configured-peer matching, advert binding) is an exact string compare.
+    /// A blocked peer could otherwise reconnect under a case variant and be
+    /// admitted as a fresh, unknown node. Only the canonical lowercase form
+    /// (`NodeIdentity::node_id`'s own output) verifies.
+    #[test]
+    fn verify_rejects_a_non_canonical_uppercase_node_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = NodeIdentity::load_or_create(dir.path()).unwrap();
+        let msg = b"hello world";
+        let sig = identity.sign(msg);
+        let upper = identity.node_id().to_uppercase().replace("RF:", "rf:");
+        assert_ne!(
+            upper,
+            identity.node_id(),
+            "fixture sanity: the hex must differ in case"
+        );
+        assert!(!verify(&upper, msg, &sig));
+        assert!(verify(&identity.node_id(), msg, &sig));
     }
 
     #[test]

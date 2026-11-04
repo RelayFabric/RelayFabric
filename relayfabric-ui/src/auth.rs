@@ -134,14 +134,17 @@ pub struct Auth {
     sessions: Mutex<HashMap<String, Session>>,
     /// Outstanding challenges: token -> (challenge bytes, purpose, expiry).
     challenges: Mutex<HashMap<String, Challenge>>,
-    /// One-time setup token (printed at startup) that authorizes the FIRST
-    /// registration when the credential store is empty.
+    /// One-time setup token that authorizes the FIRST registration when
+    /// the credential store is empty. Written to `setup_token_path` (0600)
+    /// rather than logged, so log readers do not get a bootstrap secret.
     pub setup_token: String,
+    pub setup_token_path: PathBuf,
     /// The WebAuthn RP id (a registrable domain suffix of the UI's host).
     pub rp_id: String,
-    /// Lower-cased host names accepted in clientData origins (the same
-    /// allowlist the proxy's Host/Origin guards use; scheme and port are
-    /// not identity here -- the host is).
+    /// Lower-cased full origins (`scheme://host[:port]`) accepted in
+    /// clientData. WebAuthn's RP-id scoping ignores port and the browser
+    /// prompt shows only the host, so a page on another port of an allowed
+    /// host could otherwise relay a ceremony; the origin must match exactly.
     pub origins: Vec<String>,
 }
 
@@ -186,12 +189,20 @@ impl Auth {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e),
         };
+        let setup_token = token();
+        let setup_token_path = state_dir.join("setup-token");
+        if creds.is_empty() {
+            write_0600(&setup_token_path, format!("{setup_token}\n").as_bytes())?;
+        } else {
+            let _ = std::fs::remove_file(&setup_token_path);
+        }
         Ok(Auth {
             path,
             creds: Mutex::new(creds),
             sessions: Mutex::new(HashMap::new()),
             challenges: Mutex::new(HashMap::new()),
-            setup_token: token(),
+            setup_token,
+            setup_token_path,
             rp_id,
             origins,
         })
@@ -205,17 +216,7 @@ impl Auth {
         let tmp =
             self.path
                 .with_extension(format!("tmp.{}.{}", std::process::id(), b64url(&rand32())));
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            f.write_all(&serde_json::to_vec_pretty(creds)?)?;
-        }
+        write_0600(&tmp, &serde_json::to_vec_pretty(creds)?)?;
         std::fs::rename(&tmp, &self.path)
     }
 
@@ -227,19 +228,33 @@ impl Auth {
         self.creds.lock().unwrap().clone()
     }
 
-    pub fn remove_credential(&self, id: &str) -> bool {
+    pub fn remove_credential(&self, id: &str) -> Result<(), &'static str> {
         let mut creds = self.creds.lock().unwrap();
-        let before = creds.len();
-        creds.retain(|c| c.id != id);
-        let removed = creds.len() != before;
-        if removed {
-            let _ = self.persist(&creds);
-            // Revoke live sessions for the deleted credential (audit
-            // finding): removing a lost/compromised passkey must not leave
-            // its 12h sessions valid.
-            self.sessions.lock().unwrap().retain(|_, s| s.cred_id != id);
+        let idx = creds
+            .iter()
+            .position(|c| c.id == id)
+            .ok_or("unknown credential")?;
+        // Deleting the last administrator would lock everyone out of
+        // credential management (recoverable only by wiping the store).
+        let admins = creds
+            .iter()
+            .filter(|c| c.role == Role::Administrator)
+            .count();
+        if creds[idx].role == Role::Administrator && admins == 1 {
+            return Err("refusing to delete the last administrator credential");
         }
-        removed
+        creds.remove(idx);
+        // Revoke live sessions for the deleted credential (audit
+        // finding): removing a lost/compromised passkey must not leave
+        // its 12h sessions valid.
+        self.sessions.lock().unwrap().retain(|_, s| s.cred_id != id);
+        // The in-memory removal stands either way; a persist failure is
+        // surfaced so the operator knows the revocation will not survive
+        // a restart.
+        self.persist(&creds).map_err(|e| {
+            tracing::error!(error = %e, "cannot persist credential store");
+            "cannot persist credential store"
+        })
     }
 
     /// Issues a challenge; returns (challenge_token, challenge_b64url).
@@ -294,7 +309,8 @@ impl Auth {
             &challenge,
             &self.origins,
         )?;
-        let (cred_id, alg, public_key) = parse_attestation_object(attestation_object, &self.rp_id)?;
+        let (cred_id, alg, public_key, counter) =
+            parse_attestation_object(attestation_object, &self.rp_id)?;
         let id = b64url(&cred_id);
         let mut creds = self.creds.lock().unwrap();
         // Bootstrap TOCTOU close (audit finding): the setup-token gate in the
@@ -313,12 +329,16 @@ impl Auth {
             id: id.clone(),
             alg,
             public_key,
-            counter: 0,
+            counter,
             role,
             label,
         });
         self.persist(&creds)
             .map_err(|_| "cannot persist credential store")?;
+        if creds.len() == 1 {
+            // Bootstrap done: the setup token is spent.
+            let _ = std::fs::remove_file(&self.setup_token_path);
+        }
         Ok(id)
     }
 
@@ -367,7 +387,12 @@ impl Auth {
         let changed = counter > cred.counter;
         if changed {
             cred.counter = counter;
-            let _ = self.persist(&creds);
+            if let Err(e) = self.persist(&creds) {
+                // Clone detection still works in memory; it just will not
+                // survive a restart. Loud, not fatal: a read-only state dir
+                // should not lock administrators out.
+                tracing::error!(error = %e, "cannot persist authenticator counter");
+            }
         }
         drop(creds);
 
@@ -458,7 +483,8 @@ fn verify_client_data(
     if cd.cross_origin == Some(true) {
         return Err("cross-origin ceremony refused");
     }
-    let (scheme, host) = split_origin(&cd.origin).ok_or("malformed origin")?;
+    let origin = cd.origin.to_ascii_lowercase();
+    let (scheme, host) = split_origin(&origin).ok_or("malformed origin")?;
     // Scheme is part of identity (audit finding): a plaintext-HTTP origin is
     // refused for any host except loopback, which browsers treat as a secure
     // context. Otherwise an active network attacker serving the login page
@@ -467,10 +493,23 @@ fn verify_client_data(
     if scheme != "https" && !(scheme == "http" && loopback) {
         return Err("origin scheme not allowed (need https, or http on loopback)");
     }
-    if !origins.iter().any(|o| o == &host) {
+    if !origins.iter().any(|o| o == &origin) {
         return Err("origin not allowed");
     }
     Ok(())
+}
+
+/// Create-or-truncate `path` with mode 0600 and write `bytes`.
+fn write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)
 }
 
 /// Splits an origin `scheme://host[:port]` into (lowercased scheme,
@@ -493,10 +532,13 @@ fn split_origin(origin: &str) -> Option<(String, String)> {
 /// and COSE public key are extracted. Returns (cred_id, alg, key_bytes)
 /// where key_bytes is SEC1-uncompressed for ES256 or raw 32 bytes for
 /// Ed25519.
+/// (credential id, COSE alg, public key bytes, attested signCount).
+type Attested = (Vec<u8>, i64, Vec<u8>, u32);
+
 fn parse_attestation_object(
     attestation_object: &[u8],
     rp_id: &str,
-) -> Result<(Vec<u8>, i64, Vec<u8>), &'static str> {
+) -> Result<Attested, &'static str> {
     let value: ciborium::Value =
         ciborium::from_reader(attestation_object).map_err(|_| "malformed attestationObject")?;
     let map = value.as_map().ok_or("attestationObject is not a map")?;
@@ -522,7 +564,10 @@ fn parse_attestation_object(
     }
     let cred_id = auth_data[55..cred_end].to_vec();
     let (alg, key) = parse_cose_key(&auth_data[cred_end..])?;
-    Ok((cred_id, alg, key))
+    // Store the attested signCount (WebAuthn L2 §7.1 step 22): seeding it
+    // with 0 would let a clone with any count 1..N pass the first login.
+    let counter = u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
+    Ok((cred_id, alg, key, counter))
 }
 
 /// COSE_Key -> (alg, key bytes): EC2/P-256 (SEC1 uncompressed) or
@@ -670,7 +715,13 @@ mod tests {
     const ORIGIN: &str = "http://localhost:8087";
 
     fn auth(dir: &std::path::Path) -> Auth {
-        Auth::open(dir.join("state"), RP.into(), vec!["localhost".into()]).unwrap()
+        Auth::open(dir.join("state"), RP.into(), vec![ORIGIN.into()]).unwrap()
+    }
+
+    /// A fresh P-256 signing key from 32 random bytes (a value at or above
+    /// the curve order is astronomically unlikely; `from_slice` would say).
+    fn test_signing_key() -> p256::ecdsa::SigningKey {
+        p256::ecdsa::SigningKey::from_slice(&rand32()).unwrap()
     }
 
     fn client_data(ty: &str, challenge_b64: &str) -> Vec<u8> {
@@ -681,20 +732,24 @@ mod tests {
     /// authData for a ceremony: rpIdHash || flags || counter || attested
     /// credential data (aaguid, credId, COSE key) when `cose` is given.
     fn auth_data(flags: u8, counter: u32, cose: Option<Vec<u8>>) -> Vec<u8> {
+        auth_data_with_cred(flags, counter, cose, b"cid1")
+    }
+
+    fn auth_data_with_cred(flags: u8, counter: u32, cose: Option<Vec<u8>>, cred: &[u8]) -> Vec<u8> {
         let mut out = Sha256::digest(RP.as_bytes()).to_vec();
         out.push(flags);
         out.extend_from_slice(&counter.to_be_bytes());
         if let Some(cose) = cose {
             out.extend_from_slice(&[0u8; 16]); // aaguid
-            out.extend_from_slice(&(4u16).to_be_bytes());
-            out.extend_from_slice(b"cid1");
+            out.extend_from_slice(&(cred.len() as u16).to_be_bytes());
+            out.extend_from_slice(cred);
             out.extend_from_slice(&cose);
         }
         out
     }
 
     fn cose_es256(key: &p256::ecdsa::VerifyingKey) -> Vec<u8> {
-        let point = key.to_encoded_point(false);
+        let point = key.to_sec1_point(false);
         let entries = ciborium::Value::Map(vec![
             (1.into(), 2.into()),
             (3.into(), (-7).into()),
@@ -728,9 +783,13 @@ mod tests {
     }
 
     fn register_es256(a: &Auth) -> (p256::ecdsa::SigningKey, String) {
-        let signing = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        register_es256_as(a, b"cid1")
+    }
+
+    fn register_es256_as(a: &Auth, cred: &[u8]) -> (p256::ecdsa::SigningKey, String) {
+        let signing = test_signing_key();
         let (tok, ch) = a.new_challenge(Purpose::Register);
-        let ad = auth_data(0x45, 0, Some(cose_es256(signing.verifying_key())));
+        let ad = auth_data_with_cred(0x45, 0, Some(cose_es256(signing.verifying_key())), cred);
         let id = a
             .register(
                 &tok,
@@ -795,7 +854,7 @@ mod tests {
         let a = Auth::open(
             dir.path().join("s"),
             "relay.internal".into(),
-            vec!["relay.internal".into()],
+            vec!["https://relay.internal".into()],
         )
         .unwrap();
         let (tok, ch) = a.new_challenge(Purpose::Register);
@@ -841,6 +900,91 @@ mod tests {
     }
 
     #[test]
+    fn same_host_other_port_origin_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = auth(dir.path());
+        let (tok, ch) = a.new_challenge(Purpose::Register);
+        let cdj = format!(
+            r#"{{"type":"webauthn.create","challenge":"{ch}","origin":"http://localhost:3000"}}"#
+        )
+        .into_bytes();
+        let ad = auth_data(0x45, 0, None);
+        assert_eq!(
+            a.register(
+                &tok,
+                &cdj,
+                &attestation_object(&ad),
+                Role::Viewer,
+                "x".into(),
+                false
+            ),
+            Err("origin not allowed")
+        );
+    }
+
+    #[test]
+    fn registration_stores_attested_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = auth(dir.path());
+        let signing = test_signing_key();
+        let (tok, ch) = a.new_challenge(Purpose::Register);
+        let ad = auth_data(0x45, 5, Some(cose_es256(signing.verifying_key())));
+        let id = a
+            .register(
+                &tok,
+                &client_data("webauthn.create", &ch),
+                &attestation_object(&ad),
+                Role::Administrator,
+                "t".into(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(a.credentials()[0].counter, 5);
+        // a clone replaying a count at or below the attested one is caught
+        assert_eq!(
+            assert_login(&a, &signing, &id, 3),
+            Err("authenticator counter regressed (possible cloned credential)")
+        );
+        assert!(assert_login(&a, &signing, &id, 6).is_ok());
+    }
+
+    #[test]
+    fn setup_token_file_is_private_and_spent_on_bootstrap() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let a = auth(dir.path());
+        let p = &a.setup_token_path;
+        assert_eq!(std::fs::read_to_string(p).unwrap().trim(), a.setup_token);
+        assert_eq!(
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        register_es256(&a);
+        assert!(!p.exists());
+        // reopening with credentials present does not mint a new one
+        let b = auth(dir.path());
+        assert!(!b.setup_token_path.exists());
+    }
+
+    #[test]
+    fn last_administrator_cannot_be_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = auth(dir.path());
+        let (_, admin) = register_es256(&a);
+        assert_eq!(
+            a.remove_credential(&admin),
+            Err("refusing to delete the last administrator credential")
+        );
+        let (_, second) = register_es256_as(&a, b"second");
+        assert_eq!(a.remove_credential(&admin), Ok(()));
+        assert_eq!(
+            a.remove_credential(&second),
+            Err("refusing to delete the last administrator credential")
+        );
+        assert_eq!(a.remove_credential("nope"), Err("unknown credential"));
+    }
+
+    #[test]
     fn split_origin_handles_ipv6_and_scheme() {
         assert_eq!(
             split_origin("http://[::1]:8087"),
@@ -860,8 +1004,8 @@ mod tests {
     fn cose_key_on_wrong_curve_is_rejected_at_registration() {
         let dir = tempfile::tempdir().unwrap();
         let a = auth(dir.path());
-        let signing = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-        let point = signing.verifying_key().to_encoded_point(false);
+        let signing = test_signing_key();
+        let point = signing.verifying_key().to_sec1_point(false);
         // Real P-256 point, but the COSE crv label claims something else.
         let cose = {
             let entries = ciborium::Value::Map(vec![
@@ -900,10 +1044,11 @@ mod tests {
     fn deleting_a_credential_revokes_its_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let a = auth(dir.path());
+        let _keep_one_admin = register_es256_as(&a, b"other");
         let (signing, id) = register_es256(&a);
         let (session, _) = assert_login(&a, &signing, &id, 1).unwrap();
         assert!(a.session_role(&session).is_some());
-        assert!(a.remove_credential(&id));
+        assert_eq!(a.remove_credential(&id), Ok(()));
         assert!(
             a.session_role(&session).is_none(),
             "removing the credential must revoke its live sessions"
@@ -918,7 +1063,7 @@ mod tests {
         let _ = register_es256(&a); // fills the store
                                     // A second require_empty registration must be refused even with a
                                     // valid ceremony — closes the concurrent-bootstrap multi-admin hole.
-        let signing = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let signing = test_signing_key();
         let (tok, ch) = a.new_challenge(Purpose::Register);
         let ad = auth_data(0x45, 0, Some(cose_es256(signing.verifying_key())));
         assert_eq!(
@@ -1021,7 +1166,7 @@ mod tests {
         let (tok, ch) = a.new_challenge(Purpose::Login);
         let cdj = client_data("webauthn.get", &ch);
         let ad = auth_data(0x05, 1, None);
-        let other = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let other = test_signing_key();
         let mut signed = ad.clone();
         signed.extend_from_slice(&Sha256::digest(&cdj));
         let sig: p256::ecdsa::Signature = other.sign(&signed);

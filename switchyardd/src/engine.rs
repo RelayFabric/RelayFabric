@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct PluginHandle {
     pub tx: mpsc::Sender<DaemonToPlugin>,
@@ -144,7 +144,18 @@ pub(crate) fn create_data_dir(data_dir: &Path) -> std::io::Result<()> {
 impl Daemon {
     pub fn new(cfg: Config, data_dir: &Path) -> std::io::Result<Daemon> {
         create_data_dir(data_dir)?;
-        let store = Store::open(&data_dir.join("relayfabric.db")).map_err(std::io::Error::other)?;
+        let db_path = data_dir.join("relayfabric.db");
+        let store = Store::open(&db_path).map_err(std::io::Error::other)?;
+        // SQLite creates the DB (and derives the -wal/-shm modes from it)
+        // under the process umask, typically 0644. The directory is the
+        // usual boundary, but an isolation deployment opens it to 0711
+        // (main.rs), so the files must stand on their own.
+        for suffix in ["", "-wal", "-shm"] {
+            let p = std::path::PathBuf::from(format!("{}{suffix}", db_path.display()));
+            if p.exists() {
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
         let recovered = store.recover().map_err(std::io::Error::other)?;
         if recovered > 0 {
             info!(recovered, "requeued in-flight deliveries from previous run");
@@ -294,7 +305,7 @@ impl Daemon {
     /// block. `load_from_str` runs `resolve_secrets` before returning, so
     /// `new.plugins[_].config` is resolved too, and a config re-applied with
     /// unchanged secret-yielding env vars compares equal. Skip that pipeline
-    /// (e.g. `serde_yaml::from_str` + `validate` by hand) and `new.plugins[_]
+    /// (e.g. `serde_norway::from_str` + `validate` by hand) and `new.plugins[_]
     /// .config` still holds the unresolved `${...}` reference string, which
     /// will never equal the resolved value in `cfg` -- a false-positive
     /// restart_required entry every single time that plugin's config block
@@ -329,6 +340,11 @@ impl Daemon {
                 restart_required.push("daemon".to_string());
             }
             if cfg.discovery != new.discovery {
+                restart_required.push("daemon".to_string());
+            }
+            // The CAS budget is read once at `Cas::new`; honest about it
+            // rather than echoing an unenforced value from GET /v1/limits.
+            if cfg.limits.global.cas_max_bytes != new.limits.global.cas_max_bytes {
                 restart_required.push("daemon".to_string());
             }
             let old_names: BTreeSet<&String> = cfg.plugins.keys().collect();
@@ -496,9 +512,12 @@ pub fn handle_inbound(
                     None
                 }
             };
-        if let Some(challenge) = matched {
-            confirm_link(d, challenge, now);
-            return;
+        match matched {
+            Some(challenge) => {
+                confirm_link(d, challenge, now);
+                return;
+            }
+            None => note_failed_link_guess(d, plugin, &sender),
         }
     }
 
@@ -562,7 +581,13 @@ pub fn handle_inbound(
         Sender { native_ref: sender },
         kind,
         body,
-        created_at.unwrap_or(now),
+        // The sender's own clock claim, kept for diagnostics but bounded:
+        // TTL and sealed-expiry arithmetic on it would panic near chrono's
+        // range, which a plugin speaking the wire format directly can
+        // supply.
+        created_at
+            .filter(|t| t.signed_duration_since(now).num_days().abs() < 36_525)
+            .unwrap_or(now),
         now + CDuration::seconds(ttl_default_secs as i64),
         hop_limit,
     );
@@ -842,6 +867,42 @@ fn fed_trust_denied(d: &Daemon, peer_node_id: &str, accept_from: &str) -> bool {
     trust_rank(level_str) < trust_rank(accept_from)
 }
 
+/// Structural checks on a federation envelope's signature chain that cost
+/// a length and a string compare, run BEFORE any signature is verified:
+/// every honest hop appends exactly one attestation (`process_due_fed`), so
+/// a chain longer than `max_hops` is never legitimate and would only make
+/// this node burn one ed25519 verification per link; and the chain's last
+/// link (last attestation, else the origin) must be the peer that delivered
+/// the frame, so a peer cannot pass off a third node's signed envelope as
+/// having come through it without attesting to that.
+fn check_chain_shape(
+    env: &Envelope,
+    peer_node_id: &str,
+    max_hops: u32,
+) -> Result<(), &'static str> {
+    if env.attestations.len() > max_hops as usize {
+        return Err("HOP_LIMIT");
+    }
+    // An envelope with no chain at all is left to `verify_chain`, whose
+    // BAD_SIGNATURE is the clearer verdict.
+    let last = env
+        .attestations
+        .last()
+        .map(|a| a.node_id.as_str())
+        .or(env.origin.as_ref().map(|o| o.node_id.as_str()));
+    if last.is_some_and(|l| l != peer_node_id) {
+        return Err("CHAIN_PEER_MISMATCH");
+    }
+    Ok(())
+}
+
+/// Persistent half of federation dedup: the in-memory `Dedup` is cleared on
+/// restart, but `messages` is keyed by the envelope id that federation
+/// preserves end to end, so an id already on disk is a replay.
+fn message_exists(d: &Daemon, id: uuid::Uuid) -> bool {
+    matches!(d.store.lock().unwrap().get_message(id), Ok(Some(_)))
+}
+
 /// Replay-window bound + TTL clamp shared verbatim by `fed_ingress` and
 /// `fed_sealed_ingress` (final-review I-1, SPEC §113.5): effective expiry
 /// is computed from the SIGNED `created_at` + this accept side's OWN
@@ -855,12 +916,20 @@ fn fed_trust_denied(d: &Daemon, peer_node_id: &str, accept_from: &str) -> bool {
 fn bound_replay_and_clamp_ttl(env: &mut Envelope, max_ttl_secs: u64) -> Result<(), &'static str> {
     const MAX_CREATED_AT_SKEW_SECS: i64 = 300;
     let ingress_now = Utc::now();
-    let stale = env.created_at + CDuration::seconds(max_ttl_secs as i64) < ingress_now;
+    // `created_at` is wire-supplied: checked arithmetic, since chrono panics
+    // on overflow near its ±262k-year range and a peer can send any
+    // parseable timestamp. An unrepresentable deadline is EXPIRED.
+    let max_ttl = CDuration::try_seconds(max_ttl_secs as i64).ok_or("EXPIRED")?;
+    let deadline = env
+        .created_at
+        .checked_add_signed(max_ttl)
+        .ok_or("EXPIRED")?;
+    let stale = deadline < ingress_now;
     let far_future = env.created_at > ingress_now + CDuration::seconds(MAX_CREATED_AT_SKEW_SECS);
     if stale || far_future {
         return Err("EXPIRED");
     }
-    let capped = Utc::now() + CDuration::seconds(max_ttl_secs as i64);
+    let capped = ingress_now + max_ttl;
     if env.expires_at > capped {
         env.expires_at = capped;
     }
@@ -896,10 +965,11 @@ fn persist_and_fan_out(
         drop(store);
         return FedIngressOutcome::Rejected("STORAGE_ERROR");
     }
-    let shas: Vec<String> = env.attachments.iter().map(|a| a.sha256.clone()).collect();
-    if let Err(e) = store.insert_attachment_refs(env.id, &shas) {
-        warn!(error = %e, "failed to persist {what} attachment refs");
-    }
+    // No attachment refs: a federated envelope only ever carries
+    // attachment metadata, never bytes, so this message owns no local
+    // blob. `load_attachments` resolves a sha only through the message's
+    // own refs, which keeps a peer from naming (and thereby exporting) any
+    // blob that happens to exist in this node's CAS.
     let queue_full_routes = fan_out_deliveries(
         &store,
         env.id,
@@ -970,17 +1040,6 @@ pub fn fed_ingress(
 ) -> FedIngressOutcome {
     env.priority = "normal".to_string();
 
-    if fed::sign::verify_chain(&env).is_err() {
-        return reject(
-            d,
-            &env,
-            &target_route,
-            peer_node_id,
-            "BAD_SIGNATURE",
-            Persistence::NoPersist,
-        );
-    }
-
     let fed_cfg = d.cfg_snapshot(|c| c.federation.clone());
     let Some(fed_cfg) = fed_cfg else {
         // Federation config vanished from under a live connection (e.g. a
@@ -1007,6 +1066,31 @@ pub fn fed_ingress(
             &target_route,
             peer_node_id,
             "TRUST_DENIED",
+            Persistence::NoPersist,
+        );
+    }
+
+    // Cheap policy before crypto (same order `fed_sealed_ingress` already
+    // uses): the trust gate above means a peer below `accept_from` never
+    // makes this node verify a signature chain, and the shape check bounds
+    // the chain a trusted-but-abusive peer can make it verify.
+    if let Err(reason) = check_chain_shape(&env, peer_node_id, fed_cfg.max_hops) {
+        return reject(
+            d,
+            &env,
+            &target_route,
+            peer_node_id,
+            reason,
+            Persistence::NoPersist,
+        );
+    }
+    if fed::sign::verify_chain(&env).is_err() {
+        return reject(
+            d,
+            &env,
+            &target_route,
+            peer_node_id,
+            "BAD_SIGNATURE",
             Persistence::NoPersist,
         );
     }
@@ -1083,6 +1167,7 @@ pub fn fed_ingress(
         .lock()
         .unwrap()
         .is_duplicate(&dedup_key, Instant::now())
+        || message_exists(d, env.id)
     {
         metrics::inc(&metrics::DUPLICATES);
         return FedIngressOutcome::Rejected("DUPLICATE");
@@ -1109,6 +1194,9 @@ pub fn fed_ingress(
     // Accepted by both dedup and the rate limiter: record now, mirroring
     // `handle_inbound`'s own ordering.
     d.dedup.lock().unwrap().record(&dedup_key, Instant::now());
+    // Stamped by us, not the wire: `received_at` is unsigned and feeds the
+    // delivery-latency metric.
+    env.received_at = Utc::now();
 
     persist_and_fan_out(
         d,
@@ -1326,8 +1414,26 @@ pub fn fed_sealed_ingress(
     // the remote-claimed value.
     env.priority = "normal".to_string();
 
+    if let Err(reason) = check_chain_shape(&env, peer_node_id, fed_cfg.max_hops) {
+        return sealed_reject(peer_node_id, reason);
+    }
     if fed::sign::verify_chain(&env).is_err() {
         return sealed_reject(peer_node_id, "BAD_SIGNATURE");
+    }
+    // The header-level dedup above keys on the sealed wrapper (`id` +
+    // `expires_at`), which the origin can re-mint around the same signed
+    // envelope; dedup the decrypted envelope's own id too (same key space
+    // as `fed_ingress`, plus the persistent `messages` table so a replay
+    // after a restart is caught as well).
+    let env_key = env.id.to_string();
+    if d.dedup
+        .lock()
+        .unwrap()
+        .is_duplicate(&env_key, Instant::now())
+        || message_exists(d, env.id)
+    {
+        metrics::inc(&metrics::DUPLICATES);
+        return FedIngressOutcome::Rejected("DUPLICATE");
     }
 
     // Replay-window bound + TTL clamp (`bound_replay_and_clamp_ttl`,
@@ -1379,7 +1485,14 @@ pub fn fed_sealed_ingress(
     }
     // Accepted by both dedup and the rate limiter: record now, mirroring
     // `fed_ingress`'s own ordering.
-    d.dedup.lock().unwrap().record(&dedup_key, Instant::now());
+    {
+        let mut dedup = d.dedup.lock().unwrap();
+        dedup.record(&dedup_key, Instant::now());
+        dedup.record(&env_key, Instant::now());
+    }
+    // Stamped by us, not the wire: `received_at` is unsigned and feeds the
+    // delivery-latency metric.
+    env.received_at = Utc::now();
 
     persist_and_fan_out(
         d,
@@ -1405,6 +1518,11 @@ pub fn initiate_link(
     target: Endpoint,
     display_name: &str,
 ) -> Result<i64, String> {
+    // A fresh challenge starts with a clean guess budget.
+    LINK_CODE_GUESSES
+        .lock()
+        .unwrap()
+        .remove(&format!("{}|{}", target.protocol, target.endpoint));
     let direct_capable: Vec<String> = {
         let plugins = d.plugins.lock().unwrap();
         plugins
@@ -1559,6 +1677,56 @@ fn enqueue_identity_send(
 /// supersedes rather than stacking a second link), inserts the new link, and
 /// enqueues best-effort confirmation notices to both parties via
 /// `IDENTITY_ROUTE`. The confirming message itself is never routed further.
+/// Wrong 6-digit replies per `(plugin, sender)` inside one challenge
+/// window. A sender who can spoof the target's native ref on a cheap
+/// transport could otherwise walk the code space inside the 15-minute
+/// challenge lifetime; after `LINK_CODE_MAX_GUESSES` the target's active
+/// challenge is revoked and the operator has to re-initiate. Ordinary
+/// 6-digit chatter with no challenge pending counts too, harmlessly: the
+/// entry ages out with the window and `initiate_link` clears it.
+const LINK_CODE_MAX_GUESSES: u32 = 5;
+const LINK_CODE_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const LINK_CODE_MAP_MAX: usize = 10_000;
+static LINK_CODE_GUESSES: std::sync::LazyLock<Mutex<HashMap<String, (u32, Instant)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn note_failed_link_guess(d: &Daemon, plugin: &str, sender: &str) {
+    let now = Instant::now();
+    let key = format!("{plugin}|{sender}");
+    let count = {
+        let mut map = LINK_CODE_GUESSES.lock().unwrap();
+        map.retain(|_, (_, first)| now.duration_since(*first) < LINK_CODE_WINDOW);
+        if map.len() >= LINK_CODE_MAP_MAX {
+            // Bounded by wholesale reset under a sender flood;
+            // per-entry LRU if that ever matters.
+            map.clear();
+        }
+        let entry = map.entry(key.clone()).or_insert((0, now));
+        entry.0 += 1;
+        let count = entry.0;
+        if count >= LINK_CODE_MAX_GUESSES {
+            map.remove(&key);
+        }
+        count
+    };
+    if count < LINK_CODE_MAX_GUESSES {
+        return;
+    }
+    match d
+        .store
+        .lock()
+        .unwrap()
+        .delete_challenges_for_target(plugin, sender)
+    {
+        Ok(n) if n > 0 => warn!(
+            plugin,
+            sender, "identity-link challenge revoked after repeated wrong codes"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "failed to revoke identity-link challenge"),
+    }
+}
+
 fn confirm_link(d: &Daemon, challenge: storage::Challenge, now: DateTime<Utc>) {
     let link_id = {
         let store = d.store.lock().unwrap();
@@ -1669,7 +1837,27 @@ fn warn_if_mark_failed(delivery: i64, state: &str, result: rusqlite::Result<()>)
     }
 }
 
-pub fn handle_result(d: &Daemon, corr: i64, delivered: bool, detail: Option<String>) {
+/// Dead-letters a delivery a policy denied (`POLICY_DENIED`), for plugin
+/// and federation destinations alike.
+fn policy_denied(d: &Daemon, del: &storage::Delivery, policy: &str) {
+    metrics::inc(&metrics::POLICY_DENIALS);
+    let result = d
+        .store
+        .lock()
+        .unwrap()
+        .mark_terminal(del.id, "dead_letter", "POLICY_DENIED");
+    warn_if_mark_failed(del.id, "dead_letter", result);
+    info!(delivery = del.id, policy, "policy denied");
+    emit_delivery(d, del.message_id, del.route.clone(), "dead_letter");
+}
+
+/// Applies a plugin's `DeliveryResult`. `plugin` is the name bound to the
+/// IPC connection the result arrived on (not anything the frame claims):
+/// delivery ids are sequential and visible to every plugin through its own
+/// `Send` frames, so without this check one plugin could mark another
+/// plugin's in-flight delivery delivered (silent loss) or nack it into
+/// dead-letter.
+pub fn handle_result(d: &Daemon, plugin: &str, corr: i64, delivered: bool, detail: Option<String>) {
     let store = d.store.lock().unwrap();
     // Fetched once, up front, and reused by both branches below: the
     // `delivered` branch already needed `route`/`message_id` (for the
@@ -1679,6 +1867,25 @@ pub fn handle_result(d: &Daemon, corr: i64, delivered: bool, detail: Option<Stri
     // design §4's `delivery` event needs `route`/`message_id` in EITHER
     // branch, which this single fetch now covers for both.
     let delivery = store.deliveries_for_id(corr);
+    match &delivery {
+        None => {
+            debug!(
+                delivery = corr,
+                plugin, "result for unknown delivery ignored"
+            );
+            return;
+        }
+        Some(del) if del.destination.protocol != plugin => {
+            warn!(
+                delivery = corr,
+                plugin,
+                owner = %del.destination.protocol,
+                "delivery result from a plugin that does not own the delivery; ignored"
+            );
+            return;
+        }
+        Some(_) => {}
+    }
     if delivered {
         metrics::inc(&metrics::EGRESS);
         // Route counter + delivery latency (design §3): looked up from the
@@ -1946,6 +2153,17 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
         return;
     }
     if del.destination.protocol == FED_PROTOCOL {
+        // Policies apply to federation destinations too (`destination_
+        // protocol: [fed]`, `drop_kinds`): deny is honored here. The
+        // Allow-side payload/attachment rules are plugin-send concerns and
+        // do not touch a signed envelope that must stay byte-identical.
+        let policies = d.cfg_snapshot(|c| c.policies.clone());
+        if let policy::Decision::Deny { policy } =
+            policy::evaluate(&policies, &env, &del.destination)
+        {
+            policy_denied(d, &del, policy);
+            return;
+        }
         process_due_fed(d, del, env, now).await;
         return;
     }
@@ -1956,17 +2174,7 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
     // cfg-guard-held-across-other-locks pattern the lock order forbids.
     let policies = d.cfg_snapshot(|c| c.policies.clone());
     match policy::evaluate(&policies, &env, &del.destination) {
-        policy::Decision::Deny { policy } => {
-            metrics::inc(&metrics::POLICY_DENIALS);
-            let result =
-                d.store
-                    .lock()
-                    .unwrap()
-                    .mark_terminal(del.id, "dead_letter", "POLICY_DENIED");
-            warn_if_mark_failed(del.id, "dead_letter", result);
-            info!(delivery = del.id, policy, "policy denied");
-            emit_delivery(d, del.message_id, del.route.clone(), "dead_letter");
-        }
+        policy::Decision::Deny { policy } => policy_denied(d, &del, policy),
         policy::Decision::Allow {
             max_payload,
             attachments_allowed,
@@ -2142,7 +2350,14 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
                 (Vec::new(), String::new())
             } else if attachments_allowed && dest_supports_attachments {
                 let frame_budget = u64::from(MAX_FRAME) - FRAME_HEADROOM_BYTES;
-                load_attachments(d, &env.attachments, max_attachment_bytes, frame_budget, tp)
+                load_attachments(
+                    d,
+                    env.id,
+                    &env.attachments,
+                    max_attachment_bytes,
+                    frame_budget,
+                    tp,
+                )
             } else {
                 // destination lacks the capability, or policy rejects
                 // attachments outright: strip every attachment and note it
@@ -2176,6 +2391,36 @@ async fn process_due(d: &Arc<Daemon>, del: storage::Delivery, now: DateTime<Utc>
                 None => env.body.clone(),
             };
             let body = transform::render(render_tag, &format!("{truncated_body}{notes}"), limit);
+            // Bound the frame BEFORE flipping the row to `attempting`: the
+            // body cap (transport class) and the attachment budget are
+            // independent, so together they can still exceed `MAX_FRAME`.
+            // An oversize frame fails in the plugin writer, after which
+            // the row would churn through reclaim forever; dead-letter it
+            // here instead. Generous estimate: CBOR adds at most 9 bytes
+            // per string/bytes item plus small fixed map overhead.
+            let frame_estimate = body.len()
+                + del.destination.endpoint.len()
+                + env.kind.len()
+                + attachments
+                    .iter()
+                    .map(|a| a.data.len() + a.filename.len() + a.mime.len() + 64)
+                    .sum::<usize>()
+                + 256;
+            if frame_estimate > MAX_FRAME as usize {
+                let result =
+                    d.store
+                        .lock()
+                        .unwrap()
+                        .mark_terminal(del.id, "dead_letter", "FRAME_OVERSIZE");
+                warn_if_mark_failed(del.id, "dead_letter", result);
+                warn!(
+                    delivery = del.id,
+                    bytes = frame_estimate,
+                    "dead-lettered: rendered frame exceeds MAX_FRAME"
+                );
+                emit_delivery(d, del.message_id, del.route.clone(), "dead_letter");
+                return;
+            }
             let result = d.store.lock().unwrap().mark_attempting(del.id);
             warn_if_mark_failed(del.id, "attempting", result);
             let send = DaemonToPlugin::Send {
@@ -2751,7 +2996,21 @@ async fn process_due_fed_sealed(
     let max_ttl_secs = d
         .cfg_snapshot(|c| c.federation.as_ref().map(|f| f.max_ttl_secs))
         .unwrap_or(86_400);
-    let expires_at = (out_env.created_at + CDuration::seconds(max_ttl_secs as i64)).timestamp();
+    // `created_at` may be a plugin's clock claim (bounded at ingress, but an
+    // addition near chrono's range must never be able to panic the pump).
+    let Some(expires) = CDuration::try_seconds(max_ttl_secs as i64)
+        .and_then(|ttl| out_env.created_at.checked_add_signed(ttl))
+    else {
+        let result = d
+            .store
+            .lock()
+            .unwrap()
+            .mark_terminal(del.id, "dead_letter", "EXPIRED");
+        warn_if_mark_failed(del.id, "dead_letter", result);
+        emit_delivery(d, del.message_id, del.route.clone(), "dead_letter");
+        return;
+    };
+    let expires_at = expires.timestamp();
     let sealed = fed::seal::seal(
         &canonical_env_cbor,
         &out_env.id.to_string(),
@@ -2821,6 +3080,7 @@ const FRAME_HEADROOM_BYTES: u64 = 64 * 1024;
 /// module-level note on the same point).
 fn load_attachments(
     d: &Daemon,
+    message_id: uuid::Uuid,
     metas: &[AttachmentMeta],
     max_attachment_bytes: Option<u64>,
     frame_budget: u64,
@@ -2845,36 +3105,57 @@ fn load_attachments(
             metrics::inc(&metrics::TRANSPORT_DEMOTED);
             continue;
         }
+        // Only blobs this message ingested may ride out with it: a
+        // federated envelope names shas it never delivered bytes for, and
+        // resolving those against the local CAS would hand a remote peer
+        // any blob it can name.
+        let owned = d
+            .store
+            .lock()
+            .unwrap()
+            .has_attachment_ref(message_id, &meta.sha256)
+            .unwrap_or(false);
+        let data = if owned {
+            d.cas.get(&meta.sha256)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "sha not referenced by this message",
+            ))
+        };
+        let data = match data {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(sha = %meta.sha256, error = %e, "attachment missing from CAS");
+                notes.push_str(&format!("\n[attachment {} unavailable]", meta.filename));
+                continue;
+            }
+        };
+        // Budget on what was actually read, never on the meta's `size`
+        // claim (sender-supplied on the wire).
+        let size = data.len() as u64;
         if let Some(cap) = max_attachment_bytes {
-            if meta.size > cap {
+            if size > cap {
                 notes.push_str(&transform::attachment_notes(
-                    &[(meta.filename.clone(), meta.size)],
+                    &[(meta.filename.clone(), size)],
                     &format!("{cap} B limit"),
                 ));
                 continue;
             }
         }
-        if cumulative + meta.size > frame_budget {
+        if cumulative + size > frame_budget {
             notes.push_str(&transform::attachment_notes(
-                &[(meta.filename.clone(), meta.size)],
+                &[(meta.filename.clone(), size)],
                 &format!("{frame_budget} B limit"),
             ));
             continue;
         }
-        match d.cas.get(&meta.sha256) {
-            Ok(data) => {
-                cumulative += meta.size;
-                attachments.push(IpcAttachment {
-                    filename: meta.filename.clone(),
-                    mime: meta.mime.clone(),
-                    data,
-                });
-            }
-            Err(e) => {
-                warn!(sha = %meta.sha256, error = %e, "attachment missing from CAS");
-                notes.push_str(&format!("\n[attachment {} unavailable]", meta.filename));
-            }
-        }
+        cumulative += size;
+        attachments.push(IpcAttachment {
+            filename: meta.filename.clone(),
+            mime: meta.mime.clone(),
+            data,
+        });
     }
     (attachments, notes)
 }
@@ -3015,7 +3296,7 @@ pub mod tests_support {
                 PluginConfig {
                     enabled: true,
                     command: None,
-                    config: serde_yaml::Value::Null,
+                    config: serde_norway::Value::Null,
                     peer_uid: None,
                 },
             );
@@ -4387,12 +4668,80 @@ mod tests {
     }
 
     #[test]
+    fn attachments_not_referenced_by_the_message_are_never_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let sha = d.cas.put(b"private photo bytes").unwrap();
+        // The fed-ingress shape: a message row that names a sha but holds
+        // no ref to it (the bytes never arrived with it).
+        let env = local_env("!x", "b");
+        d.store.lock().unwrap().insert_message(&env).unwrap();
+        let metas = vec![AttachmentMeta {
+            filename: "p.jpg".into(),
+            mime: "application/octet-stream".into(),
+            size: 0,
+            sha256: sha.clone(),
+        }];
+        let tp = || {
+            relay_core::TransportPolicy::for_class(relay_core::TransportClass::TerrestrialInternet)
+        };
+        let (attachments, notes) = load_attachments(&d, env.id, &metas, None, 1 << 20, tp());
+        assert!(
+            attachments.is_empty(),
+            "a sha the message never ingested must not leave"
+        );
+        assert!(notes.contains("unavailable"));
+
+        d.store
+            .lock()
+            .unwrap()
+            .insert_attachment_refs(env.id, &[sha])
+            .unwrap();
+        let (attachments, _) = load_attachments(&d, env.id, &metas, None, 1 << 20, tp());
+        assert_eq!(attachments.len(), 1);
+    }
+
+    #[test]
+    fn attachment_budget_uses_the_blob_size_not_the_claimed_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let sha = d.cas.put(&[7u8; 100]).unwrap();
+        let env = local_env("!x", "b");
+        {
+            let store = d.store.lock().unwrap();
+            store.insert_message(&env).unwrap();
+            store
+                .insert_attachment_refs(env.id, std::slice::from_ref(&sha))
+                .unwrap();
+        }
+        let metas = vec![AttachmentMeta {
+            filename: "big.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 0, // claims to be free
+            sha256: sha,
+        }];
+        let tp =
+            relay_core::TransportPolicy::for_class(relay_core::TransportClass::TerrestrialInternet);
+        let (attachments, notes) = load_attachments(&d, env.id, &metas, Some(50), 1 << 20, tp);
+        assert!(attachments.is_empty());
+        assert!(notes.contains("50 B limit"));
+    }
+
+    #[test]
     fn load_attachments_drops_whatever_would_exceed_the_cumulative_frame_budget() {
         let dir = tempfile::tempdir().unwrap();
         let d = test_daemon(dir.path());
 
         let sha_a = d.cas.put(&[1u8; 10]).unwrap();
         let sha_b = d.cas.put(&[2u8; 10]).unwrap();
+        let env = local_env("!x", "b");
+        {
+            let store = d.store.lock().unwrap();
+            store.insert_message(&env).unwrap();
+            store
+                .insert_attachment_refs(env.id, &[sha_a.clone(), sha_b.clone()])
+                .unwrap();
+        }
         let metas = vec![
             AttachmentMeta {
                 filename: "a.bin".into(),
@@ -4411,7 +4760,7 @@ mod tests {
         // budget only has room for the first attachment's 10 bytes.
         let tp =
             relay_core::TransportPolicy::for_class(relay_core::TransportClass::TerrestrialInternet);
-        let (attachments, notes) = load_attachments(&d, &metas, None, 15, tp);
+        let (attachments, notes) = load_attachments(&d, env.id, &metas, None, 15, tp);
 
         assert_eq!(
             attachments.len(),
@@ -4600,7 +4949,7 @@ mod tests {
         let latency_sum_before =
             metrics::DELIVERY_LATENCY_MICROS_SUM.load(std::sync::atomic::Ordering::Relaxed);
 
-        handle_result(&d, delivery_id, true, None);
+        handle_result(&d, &dest_plugin(&d, delivery_id), delivery_id, true, None);
 
         let route_after = metrics::ROUTE_MESSAGES
             .lock()
@@ -4683,7 +5032,7 @@ mod tests {
         let latency_sum_before =
             metrics::DELIVERY_LATENCY_MICROS_SUM.load(std::sync::atomic::Ordering::Relaxed);
 
-        handle_result(&d, delivery_id, true, None);
+        handle_result(&d, &dest_plugin(&d, delivery_id), delivery_id, true, None);
 
         let latency_sum_after =
             metrics::DELIVERY_LATENCY_MICROS_SUM.load(std::sync::atomic::Ordering::Relaxed);
@@ -6396,7 +6745,7 @@ mod tests {
         let d = test_daemon(dir.path());
         let mut new_cfg = d.cfg.read().unwrap().clone();
         new_cfg.plugins.get_mut("mocka").unwrap().config =
-            serde_yaml::Value::String("changed".into());
+            serde_norway::Value::String("changed".into());
         let outcome = d.apply_config(new_cfg);
         assert_eq!(outcome.restart_required, vec!["mocka".to_string()]);
     }
@@ -6421,7 +6770,7 @@ mod tests {
             crate::config::PluginConfig {
                 enabled: true,
                 command: None,
-                config: serde_yaml::Value::Null,
+                config: serde_norway::Value::Null,
                 peer_uid: None,
             },
         );
@@ -6445,6 +6794,16 @@ mod tests {
         let d = test_daemon(dir.path());
         let mut new_cfg = d.cfg.read().unwrap().clone();
         new_cfg.node.data_dir = dir.path().join("moved");
+        let outcome = d.apply_config(new_cfg);
+        assert_eq!(outcome.restart_required, vec!["daemon".to_string()]);
+    }
+
+    #[test]
+    fn apply_config_cas_budget_change_is_restart_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let mut new_cfg = d.cfg.read().unwrap().clone();
+        new_cfg.limits.global.cas_max_bytes += 1024;
         let outcome = d.apply_config(new_cfg);
         assert_eq!(outcome.restart_required, vec!["daemon".to_string()]);
     }
@@ -6641,7 +7000,7 @@ mod tests {
             crate::config::PluginConfig {
                 enabled: true,
                 command: None,
-                config: serde_yaml::Value::Null,
+                config: serde_norway::Value::Null,
                 peer_uid: None,
             },
         );
@@ -7012,6 +7371,44 @@ routes:
         (due[0].id, message_id)
     }
 
+    /// The plugin a delivery was dispatched to (what the IPC layer passes
+    /// as `handle_result`'s `plugin`).
+    fn dest_plugin(d: &Daemon, delivery_id: i64) -> String {
+        d.store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap()
+            .destination
+            .protocol
+    }
+
+    #[test]
+    fn handle_result_from_another_plugin_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let (delivery_id, _) = deliver_one_message(&d);
+        let owner = dest_plugin(&d, delivery_id);
+        assert_ne!(owner, "intruder");
+
+        handle_result(&d, "intruder", delivery_id, true, None);
+        let state = |id| d.store.lock().unwrap().deliveries_for_id(id).unwrap().state;
+        assert_eq!(
+            state(delivery_id),
+            "attempting",
+            "foreign ack must not mark delivered"
+        );
+        handle_result(&d, "intruder", delivery_id, false, Some("nack".into()));
+        assert_eq!(
+            state(delivery_id),
+            "attempting",
+            "foreign nack must not retry/dead-letter"
+        );
+
+        handle_result(&d, &owner, delivery_id, true, None);
+        assert_eq!(state(delivery_id), "delivered");
+    }
+
     #[test]
     fn handle_result_emits_delivery_event_state_delivered() {
         let dir = tempfile::tempdir().unwrap();
@@ -7019,7 +7416,7 @@ routes:
         let (delivery_id, message_id) = deliver_one_message(&d);
 
         let mut rx = d.events.subscribe();
-        handle_result(&d, delivery_id, true, None);
+        handle_result(&d, &dest_plugin(&d, delivery_id), delivery_id, true, None);
 
         let ev = rx
             .try_recv()
@@ -7045,7 +7442,13 @@ routes:
         let (delivery_id, _message_id) = deliver_one_message(&d); // attempt_count -> 1
 
         let mut rx = d.events.subscribe();
-        handle_result(&d, delivery_id, false, Some("boom".into()));
+        handle_result(
+            &d,
+            &dest_plugin(&d, delivery_id),
+            delivery_id,
+            false,
+            Some("boom".into()),
+        );
 
         let ev = rx
             .try_recv()
@@ -7086,7 +7489,13 @@ routes:
         };
 
         let mut rx = d.events.subscribe();
-        handle_result(&d, delivery_id, false, Some("boom".into()));
+        handle_result(
+            &d,
+            &dest_plugin(&d, delivery_id),
+            delivery_id,
+            false,
+            Some("boom".into()),
+        );
 
         let ev = rx
             .try_recv()
@@ -7203,7 +7612,7 @@ routes:
             store.mark_attempting(due[0].id).unwrap();
             due[0].id
         };
-        handle_result(&d, delivery_id, true, None);
+        handle_result(&d, &dest_plugin(&d, delivery_id), delivery_id, true, None);
 
         // leg 3: identity-link confirm
         seed_challenge(
@@ -7582,6 +7991,205 @@ routes:
     }
 
     #[test]
+    fn fed_ingress_rejects_chain_longer_than_max_hops_before_verifying() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        let mut env = signed_test_envelope(&identity, "hello", 0);
+        // Five bogus links on a max_hops=4 node: refused on length alone,
+        // before a single signature is checked (the sigs here are junk).
+        for _ in 0..5 {
+            env.attestations.push(relay_core::Attestation {
+                node_id: node_id.clone(),
+                ts: Utc::now(),
+                sig: vec![0u8; 64],
+            });
+        }
+        let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
+        assert!(
+            matches!(outcome, FedIngressOutcome::Rejected("HOP_LIMIT")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn fed_ingress_rejects_chain_that_does_not_end_at_the_delivering_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = test_peer_identity(dir.path(), "origin");
+        let relay = test_peer_identity(dir.path(), "relay");
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![
+            fed_peer_cfg("origin", &origin.node_id(), "verified"),
+            fed_peer_cfg("relay", &relay.node_id(), "verified"),
+        ];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        // Signed by `origin` only, but handed to us by `relay`, which did
+        // not attest to forwarding it.
+        let env = signed_test_envelope(&origin, "hello", 0);
+        let outcome = fed_ingress(&d, &relay.node_id(), env, "general".to_string());
+        assert!(
+            matches!(outcome, FedIngressOutcome::Rejected("CHAIN_PEER_MISMATCH")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn fed_ingress_duplicate_is_caught_after_in_memory_dedup_is_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = test_peer_identity(dir.path(), "peer");
+        let node_id = identity.node_id();
+        let mut cfg = fed_config("verified", 4, 86_400);
+        cfg.peers = vec![fed_peer_cfg("phoenix", &node_id, "verified")];
+        let d = test_daemon_with_federation(dir.path(), cfg);
+
+        let env = signed_test_envelope(&identity, "once", 0);
+        let replay = env.clone();
+        assert!(matches!(
+            fed_ingress(&d, &node_id, env, "general".to_string()),
+            FedIngressOutcome::Accepted(_)
+        ));
+        // Simulate a restart: the in-memory dedup window is gone.
+        *d.dedup.lock().unwrap() = dedup::Dedup::new(std::time::Duration::from_secs(3600));
+        let outcome = fed_ingress(&d, &node_id, replay, "general".to_string());
+        assert!(
+            matches!(outcome, FedIngressOutcome::Rejected("DUPLICATE")),
+            "{outcome:?}"
+        );
+        let counts = d.store.lock().unwrap().queue_counts().unwrap();
+        assert_eq!(
+            counts,
+            vec![("pending".to_string(), 2)],
+            "no second fan-out"
+        );
+    }
+
+    #[test]
+    fn bound_replay_rejects_unrepresentable_deadline_without_panicking() {
+        let mut env = local_env("!x", "b");
+        env.created_at = DateTime::<Utc>::MAX_UTC;
+        assert_eq!(bound_replay_and_clamp_ttl(&mut env, 86_400), Err("EXPIRED"));
+        env.created_at = DateTime::<Utc>::MIN_UTC;
+        assert_eq!(bound_replay_and_clamp_ttl(&mut env, 86_400), Err("EXPIRED"));
+    }
+
+    #[test]
+    fn repeated_wrong_link_codes_revoke_the_challenge() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        let now = Utc::now();
+        let reply = |body: &str| {
+            handle_inbound(
+                &d,
+                "mocka",
+                "chan".into(),
+                "!guess-target".into(),
+                "text".into(),
+                body.into(),
+                None,
+                vec![],
+                None,
+            )
+        };
+        d.store
+            .lock()
+            .unwrap()
+            .create_challenge(
+                "424242",
+                "mocka",
+                "!guess-target",
+                "mockb",
+                "!requester",
+                "Name",
+                now,
+                now + CDuration::minutes(15),
+            )
+            .unwrap();
+        for code in ["000001", "000002", "000003", "000004", "000005"] {
+            reply(code);
+        }
+        // The real code no longer confirms anything: the challenge is gone.
+        reply("424242");
+        let linked = d
+            .store
+            .lock()
+            .unwrap()
+            .link_for_identity("mocka", "!guess-target")
+            .unwrap();
+        assert!(
+            linked.is_none(),
+            "challenge must be revoked after repeated wrong codes"
+        );
+    }
+
+    #[test]
+    fn handle_inbound_bounds_an_absurd_sender_created_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        handle_inbound(
+            &d,
+            "mocka",
+            "chan".into(),
+            "!a".into(),
+            "text".into(),
+            "hi".into(),
+            Some(DateTime::<Utc>::MAX_UTC),
+            vec![],
+            None,
+        );
+        let store = d.store.lock().unwrap();
+        let due = store
+            .due_deliveries(Utc::now() + CDuration::seconds(1), 10)
+            .unwrap();
+        let env = store.get_message(due[0].message_id).unwrap().unwrap();
+        assert!((Utc::now() - env.created_at).num_seconds().abs() < 60);
+    }
+
+    #[tokio::test]
+    async fn fed_destination_honors_policy_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_config("verified", 4, 86_400),
+        ));
+        let mut rx = register_fed_conn(&d, "phoenix", &format!("rf:{}", "11".repeat(32)));
+        d.cfg.write().unwrap().policies.push(crate::config::Policy {
+            name: "no-text-out".into(),
+            r#match: crate::config::PolicyMatch {
+                destination_protocol: vec![FED_PROTOCOL.to_string()],
+            },
+            rules: crate::config::PolicyRules {
+                drop_kinds: vec!["text".into()],
+                ..Default::default()
+            },
+        });
+
+        let env = local_env("!ref", "hello");
+        let delivery_id = queue_fed_delivery(&d, &env, "phoenix/regional-chat");
+        let del = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
+        process_due(&d, del, Utc::now()).await;
+
+        let after = d
+            .store
+            .lock()
+            .unwrap()
+            .deliveries_for_id(delivery_id)
+            .unwrap();
+        assert_eq!(after.state, "dead_letter");
+        assert_eq!(after.reason.as_deref(), Some("POLICY_DENIED"));
+        assert!(rx.try_recv().is_err(), "nothing may reach the wire");
+    }
+
+    #[test]
     fn fed_ingress_happy_path_accepts_fans_out_and_increments_fed_ingress() {
         let dir = tempfile::tempdir().unwrap();
         let identity = test_peer_identity(dir.path(), "peer");
@@ -7691,7 +8299,9 @@ routes:
                 8,
             );
             let outcome = fed_ingress(&d, &node_id, env, "general".to_string());
-            assert_eq!(outcome, FedIngressOutcome::Rejected("BAD_SIGNATURE"));
+            // Cheap policy runs before crypto: an unconfigured peer is
+            // refused at the trust gate and never costs a verification.
+            assert_eq!(outcome, FedIngressOutcome::Rejected("TRUST_DENIED"));
         }
 
         let store = d.store.lock().unwrap();

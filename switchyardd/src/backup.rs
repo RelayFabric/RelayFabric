@@ -67,6 +67,17 @@ pub fn snapshot(data_dir: &Path, out: &Path) -> Result<(), String> {
         return Err(format!("data_dir {} does not exist", data_dir.display()));
     }
     fs::create_dir_all(out).map_err(|e| format!("create {}: {e}", out.display()))?;
+    // `copy_tree` would otherwise recurse into the backup it is writing.
+    if let (Ok(out_real), Ok(data_real)) = (out.canonicalize(), data_dir.canonicalize()) {
+        if out_real.starts_with(&data_real) {
+            let _ = fs::remove_dir(out); // only the empty dir just created
+            return Err(format!(
+                "--out {} is inside data_dir {}; choose a location outside it",
+                out.display(),
+                data_dir.display()
+            ));
+        }
+    }
     // Owner-only, same posture as data_dir itself.
     let _ = fs::set_permissions(out, std::os::unix::fs::PermissionsExt::from_mode(0o700));
 
@@ -84,6 +95,10 @@ pub fn snapshot(data_dir: &Path, out: &Path) -> Result<(), String> {
         // as a literal (path is operator-supplied, not attacker input).
         conn.execute("VACUUM INTO ?1", [out_db.to_string_lossy().as_ref()])
             .map_err(|e| format!("vacuum into {}: {e}", out_db.display()))?;
+        // VACUUM INTO creates the file under the umask; the queue holds
+        // message bodies, so match the 0600 the daemon keeps on the live DB.
+        fs::set_permissions(&out_db, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .map_err(|e| format!("chmod {}: {e}", out_db.display()))?;
     }
 
     copy_tree(data_dir, out, true)?;
@@ -111,6 +126,20 @@ pub fn restore_into(input: &Path, data_dir: &Path) -> Result<(), String> {
         data_dir,
         std::os::unix::fs::PermissionsExt::from_mode(0o700),
     );
+    // A WAL/SHM pair left by an unclean daemon death would be replayed by
+    // SQLite over the restored DB on next open (the backup never carries
+    // them, so the copy below can't overwrite them): discard them first.
+    for sidecar in ["relayfabric.db-wal", "relayfabric.db-shm"] {
+        let path = data_dir.join(sidecar);
+        match fs::remove_file(&path) {
+            Ok(()) => eprintln!(
+                "discarded stale {} (uncommitted state from the previous daemon run)",
+                path.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove {}: {e}", path.display())),
+        }
+    }
     for entry in fs::read_dir(input).map_err(|e| format!("read {}: {e}", input.display()))? {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
@@ -248,6 +277,86 @@ mod tests {
         assert_eq!(
             fs::read(data_dir.join("attachments").join("ab12")).unwrap(),
             b"blobdata"
+        );
+    }
+
+    /// A daemon that died uncleanly leaves `relayfabric.db-wal`/`-shm`
+    /// behind; the backup excludes those, so a plain copy of the DB would
+    /// leave the stale WAL in place and SQLite would replay it over the
+    /// restored pages on next open. Restore must discard it.
+    #[test]
+    fn restore_discards_a_hot_wal_left_by_an_unclean_shutdown() {
+        let src = tempfile::tempdir().unwrap();
+        let snapdir = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        seed_data_dir(src.path());
+        let snap = snapdir.path().join("snap");
+        snapshot(src.path(), &snap).unwrap();
+
+        // Target data_dir: same schema, different row, committed only to
+        // the WAL and never checkpointed (NO_CKPT_ON_CLOSE mimics a crash).
+        let data_dir = dest.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let conn = rusqlite::Connection::open(data_dir.join(DB_FILE)).unwrap();
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE t(v TEXT); INSERT INTO t(v) VALUES('stale-wal-row');",
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            data_dir.join("relayfabric.db-wal").is_file(),
+            "test precondition: a hot WAL must be left behind"
+        );
+
+        restore_into(&snap, &data_dir).unwrap();
+
+        assert!(!data_dir.join("relayfabric.db-wal").exists());
+        assert!(!data_dir.join("relayfabric.db-shm").exists());
+        let conn = rusqlite::Connection::open(data_dir.join(DB_FILE)).unwrap();
+        let rows: Vec<String> = conn
+            .prepare("SELECT v FROM t ORDER BY v")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec!["hello-backup".to_string()]);
+    }
+
+    #[test]
+    fn snapshot_refuses_an_out_dir_inside_data_dir() {
+        let src = tempfile::tempdir().unwrap();
+        seed_data_dir(src.path());
+        for out in [src.path().join("backup"), src.path().to_path_buf()] {
+            let err = snapshot(src.path(), &out).unwrap_err();
+            assert!(err.contains("inside"), "{}: {err}", out.display());
+        }
+        assert!(
+            !src.path().join("backup").join(MANIFEST).exists(),
+            "nothing must be written for a refused backup"
+        );
+    }
+
+    #[test]
+    fn snapshot_db_copy_is_owner_only() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        seed_data_dir(src.path());
+        let snap = out.path().join("snap");
+        snapshot(src.path(), &snap).unwrap();
+        let mode = fs::metadata(snap.join(DB_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "VACUUM INTO output must be 0600, not umask-derived"
         );
     }
 

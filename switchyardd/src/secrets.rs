@@ -79,18 +79,26 @@ pub fn resolve(r: &SecretRef) -> Result<String, String> {
                     r.display_form()
                 ));
             }
-            let raw = std::fs::read_to_string(path)
-                .map_err(|e| format!("secret reference {} is unreadable: {e}", r.display_form()))?;
+            // One generic error for every way the read can fail (missing,
+            // a directory, permission denied, empty after trim): the text
+            // is echoed by the admin API's validate/put 422 body, and a
+            // distinct message per cause would be a file-existence oracle
+            // over the daemon's whole filesystem. The io detail is for the
+            // operator only -- stderr, for the same pre-`tracing_subscriber`
+            // reason as the permission warning below.
+            let unreadable = || format!("secret reference {} could not be read", r.display_form());
+            let raw = std::fs::read_to_string(path).map_err(|e| {
+                eprintln!("warning: {}: {e}", unreadable());
+                unreadable()
+            })?;
             let trimmed = raw.trim().to_string();
             if trimmed.is_empty() {
                 // symmetric with the env arm above: an empty/whitespace-only
                 // secret file is exactly as unusable as an unset/empty env
                 // var, and silently resolving to "" would hand plugins an
                 // empty token instead of failing loudly at config load.
-                return Err(format!(
-                    "secret reference {} is empty or unset",
-                    r.display_form()
-                ));
+                eprintln!("warning: {}: file is empty", unreadable());
+                return Err(unreadable());
             }
             if let Some(warning) = permission_warning(path) {
                 // eprintln, not tracing::warn!: this runs inside
@@ -307,6 +315,34 @@ mod tests {
             assert!(
                 err.contains(&format!("${{file:{}}}", path.display())),
                 "err was: {err}"
+            );
+        }
+    }
+
+    /// The error text reaches admin-API callers (`POST /v1/config/validate`
+    /// echoes it in the 422 body), so it must not distinguish missing /
+    /// denied / directory / empty -- that would be a file-existence oracle
+    /// for any path, as the daemon uid. One generic message for all of
+    /// them; the io detail is operator-only (stderr).
+    #[test]
+    fn resolve_file_error_text_is_generic_across_missing_directory_and_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.txt");
+        std::fs::write(&empty, "").unwrap();
+        let cases = [
+            ("missing", dir.path().join("does-not-exist.txt")),
+            ("directory", dir.path().to_path_buf()),
+            ("empty", empty),
+        ];
+        for (label, path) in cases {
+            let err = resolve(&SecretRef::File(path.clone())).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "secret reference ${{file:{}}} could not be read",
+                    path.display()
+                ),
+                "{label}: error text must be the one generic form"
             );
         }
     }

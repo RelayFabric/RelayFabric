@@ -98,6 +98,98 @@ pub enum Fed {
     Unknown,
 }
 
+/// The tag-only view of a frame -- `t`, with every other field skipped --
+/// decoded by `fed::conn::decode_inbound` BEFORE anything else, so a
+/// per-tag size cap and the peer's trust can be checked without first
+/// paying for a full decode of whatever the peer chose to send.
+#[derive(Deserialize)]
+struct Peek {
+    t: String,
+}
+
+/// Reads just `t` from one encoded frame; `None` if the bytes aren't a
+/// CBOR map carrying a text `t` at all.
+///
+/// STREAMING -- the property the whole pre-decode gate rests on: a plain
+/// struct decode is not the internally-tagged-enum path. serde's derived
+/// struct visitor hands every unrecognized key's value to `IgnoredAny`,
+/// which ciborium (0.2) serves through `deserialize_any`: an array or map
+/// is walked element by element with nothing retained, an integer/float/
+/// bool is consumed in place, and only a byte/text string is materialized
+/// -- transiently, 1:1 with its own length, so never more than the frame
+/// itself. `Fed`'s own `#[serde(tag = "t")]` decode, by contrast, must
+/// buffer the ENTIRE frame into serde's generic `Content` tree (~32 bytes
+/// per node) before it can even look at `t` -- a 16 MiB array of 1-byte
+/// ints is ~0.5 GiB of heap per frame, and any minted identity that
+/// completes a bare Noise handshake could send those in a loop.
+/// `peek_tag_skips_a_huge_unrecognized_field` below drives this path with
+/// exactly such a frame.
+pub fn peek_tag(bytes: &[u8]) -> Option<String> {
+    ciborium::from_reader::<Peek, _>(bytes).ok().map(|p| p.t)
+}
+
+/// Plain-struct mirrors of each `Fed` variant's fields, for
+/// `decode_tagged`: decoding through one of these takes the same
+/// streaming path `Peek` does (`t` is just one more key they skip), never
+/// `Fed`'s `Content`-buffering tagged-enum path. They decode exactly the
+/// maps `Fed`'s derived `Serialize` produces -- the wire format is
+/// untouched -- as `decode_tagged_matches_the_derived_decode_for_every_
+/// variant` below proves against every variant.
+#[derive(Deserialize)]
+struct EnvelopeFields {
+    env: Box<Envelope>,
+    target_route: String,
+}
+#[derive(Deserialize)]
+struct AckFields {
+    id: String,
+}
+#[derive(Deserialize)]
+struct AdvertFields {
+    advert: Advert,
+}
+#[derive(Deserialize)]
+struct SealedFields {
+    sealed: SealedEnvelope,
+    target_route: String,
+}
+
+/// Decodes one frame whose `t` `peek_tag` already read. `None` for a tag
+/// this build doesn't know (design §5 additive versioning: the frame is
+/// ignored -- and, now, never decoded at all, there being nothing on it
+/// to act on) or for a known tag whose fields don't fit the variant.
+pub fn decode_tagged(tag: &str, bytes: &[u8]) -> Option<Fed> {
+    fn fields<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Option<T> {
+        ciborium::from_reader(bytes).ok()
+    }
+    Some(match tag {
+        "envelope" => {
+            let EnvelopeFields { env, target_route } = fields(bytes)?;
+            Fed::Envelope { env, target_route }
+        }
+        "ack" => Fed::Ack {
+            id: fields::<AckFields>(bytes)?.id,
+        },
+        "ping" => Fed::Ping {},
+        "pong" => Fed::Pong {},
+        "advert" => Fed::Advert {
+            advert: fields::<AdvertFields>(bytes)?.advert,
+        },
+        "advert_req" => Fed::AdvertReq {},
+        "sealed" => {
+            let SealedFields {
+                sealed,
+                target_route,
+            } = fields(bytes)?;
+            Fed::Sealed {
+                sealed,
+                target_route,
+            }
+        }
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +385,111 @@ mod tests {
         ciborium::into_writer(&map, &mut buf).unwrap();
         let decoded: Fed = ciborium::from_reader(buf.as_slice()).unwrap();
         assert!(matches!(decoded, Fed::Ping {}), "got {decoded:?}");
+        // The streaming path keeps the same forward-compat posture.
+        assert!(matches!(decode_tagged("ping", &buf), Some(Fed::Ping {})));
+    }
+
+    // --- pre-decode peek + streaming decode (DoS hardening) -----------------
+
+    fn encode(frame: &Fed) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(frame, &mut buf).unwrap();
+        buf
+    }
+
+    fn every_variant() -> Vec<(&'static str, Fed)> {
+        vec![
+            (
+                "envelope",
+                Fed::Envelope {
+                    env: Box::new(envelope()),
+                    target_route: "regional-chat".into(),
+                },
+            ),
+            (
+                "ack",
+                Fed::Ack {
+                    id: "0189f1e4-1111-7000-8000-000000000001".into(),
+                },
+            ),
+            ("ping", Fed::Ping {}),
+            ("pong", Fed::Pong {}),
+            (
+                "advert",
+                Fed::Advert {
+                    advert: sample_advert(),
+                },
+            ),
+            ("advert_req", Fed::AdvertReq {}),
+            (
+                "sealed",
+                Fed::Sealed {
+                    sealed: sample_sealed(),
+                    target_route: "regional-chat".into(),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn peek_tag_reads_the_tag_of_every_variant() {
+        for (tag, frame) in every_variant() {
+            assert_eq!(peek_tag(&encode(&frame)).as_deref(), Some(tag));
+        }
+        assert_eq!(peek_tag(b"\x00"), None, "a bare int is not a frame map");
+        assert_eq!(peek_tag(&[0xa0]), None, "an empty map has no tag");
+    }
+
+    /// The mirror-struct decode must produce exactly what the derived
+    /// tagged-enum decode does for every variant (compared via a CBOR
+    /// re-encode, since `Fed` isn't `PartialEq`), proving the wire format
+    /// is untouched by taking the streaming path.
+    #[test]
+    fn decode_tagged_matches_the_derived_decode_for_every_variant() {
+        for (tag, frame) in every_variant() {
+            let bytes = encode(&frame);
+            let derived: Fed = ciborium::from_reader(bytes.as_slice()).unwrap();
+            let streamed = decode_tagged(tag, &bytes).unwrap_or_else(|| panic!("{tag} failed"));
+            assert_eq!(encode(&streamed), encode(&derived), "{tag}");
+            assert_eq!(encode(&streamed), bytes, "{tag}: round-trip");
+        }
+    }
+
+    #[test]
+    fn decode_tagged_rejects_an_unknown_tag_and_a_malformed_known_one() {
+        assert!(decode_tagged("resync", &encode(&Fed::Ping {})).is_none());
+        // `ack` with no `id`, and with a non-text `id`.
+        let no_id = Value::Map(vec![(Value::Text("t".into()), Value::Text("ack".into()))]);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&no_id, &mut buf).unwrap();
+        assert!(decode_tagged("ack", &buf).is_none());
+        let bad_id = Value::Map(vec![
+            (Value::Text("t".into()), Value::Text("ack".into())),
+            (Value::Text("id".into()), Value::Integer(5.into())),
+        ]);
+        buf.clear();
+        ciborium::into_writer(&bad_id, &mut buf).unwrap();
+        assert!(decode_tagged("ack", &buf).is_none());
+    }
+
+    /// The amplification shape `peek_tag`'s doc comment describes: a
+    /// `ping` carrying a one-million-element array of 1-byte ints under an
+    /// unrecognized key (1 MiB on the wire; ~32 MiB as a `Content` tree
+    /// through the tagged-enum path, scaling to ~0.5 GiB at `MAX_FRAME`).
+    /// Hand-built as raw CBOR so the test itself never materializes a
+    /// million values either. Both the peek and the streaming decode must
+    /// walk straight past it -- the field is skipped via `IgnoredAny`,
+    /// element by element, never collected.
+    #[test]
+    fn peek_tag_skips_a_huge_unrecognized_field() {
+        const N: usize = 1_000_000;
+        let mut buf = Vec::with_capacity(N + 16);
+        buf.push(0xa2); // map(2)
+        buf.extend_from_slice(b"\x61t\x64ping"); // "t": "ping"
+        buf.extend_from_slice(b"\x61x\x9a"); // "x": array(u32 length follows)
+        buf.extend_from_slice(&(N as u32).to_be_bytes());
+        buf.resize(buf.len() + N, 0x00); // N x unsigned 0
+        assert_eq!(peek_tag(&buf).as_deref(), Some("ping"));
+        assert!(matches!(decode_tagged("ping", &buf), Some(Fed::Ping {})));
     }
 }

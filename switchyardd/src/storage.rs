@@ -257,6 +257,33 @@ impl Store {
         Ok(())
     }
 
+    /// Whether `message_id` legitimately references `sha`, i.e. the bytes
+    /// were ingested by this node for that message (`insert_attachment_refs`)
+    /// -- as opposed to a federated envelope merely naming a sha that happens
+    /// to exist in the local CAS. Egress (`engine::load_attachments`) only
+    /// ships blobs the message owns.
+    pub fn has_attachment_ref(&self, message_id: Uuid, sha: &str) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM message_attachments WHERE message_id = ?1 AND sha256 = ?2",
+            params![message_id.to_string(), sha],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Revokes every active challenge for a target (the identity-link
+    /// wrong-code cap in `engine::handle_inbound`). Returns rows deleted.
+    pub fn delete_challenges_for_target(
+        &self,
+        target_protocol: &str,
+        target_ref: &str,
+    ) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "DELETE FROM link_challenges WHERE target_protocol = ?1 AND target_ref = ?2",
+            params![target_protocol, target_ref],
+        )
+    }
+
     pub fn get_message(&self, id: Uuid) -> rusqlite::Result<Option<Envelope>> {
         let mut stmt = self
             .conn
@@ -1096,6 +1123,37 @@ impl Store {
         self.conn.execute(
             "DELETE FROM peer_adverts WHERE expires < ?1",
             params![ts(now)],
+        )
+    }
+
+    /// Caps the runtime-learned `seen` rows (`record_seen`) at `max`,
+    /// deleting the oldest-`first_seen` beyond it; config-seeded levels
+    /// (`verified`/`trusted`/`blocked`) are never touched. Every minted
+    /// identity that completes a handshake under `discovery: public` costs
+    /// one such row, so without a cap the table grows by one row per
+    /// attacker keypair, forever (`fed::conn::admit_and_run` calls this
+    /// right after each `record_seen`). Returns the number of rows deleted.
+    pub fn prune_seen_trust(&self, max: usize) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "DELETE FROM node_trust WHERE level = 'seen' AND node_id IN (
+               SELECT node_id FROM node_trust WHERE level = 'seen'
+               ORDER BY first_seen DESC, node_id LIMIT -1 OFFSET ?1)",
+            params![max as i64],
+        )
+    }
+
+    /// Caps stored peer adverts at `max`, deleting the oldest-`received_at`
+    /// beyond it -- the same one-row-per-minted-identity growth shape as
+    /// `prune_seen_trust`, which the hourly `purge_expired_adverts` sweep
+    /// does nothing about until each row's (24h-clamped) `expires` passes
+    /// (`fed::conn::receive_advert` calls this right after each upsert).
+    /// Returns the number of rows deleted.
+    pub fn prune_peer_adverts(&self, max: usize) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "DELETE FROM peer_adverts WHERE node_id IN (
+               SELECT node_id FROM peer_adverts
+               ORDER BY received_at DESC, node_id LIMIT -1 OFFSET ?1)",
+            params![max as i64],
         )
     }
 }
@@ -3072,5 +3130,66 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         assert_eq!(remaining[0].0, "rf:dd");
         // A second purge with nothing left to remove is a clean no-op.
         assert_eq!(s.purge_expired_adverts(now).unwrap(), 0);
+    }
+
+    // ---- caps on attacker-mintable rows (DoS hardening) --------------------
+
+    #[test]
+    fn prune_seen_trust_evicts_the_oldest_seen_rows_beyond_max_and_spares_config_levels() {
+        let (_d, s) = store();
+        let t0 = Utc::now();
+        // Five `seen` rows, one per second, oldest first -- plus a configured
+        // level older than all of them, which must survive regardless.
+        s.seed_trust(&node_id(0xee), "verified", t0 - Duration::hours(1))
+            .unwrap();
+        for i in 1..=5u8 {
+            s.record_seen(&node_id(i), t0 + Duration::seconds(i64::from(i)))
+                .unwrap();
+        }
+        assert_eq!(s.prune_seen_trust(3).unwrap(), 2);
+        for i in 1..=2u8 {
+            assert_eq!(s.trust_level(&node_id(i)).unwrap(), None, "oldest must go");
+        }
+        for i in 3..=5u8 {
+            assert_eq!(
+                s.trust_level(&node_id(i)).unwrap().as_deref(),
+                Some("seen"),
+                "newest must stay"
+            );
+        }
+        assert_eq!(
+            s.trust_level(&node_id(0xee)).unwrap().as_deref(),
+            Some("verified"),
+            "a config-seeded level is never pruned, however old"
+        );
+        // At or under the cap: a clean no-op.
+        assert_eq!(s.prune_seen_trust(3).unwrap(), 0);
+        assert_eq!(s.prune_seen_trust(100).unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_peer_adverts_evicts_the_oldest_received_rows_beyond_max() {
+        let (_d, s) = store();
+        let t0 = Utc::now();
+        let expires = t0 + Duration::hours(12);
+        for i in 1..=5u8 {
+            s.upsert_peer_advert(
+                &node_id(i),
+                b"advert",
+                "n",
+                expires,
+                t0 + Duration::seconds(i64::from(i)),
+            )
+            .unwrap();
+        }
+        assert_eq!(s.prune_peer_adverts(2).unwrap(), 3);
+        let remaining: Vec<String> = s
+            .list_peer_adverts(t0)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(remaining, vec![node_id(4), node_id(5)]);
+        assert_eq!(s.prune_peer_adverts(2).unwrap(), 0);
     }
 }

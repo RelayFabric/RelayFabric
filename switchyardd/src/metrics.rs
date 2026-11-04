@@ -207,7 +207,8 @@ impl PluginGauges {
             names.sort_by(|a, b| a.0.cmp(b.0));
             for (name, value) in names {
                 out.push_str(&format!(
-                    "relayfabric_plugin_gauge{{plugin=\"{plugin}\",name=\"{name}\"}} {value}\n"
+                    "relayfabric_plugin_gauge{{plugin=\"{}\",name=\"{name}\"}} {value}\n",
+                    escape_label(plugin)
                 ));
             }
         }
@@ -260,6 +261,22 @@ fn render_latency(sum_micros: u64, count: u64) -> String {
     )
 }
 
+/// Prometheus text exposition escaping for a label VALUE: `\` -> `\\`,
+/// `"` -> `\"`, newline -> `\n`. Plugin, route and peer names are config-
+/// validated to a safe charset, but the renderer must not depend on that.
+fn escape_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn render_routes(routes: &HashMap<String, u64>) -> String {
     let mut out = String::new();
     out.push_str("# TYPE relayfabric_route_messages_total counter\n");
@@ -267,7 +284,8 @@ fn render_routes(routes: &HashMap<String, u64>) -> String {
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (route, n) in entries {
         out.push_str(&format!(
-            "relayfabric_route_messages_total{{route=\"{route}\"}} {n}\n"
+            "relayfabric_route_messages_total{{route=\"{}\"}} {n}\n",
+            escape_label(route)
         ));
     }
     out
@@ -309,13 +327,15 @@ pub fn render(
     out.push_str("# TYPE relayfabric_queue_depth gauge\n");
     for (state, n) in queue_counts {
         out.push_str(&format!(
-            "relayfabric_queue_depth{{state=\"{state}\"}} {n}\n"
+            "relayfabric_queue_depth{{state=\"{}\"}} {n}\n",
+            escape_label(state)
         ));
     }
     out.push_str("# TYPE relayfabric_plugin_up gauge\n");
     for (plugin, up) in plugin_up {
         out.push_str(&format!(
-            "relayfabric_plugin_up{{plugin=\"{plugin}\"}} {}\n",
+            "relayfabric_plugin_up{{plugin=\"{}\"}} {}\n",
+            escape_label(plugin),
             u8::from(*up)
         ));
     }
@@ -326,7 +346,8 @@ pub fn render(
         entries.sort_by(|a, b| a.0.cmp(b.0));
         for (peer, up) in entries {
             out.push_str(&format!(
-                "relayfabric_federation_peer_up{{peer=\"{peer}\"}} {}\n",
+                "relayfabric_federation_peer_up{{peer=\"{}\"}} {}\n",
+                escape_label(peer),
                 u8::from(*up)
             ));
         }
@@ -379,6 +400,64 @@ mod tests {
         assert!(out.contains("relayfabric_sealed_ingress_total"));
         assert!(out.contains("relayfabric_sealed_rejected_total"));
         assert!(out.contains("relayfabric_transport_demoted_total"));
+    }
+
+    // ---- label escaping ------------------------------------------------
+
+    /// Prometheus text exposition: inside a label value, `\`, `"` and
+    /// newline must be written as `\\`, `\"` and `\n`. An unescaped quote
+    /// or newline in any one label breaks the whole scrape.
+    #[test]
+    fn label_values_are_escaped_per_exposition_rules() {
+        let raw = "a\"b\nc\\d";
+        let escaped = r#"a\"b\nc\\d"#;
+
+        let out = render(
+            &[(raw.into(), 3)],
+            &[(raw.into(), true)],
+            &PluginGauges::new(),
+        );
+        assert!(
+            out.contains(&format!(
+                "relayfabric_queue_depth{{state=\"{escaped}\"}} 3\n"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "relayfabric_plugin_up{{plugin=\"{escaped}\"}} 1\n"
+            )),
+            "{out}"
+        );
+
+        let mut routes = HashMap::new();
+        routes.insert(raw.to_string(), 7u64);
+        let out = render_routes(&routes);
+        assert_eq!(
+            out,
+            format!(
+                "# TYPE relayfabric_route_messages_total counter\n\
+                 relayfabric_route_messages_total{{route=\"{escaped}\"}} 7\n"
+            )
+        );
+
+        let gauges = PluginGauges::new();
+        gauges.record(raw, [("rssi".to_string(), 1.0)].into_iter().collect());
+        let out = gauges.render(Instant::now());
+        assert_eq!(
+            out,
+            format!("relayfabric_plugin_gauge{{plugin=\"{escaped}\",name=\"rssi\"}} 1\n")
+        );
+
+        let peer = "test-only-fed-peer-escape\"\n\\";
+        set_federation_peer_up(peer, true);
+        let out = render(&[], &[], &PluginGauges::new());
+        assert!(
+            out.contains(
+                r#"relayfabric_federation_peer_up{peer="test-only-fed-peer-escape\"\n\\"} 1"#
+            ),
+            "{out}"
+        );
     }
 
     // ---- federation peer up/down gauge --------------------------------

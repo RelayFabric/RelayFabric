@@ -33,7 +33,7 @@ use crate::events::Event;
 use crate::fed::advert::{self, Advert};
 use crate::fed::noise::{self, FedChannel, StaticKey};
 use crate::fed::short_node_id;
-use crate::fed::wire::Fed;
+use crate::fed::wire::{self, Fed};
 use crate::metrics;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -161,6 +161,31 @@ const ADVERT_MAX_FUTURE_SECS: i64 = 86_400;
 /// what it actually is ("federation advert rejected...") instead of
 /// borrowing envelope-ingress wording for an unrelated frame type.
 const ADVERT_REJECT_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+// ---- inbound admission + pre-decode frame gate (DoS hardening) ------------
+
+/// Byte cap on a `ping`/`pong`/`ack`/`advert_req` frame: a few bytes of
+/// map framing plus, for `ack`, a 36-char UUID. Anything larger under one
+/// of those tags is not a keepalive or an ack.
+const SMALL_FRAME_MAX_BYTES: usize = 1024;
+/// Byte cap on a cleartext `envelope` frame: body text plus attachment
+/// METADATA only (blobs never cross a fed link -- `relay_core::
+/// AttachmentMeta` is name/mime/size/sha), so 1 MiB is generous. The
+/// transport's 16 MiB `noise::MAX_FRAME` ceiling exists for `sealed`.
+const ENVELOPE_FRAME_MAX_BYTES: usize = 1024 * 1024;
+/// The `{t, advert}` map framing around the advert document itself (17
+/// bytes, rounded up), so the frame-level cap sits just above
+/// `ADVERT_MAX_BYTES` and never trips before `receive_advert`'s own
+/// document-level check would.
+const ADVERT_FRAME_WRAP_BYTES: usize = 32;
+/// Per-peer throttle for a dropped-frame / refused-admission log line
+/// (same shape as `ADVERT_REJECT_WARN_INTERVAL`, own map below).
+const INBOUND_REJECT_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// Caps on the rows any minted identity can create under `discovery:
+/// public` (`Store::prune_seen_trust`/`prune_peer_adverts`): the oldest
+/// beyond these are evicted on every insert.
+const MAX_SEEN_TRUST_ROWS: usize = 10_000;
+const MAX_PEER_ADVERTS: usize = 10_000;
 
 /// Top-level entry point (called once from `main.rs` when
 /// `cfg.federation.is_some()`): seeds the trust store from `fcfg` (design
@@ -396,31 +421,64 @@ async fn spawn_outbound(d: Arc<Daemon>, peer: PeerConfig, static_key: Arc<Static
 /// is refused here even though the Noise handshake itself already
 /// succeeded and the identity is cryptographically genuine (§112.7: trust
 /// is about POLICY, not identity) -- the channel is simply dropped, no
-/// frame ever flows. Otherwise records `seen` (never raises trust beyond
-/// it, §112.7 MUST -- `record_seen`'s own `INSERT OR IGNORE` enforces
-/// this), registers the connection (`register_up`, SSE `federation` event
-/// and `relayfabric_federation_peer_up` gauge and `FedState.conns`
-/// insert), runs the frame loop until it ends, then deregisters
-/// (`register_down`, the symmetric down event/gauge/removal).
+/// frame ever flows. So is, unless discovery is `public`, a peer this
+/// daemon has no `peers[]`/`trusted` entry for (its level is `seen` or
+/// nothing): the handshake proves only possession of SOME keypair, which
+/// any attacker mints for free, and admitting such a peer would hand it a
+/// task, one of `MAX_INBOUND_CONNS`'s slots for as long as it keeps
+/// pinging, and a permanent `node_trust` row -- refused before any of
+/// that, nothing persisted. (`accept_from` is deliberately NOT the bar
+/// here: a configured `verified` peer under `accept_from: trusted` is one
+/// this daemon sends to and refuses ingress from, and must stay
+/// connected for that egress -- `decode_inbound` keeps its `envelope`/
+/// `sealed` frames out.) Otherwise records `seen` (never raises trust
+/// beyond it, §112.7 MUST -- `record_seen`'s own `INSERT OR IGNORE`
+/// enforces this; `prune_seen_trust` caps how many such rows `public`
+/// mode can accumulate), registers the connection (`register_up`, SSE
+/// `federation` event and `relayfabric_federation_peer_up` gauge and
+/// `FedState.conns` insert), runs the frame loop until it ends, then
+/// deregisters (`register_down`, the symmetric down event/gauge/removal).
 async fn admit_and_run<S>(d: Arc<Daemon>, channel: FedChannel<S>, peer_key: String, node_id: String)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let now = Utc::now();
-    let blocked = d
+    let level = d
         .store
         .lock()
         .unwrap()
         .trust_level(&node_id)
-        .unwrap_or(None)
-        .as_deref()
-        == Some("blocked");
-    if blocked {
+        .unwrap_or(None);
+    if level.as_deref() == Some("blocked") {
         warn!(node = %display_peer_key(&node_id), "blocked federation peer dropped at handshake");
         return;
     }
-    if let Err(e) = d.store.lock().unwrap().record_seen(&node_id, now) {
-        warn!(error = %e, "failed to record federation peer as seen");
+    let vouched =
+        engine::trust_rank(level.as_deref().unwrap_or("unknown")) >= engine::trust_rank("verified");
+    if !vouched && !discovery_is_public(&d) {
+        // Counted as a federation rejection: an operator watching
+        // `relayfabric_federation_rejected_total` still sees unconfigured
+        // peers knocking, even though no envelope of theirs is ever decoded.
+        metrics::inc(&metrics::FED_REJECTED);
+        if super::warn_throttle_due(
+            &INBOUND_REJECT_LOG_THROTTLE,
+            &node_id,
+            INBOUND_REJECT_LOG_INTERVAL,
+        ) {
+            debug!(node = %display_peer_key(&node_id),
+                "unconfigured federation peer dropped at handshake (discovery is not public; \
+                 further repeats from this peer are throttled to 1/min)");
+        }
+        return;
+    }
+    {
+        let store = d.store.lock().unwrap();
+        if let Err(e) = store.record_seen(&node_id, now) {
+            warn!(error = %e, "failed to record federation peer as seen");
+        }
+        if let Err(e) = store.prune_seen_trust(MAX_SEEN_TRUST_ROWS) {
+            warn!(error = %e, "failed to prune federation seen rows");
+        }
     }
 
     let (tx, rx) = mpsc::channel::<Fed>(64);
@@ -602,17 +660,18 @@ async fn run_conn<S>(
                 match frame {
                     Ok(bytes) => {
                         last_activity = Instant::now();
-                        if let Ok(decoded) = ciborium::from_reader::<Fed, _>(bytes.as_slice()) {
+                        if let Some(decoded) = decode_inbound(d, node_id, &bytes) {
                             if let Some(reply) = handle_frame(d, node_id, peer_key, decoded) {
                                 if send_fed(&mut channel, &reply).await.is_err() { break; }
                             }
                         }
-                        // a frame that isn't valid CBOR / doesn't match
-                        // `Fed`'s shape is ignored -- the connection stays
-                        // up (design §5's additive-versioning posture
-                        // already tolerates an unrecognized-but-well-formed
-                        // frame via `Fed::Unknown`; this is the same
-                        // tolerance extended to outright garbage).
+                        // a frame `decode_inbound` refuses -- garbage, an
+                        // unrecognized tag, over its tag's cap, or a type
+                        // this peer may not send -- is ignored and the
+                        // connection stays up (design §5's additive-
+                        // versioning posture already tolerates an
+                        // unrecognized-but-well-formed frame; this is the
+                        // same tolerance extended to outright garbage).
                     }
                     Err(_) => break, // stream error: EOF, decrypt failure, etc.
                 }
@@ -667,6 +726,106 @@ async fn send_fed<S: AsyncRead + AsyncWrite + Unpin>(
             "federation send timed out",
         )),
     }
+}
+
+/// Per-peer throttle map for `reject_frame`'s warn line and
+/// `admit_and_run`'s refused-admission debug line (one map: a refused peer
+/// never gets as far as sending a frame, so the two never contend).
+static INBOUND_REJECT_LOG_THROTTLE: std::sync::LazyLock<
+    Mutex<HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Pre-decode admission for one inbound frame (DoS hardening): reads only
+/// the tag (`wire::peek_tag`, a streaming decode that skips everything
+/// else), then refuses -- before any full decode -- a frame over its
+/// tag's byte cap, a tag this build doesn't know, or a frame type this
+/// peer isn't permitted to send: `envelope`/`sealed` need the peer at or
+/// above `federation.accept_from` (the SAME gate `engine::fed_ingress`/
+/// `fed_sealed_ingress` apply after decoding -- hoisted here as a cheap
+/// copy so an unqualified peer can't make this daemon decode anything,
+/// while the engine's own check stays authoritative), `advert`/
+/// `advert_req` need `advert_scope_allows` (likewise still applied by
+/// `handle_frame`/`receive_advert`), and `ping`/`pong`/`ack` are allowed
+/// from any admitted peer (`handle_fed_ack` resolves an ack only against
+/// deliveries addressed to that very peer). Only then is the frame
+/// decoded, through `wire::decode_tagged` -- plain per-variant structs,
+/// the same streaming path as the peek -- never `Fed`'s tagged-enum
+/// `Deserialize`, which buffers the whole frame into serde's `Content`
+/// tree first (see `wire::peek_tag` for the ~32x amplification that makes
+/// that path unusable on hostile input).
+fn decode_inbound(d: &Daemon, peer_node_id: &str, bytes: &[u8]) -> Option<Fed> {
+    let tag = wire::peek_tag(bytes)?;
+    let cap = match tag.as_str() {
+        "ping" | "pong" | "ack" | "advert_req" => SMALL_FRAME_MAX_BYTES,
+        "advert" => ADVERT_MAX_BYTES + ADVERT_FRAME_WRAP_BYTES,
+        "envelope" => ENVELOPE_FRAME_MAX_BYTES,
+        // The one frame type legitimately allowed to approach the
+        // transport ceiling (`engine::SEALED_MAX_BYTES` is sized from it);
+        // `FedChannel::recv_frame` already refuses anything past it.
+        "sealed" => noise::MAX_FRAME as usize,
+        _ => return None, // unknown tag (design §5): ignored, never decoded
+    };
+    if bytes.len() > cap {
+        reject_frame(peer_node_id, &tag, "OVERSIZED");
+        return None;
+    }
+    let permitted = match tag.as_str() {
+        "envelope" | "sealed" => !trust_below_accept_from(d, peer_node_id),
+        "advert" | "advert_req" => advert_scope_allows(d, peer_node_id),
+        _ => true,
+    };
+    if !permitted {
+        reject_frame(peer_node_id, &tag, "TRUST_DENIED");
+        return None;
+    }
+    wire::decode_tagged(&tag, bytes)
+}
+
+/// Counts a frame `decode_inbound` dropped -- `ADVERT_REJECTED` for an
+/// `advert` (so `receive_advert`'s metric contract holds for a frame that
+/// never reached it), `FED_REJECTED` for anything else -- and, at most
+/// once per peer per minute, warns with `reason`. Never persists
+/// anything: every drop here is reachable by a peer with no trust at all.
+fn reject_frame(peer_node_id: &str, tag: &str, reason: &str) {
+    if tag == "advert" {
+        reject_advert(peer_node_id, reason);
+        return;
+    }
+    metrics::inc(&metrics::FED_REJECTED);
+    if super::warn_throttle_due(
+        &INBOUND_REJECT_LOG_THROTTLE,
+        peer_node_id,
+        INBOUND_REJECT_LOG_INTERVAL,
+    ) {
+        warn!(peer = %short_node_id(peer_node_id), tag, reason,
+            "federation frame dropped before decode (further repeats from this peer are \
+             throttled to 1/min)");
+    }
+}
+
+/// `engine::fed_ingress`'s trust gate, as a local copy (that one is
+/// private to `engine`, and the two must stay independently correct --
+/// this one only saves the decode, the engine's still decides): true when
+/// the peer's stored trust level ranks below `federation.accept_from`, or
+/// when there is no federation config at all (fail closed, matching
+/// `fed_ingress`'s own posture for that case).
+fn trust_below_accept_from(d: &Daemon, peer_node_id: &str) -> bool {
+    let Some(accept_from) =
+        d.cfg_snapshot(|c| c.federation.as_ref().map(|f| f.accept_from.clone()))
+    else {
+        return true;
+    };
+    let level = d
+        .store
+        .lock()
+        .unwrap()
+        .trust_level(peer_node_id)
+        .unwrap_or(None);
+    engine::trust_rank(level.as_deref().unwrap_or("unknown")) < engine::trust_rank(&accept_from)
+}
+
+fn discovery_is_public(d: &Daemon) -> bool {
+    d.cfg_snapshot(|c| c.discovery.mode == "public")
 }
 
 /// Dispatches one decoded frame (design §5): `Ping` -> `Pong` reply;
@@ -739,24 +898,7 @@ fn advert_scope_allows(d: &Daemon, peer_node_id: &str) -> bool {
     match mode.as_str() {
         "disabled" => false,
         "public" => true,
-        "federation" => {
-            let Some(accept_from) =
-                d.cfg_snapshot(|c| c.federation.as_ref().map(|f| f.accept_from.clone()))
-            else {
-                // Federation config vanished from under a live connection
-                // -- defensive, matches `fed_ingress`'s own posture for the
-                // analogous case (fail closed, never open).
-                return false;
-            };
-            let level = d
-                .store
-                .lock()
-                .unwrap()
-                .trust_level(peer_node_id)
-                .unwrap_or(None);
-            let level_str = level.as_deref().unwrap_or("unknown");
-            engine::trust_rank(level_str) >= engine::trust_rank(&accept_from)
-        }
+        "federation" => !trust_below_accept_from(d, peer_node_id),
         _ => false, // config::validate rejects any other mode; defensive.
     }
 }
@@ -924,13 +1066,15 @@ fn receive_advert(d: &Daemon, peer_node_id: &str, advert: Advert) {
     let expires_dt = DateTime::<Utc>::from_timestamp(clamped_expires, 0).unwrap_or(now);
     let sanitized_name = sanitize_advert_name(&advert.name);
 
-    let result = d.store.lock().unwrap().upsert_peer_advert(
-        &advert.node_id,
-        &raw,
-        &sanitized_name,
-        expires_dt,
-        now,
-    );
+    let result = {
+        let store = d.store.lock().unwrap();
+        let upserted =
+            store.upsert_peer_advert(&advert.node_id, &raw, &sanitized_name, expires_dt, now);
+        if let Err(e) = store.prune_peer_adverts(MAX_PEER_ADVERTS) {
+            warn!(error = %e, "failed to prune peer adverts");
+        }
+        upserted
+    };
     match result {
         Ok(()) => {
             metrics::inc(&metrics::ADVERT_RX);
@@ -1026,6 +1170,19 @@ mod tests {
         }
     }
 
+    /// `fed_cfg` with `trusted` set: an inbound-only peer this daemon
+    /// vouches for by node_id without a `peers[]` entry (still keyed by
+    /// its raw node_id in `FedState.conns`). Every test below that drives
+    /// a full `admit_and_run` for a non-`peers[]` identity uses this --
+    /// under non-`public` discovery, an unvouched peer is now refused at
+    /// admission (see the admission tests), which is not what those tests
+    /// are about.
+    fn fed_cfg_trusting(node_ids: &[&str]) -> FederationConfig {
+        let mut cfg = fed_cfg(vec![], vec![]);
+        cfg.trusted = node_ids.iter().map(|s| s.to_string()).collect();
+        cfg
+    }
+
     // ---- blocked-at-handshake (duplex) ------------------------------------
 
     #[tokio::test]
@@ -1077,10 +1234,71 @@ mod tests {
         );
     }
 
-    // ---- SEEN recorded on successful handshake -----------------------------
+    // ---- unconfigured-peer admission: refused unless discovery is public --
 
+    /// A genuine handshake from an identity this daemon has no `peers[]`/
+    /// `trusted` entry for -- i.e. any freshly minted keypair -- is closed
+    /// right after the handshake under non-`public` discovery: no `seen`
+    /// row, no registration, no `Federation` event, and the peer sees the
+    /// connection drop rather than idle. Without this, every minted
+    /// identity got a task, a `node_trust` row for life, and a share of
+    /// `MAX_INBOUND_CONNS` for as long as it kept pinging.
     #[tokio::test]
-    async fn unconfigured_peer_handshake_records_seen_and_emits_up_then_down() {
+    async fn unconfigured_peer_is_refused_after_handshake_when_discovery_is_not_public() {
+        let dir = tempfile::tempdir().unwrap();
+        let (peer_key, peer_id) = keypair(dir.path());
+        let node_id = peer_id.node_id();
+        let d = Arc::new(test_daemon_with_federation(
+            dir.path(),
+            fed_cfg(vec![], vec![]),
+        )); // discovery: disabled (the default)
+        assert_eq!(d.store.lock().unwrap().trust_level(&node_id).unwrap(), None);
+        let mut events = d.events.subscribe();
+
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (daemon_static, daemon_identity) = keypair(dir.path());
+        let responder = tokio::spawn(async move {
+            noise::handshake_responder(b, &daemon_static, &daemon_identity).await
+        });
+        let mut client_channel = handshake_initiator(a, &peer_key, &peer_id, None)
+            .await
+            .unwrap();
+        let (server_channel, server_node_id) = responder.await.unwrap().unwrap();
+        let d2 = d.clone();
+        let conn_task = tokio::spawn(async move {
+            admit_and_run(d2, server_channel, server_node_id.clone(), server_node_id).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), conn_task)
+            .await
+            .expect("an unvouched peer must be refused promptly, not kept running")
+            .unwrap();
+
+        assert_eq!(
+            d.store.lock().unwrap().trust_level(&node_id).unwrap(),
+            None,
+            "a refused peer must not get a `seen` row"
+        );
+        assert!(d.fed.as_ref().unwrap().conns.lock().unwrap().is_empty());
+        assert!(
+            events.try_recv().is_err(),
+            "a refused peer must not emit any Federation event"
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_channel.recv_frame(),
+        )
+        .await;
+        assert!(result.is_ok(), "must not hang");
+        assert!(
+            result.unwrap().is_err(),
+            "the refused connection must be closed, not idle"
+        );
+    }
+
+    /// The `public` counterpart: an unconfigured peer IS admitted (that is
+    /// what the mode means), recording `seen` and emitting up/down.
+    #[tokio::test]
+    async fn unconfigured_peer_is_admitted_and_recorded_seen_under_public_discovery() {
         let dir = tempfile::tempdir().unwrap();
         let (peer_key, peer_id) = keypair(dir.path());
         let node_id = peer_id.node_id();
@@ -1089,6 +1307,7 @@ mod tests {
             dir.path(),
             fed_cfg(vec![], vec![]),
         ));
+        set_discovery(&d, "public", 3600);
         assert_eq!(d.store.lock().unwrap().trust_level(&node_id).unwrap(), None);
 
         let mut rx = d.events.subscribe();
@@ -1278,13 +1497,14 @@ mod tests {
     #[tokio::test]
     async fn crossed_admit_and_run_drops_the_second_connection_and_keeps_the_first() {
         let dir = tempfile::tempdir().unwrap();
+        let (peer1_key, peer1_id) = keypair(dir.path());
+        let (peer2_key, peer2_id) = keypair(dir.path());
         let d = Arc::new(test_daemon_with_federation(
             dir.path(),
-            fed_cfg(vec![], vec![]),
+            fed_cfg_trusting(&[&peer1_id.node_id(), &peer2_id.node_id()]),
         ));
 
         // First connection: full handshake, then parked in run_conn.
-        let (peer1_key, peer1_id) = keypair(dir.path());
         let (a1, b1) = tokio::io::duplex(1 << 16);
         let (ds1, di1) = keypair(dir.path());
         let responder =
@@ -1322,7 +1542,6 @@ mod tests {
 
         // Second connection, same peer key (the crossed dial).
         let mut events = d.events.subscribe();
-        let (peer2_key, peer2_id) = keypair(dir.path());
         let (a2, b2) = tokio::io::duplex(1 << 16);
         let (ds2, di2) = keypair(dir.path());
         let responder =
@@ -1552,7 +1771,7 @@ mod tests {
         let node_id = peer_id.node_id();
         let d = Arc::new(test_daemon_with_federation(
             dir.path(),
-            fed_cfg(vec![], vec![]),
+            fed_cfg_trusting(&[&node_id]),
         ));
         let mut rx = d.events.subscribe();
 
@@ -1750,7 +1969,7 @@ mod tests {
         let (daemon_static, daemon_identity) = keypair(dir.path());
         let d = Arc::new(test_daemon_with_federation(
             dir.path(),
-            fed_cfg(vec![], vec![]),
+            fed_cfg_trusting(&[&node_id]),
         ));
 
         let (a, b) = tokio::io::duplex(1 << 16);
@@ -1806,6 +2025,149 @@ mod tests {
             d.fed.as_ref().unwrap().conns.lock().unwrap().is_empty(),
             "a send-timed-out connection must deregister, exactly like any other closed connection"
         );
+    }
+
+    // ---- pre-decode frame gate (DoS hardening) ----------------------------
+
+    fn encode(frame: &Fed) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(frame, &mut buf).unwrap();
+        buf
+    }
+
+    fn sample_envelope_frame() -> Fed {
+        let now = Utc::now();
+        Fed::Envelope {
+            env: Box::new(relay_core::Envelope::new(
+                "mock:origin".parse().unwrap(),
+                Sender {
+                    native_ref: "!remote".into(),
+                },
+                "text".into(),
+                "hi".into(),
+                now,
+                now + chrono::Duration::hours(1),
+                8,
+            )),
+            target_route: "general".into(),
+        }
+    }
+
+    fn sample_sealed_frame() -> Fed {
+        Fed::Sealed {
+            sealed: crate::fed::seal::SealedEnvelope {
+                alg: "x25519-xchacha20poly1305-v1".into(),
+                id: "0189f1e4-4444-7000-8000-000000000004".into(),
+                expires_at: 1_800_000_000,
+                epk: vec![7u8; 32],
+                nonce: vec![9u8; 24],
+                ct: vec![1, 2, 3, 4],
+            },
+            target_route: "general".into(),
+        }
+    }
+
+    /// The per-tag permission matrix `decode_inbound` applies before any
+    /// decode: keepalives and acks from any admitted peer; `envelope`/
+    /// `sealed` only from a peer at or above `accept_from`; `advert_req`
+    /// (and `advert`) only where `advert_scope_allows` -- `public` admits
+    /// a merely-seen peer, `federation` does not.
+    #[test]
+    fn decode_inbound_gates_envelope_sealed_and_advert_frames_by_peer_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![])); // accept_from: verified
+        set_discovery(&d, "public", 3600);
+        let seen = format!("rf:{}", "88".repeat(32));
+        let verified = format!("rf:{}", "99".repeat(32));
+        {
+            let store = d.store.lock().unwrap();
+            store.record_seen(&seen, Utc::now()).unwrap();
+            store.seed_trust(&verified, "verified", Utc::now()).unwrap();
+        }
+        let ping = encode(&Fed::Ping {});
+        let ack = encode(&Fed::Ack {
+            id: "0189f1e4-1111-7000-8000-000000000001".into(),
+        });
+        let envelope = encode(&sample_envelope_frame());
+        let sealed = encode(&sample_sealed_frame());
+        let advert_req = encode(&Fed::AdvertReq {});
+
+        assert!(matches!(
+            decode_inbound(&d, &seen, &ping),
+            Some(Fed::Ping {})
+        ));
+        assert!(matches!(
+            decode_inbound(&d, &seen, &ack),
+            Some(Fed::Ack { .. })
+        ));
+        assert!(
+            decode_inbound(&d, &seen, &envelope).is_none(),
+            "a seen peer's envelope must be refused before decode"
+        );
+        assert!(decode_inbound(&d, &seen, &sealed).is_none());
+        assert!(matches!(
+            decode_inbound(&d, &verified, &envelope),
+            Some(Fed::Envelope { .. })
+        ));
+        assert!(matches!(
+            decode_inbound(&d, &verified, &sealed),
+            Some(Fed::Sealed { .. })
+        ));
+
+        assert!(matches!(
+            decode_inbound(&d, &seen, &advert_req),
+            Some(Fed::AdvertReq {})
+        ));
+        set_discovery(&d, "federation", 3600);
+        assert!(decode_inbound(&d, &seen, &advert_req).is_none());
+        assert!(matches!(
+            decode_inbound(&d, &verified, &advert_req),
+            Some(Fed::AdvertReq {})
+        ));
+    }
+
+    /// Per-tag byte caps and unknown tags, both decided from the peeked
+    /// tag and the raw length alone: a `ping` padded to 2 KiB with an
+    /// unrecognized field is over `SMALL_FRAME_MAX_BYTES` and dropped; the
+    /// same padding on an `envelope` from a qualified peer is nowhere near
+    /// its own cap and decodes; a tag this build doesn't know is never
+    /// decoded at all.
+    #[test]
+    fn decode_inbound_drops_an_over_cap_frame_and_never_decodes_an_unknown_tag() {
+        use ciborium::Value;
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon_with_federation(dir.path(), fed_cfg(vec![], vec![]));
+        let verified = format!("rf:{}", "aa".repeat(32));
+        d.store
+            .lock()
+            .unwrap()
+            .seed_trust(&verified, "verified", Utc::now())
+            .unwrap();
+
+        let padded = |frame: &Fed| {
+            let mut v: Value = ciborium::from_reader(encode(frame).as_slice()).unwrap();
+            v.as_map_mut().unwrap().push((
+                Value::Text("pad".into()),
+                Value::Bytes(vec![0u8; 2 * SMALL_FRAME_MAX_BYTES]),
+            ));
+            let mut buf = Vec::new();
+            ciborium::into_writer(&v, &mut buf).unwrap();
+            buf
+        };
+        assert!(decode_inbound(&d, &verified, &padded(&Fed::Ping {})).is_none());
+        assert!(matches!(
+            decode_inbound(&d, &verified, &padded(&sample_envelope_frame())),
+            Some(Fed::Envelope { .. })
+        ));
+
+        let unknown = Value::Map(vec![(
+            Value::Text("t".into()),
+            Value::Text("resync".into()),
+        )]);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&unknown, &mut buf).unwrap();
+        assert!(decode_inbound(&d, &verified, &buf).is_none());
+        assert!(decode_inbound(&d, &verified, b"not cbor at all").is_none());
     }
 
     // ---- RFDP discovery (design §2/§3, cycle G) ---------------------------
@@ -2509,7 +2871,7 @@ mod tests {
         let node_id = peer_id.node_id();
         let d = Arc::new(test_daemon_with_federation(
             dir.path(),
-            fed_cfg(vec![], vec![]),
+            fed_cfg_trusting(&[&node_id]),
         ));
         let mut events = d.events.subscribe();
 
@@ -2607,7 +2969,7 @@ mod tests {
         let node_id = peer_id.node_id();
         let d = Arc::new(test_daemon_with_federation(
             dir.path(),
-            fed_cfg(vec![], vec![]),
+            fed_cfg_trusting(&[&node_id]),
         ));
 
         let (a, b) = tokio::io::duplex(1 << 16);
@@ -2685,7 +3047,7 @@ mod tests {
         let node_id = peer_id.node_id();
         let d = Arc::new(test_daemon_with_federation(
             dir.path(),
-            fed_cfg(vec![], vec![]),
+            fed_cfg_trusting(&[&node_id]),
         ));
 
         let (a, b) = tokio::io::duplex(1 << 16);

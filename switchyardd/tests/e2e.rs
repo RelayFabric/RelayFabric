@@ -2112,11 +2112,12 @@ federation:
     .await;
 
     // ---- 5. trust-denied: daemon C dials A but is never listed as A's ------
-    // peer -- handshake succeeds (Noise identity binding is orthogonal to
-    // policy trust), envelope TRUST_DENIED. Per Task 4's binding ruling this
-    // is Persistence::NoPersist -- nothing written to storage -- so this is
-    // asserted via FED_REJECTED on GET /metrics + a bounded negative, never
-    // via /v1/queue?state=dead_letter.
+    // peer -- the Noise handshake succeeds (identity binding is orthogonal
+    // to policy trust) but, discovery not being `public`, A drops the
+    // connection right there: no envelope of C's is ever decoded, nothing
+    // is written to storage, and the refusal counts as FED_REJECTED. So
+    // this is asserted via GET /metrics + a bounded negative, never via
+    // /v1/queue?state=dead_letter.
     let config_c = format!(
         r#"
 node:
@@ -2955,8 +2956,8 @@ federation:
 ///   transcript, not in a test.
 /// - `/docs/swagger-ui-bundle.js` contains the vendored Swagger UI dist's
 ///   own embedded version string, PINNED to the exact version currently
-///   vendored (`utoipa-swagger-ui-vendored` 0.1.2 bakes in Swagger UI
-///   5.17.14 — confirmed directly against that crate's `res/*.zip`). If a
+///   vendored (`utoipa-swagger-ui-vendored` 0.2.0 bakes in Swagger UI
+///   5.32.6 — confirmed directly against that crate's `res/*.zip`). If a
 ///   future `utoipa-swagger-ui`/`-vendored` bump changes this, this
 ///   assertion fails LOUDLY rather than silently shipping a different
 ///   dist (with possibly different default phone-home behavior) unnoticed.
@@ -3042,8 +3043,8 @@ async fn openapi_doc_and_swagger_ui_are_served() {
     // swagger-ui-bundle.js -- pinned vendored dist version regression guard.
     let bundle_js = admin_get(&d.admin_sock(), "/docs/swagger-ui-bundle.js").await;
     assert!(
-        bundle_js.contains("PACKAGE_VERSION:\"5.17.14\""),
-        "vendored Swagger UI dist version drifted from the pinned 5.17.14 -- re-verify \
+        bundle_js.contains("PACKAGE_VERSION:\"5.32.6\""),
+        "vendored Swagger UI dist version drifted from the pinned 5.32.6 -- re-verify \
          validatorUrl:none (and no new phone-home) still holds in the new version before \
          updating this assertion"
     );

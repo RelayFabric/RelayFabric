@@ -55,8 +55,8 @@ pub enum PluginToDaemon {
     // both golden-byte tests below stay byte-identical. Best-effort,
     // rate-limited (plugin-side) gauge snapshot (e.g. RSSI/SNR, queue
     // depth); a plugin that never sends it changes nothing for the daemon
-    // (unknown-t tolerance already covers older plugins on the daemon side,
-    // and older daemons ignore this the same way).
+    // (an older daemon decodes it as `Unknown` and ignores it, and a
+    // plugin that never sends it changes nothing).
     Gauges {
         gauges: BTreeMap<String, f64>,
     },
@@ -65,6 +65,12 @@ pub enum PluginToDaemon {
     // idle-but-healthy plugin from a wedged one -- any received frame,
     // including this, refreshes the plugin's liveness deadline.
     Pong,
+    // Catch-all for a `t` this build doesn't know (docs/plugin-authors.md
+    // §3: an unrecognized tag MUST be ignored, not tear the connection
+    // down). Never sent; `#[serde(other)]` makes it the decode fallback.
+    // Kept LAST and must stay last: any real new variant goes above it.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +104,11 @@ pub enum DaemonToPlugin {
     // the daemon restarts a connected plugin that stops answering (see
     // plugins::supervise). Idempotent and side-effect-free for the plugin.
     Ping,
+    // Catch-all for an unrecognized `t` (see PluginToDaemon::Unknown): a
+    // plugin on an older relay-ipc keeps running when a newer daemon sends
+    // a frame it doesn't know. Never sent; kept LAST and must stay last.
+    #[serde(other)]
+    Unknown,
 }
 
 pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
@@ -106,9 +117,12 @@ pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
 ) -> io::Result<()> {
     let mut body = Vec::new();
     ciborium::into_writer(msg, &mut body).map_err(io::Error::other)?;
-    let len = u32::try_from(body.len()).map_err(io::Error::other)?;
+    // InvalidInput (not Other): this is the message's fault, not the
+    // socket's, so a writer loop can drop the one frame and carry on.
+    let too_big = || io::Error::new(io::ErrorKind::InvalidInput, "frame exceeds MAX_FRAME");
+    let len = u32::try_from(body.len()).map_err(|_| too_big())?;
     if len > MAX_FRAME {
-        return Err(io::Error::other("frame exceeds MAX_FRAME"));
+        return Err(too_big());
     }
     w.write_all(&len.to_be_bytes()).await?;
     w.write_all(&body).await?;
@@ -317,6 +331,54 @@ mod tests {
             panic!("wrong variant");
         };
         assert_eq!(priority.as_deref(), Some("emergency"));
+    }
+
+    /// Forward compatibility (docs/plugin-authors.md §3): a frame whose `t`
+    /// tag this build doesn't know must decode to `Unknown` -- with any
+    /// payload fields skipped -- rather than fail the whole connection.
+    /// Both directions, so an older daemon tolerates a newer plugin and
+    /// vice versa.
+    #[tokio::test]
+    async fn unknown_tag_decodes_to_unknown_in_both_directions() {
+        // {"t": "future-frame", "x": 1} as CBOR
+        let body: Vec<u8> = vec![
+            0xa2, 0x61, b't', 0x6c, b'f', b'u', b't', b'u', b'r', b'e', b'-', b'f', b'r', b'a',
+            b'm', b'e', 0x61, b'x', 0x01,
+        ];
+        let mut framed = (body.len() as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&body);
+
+        let mut r = &framed[..];
+        let got: PluginToDaemon = read_frame(&mut r).await.unwrap();
+        assert!(matches!(got, PluginToDaemon::Unknown), "got {got:?}");
+
+        let mut r = &framed[..];
+        let got: DaemonToPlugin = read_frame(&mut r).await.unwrap();
+        assert!(matches!(got, DaemonToPlugin::Unknown), "got {got:?}");
+    }
+
+    /// An oversize frame is the one write_frame failure that is the
+    /// MESSAGE's fault, not the socket's: it reports `InvalidInput` so a
+    /// writer loop can drop that frame and keep the connection.
+    #[tokio::test]
+    async fn write_frame_oversize_is_invalid_input_not_a_socket_error() {
+        let mut buf = Vec::new();
+        let msg = PluginToDaemon::Inbound {
+            endpoint: "chan".into(),
+            sender: "s".into(),
+            kind: "text".into(),
+            body: String::new(),
+            created_at: None,
+            attachments: vec![IpcAttachment {
+                filename: "big.bin".into(),
+                mime: "application/octet-stream".into(),
+                data: vec![0u8; MAX_FRAME as usize + 1],
+            }],
+            priority: None,
+        };
+        let err = write_frame(&mut buf, &msg).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(buf.is_empty(), "nothing may reach the socket");
     }
 
     #[tokio::test]
