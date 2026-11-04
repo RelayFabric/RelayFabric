@@ -579,7 +579,7 @@ class BridgeGaugesTests(unittest.TestCase):
         self.assertEqual(frames[0]["t"], "inbound")
 
     def test_emits_rssi_and_snr_when_present_once_rate_limit_elapses(self):
-        self.bridge._last_gauges_at = 0  # force the rate limit open
+        self.bridge._last_gauges_at = float("-inf")  # force the rate limit open (0 is not enough: monotonic time is uptime, and a fresh CI runner has less than the interval)
         ev = text_event()
         ev["rssi"] = -91
         ev["snr"] = 7.25
@@ -590,7 +590,7 @@ class BridgeGaugesTests(unittest.TestCase):
         self.assertEqual(frames[1]["t"], "inbound")
 
     def test_falls_back_to_queue_depth_when_rssi_snr_absent(self):
-        self.bridge._last_gauges_at = 0
+        self.bridge._last_gauges_at = float("-inf")
         self.bridge.handle_event("msh/2/json/ch-0/!12345678", text_event())
         frames = self.sock.frames()
         self.assertEqual(frames[0], {"t": "gauges", "gauges": {"queue_depth": 7.0}})
@@ -600,7 +600,7 @@ class BridgeGaugesTests(unittest.TestCase):
         # controls this JSON, and Python's stdlib json module parses the
         # NaN/Infinity/-Infinity literals by default) -- both must be
         # rejected here, not forwarded to the daemon.
-        self.bridge._last_gauges_at = 0
+        self.bridge._last_gauges_at = float("-inf")
         ev = text_event()
         ev["rssi"] = float("nan")
         ev["snr"] = float("inf")
@@ -609,7 +609,7 @@ class BridgeGaugesTests(unittest.TestCase):
         self.assertEqual(frames[0], {"t": "gauges", "gauges": {"queue_depth": 7.0}})
 
     def test_second_event_within_the_window_does_not_re_emit(self):
-        self.bridge._last_gauges_at = 0
+        self.bridge._last_gauges_at = float("-inf")
         self.bridge.handle_event("msh/2/json/ch-0/!12345678", text_event())
         self.assertEqual(self.sock.frames()[0]["t"], "gauges")
 

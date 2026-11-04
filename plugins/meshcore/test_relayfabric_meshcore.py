@@ -765,7 +765,7 @@ class BridgeGaugesTests(unittest.TestCase):
         self.assertEqual(len(self.sock.frames()), 1)
 
     def test_emits_queue_depth_once_rate_limit_elapses(self):
-        self.bridge._last_gauges_at = 0  # force the rate limit open
+        self.bridge._last_gauges_at = float("-inf")  # force the rate limit open (0 is not enough: monotonic time is uptime, and a fresh CI runner has less than the interval)
         self.bridge.handle_event(channel_event())
         frames = self.sock.frames()
         self.assertEqual(len(frames), 2)
@@ -773,7 +773,7 @@ class BridgeGaugesTests(unittest.TestCase):
         self.assertEqual(frames[1]["t"], "inbound")
 
     def test_second_event_within_the_window_does_not_re_emit(self):
-        self.bridge._last_gauges_at = 0
+        self.bridge._last_gauges_at = float("-inf")
         self.bridge.handle_event(channel_event())
         self.assertEqual(self.sock.frames()[0]["t"], "gauges")
 

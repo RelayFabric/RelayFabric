@@ -385,17 +385,34 @@ async fn poll_until_contains(sock: &Path, path: &str, needle: &str) -> String {
 /// Opens a raw HTTP/1.0 SSE connection to `/v1/events`, mirroring
 /// `events_stream_over_http_1_0_flushes_incrementally_not_buffered_to_eof`'s
 /// wire framing (switchyardctl is a separate binary crate, unreachable from
-/// here -- see that test's doc comment). Returns the still-open stream; the
-/// caller drives it with `poll_stream_until_contains` below rather than ever
-/// reading to EOF, since `/v1/events` streams for as long as the daemon is
-/// alive.
-async fn open_events_stream(sock: &Path) -> UnixStream {
-    use tokio::io::AsyncWriteExt;
+/// here -- see that test's doc comment). Returns the still-open stream plus
+/// everything read so far (the response headers and any event bytes that
+/// arrived with them); the caller drives it with `poll_stream_until_contains`
+/// below rather than ever reading to EOF, since `/v1/events` streams for as
+/// long as the daemon is alive.
+///
+/// It does not return before the response headers are in: the handler
+/// subscribes to the event bus before hyper writes them, so once they have
+/// arrived no later event can be missed. Returning right after the request
+/// let a mutation issued next race ahead of the subscription, and its event
+/// was then never seen (an intermittent CI failure).
+async fn open_events_stream(sock: &Path) -> (UnixStream, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = UnixStream::connect(sock).await.unwrap();
     s.write_all(b"GET /v1/events HTTP/1.0\r\nhost: x\r\n\r\n")
         .await
         .unwrap();
-    s
+    let mut collected = String::new();
+    let mut buf = [0u8; 4096];
+    while !collected.contains("\r\n\r\n") {
+        let n = timeout(Duration::from_secs(5), s.read(&mut buf))
+            .await
+            .expect("timed out waiting for the SSE response headers")
+            .unwrap();
+        assert!(n > 0, "SSE stream closed before its headers arrived");
+        collected.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
+    (s, collected)
 }
 
 /// Polls an already-open SSE stream (`open_events_stream`) with a bounded
@@ -1630,8 +1647,7 @@ async fn config_apply_reload_and_events_full_workflow() {
     );
 
     // ---- 2. open the SSE connection BEFORE the mutation --------------------
-    let mut sse = open_events_stream(&d.admin_sock()).await;
-    let mut sse_buf = String::new();
+    let (mut sse, mut sse_buf) = open_events_stream(&d.admin_sock()).await;
 
     // ---- 3. PUT a mutated config adding a second route ("extra"), reusing
     // the already-enabled mocka/mockb -- restart_required must be empty
@@ -1980,8 +1996,7 @@ federation:
 
     // Open A's SSE stream BEFORE B ever connects, so the "federation up"
     // event for peer b lands in the buffer this test polls below.
-    let mut sse_a = open_events_stream(&d_a.admin_sock()).await;
-    let mut sse_a_buf = String::new();
+    let (mut sse_a, mut sse_a_buf) = open_events_stream(&d_a.admin_sock()).await;
 
     // ---- 2. daemon B: dials A, federates "b-in"/"loop" from a -------------
     let config_b = format!(
