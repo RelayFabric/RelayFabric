@@ -30,7 +30,7 @@ jobs:
       # Publish only on pushes to main; PRs from forks can't access packages.
       - name: Log in to GHCR
         if: github.event_name == 'push'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
