@@ -35,7 +35,7 @@ RUN cargo build -j2 --release \
       -p switchyardd -p switchyardctl -p relayfabric-mqtt -p relayfabric-ui
 
 # ---------- Python dependency builder ----------
-FROM python:3.12-slim-bookworm@sha256:e697c81897302a4c4333bade000d98038fbb21eb064f8ee1fd42d02ebcd9d337 AS py-builder
+FROM python:3.15-slim-bookworm@sha256:4e03260adeeebafccd084f3584e6b84823aba5651cfb53ef8a078ed441ddf9cd AS py-builder
 # build tools cover any dependency without a prebuilt wheel for this platform
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential libffi-dev && rm -rf /var/lib/apt/lists/*
@@ -60,7 +60,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
       "Pillow==13.0.0"
 
 # ---------- Runtime ----------
-FROM python:3.12-slim-bookworm@sha256:e697c81897302a4c4333bade000d98038fbb21eb064f8ee1fd42d02ebcd9d337 AS runtime
+FROM python:3.15-slim-bookworm@sha256:4e03260adeeebafccd084f3584e6b84823aba5651cfb53ef8a078ed441ddf9cd AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
 
