@@ -11,10 +11,23 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # Both follow ed25519-dalek 2, snow 0.10, and crypto_box, which still
+      # take rand_core 0.6 RNGs and curve25519-dalek 4; bumping either on its
+      # own splits the tree into two copies. Lift once those crates move.
+      - dependency-name: rand
+        versions: [">=0.9"]
+      - dependency-name: curve25519-dalek
+        versions: [">=5"]
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The interpreter minor is chosen by hand (the plugins' native deps
+      # need prebuilt wheels for it); digest refreshes of 3.12 still flow.
+      - dependency-name: python
+        versions: [">=3.13"]
   - package-ecosystem: pip
     directory: /sdk/python
     schedule:
