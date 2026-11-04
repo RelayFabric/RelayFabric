@@ -75,9 +75,12 @@ never echoes the plugin's own publishes back to it.
 
 | Key | Default | Notes |
 |---|---|---|
-| `broker` | — | `mqtt://host[:port]`; port defaults to `1883` |
+| `broker` | — | `mqtt://host[:port]` (plaintext, port `1883`) or `mqtts://host[:port]` (TLS, port `8883`) |
 | `topics` | `[]` | Topics to subscribe; each topic name is also the endpoint |
 | `client_id` | `"relayfabric"` | MQTT client identifier |
+| `username` | `null` | Broker login; both `username` and `password` must be set to be used |
+| `password` | `null` | Broker password (use a `${env:...}`/`${file:...}` [secret reference](configuration.md#secret-references)) |
+| `ca_file` | `null` | PEM certificate of the private CA that signed the broker's certificate (`mqtts://`); unset verifies against the system trust store |
 
 ```yaml
 plugins:
@@ -89,9 +92,28 @@ plugins:
       topics: [chat/a, chat/b]
 ```
 
+!!! warning "Use `mqtts://` beyond the local host"
+    Plain `mqtt://` sends the login and every message in the clear, so keep
+    it to a broker on the local host or a trusted network (a LAN, a
+    WireGuard tunnel, an SSH forward). Anything further away, including a
+    broker across the public Internet, should be `mqtts://`: the plugin
+    verifies the broker's certificate against the system trust store (or
+    `ca_file` for a private CA) and refuses to connect otherwise; there is
+    no insecure opt-out.
+
+The session is `clean_start`, so subscriptions are re-issued on every
+(re)connect; a message still unacknowledged by the broker when the
+connection drops is reported to the daemon as not delivered and retried
+through the normal retry path. The plugin advertises a maximum packet size
+of about 80 KB to the broker (its `max_payload` of 64 000 bytes plus
+headroom), and refuses, per message, any publish larger than the limit the
+broker advertises back.
+
 !!! note "Licensing"
-    Built on `rumqttc`, an MIT/Apache-2.0 async MQTT client. No GPL
-    dependency in this plugin's path.
+    Built on `rumqttc`, an MIT/Apache-2.0 async MQTT client, with TLS from
+    the platform OpenSSL through `native-tls` (so the binary needs
+    `libssl3`, and a source build needs `libssl-dev` and `pkg-config`). No
+    GPL dependency in this plugin's path.
 
 ---
 

@@ -44,25 +44,36 @@ prebuilt, signed artifacts for x86-64 and aarch64 — no need to compile
 unless you're developing.
 
 **Debian/Ubuntu (`.deb`)** — daemon, CLI, MQTT plugin, and the hardened
-systemd units:
+systemd units. The package has no maintainer scripts, so the service user,
+its state directory, and the config are created by hand:
 
 ```
 # pick your arch from the release assets
 sudo dpkg -i relayfabric_0.4.2-1_amd64.deb
+sudo useradd --system --home /var/lib/relayfabric --shell /usr/sbin/nologin relayfabric
+sudo install -d -o relayfabric -g relayfabric -m 0711 /var/lib/relayfabric
+sudo cp /etc/relayfabric/relayfabric.yaml.example /etc/relayfabric/relayfabric.yaml
+sudoedit /etc/relayfabric/relayfabric.yaml   # node.data_dir is already /var/lib/relayfabric
+switchyardd --check-config --config /etc/relayfabric/relayfabric.yaml
 sudo systemctl enable --now switchyardd
 ```
+
+Plugins the daemon spawns itself run inside the unit's sandbox (no
+`/dev/tty*`, no W^X memory); serial/BLE plugins go in
+`relayfabric-plugin@<name>` or need a drop-in — see the header of
+[`deploy/systemd/switchyardd.service`](deploy/systemd/switchyardd.service).
 
 **Tarball** — the same binaries plus the web UI, `deploy/` units, and the
 example config:
 
 ```
-tar xzf relayfabric-0.4.0-x86_64-unknown-linux-gnu.tar.gz
+tar xzf relayfabric-0.4.2-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 **Container image** (semver-tagged on GHCR):
 
 ```
-docker run ghcr.io/relayfabric/relayfabric:0.4.0
+docker run ghcr.io/relayfabric/relayfabric:0.4.2
 ```
 
 **Verify** — every tarball and `.deb` is cosign-signed and checksummed;
@@ -129,9 +140,10 @@ Commands assume `target/release/` is on your `PATH`.
 The routing, policy, and security model — including deny-by-default
 routing, route-scoped pseudonyms, TTL/dedup/retry semantics, and the plugin
 IPC protocol — is specified in [`docs/SPEC.md`](docs/SPEC.md). The
-administrative web UI (`relayfabric-ui`) and its reverse-proxy are documented
-in [`relayfabric-ui/README.md`](relayfabric-ui/README.md); the architecture and
-the still-deferred auth/RBAC work are in
+administrative web UI (`relayfabric-ui`), its passkey (WebAuthn) auth and
+roles, and its reverse-proxy are documented in
+[`relayfabric-ui/README.md`](relayfabric-ui/README.md); the architecture
+notes and the TLS / remote-access setup are in
 [`docs/webui-notes.md`](docs/webui-notes.md).
 
 ## License

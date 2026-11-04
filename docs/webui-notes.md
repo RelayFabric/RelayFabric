@@ -1,10 +1,12 @@
 # RelayFabric WebUI — Design Notes
 
-Status: the UI and its reverse-proxy are built: see `relayfabric-ui/`. What
-remains deferred is authentication/RBAC on the proxy; today it binds to
-loopback with no auth of its own. The administrative API was designed for the
-WebUI from day one, and these notes capture that architecture and the deferred
-auth work.
+Status: the UI and its reverse-proxy are built (`relayfabric-ui/`), and
+since v0.4 the proxy authenticates with passkeys (WebAuthn) and enforces
+scoped roles on every proxied request; see `relayfabric-ui/README.md` for
+the flags and roles. It binds to loopback by default and does no TLS of its
+own — the "Remote access" section below covers fronting it. The
+administrative API was designed for the WebUI from day one, and these notes
+capture that architecture.
 
 ## Architecture
 
@@ -100,8 +102,12 @@ Two hard requirements come from WebAuthn:
 
 Also pass `--allowed-host <hostname>` for the public name: the UI rejects
 requests whose `Host` isn't allow-listed, and Origin-checks every
-state-changing request. The proxy must forward the `Host` header and **not
-buffer responses**, or the `/v1/events` SSE stream won't flow.
+state-changing request. `--allowed-host` admits the default-port
+`https://<hostname>` origin only; if the proxy serves the UI on another
+port, add that exact origin too (`--origin https://<hostname>:8443`),
+because browser origins are port-specific. The proxy must forward the
+`Host` header and **not buffer responses**, or the `/v1/events` SSE stream
+won't flow.
 
 **Caddy** (automatic Let's Encrypt TLS):
 

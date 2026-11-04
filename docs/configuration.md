@@ -17,7 +17,7 @@ starting point rather than writing a config from scratch.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `name` | string | *required* | This node's identifier. Signed into RFDP adverts, so it's capped at 64 characters and rejects control characters, newlines, and Unicode bidi/spoofing codepoints. |
-| `data_dir` | path | *required* | Directory for the plugin/admin Unix sockets, storage (CAS, delivery queue), and node identity keys. Keep it a **short absolute path** (e.g. `/var/lib/relayfabric` or `/run/relayfabric`): the derived socket paths must fit the OS Unix-socket limit (~104 bytes), and `--check-config` rejects a `data_dir` long enough to overflow it rather than letting the daemon fail at bind. |
+| `data_dir` | path | *required* | Directory for the plugin/admin Unix sockets, storage (CAS, delivery queue), and node identity keys. Must be a **short absolute path** (e.g. `/var/lib/relayfabric` or `/run/relayfabric`): a relative path is rejected, and the derived socket paths must fit the OS Unix-socket limit (~104 bytes), so `--check-config` rejects a `data_dir` long enough to overflow it rather than letting the daemon fail at bind. Cannot be changed through the admin API (see [Validating configuration](#validating-configuration)). |
 | `public` | bool | `false` | When `true`, every route's source/destination protocols must be covered by `public_services` ingress/egress lists (see below); `--check-config` rejects an uncovered route. |
 
 !!! warning "Restart required"
@@ -28,7 +28,10 @@ starting point rather than writing a config from scratch.
 ## `plugins`
 
 A map of plugin name → configuration. The name is also the protocol prefix
-used in route endpoints (`mqtt:chat/a`, `lxmf:pasadena`, ...).
+used in route endpoints (`mqtt:chat/a`, `lxmf:pasadena`, ...), the socket
+file name under `<data_dir>/plugins.d/`, and a `/metrics` label, so it is
+limited to 1–64 characters of `[A-Za-z0-9_-]` (`meshtastic-direct` is fine;
+`my.plugin` or `a/b` is rejected at load).
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -53,7 +56,7 @@ won't see the venv's dependencies.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `name` | string | *required* | Unique route name. `@identity` is reserved for identity-link delivery. |
+| `name` | string | *required* | Unique route name, 1–64 characters of `[A-Za-z0-9_-]` (it is a `/metrics` label and a queue/trace key). `@identity` is reserved for identity-link delivery. |
 | `sources` | list of `"protocol:endpoint"` | *required* | Inbound endpoints this route accepts from. Must reference enabled plugins; `fed` is never a valid source protocol. |
 | `destinations` | list of `"protocol:endpoint"` | *required* | Outbound endpoints this route fans a message out to. `fed:<peer_name>/<remote_route>` is valid here (see [federation](#federation)). |
 | `identity_mode` | `pseudonymous` \| `linked` | `pseudonymous` | `linked` renders a verified identity link's `display_name` at egress instead of the route's HMAC alias, when one exists for the sender. Linking itself is always an explicit operator/user action (`switchyardctl link`/`unlink`/`identities`, or the admin API), never implicit. |
@@ -170,7 +173,7 @@ off: no Noise listener, no fed egress/ingress, no trust seeding.
 | `listen` | string \| null | `null` | Bind address for the Noise listener. `null` means outbound-only (no inbound listener). |
 | `accept_from` | `verified` \| `trusted` | `verified` | Minimum trust-store level an inbound envelope's signer chain must have to be accepted. |
 | `max_hops` | integer | `4` | Inbound envelopes at or over this hop count are dead-lettered `HOP_LIMIT`. |
-| `max_ttl_secs` | integer | `86400` | Inbound TTL is clamped down to this many seconds. |
+| `max_ttl_secs` | integer | `86400` | Inbound TTL is clamped down to this many seconds. Must be 1 to 315360000 (10 years). |
 | `identity_exposure` | `pseudonymous` \| `full` | `pseudonymous` | Outbound source-reference handling. |
 | `ingress_routes` | list of route names | `[]` | Local routes federated peers may inject an inbound envelope into. Empty means no route accepts fed ingress. |
 | `peers` | list of peer entries | `[]` | See below. |
@@ -182,7 +185,7 @@ Each `peers[]` entry:
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `name` | string | *required* | Local label for the peer. |
-| `node_id` | string | *required* | `"rf:"` + 64 hex chars: the peer's Ed25519 public key. |
+| `node_id` | string | *required* | `"rf:"` + 64 **lowercase** hex chars: the peer's Ed25519 public key. Node ids are compared byte-for-byte against the lowercase form a peer presents, so an uppercase id (here, in `trusted`, or in `blocked`) is rejected at load rather than silently never matching. |
 | `addr` | string | *required* | `host:port` to dial. |
 | `trust` | `verified` \| `trusted` | `verified` | Trust level seeded at boot. |
 | `messages_per_minute` | integer | `0` (unlimited) | Aggregate egress budget for this peer's fed link. |
@@ -212,9 +215,9 @@ set; see [Federation & Discovery](federation.md).
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `ttl_default_secs` | integer | `86400` | Default message time-to-live, in seconds. |
-| `dedup_ttl_secs` | integer | `86400` | How long a delivered message's dedup fingerprint is remembered. Must be ≥ 1. |
-| `retention_secs` | integer | `86400` | How long terminal deliveries (delivered/failed/expired/dead_letter) and their orphaned CAS attachments are kept before the hourly purge removes them. Lower it on a small-disk node; raise it for a longer dead-letter/forensic window. Must be ≥ 1. |
+| `ttl_default_secs` | integer | `86400` | Default message time-to-live, in seconds. Must be 1 to 315360000 (10 years). |
+| `dedup_ttl_secs` | integer | `86400` | How long a delivered message's dedup fingerprint is remembered. Must be 1 to 315360000. |
+| `retention_secs` | integer | `86400` | How long terminal deliveries (delivered/failed/expired/dead_letter) and their orphaned CAS attachments are kept before the hourly purge removes them. Lower it on a small-disk node; raise it for a longer dead-letter/forensic window. Must be 1 to 315360000. |
 | `hop_limit` | integer | `8` | Maximum route hops before a message is dropped. Must be ≥ 1. |
 | `max_attachment_bytes` | integer | `8000000` (8 MB) | Daemon-wide inbound attachment budget, in bytes. |
 
@@ -249,9 +252,15 @@ config:
     resolved.
 
 Resolved values are passed to the plugin process via the
-`RELAYFABRIC_PLUGIN_CONFIG` env var at spawn (the plugin scrubs it from its
-own environment immediately after parsing, so children it spawns don't
-inherit it). Resolved secret values **never** appear in admin API
+`RELAYFABRIC_PLUGIN_CONFIG` env var at spawn. Plugins start from a scrubbed
+environment (`PATH`, `HOME`, locale, `TZ`, `TMPDIR`, `RUST_LOG`, `PYTHON*`,
+`VIRTUAL_ENV`, `XDG_*`, `SSL_CERT_*`, proxy variables, plus the
+`RELAYFABRIC_*` spawn contract), so the variable a `${env:NAME}` reference
+reads is never itself inherited by any plugin, only its resolved value,
+inside that plugin's own config. The plugin scrubs
+`RELAYFABRIC_PLUGIN_CONFIG` from its own environment immediately after
+parsing, so children it spawns don't inherit it either. Resolved secret
+values **never** appear in admin API
 responses, logs, or `--check-config` output: those always show the
 unresolved `${...}` form.
 
@@ -303,12 +312,35 @@ any plugins:
 - Valid: prints `configuration valid: N route(s), M plugin(s)` and exits 0.
 - Invalid: prints `config error: <message>` to stderr and exits 1.
 
+Unknown keys are an error at every typed level (`node`, `plugins.<name>`,
+`routes[]`, `federation`, `limits`, ...), so a typo like `hop_limt:` fails
+loudly instead of silently taking the default. A plugin's own `config:`
+block is the one free-form exception.
+
 The admin API exposes the same pipeline for a running daemon:
 `POST /v1/config/validate` checks a candidate YAML body without applying
 it, `PUT /v1/config` validates and applies it (returning which parts need a
 restart), and `GET /v1/config` serves the currently loaded config back
 byte-for-byte, secrets still in `${...}` form. See
 [Operations](operations.md).
+
+!!! note "What the admin API refuses"
+    `PUT /v1/config` additionally refuses (422, nothing written) a body
+    that would, relative to the running config:
+
+    - set or change a plugin `command` (the daemon runs it via `sh -c`);
+    - change `node.data_dir` (restart-required, so it could never apply,
+      and the next start would mint fresh identity keys in the new
+      directory);
+    - introduce a `${env:...}`/`${file:...}` secret reference, or move an
+      existing one to a different plugin (the daemon would read the file
+      or variable and hand the value to that plugin's network peer).
+
+    Keeping a reference where it is, or removing one, is fine. For any of
+    the three, edit the config file on disk and restart. An unreadable
+    `${file:...}` is reported with one generic message whatever the cause
+    (missing, directory, permission denied, empty); the detail goes to the
+    daemon's stderr only.
 
 ## Hot reload summary
 

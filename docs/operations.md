@@ -27,9 +27,12 @@ switchyardd --config docs/relayfabric.example.yaml --check-config
 
 There is no `--data-dir` flag: the data directory comes entirely from
 `node.data_dir` in the config file. `switchyardd` creates that directory if
-it doesn't exist (and tightens its permissions to `0700` if it already
-exists with looser ones), then keeps everything the daemon needs to persist
-inside it:
+it doesn't exist and sets its mode: `0700` normally, or `0711` when any
+enabled plugin has `peer_uid` set (so that plugin's own user can traverse
+into `plugins.d/` to reach its socket; see
+[Hardened systemd deployment](#hardened-systemd-deployment)). A
+pre-existing directory with looser permissions is tightened to that mode.
+Everything the daemon needs to persist then lives inside it:
 
 - `admin.sock`: the admin API, bound fresh on every start (any stale
   socket file from a previous run is removed first) and hardened to `0600`
@@ -44,16 +47,23 @@ inside it:
 - A SQLite-backed store for the message/delivery queue, dedup state, and
   identity links.
 - Node identity keys, under their own subdirectory.
-- `relayfabric.yaml` / `relayfabric.yaml.prev` / `relayfabric.yaml.prev.2` …
-  `.prev.5`: the applied config and up to five rotated backups, when config is
-  managed through the admin API rather than edited on disk directly (see
-  [Config hot-reload](#config-hot-reload)).
 
-!!! note "0700 directory, 0600 sockets"
+The config file itself is not in the data directory: when config is
+managed through the admin API rather than edited on disk directly (see
+[Config hot-reload](#config-hot-reload)), the daemon rewrites the
+`--config` file in place (via `<config>.tmp` + rename) and keeps up to five
+rotated backups beside it (`<config>.prev`, `.prev.2` … `.prev.5`), so the
+config's directory must be writable by the daemon's user — the systemd unit
+grants that with `ReadWritePaths=/etc/relayfabric`.
+
+!!! note "0700 (or 0711) directory, 0600 sockets"
     The `0700` directory is the actual access-control boundary. See
     [Security & Sealed Routing](security.md) for what that does and doesn't
     protect. The `0600` socket mode is defense-in-depth on top of it, not a
-    second boundary.
+    second boundary. In the `0711` (per-plugin-user) layout other users can
+    traverse the directory but not list it, and the admin socket's `0600`
+    mode plus the `SO_PEERCRED` check on each plugin socket carry the
+    boundary instead.
 
 ## The admin API
 
@@ -281,21 +291,16 @@ LXMF, Signal, Meshtastic, MeshCore, Nostr, and Bitchat plugins surfaces
 live, interleaved with the daemon's own log lines, instead of arriving in
 delayed bursts.
 
-## See also
-
-- [API Reference](api-reference.md): the full admin API contract
-- [Configuration](configuration.md): config file format and secret syntax
-- [Security & Sealed Routing](security.md): the access-control model
-  behind the admin socket, and sealed-routing security modes
-</content>
-
 ## Hardened systemd deployment
 
 `deploy/systemd/` ships two units (v0.4 cycle B):
 
 - `switchyardd.service`: the daemon as its own `relayfabric` user with
   full sandboxing (`ProtectSystem=strict`, seccomp `@system-service`, empty
-  capability set, `MemoryDenyWriteExecute`).
+  capability set, `MemoryDenyWriteExecute`). `/etc/relayfabric` is listed
+  in `ReadWritePaths` so `PUT /v1/config` and rollback can rewrite the
+  config file (they write `<config>.tmp` and rename), which the strict
+  read-only root would otherwise refuse.
 - `relayfabric-plugin@.service`: one instance per plugin, each under its
   own `relayfabric-plugin-<name>` user. Pair each instance with the
   plugin's `peer_uid` in `relayfabric.yaml`; the daemon then accepts only
@@ -303,9 +308,40 @@ delayed bursts.
   `PrivateDevices` per-instance via a drop-in (`DeviceAllow=/dev/ttyUSB0`),
   and radio plugins drop `AF_INET` entirely.
 
+The `.deb` installs the binaries and both units but has no maintainer
+scripts: create the `relayfabric` user, the state directory, and the config
+yourself (the exact commands are in the unit's header comment and the
+project README). The state directory is `0711` in this layout, not `0700`:
+each plugin user must be able to traverse into `plugins.d/` to reach its
+own socket, and the daemon uses `0711` itself once any plugin has
+`peer_uid` set, while `admin.sock` stays `0600` and the identity/key files
+keep their own owner-only modes.
+
 Under this layout a compromised plugin parser cannot read the daemon's
 identity/sealed keys, open `admin.sock`, impersonate another plugin, or
 reach devices and networks outside its allowlist.
+
+!!! warning "Plugins the daemon spawns inherit its sandbox"
+    A plugin started by the daemon (`command:` in `relayfabric.yaml`)
+    runs inside `switchyardd.service`'s own sandbox, as the daemon's user:
+    `PrivateDevices=yes` hides every serial and Bluetooth device,
+    `MemoryDenyWriteExecute=yes` breaks CPython extensions that need W^X
+    exceptions (ctypes/cffi, e.g. `coincurve`), and the seccomp filter and
+    empty capability set apply to it too. Run serial/BLE plugins
+    (`meshcore`, `meshtastic-direct`) and cffi-based ones through
+    `relayfabric-plugin@<name>` instead (no `command:`, a `peer_uid`), or,
+    if they must stay daemon-spawned, open exactly the holes needed with a
+    drop-in at `/etc/systemd/system/switchyardd.service.d/override.conf`:
+
+    ```ini
+    [Service]
+    PrivateDevices=no
+    DeviceAllow=/dev/ttyUSB0 rw
+    SupplementaryGroups=dialout
+    MemoryDenyWriteExecute=no
+    ```
+
+    then `systemctl daemon-reload && systemctl restart switchyardd`.
 
 ## Key rotation
 
@@ -319,9 +355,16 @@ created-if-absent on startup.
 | Sealed-routing key (X25519) | `sealed.key` | **Bounded staleness.** Peers learn it from your signed advert. Delete + restart publishes the new key on the next advert refresh (`advert_ttl_secs / 2`); until each peer refreshes, sealed envelopes they encrypt to the OLD key are rejected `BAD_SEAL` (never silently readable: the old private key is gone). Rotate during a quiet window. |
 | Node identity (Ed25519) | `identity/node.key` | **This is replacement, not rotation.** The `rf:` node_id IS this key: every peer's `federation.peers[].node_id`, trust store entry, and allow list names it. A new key is a new node. Coordinate with every peer, or you drop out of the fabric. Treat compromise as decommission + re-introduction. |
 | Alias key (HMAC) | `alias.key` | **A deliberate privacy reset.** Every route-scoped pseudonym changes at once; persona continuity across all bridged networks breaks by design. Never rotate casually; rotate immediately if the key may have leaked (it enables offline alias-to-sender correlation attempts). |
-| UI passkeys | `<ui state-dir>/credentials.json` | Remove individual credentials as an administrator (`DELETE /auth/credentials/<id>`); full reset = delete the file and restart `relayfabric-ui`, which prints a fresh one-time setup token. Sessions are in-memory. A UI restart revokes all of them. |
+| UI passkeys | `<ui state-dir>/credentials.json` | Remove individual credentials as an administrator (`DELETE /auth/credentials/<id>`); full reset = delete the file and restart `relayfabric-ui`, which writes a fresh one-time setup token to `<ui state-dir>/setup-token` (0600). Sessions are in-memory. A UI restart revokes all of them. |
 
 Compromise triage order: **node identity** (decommission), then **sealed
 key** (rotate now: future sealed traffic; past traffic to the old key is
 compromised), then **alias key** (rotate: pseudonym unlinkability), then
 Noise static (rotate, cheap), then UI credentials.
+
+## See also
+
+- [API Reference](api-reference.md): the full admin API contract
+- [Configuration](configuration.md): config file format and secret syntax
+- [Security & Sealed Routing](security.md): the access-control model
+  behind the admin socket, and sealed-routing security modes

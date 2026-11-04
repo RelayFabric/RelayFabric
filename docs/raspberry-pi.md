@@ -33,6 +33,15 @@ curl -LO "https://github.com/RelayFabric/RelayFabric/releases/download/v${VER}/r
 sudo dpkg -i "relayfabric_${VER}-1_arm64.deb"
 ```
 
+The package has no maintainer scripts, so create the service user, its state directory, and the config yourself before enabling the unit:
+
+```bash
+sudo useradd --system --home /var/lib/relayfabric --shell /usr/sbin/nologin relayfabric
+sudo install -d -o relayfabric -g relayfabric -m 0711 /var/lib/relayfabric
+sudo cp /etc/relayfabric/relayfabric.yaml.example /etc/relayfabric/relayfabric.yaml
+# edit /etc/relayfabric/relayfabric.yaml for your plugins; node.data_dir is already /var/lib/relayfabric
+```
+
 Every artifact is signed; verify it with cosign first if you like (the command is on each release page). The Python protocol plugins are not in the `.deb`; set up a virtualenv for the ones you use (see [Python plugins on ARM](#python-plugins-on-arm)).
 
 ### 2. The tarball
@@ -135,13 +144,31 @@ See [Example Configs](examples.md) for more starting points, including the mesht
 
 ## Run as a service
 
-If you installed the `.deb`, it ships a hardened systemd unit; enable it:
+If you installed the `.deb`, it ships a hardened systemd unit; once the user, state directory, and config from the install step exist, enable it:
 
 ```bash
+switchyardd --check-config --config /etc/relayfabric/relayfabric.yaml
 sudo systemctl enable --now switchyardd
 ```
 
-For the tarball or a source build, adapt the units in [`deploy/systemd/`](https://github.com/RelayFabric/RelayFabric/tree/main/deploy/systemd) to your paths and user. The [Operations](operations.md) page covers health probes (`switchyardctl health`), metrics, and backups, all of which work the same on a Pi.
+For the tarball or a source build, adapt the units in [`deploy/systemd/`](https://github.com/RelayFabric/RelayFabric/tree/main/deploy/systemd) to your paths and user (`ExecStart` uses a bare `switchyardd`, which systemd resolves in `/usr/local/bin` as well as `/usr/bin`). The [Operations](operations.md) page covers health probes (`switchyardctl health`), metrics, and backups, all of which work the same on a Pi.
+
+!!! warning "Serial and BLE plugins versus the daemon's sandbox"
+    `switchyardd.service` runs with `PrivateDevices=yes` and `MemoryDenyWriteExecute=yes`, and a plugin the daemon spawns itself (`command:` in the config) inherits that sandbox: it sees no `/dev/ttyUSB*`, `/dev/ttyACM*`, or Bluetooth device, and CPython cffi extensions fail to load. On a Pi this is exactly the MeshCore / Meshtastic-direct case. Either run those plugins through `relayfabric-plugin@<name>` (own user, `peer_uid` in the config, the device allow-list in that instance's drop-in; see the [hardened systemd deployment](operations.md#hardened-systemd-deployment)), or, if the daemon must spawn them, add a drop-in for the daemon unit:
+
+    ```bash
+    sudo systemctl edit switchyardd
+    ```
+
+    ```ini
+    [Service]
+    PrivateDevices=no
+    DeviceAllow=/dev/ttyUSB0 rw
+    SupplementaryGroups=dialout
+    MemoryDenyWriteExecute=no
+    ```
+
+    then `sudo systemctl restart switchyardd`.
 
 ## See also
 

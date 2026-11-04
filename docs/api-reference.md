@@ -98,14 +98,18 @@ plainly rather than implying a protection that doesn't exist:
 
 - Access control is entirely the OS filesystem's: the admin socket lives
   inside `data_dir`, which `switchyardd` creates (and, if it already
-  exists with looser permissions, tightens) to mode `0700`. A `0700`
+  exists with looser permissions, tightens) to mode `0700` (`0711` instead,
+  for `data_dir` and `plugins.d/`, when any enabled plugin sets `peer_uid`,
+  so that plugin's own UID can traverse to its socket; a `0711` directory
+  still cannot be listed, and the `0600` socket mode plus the `SO_PEERCRED`
+  check stay the boundary). A `0700`
   directory cannot even be traversed by another UID, so **any process
   running as the same UID as the daemon has full admin access (every
   route above, including config replace/rollback and identity linking)
   and `root` always does, regardless of UID.** There is no per-route, no
   per-user, and no read-only tier: reaching the socket at all is
-  equivalent to full admin. As a second belt on top of the `0700`
-  directory, `admin.sock` and the per-plugin `plugins.d/*.sock` are themselves
+  equivalent to full admin. As a second belt on top of the directory
+  mode, `admin.sock` and the per-plugin `plugins.d/*.sock` are themselves
   explicitly locked to mode `0600` right after `bind()` (`bind()` alone
   leaves a socket file's mode umask-derived, not tightened). So even if
   the parent directory's permissions were ever loosened by mistake, the
@@ -130,7 +134,8 @@ plainly rather than implying a protection that doesn't exist:
   service described in `docs/webui-notes.md`, fronting this socket.
   **As of v0.4, `relayfabric-ui` provides it: passkey (WebAuthn)
   authentication with scoped roles**, enforced on every proxied request
-  (first-run bootstrap via a one-time console setup token). The socket
+  (first-run bootstrap via a one-time setup token written to
+  `<state-dir>/setup-token`, mode 0600, never logged). The socket
   itself stays filesystem-guarded; expose only the authenticated UI, and
   only behind TLS for non-localhost use.
 
@@ -192,6 +197,17 @@ destination edge gateways.
 - `GET /v1/config` returns the raw YAML with secret *references*
   (`${env:...}`) intact and unresolved: never the resolved secret value.
   No handler on this API ever echoes a resolved secret back to a caller.
+- `PUT /v1/config` refuses (422, nothing written) a body that would set or
+  change a plugin `command`, change `node.data_dir`, or introduce or move
+  a `${env:...}`/`${file:...}` secret reference relative to the running
+  config: each would turn config-write access into code execution, an
+  identity-key swap, or a file-read-to-network primitive. Those edits go
+  in the config file on disk, followed by a restart. An unreadable
+  `${file:...}` in a validate/put body is reported with one generic
+  message regardless of cause, so the API is not a file-existence oracle.
+- `POST /v1/identities/link` requires a `display_name` that is non-empty,
+  at most 64 characters, and free of control or bidi/invisible spoofing
+  characters (it is rendered as a `[tag]` prefix on every message).
 - `/v1/events` (SSE) is an advisory, best-effort live feed for UI/tooling
   convenience, not a durable or complete audit log. A client that
   disconnects misses events emitted while it was away; use `/v1/queue` and

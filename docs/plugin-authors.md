@@ -58,10 +58,35 @@ daemon rejected you. Log it and exit; do not proceed to the read loop.
 | `send_direct`       | daemon → plugin   | deliver to a native ref, no endpoint mapping (requires `direct_messages`) |
 | `delivery_result`   | plugin → daemon   | outcome of a `send`/`send_direct`, correlated by `corr` |
 | `shutdown`          | daemon → plugin   | clean-exit request                         |
+| `ping` / `pong`     | daemon → plugin / plugin → daemon | liveness probe; answer every `ping` or the daemon restarts you |
+| `gauges`            | plugin → daemon   | optional best-effort metrics snapshot      |
 
 An unrecognized `t` in either direction MUST be ignored, not treated as an
 error. This is how new frame variants can be added later without breaking
-plugins/daemons that don't know about them yet.
+plugins/daemons that don't know about them yet. The daemon side honors
+this: `relay-ipc` decodes any unknown tag as the `Unknown` variant (of
+`PluginToDaemon` and `DaemonToPlugin` alike, always the last variant), and
+`switchyardd` logs and skips it while the connection stays up. Do the same
+in a plugin: the Python runner ignores unknown tags, and a Rust plugin
+should match `DaemonToPlugin::Unknown => {}`.
+
+The daemon also enforces two deadlines on the socket: the `hello` must
+arrive within 10 s of connecting, and after that some frame (a `pong` is
+enough) must arrive at least every 90 s, or the daemon drops the
+connection. It pings every 20 s, so a plugin that answers pings never hits
+the second one.
+
+### 3a. Environment and secrets
+
+The daemon spawns a plugin with a scrubbed environment: a short allowlist
+of runtime basics (`PATH`, `HOME`, `USER`, `LANG`/`LC_*`, `TZ`, `TMPDIR`,
+`RUST_LOG`, `PYTHON*`, `VIRTUAL_ENV`, `XDG_*`, `SSL_CERT_*`, proxy
+variables) plus the contract variables above. Nothing else from the
+daemon's environment is inherited, in particular not the variables a
+`${env:NAME}` secret reference reads: those reach you only as resolved
+values inside `RELAYFABRIC_PLUGIN_CONFIG`. Remove that variable from your
+own environment as soon as you have parsed it (`run_plugin` and the MQTT
+plugin both do), so child processes you spawn don't inherit it either.
 
 ### 4. DeliveryResult semantics
 
