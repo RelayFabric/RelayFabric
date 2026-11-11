@@ -13,7 +13,7 @@
 # ecosystem bumps the digests.
 
 # ---------- Rust builder ----------
-FROM rust:1-slim-bookworm@sha256:ed2c95ca377d6571b124b05e75e01207973ded639dce7d5542eb7bcd797e32aa AS rust-builder
+FROM rust:1-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd AS rust-builder
 WORKDIR /build
 # The MQTT plugin's TLS comes from the platform OpenSSL (native-tls).
 RUN apt-get update && apt-get install -y --no-install-recommends \
