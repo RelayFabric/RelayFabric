@@ -7,36 +7,37 @@ follow "Steps for a change" below.
 Two threads share one `_SendQueue`. The read loop (the `while True` loop at the end of
 `run_plugin`) calls `offer` for each `send` and `send_direct` frame, and `close` for
 the `shutdown` frame. The worker (`_sender_loop`) calls `get`, `_dispatch`, and
-`release`. The verification checks six rules in every order in which the steps of
+`release`. The verification checks seven rules in every order in which the steps of
 the two threads can happen, within the bounds given below.
 
 - **Model check:** `SendQueue.tla` with `SendQueue.cfg`, a TLA+ model of the two
-  threads. It passes: 132,180 states, about 2 seconds.
+  threads. It passes: 145,267 states, about 2 seconds.
 - **Trace check:** `trace_run.py` runs the real code in six scenarios and logs each
   step. `SendQueueTrace.tla` checks that the model can take the same steps in the
   same order. It passes on all six logs.
-- **Finding F1:** the code breaks a seventh rule, `CloseNeverWaits`. See "Known
-  weaknesses".
+- **Finding F1, fixed:** the first version of this record found that `close()`
+  waited when the queue was full. See "Fixed findings".
 
 Last checked against the code on 2026-11-23, with the `tla-check` skill of the
-`formal-proofs` plugin, version 0.4.0 (TLC 1.7.4), and CPython 3.14.4.
+`formal-proofs` plugin, version 0.4.0 (TLC 1.7.4), and CPython 3.12.10.
 
 ## Covered code
 
 ```
 covered:
-  - sdk/python/relayfabric_sdk/runner.py f9a1d56fcdf3
+  - sdk/python/relayfabric_sdk/runner.py d0ed12eb8e34
     > SEND_QUEUE_MAX = 256
     > class _SendQueue:
-    > self._q = queue.Queue(maxsize=maxsize)
+    > self._q = queue.Queue()
+    > self._maxsize = maxsize
     > self._pending = set()
     > self._lock = threading.Lock()
     > def _key(frame):
     > def offer(self, kind, frame):
     > with self._lock:
     > if corr is not None and corr in self._pending:
+    > if self._q.qsize() >= self._maxsize:
     > self._q.put_nowait((kind, frame))
-    > except queue.Full:
     > self._pending.add(corr)
     > def release(self, corr):
     > with self._lock:
@@ -81,10 +82,11 @@ code moves away from it. Only the trace check runs the code, and only in six
 scenarios: five fixed orders of steps, and one order that differs from run to run.
 
 The model also assumes code that is not in this repo: `queue.Queue` and
-`threading.Lock` of the Python standard library. It assumes that `put_nowait` raises
-`queue.Full` at `maxsize`, that `put` waits at `maxsize`, that `get` waits on an empty
-queue, that each of those calls is one indivisible step, and that the queue hands
-out the oldest item first.
+`threading.Lock` of the Python standard library. It assumes that a `queue.Queue()`
+built with no `maxsize` never makes `put` wait and never makes `put_nowait` raise
+`queue.Full`, that `qsize` returns the count of items at the moment of the call,
+that `get` waits on an empty queue, that each of those calls is one indivisible
+step, and that the queue hands out the oldest item first.
 
 ## Why this target
 
@@ -108,12 +110,17 @@ The cases that they do not reach:
 
 1. The worker finishes a send while `offer` is between `put_nowait` and
    `self._pending.add(corr)`. `offer` holds `_lock` to make this safe. With the lock
-   removed from `offer` (`breaks/no_lock.patch`), all 29 tests still pass.
+   removed from `offer` (`breaks/no_lock.patch`), all 30 tests still pass.
 2. Whether the worker releases a corr at all. With the `release` call removed from
-   `_sender_loop` (`breaks/no_release.patch`), all 29 tests still pass, and every later
+   `_sender_loop` (`breaks/no_release.patch`), all 30 tests still pass, and every later
    re-dispatch of a corr that was sent once is dropped.
-3. A `shutdown` frame that arrives while the queue is at its bound. No test does
-   this, and this is where finding F1 is.
+3. A `shutdown` frame that arrives while the queue is at its bound. This is where
+   finding F1 was. `SendQueueTests.test_close_on_a_full_queue_does_not_wait` now
+   calls `close` on a full queue, but no test sends `shutdown` to `run_plugin` with
+   the queue full; the scenario `shutdown_when_full` of the trace check does.
+4. The worker takes a send while `offer` is between its size check and
+   `put_nowait`. The bound holds there because only the read loop adds sends. No
+   test makes the two threads meet at that point.
 
 ## Why a TLA+ model
 
@@ -133,8 +140,8 @@ All code is in `sdk/python/relayfabric_sdk/runner.py`.
 | read loop: `frame = read_frame(sock)` returns a `send` or `send_direct` frame; `_SendQueue._key` | `Receive(c)`; a frame with no corr is `NoCorr`, 0 | `Receive` |
 | `offer`: `with self._lock:` | `OfferLock`, `OfferUnlock`; variable `lock` | `Lock`, `Unlock` by the reader |
 | `offer`: `corr in self._pending` | `OfferCheck`; variable `pending` | `Check` |
+| `offer`: `if self._q.qsize() >= self._maxsize:` | `OfferRoom` when there is room, `OfferFull` for `return "full"` | `Size` |
 | `offer`: `self._q.put_nowait((kind, frame))` | `OfferPut`; variable `queue` | `Put` |
-| `offer`: `except queue.Full: return "full"` | `OfferFull` | none: the trace spec infers it |
 | `offer`: `self._pending.add(corr)` | `OfferAdd` | `Add` |
 | `_enqueue`: `_send_frame(delivery_result(corr, False, "plugin busy"))` | `AnswerBusy` | `Busy` |
 | read loop: the `shutdown` frame | `ReceiveShutdown` | `Shutdown` |
@@ -145,7 +152,7 @@ All code is in `sdk/python/relayfabric_sdk/runner.py`.
 | `_sender_loop`: `_dispatch(kind, frame)`, which calls `bridge.handle_send` or `bridge.handle_send_direct` | `Dispatch` | `Dispatch` |
 | `release`: `with self._lock:` | `ReleaseLock`, `ReleaseUnlock` | `Lock`, `Unlock` by the worker |
 | `release`: `self._pending.discard(corr)` | `ReleaseDiscard` | `Discard` |
-| `SEND_QUEUE_MAX` | constant `MaxQueue` | `MAX_QUEUE` |
+| `SEND_QUEUE_MAX`, kept in `self._maxsize` | constant `MaxQueue` | `MAX_QUEUE` |
 
 The model has one reader and one worker, because in the code only the read loop
 calls `offer` and `close`, and only `_sender_loop` calls `get` and `release`. The
@@ -172,15 +179,21 @@ held, or one call on `_q`, which `queue.Queue` guards with its own mutex.
 | `DrainedAtStop` | When the worker ends on the shutdown sentinel, the bridge has been given every send that `offer` accepted. | A send that was accepted just before shutdown is dropped without a result. |
 | `BusyAnswered` | Before the read loop reads its next frame, each send with a corr that was refused for a full queue has its `plugin busy` result. | The daemon is not told to back off, and waits 60 seconds for a send that the plugin never queued. |
 | `Bounded` | No more than `SEND_QUEUE_MAX` sends wait in the queue. | A slow backend lets the backlog, and the memory of the plugin, grow without limit. |
+| `CloseNeverWaits` | The `shutdown` frame never has to wait for a send that the bridge is still working on. | With a full queue and a stuck send, the plugin does not stop on `shutdown`: `bridge.stop()` does not run, and the process stays until something kills it. |
 
 A send is "in flight" from the moment the worker takes it until the worker has
 discarded its corr. In the model that is `Holding`, which names the places of the
 worker: `dispatch`, `release`, and `discard`.
 
+`CloseNeverWaits` is a rule about a step that can always be taken: while the worker
+is in `_dispatch`, the read loop can take its `Close` step. `_q` has no bound of its
+own, so `Close` has no condition but its place in the read loop. The rule can still
+fail: the fault `CloseWaits` below breaks it.
+
 Bounds of the committed config: corr values 1 and 2 and frames with no corr, a
 queue bound of 2, and five `send` or `send_direct` frames in a run, then `shutdown`
 or a lost connection at any point. One larger run also passed on 2026-11-23, with
-three corr values, a queue bound of 3, and seven frames: 14,328,165 states, 15
+three corr values, a queue bound of 3, and seven frames: 15,403,161 states, 15
 seconds on 24 cores.
 
 ## Run the checks
@@ -193,9 +206,9 @@ far above its 500 states.
 
 1. **Model check.** Check `sdk/python/formal/send_queue/SendQueue.tla`. The config
    `SendQueue.cfg` is next to it. A pass is exit code 0, with `Model checking
-   completed. No error has been found.` and 132,180 distinct states.
+   completed. No error has been found.` and 145,267 distinct states.
 2. **The pass is not empty.** With the same skill, list how often each action ran.
-   Each of the 18 actions under `Next` must be in the list with a count above 0.
+   Each of the 19 actions under `Next` must be in the list with a count above 0.
    No action is switched off in the committed config, so an action with `0:0` is
    an error in the model. `Exited` finds no new state by design, and still shows
    how often it ran.
@@ -209,13 +222,16 @@ far above its 500 states.
    ```
 
    It writes `redispatch.log`, `overflow.log`, `free_running.log`,
-   `connection_lost.log`, `join_timeout.log`, and `close_waits.log`. With the trace
+   `connection_lost.log`, `join_timeout.log`, and `shutdown_when_full.log`. With the trace
    check of the `tla-check` skill, check each log against
    `sdk/python/formal/send_queue/SendQueueTrace.tla`. The config `SendQueueTrace.cfg`
    is next to it. A pass is exit code 0 and `ok: the model follows all N events`
    for each of the six logs. `free_running.log` differs from run to run on purpose:
    its two threads meet in a random order. Five logs are the same in every run.
    Keep a log that the model cannot follow, because the log is the reproduction.
+   The scenario `shutdown_when_full` is also a check of its own: `trace_run.py`
+   stops with `scenario stalled` when `run_plugin` has not exited 3 seconds after
+   the `shutdown` frame.
 4. **The tests of the repo.** From `sdk/python`:
    `PYTHONPATH=. python -m unittest tests.test_runner`.
 
@@ -291,12 +307,13 @@ Checked on 2026-11-23: each fault breaks the rules in its row, and no other rule
 | `EarlyRelease` | the corr leaves `_pending` when the worker takes the frame, before `_dispatch` | `OneSendPerCorr` |
 | `NoLock` | `offer` does not take `_lock` | `NoStuckCorr` |
 | `NoRelease` | `_sender_loop` does not discard the corr after `_dispatch` | `NoStuckCorr` |
-| `ReserveOnFull` | `offer` adds the corr to `_pending` also when `put_nowait` raises `queue.Full` | `NoStuckCorr` |
+| `ReserveOnFull` | `offer` adds the corr to `_pending` also when it returns `"full"` | `NoStuckCorr` |
 | `Lifo` | the worker takes the newest item, not the oldest | `InOrder` |
 | `Lifo` | the same | `DrainedAtStop` |
 | `StopJumpsQueue` | `close` puts the sentinel at the front of the queue | `DrainedAtStop` |
 | `NoBusy` | `_enqueue` sends no `plugin busy` result | `BusyAnswered` |
-| `NoBound` | `put_nowait` never raises `queue.Full` | `Bounded` |
+| `NoBound` | `offer` skips the `self._q.qsize() >= self._maxsize` check | `Bounded` |
+| `CloseWaits` | `_q` has the bound again, as `queue.Queue(maxsize=maxsize)`, so the `put` in `close` waits for room | `CloseNeverWaits` |
 
 Every action of the model runs in the committed config. The faults are branches
 inside actions, not actions of their own, so none of them shows as an action that
@@ -314,65 +331,22 @@ git apply -R sdk/python/formal/send_queue/breaks/no_lock.patch
 
 | Patch | The break | What must fail |
 |-------|-----------|----------------|
-| `no_lock.patch` | `offer` without `with self._lock:` | The trace check exits with 1 on all six logs. The 29 tests of `tests/test_runner.py` pass. |
-| `no_release.patch` | `_sender_loop` without the `release` call | The trace check exits with 1 on `redispatch.log`, `overflow.log`, `free_running.log`, and `close_waits.log`. The 29 tests pass. |
+| `no_lock.patch` | `offer` without `with self._lock:` | The trace check exits with 1 on all six logs. The 30 tests of `tests/test_runner.py` pass. |
+| `no_release.patch` | `_sender_loop` without the `release` call | The trace check exits with 1 on `redispatch.log`, `overflow.log`, and `free_running.log`. In the other three logs the worker never gets as far as `release`. The 30 tests pass. |
+
+The fault `CloseWaits` has no patch file, because the tests catch it in the real
+code: with `self._q = queue.Queue(maxsize=maxsize)` in `__init__`,
+`test_close_on_a_full_queue_does_not_wait` fails, and `trace_run.py` stops with
+`scenario stalled` in `shutdown_when_full`.
 
 The shortest way to see the trace check fail is to delete one line from a log: it
 must exit with 1 and name the event that the model cannot take.
 
 ## Known weaknesses
 
-These are cases that the model includes and shows to break. They are apart from
-what the check leaves out, which is the next section. Each rule here has a config
-of its own, so that `SendQueue.cfg` can pass. For each of them, exit code 12 is the
-expected result.
-
-### F1: `close()` waits when the queue is full (a bug)
-
-Rule `CloseNeverWaits`: the `shutdown` frame never has to wait for a send that the
-bridge is still working on. In the model: while the worker is in `_dispatch`, the
-read loop can always take its `Close` step.
-
-The comment on `close` says that the sentinel "bypasses the bound so shutdown can
-never block", and the comment in the `shutdown` branch says that a wedged send "is
-abandoned at the join timeout rather than hanging exit". The code does not do
-that: `close` calls `self._q.put(None)`, and `put` waits for as long as the queue is
-at `maxsize`.
-
-The path, with the real bound of 256:
-
-1. A send is inside `bridge.handle_send`, and the backend is slow or stuck.
-2. The daemon keeps sending, until 256 more sends wait in the queue.
-3. The daemon sends `shutdown`. The read loop calls `send_q.close()`.
-4. `self._q.put(None)` waits for room. Only the worker makes room, and the worker
-   is inside `handle_send`.
-5. The read loop stays in `close()`. It does not reach `sender.join(timeout=2.0)`,
-   `bridge.stop()`, or `sys.exit(0)` until `handle_send` returns. It also reads no
-   more frames, so it answers no ping and does not see the connection close.
-
-The harm: with a full queue and a stuck send, the plugin does not stop on
-`shutdown`. `bridge.stop()` does not run, and the process stays until something
-kills it. A plugin that the daemon started is killed when the daemon exits, about
-half a second after it sends `shutdown` (`switchyardd/src/main.rs`). A plugin that
-the daemon did not start, such as one under systemd, has nothing that kills it.
-
-How to see it:
-
-- In the model: check `SendQueue.tla` with the config `CloseNeverWaits.cfg`. TLC
-  reports `Invariant CloseNeverWaits is violated`. The shortest path has 16 states.
-- In the real code: `trace_run.py` prints, for the scenario `close_waits`, that
-  `run_plugin` has not exited 3 seconds after the `shutdown` frame. Check
-  `close_waits.log` against `SendQueueTrace.tla` with the config
-  `CloseNeverWaitsTrace.cfg`: exit code 12, on the state that the log leads to.
-
-The rule can hold. On a scratch copy of the model, checked on 2026-11-23, `Close`
-without its wait (the line `Len(queue) < MaxQueue`) keeps `CloseNeverWaits` and the
-six rules, in 141,322 states. That is a `close` that does what its comment says.
-
-When `close` is fixed: update `Close` in `SendQueue.tla` from the new code, move
-`CloseNeverWaits` into `SendQueue.cfg` and `SendQueueTrace.cfg`, delete
-`CloseNeverWaits.cfg` and `CloseNeverWaitsTrace.cfg`, and update the scenario
-`close_waits` and this section.
+This is a case that the model includes and shows to break. It is apart from what
+the check leaves out, which is a later section. Its rule has a config of its own,
+so that `SendQueue.cfg` can pass. Exit code 12 is the expected result.
 
 ### W1: sends that were accepted can be dropped at exit (by design)
 
@@ -386,9 +360,31 @@ The harm: the daemon gets no result for those sends. It sends them again after
 its 60 second window, to the plugin when it runs again.
 
 How to see it: check `SendQueue.tla` with the config `NoSendAbandoned.cfg`. TLC
-reports `Invariant NoSendAbandoned is violated`. The shortest path has 6 states, and
-ends with a lost connection. The logs `connection_lost.log` and `join_timeout.log`
-are real runs of the two ways.
+reports `Invariant NoSendAbandoned is violated`. The shortest path has 7 states, and
+ends with a lost connection. The logs `connection_lost.log`, `join_timeout.log`, and
+`shutdown_when_full.log` are real runs of the two ways.
+
+## Fixed findings
+
+### F1: `close()` waited when the queue was full
+
+The first version of this record found that the code broke `CloseNeverWaits`. `_q`
+was `queue.Queue(maxsize=maxsize)`, and `close` put the sentinel with
+`self._q.put(None)`, which waits for as long as the queue is at `maxsize`. With a
+send stuck inside `bridge.handle_send` and `SEND_QUEUE_MAX` more sends in the queue,
+the read loop stayed in `close()` on a `shutdown` frame. It did not reach
+`sender.join(timeout=2.0)`, `bridge.stop()`, or `sys.exit(0)` until `handle_send`
+returned.
+
+The fix: `_q` has no bound of its own, and `offer` keeps the bound with
+`self._q.qsize() >= self._maxsize`, made while it holds `_lock`. So the `put` in
+`close` never waits. The size check and `put_nowait` are two steps, and the worker
+can take a send between them; only the read loop adds sends, so the queue can only
+get shorter there. `Bounded` checks that in every order of the steps.
+
+What guards it now: `CloseNeverWaits` in `SendQueue.cfg` and `SendQueueTrace.cfg`,
+the fault `CloseWaits`, the scenario `shutdown_when_full`, and
+`SendQueueTests.test_close_on_a_full_queue_does_not_wait`.
 
 ## What the check does not cover
 
@@ -416,7 +412,10 @@ are real runs of the two ways.
 - **The rest of `run_plugin`:** the environment, the handshake, the config, and the
   frames that are not `send`, `send_direct`, or `shutdown`.
 - **The daemon:** its reclaim window, its retries, and what it does with a
-  `plugin busy` result.
+  `plugin busy` result. It sends `shutdown` only when it exits, and kills its
+  plugins about half a second later (`switchyardd/src/main.rs`). That is sooner
+  than `sender.join(timeout=2.0)` gives up, so in a plugin that the daemon started,
+  `bridge.stop()` does not run when a send is stuck at shutdown.
 - **More than one reader or worker.** The model has one of each.
 - **The standard library.** `queue.Queue` and `threading.Lock` are assumed to work
   as documented.

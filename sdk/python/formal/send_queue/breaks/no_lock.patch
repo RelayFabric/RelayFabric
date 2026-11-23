@@ -1,8 +1,8 @@
 diff --git a/sdk/python/relayfabric_sdk/runner.py b/sdk/python/relayfabric_sdk/runner.py
-index db8701e..2558cec 100644
+index 5d02387..4101197 100644
 --- a/sdk/python/relayfabric_sdk/runner.py
 +++ b/sdk/python/relayfabric_sdk/runner.py
-@@ -58,7 +58,7 @@ class _SendQueue:
+@@ -61,7 +61,7 @@ class _SendQueue:
  
      def offer(self, kind, frame):
          corr = self._key(frame)
@@ -10,4 +10,4 @@ index db8701e..2558cec 100644
 +        if True:
              if corr is not None and corr in self._pending:
                  return "duplicate"
-             try:
+             # Only the read loop adds sends, so between this check and the

@@ -18,7 +18,7 @@ EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
   Corrs,      \* the corr values that the daemon uses in a run, as numbers above 0
-  MaxQueue,   \* SEND_QUEUE_MAX: the maxsize of _SendQueue._q
+  MaxQueue,   \* SEND_QUEUE_MAX: _SendQueue._maxsize, the bound that offer keeps
   MaxFrames,  \* how many send and send_direct frames the daemon sends in a run
   Faults      \* deliberate breaks, by name; {} is the code as it is written
 
@@ -69,7 +69,7 @@ Receive(c) ==
 OfferLock ==
   /\ reader = "lock"
   /\ IF "NoLock" \in Faults THEN UNCHANGED lock ELSE lock = "free" /\ lock' = "reader"
-  /\ reader' = IF cur.corr = NoCorr THEN "put" ELSE "check"
+  /\ reader' = IF cur.corr = NoCorr THEN "size" ELSE "check"
   /\ UNCHANGED <<cur, outcome, received, pending, queue, worker, taken,
                  accepted, dispatched, refused, busy>>
 
@@ -78,23 +78,22 @@ OfferCheck ==
   /\ reader = "check"
   /\ IF cur.corr \in pending /\ "NoDedup" \notin Faults
        THEN outcome' = "duplicate" /\ reader' = "unlock"
-       ELSE outcome' = outcome /\ reader' = "put"
+       ELSE outcome' = outcome /\ reader' = "size"
   /\ UNCHANGED <<cur, received, lock, pending, queue, worker, taken,
                  accepted, dispatched, refused, busy>>
 
-\* offer: `self._q.put_nowait((kind, frame))` finds room
-OfferPut ==
-  /\ reader = "put"
+\* offer: `if self._q.qsize() >= self._maxsize:` finds room. The put is a later
+\* step, so the worker can take an item between the two.
+OfferRoom ==
+  /\ reader = "size"
   /\ Len(queue) < MaxQueue \/ "NoBound" \in Faults
-  /\ queue' = Append(queue, cur)
-  /\ accepted' = Append(accepted, cur)
-  /\ outcome' = "queued"
-  /\ reader' = IF cur.corr = NoCorr THEN "unlock" ELSE "add"
-  /\ UNCHANGED <<cur, received, lock, pending, worker, taken, dispatched, refused, busy>>
+  /\ reader' = "put"
+  /\ UNCHANGED <<cur, outcome, received, lock, pending, queue, worker, taken,
+                 accepted, dispatched, refused, busy>>
 
-\* offer: put_nowait raises queue.Full: `return "full"`
+\* offer: `if self._q.qsize() >= self._maxsize: return "full"`
 OfferFull ==
-  /\ reader = "put"
+  /\ reader = "size"
   /\ Len(queue) >= MaxQueue /\ "NoBound" \notin Faults
   /\ outcome' = "full"
   /\ refused' = IF cur.corr = NoCorr THEN refused ELSE Append(refused, cur)
@@ -102,6 +101,16 @@ OfferFull ==
                   THEN pending \cup {cur.corr} ELSE pending
   /\ reader' = "unlock"
   /\ UNCHANGED <<cur, received, lock, queue, worker, taken, accepted, dispatched, busy>>
+
+\* offer: `self._q.put_nowait((kind, frame))`. _q has no bound of its own, so
+\* this put never raises queue.Full.
+OfferPut ==
+  /\ reader = "put"
+  /\ queue' = Append(queue, cur)
+  /\ accepted' = Append(accepted, cur)
+  /\ outcome' = "queued"
+  /\ reader' = IF cur.corr = NoCorr THEN "unlock" ELSE "add"
+  /\ UNCHANGED <<cur, received, lock, pending, worker, taken, dispatched, refused, busy>>
 
 \* offer: `self._pending.add(corr)`
 OfferAdd ==
@@ -135,10 +144,11 @@ ReceiveShutdown ==
   /\ UNCHANGED <<cur, outcome, received, lock, pending, queue, worker, taken,
                  accepted, dispatched, refused, busy>>
 
-\* close: `self._q.put(None)`. This put waits for as long as the queue is at its bound.
+\* close: `self._q.put(None)`. _q has no bound of its own, so this put never waits.
+\* The fault CloseWaits is a _q that has the bound: there the put waits for room.
 Close ==
   /\ reader = "close"
-  /\ Len(queue) < MaxQueue
+  /\ "CloseWaits" \in Faults => Len(queue) < MaxQueue
   /\ queue' = IF "StopJumpsQueue" \in Faults THEN <<Stop>> \o queue ELSE Append(queue, Stop)
   /\ reader' = "join"
   /\ UNCHANGED <<cur, outcome, received, lock, pending, worker, taken,
@@ -216,7 +226,7 @@ Exited == reader = "exited" /\ UNCHANGED vars
 
 Next ==
   \/ \E c \in Corrs \cup {NoCorr} : Receive(c)
-  \/ OfferLock \/ OfferCheck \/ OfferPut \/ OfferFull \/ OfferAdd \/ OfferUnlock
+  \/ OfferLock \/ OfferCheck \/ OfferRoom \/ OfferFull \/ OfferPut \/ OfferAdd \/ OfferUnlock
   \/ AnswerBusy
   \/ ReceiveShutdown \/ Close \/ Exit \/ ConnectionLost
   \/ Get \/ Dispatch \/ ReleaseLock \/ ReleaseDiscard \/ ReleaseUnlock
@@ -257,14 +267,14 @@ BusyAnswered == reader = "read" => busy = refused
 \* No more than SEND_QUEUE_MAX sends wait in the queue.
 Bounded == Cardinality({i \in DOMAIN queue : queue[i] # Stop}) <= MaxQueue
 
-(* Two rules that the code as it is written breaks. They are in configs of their
-   own, CloseNeverWaits.cfg and NoSendAbandoned.cfg, so that SendQueue.cfg can
-   pass. VERIFY.md tells both stories. *)
-
 \* close() never has to wait for a send that the bridge is still working on:
 \* while the worker is in _dispatch, the read loop can always take its Close step.
-\* (The comment on close() promises more, that it never waits at all. That breaks too.)
+\* (The comment on close() promises more, that it never waits at all. Close has
+\* no condition but its place in the read loop, so that holds as well.)
 CloseNeverWaits == (reader = "close" /\ worker = "release") => ENABLED Close
+
+(* A rule that the code as it is written breaks. It is in a config of its own,
+   NoSendAbandoned.cfg, so that SendQueue.cfg can pass. VERIFY.md tells the story. *)
 
 \* When the process exits, the bridge has been given every send that offer accepted.
 NoSendAbandoned == reader = "exited" => dispatched = accepted

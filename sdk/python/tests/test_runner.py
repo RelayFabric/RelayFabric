@@ -401,6 +401,20 @@ class SendQueueTests(unittest.TestCase):
         self.assertEqual(q.get(), ("send", {"corr": 1}))
         self.assertEqual(q.offer("send", {"corr": 3}), "queued")
 
+    def test_close_on_a_full_queue_does_not_wait(self):
+        # Shutdown behind a wedged send: the worker makes no room, so a
+        # close() that waited for it would hang the read loop short of
+        # bridge.stop().
+        q = runner._SendQueue(maxsize=1)
+        self.assertEqual(q.offer("send", {"corr": 1}), "queued")
+        closer = threading.Thread(target=q.close, daemon=True)
+        closer.start()
+        closer.join(1)
+        self.assertFalse(closer.is_alive(), "close() waited for room in a full queue")
+        # the sentinel goes behind the queued send, which still drains first
+        self.assertEqual(q.get(), ("send", {"corr": 1}))
+        self.assertIsNone(q.get())
+
     def test_default_bound_is_256(self):
         self.assertEqual(runner.SEND_QUEUE_MAX, 256)
 

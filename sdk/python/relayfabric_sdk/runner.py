@@ -43,7 +43,10 @@ class _SendQueue:
     """
 
     def __init__(self, maxsize=SEND_QUEUE_MAX):
-        self._q = queue.Queue(maxsize=maxsize)
+        # Unbounded underneath: `offer` enforces the bound, so the sentinel
+        # that `close` puts never has to wait for room.
+        self._q = queue.Queue()
+        self._maxsize = maxsize
         self._pending = set()
         self._lock = threading.Lock()
 
@@ -61,10 +64,11 @@ class _SendQueue:
         with self._lock:
             if corr is not None and corr in self._pending:
                 return "duplicate"
-            try:
-                self._q.put_nowait((kind, frame))
-            except queue.Full:
+            # Only the read loop adds sends, so between this check and the
+            # put the size can only drop: the bound still holds.
+            if self._q.qsize() >= self._maxsize:
                 return "full"
+            self._q.put_nowait((kind, frame))
             if corr is not None:
                 self._pending.add(corr)
             return "queued"
@@ -81,7 +85,8 @@ class _SendQueue:
         return self._q.get()
 
     def close(self):
-        # Shutdown sentinel; bypasses the bound so shutdown can never block.
+        # Shutdown sentinel. The bound is enforced in `offer`, not by the
+        # queue, so this never blocks -- not even behind a wedged send.
         self._q.put(None)
 
 

@@ -14,6 +14,7 @@ Event(e) ==
   \/ e.action = "Lock" /\ e.by = "reader" /\ OfferLock
   \/ e.action = "Check" /\ e.by = "reader" /\ OfferCheck
        /\ e.corr = cur.corr /\ e.found = (cur.corr \in pending)
+  \/ e.action = "Size" /\ e.by = "reader" /\ (OfferRoom \/ OfferFull) /\ e.size = Len(queue)
   \/ e.action = "Put" /\ e.by = "reader" /\ OfferPut /\ e.corr = cur.corr
   \/ e.action = "Add" /\ e.by = "reader" /\ OfferAdd /\ e.corr = cur.corr
   \/ e.action = "Unlock" /\ e.by = "reader" /\ OfferUnlock /\ e.pending = pending
@@ -33,11 +34,9 @@ Event(e) ==
 TraceInit == Init /\ traceAt = 0
 
 TraceNext ==
-  \/ /\ traceAt < Len(TraceLog)
-     /\ Event(TraceLog[traceAt + 1])
-     /\ traceAt' = traceAt + 1
-  \* A put_nowait that raises queue.Full writes no line, because it changes nothing in the queue.
-  \/ OfferFull /\ UNCHANGED traceAt
+  /\ traceAt < Len(TraceLog)
+  /\ Event(TraceLog[traceAt + 1])
+  /\ traceAt' = traceAt + 1
 
 TraceUnfinished == traceAt < Len(TraceLog)
 =============================================================================

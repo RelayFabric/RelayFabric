@@ -1,8 +1,8 @@
 diff --git a/sdk/python/relayfabric_sdk/runner.py b/sdk/python/relayfabric_sdk/runner.py
-index db8701e..caff2f1 100644
+index 5d02387..b18c975 100644
 --- a/sdk/python/relayfabric_sdk/runner.py
 +++ b/sdk/python/relayfabric_sdk/runner.py
-@@ -195,10 +195,7 @@ def run_plugin(plugin_name, version, bridge_factory, capabilities, *,
+@@ -200,10 +200,7 @@ def run_plugin(plugin_name, version, bridge_factory, capabilities, *,
              if item is None:  # shutdown sentinel
                  return
              kind, frame = item

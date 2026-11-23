@@ -11,7 +11,8 @@ builds in __init__ for subclasses that log, so a line is written at every place
 where the code touches them, not once per call of offer or release:
 
 - _q: queue.Queue calls _put and _get with its own mutex held, so "Put" and
-  "Get" lines are written inside the step that they report;
+  "Get" lines are written inside the step that they report; "Size" is written
+  by qsize with that mutex held, with the size that offer is given;
 - _pending: "Check", "Add" and "Discard" lines are written by the set, while
   the caller holds _SendQueue._lock;
 - _lock: "Lock" is written after the lock is taken, and "Unlock" before it is
@@ -19,7 +20,6 @@ where the code touches them, not once per call of offer or release:
 
 "Receive", "Shutdown" and "Lost" come from a wrapper around runner.read_frame.
 "Dispatch", "Busy" and "Exit" come from the bridge that the scenario supplies.
-A put_nowait that raises queue.Full writes no line; the trace spec infers it.
 
 Each scenario must fit SendQueueTrace.cfg: corr 1 or 2 or none, a queue bound
 of MAX_QUEUE, and at most five send frames.
@@ -87,6 +87,12 @@ def _traced_queue(built, sink):
             else:
                 _log(sink, "Get", _corr(item[1]))
             return item
+
+        def qsize(self):
+            with self.mutex:  # as queue.Queue.qsize does, so the line is written inside the step
+                size = self._qsize()
+                _log(sink, "Size", size=size)
+                return size
 
     return _TracedQueue(maxsize=built.maxsize)
 
@@ -330,8 +336,8 @@ def join_timeout():
         go.set()
 
 
-def close_waits():
-    """Shutdown while a send is stuck in the bridge and the queue is full: the replay of finding F1."""
+def shutdown_when_full():
+    """Shutdown while a send is stuck in the bridge and the queue is full: close does not wait for room."""
     started, go, at_shutdown = threading.Event(), threading.Event(), threading.Event()
 
     def on_dispatch(n):
@@ -342,20 +348,18 @@ def close_waits():
     frames = [_send(1), _send(2), _send(), SHUTDOWN]
     gates = {1: lambda: _must(started, "the first send never reached the bridge"), 3: at_shutdown.set}
     thread, result = _start(frames, gates, on_dispatch)
-    _must(at_shutdown, "the read loop never reached the shutdown frame")
-    began = time.monotonic()
-    thread.join(3.0)  # longer than the 2 s of sender.join in run_plugin
-    if thread.is_alive():
-        print("close_waits: 3.0 s after the shutdown frame, run_plugin has not exited and bridge.stop() "
-              "has not run; releasing the stuck send")
-    else:
-        print(f"close_waits: run_plugin exited {time.monotonic() - began:.1f} s after the shutdown frame, "
-              "with the send still stuck: close() did not wait")
-    go.set()
-    return _finish(thread, result, want_code=0)
+    try:
+        _must(at_shutdown, "the read loop never reached the shutdown frame")
+        thread.join(3.0)  # longer than the 2 s of sender.join in run_plugin
+        if thread.is_alive():
+            raise RuntimeError("scenario stalled: 3 s after the shutdown frame run_plugin has not exited, "
+                               "so close() waited for the stuck send")
+        return _finish(thread, result, want_code=0)
+    finally:
+        go.set()
 
 
-SCENARIOS = [redispatch, overflow, free_running, connection_lost, join_timeout, close_waits]
+SCENARIOS = [redispatch, overflow, free_running, connection_lost, join_timeout, shutdown_when_full]
 
 
 def main(argv):
