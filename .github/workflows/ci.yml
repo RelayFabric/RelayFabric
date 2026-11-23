@@ -2,9 +2,9 @@ name: CI
 
 # The mandatory merge gate (v0.4 cycle A): formatting, clippy with warnings
 # denied, the full Rust workspace test suite (which includes the golden IPC
-# wire vectors), every Python plugin suite plus the SDK suite, and the
-# dependency policy/vulnerability audit. The container build lives in
-# docker.yml.
+# wire vectors), every Python plugin suite plus the SDK suite, the formal
+# model of the SDK send queue, and the dependency policy/vulnerability
+# audit. The container build lives in docker.yml.
 on:
   push:
     branches: [main]
@@ -63,6 +63,57 @@ jobs:
         run: |
           pip install pip-audit
           pip-audit || true
+
+  formal:
+    # The TLA+ model of the SDK send queue; its record is VERIFY.md in
+    # $FORMAL. Fails when the covered lines of runner.py changed without a
+    # re-sync of that record, when the model breaks a rule, when a
+    # deliberate fault no longer breaks its rule, or when the model cannot
+    # follow a log of the real run_plugin.
+    runs-on: ubuntu-latest
+    env:
+      FORMAL: sdk/python/formal/send_queue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # so a drift failure can list the commits since the last sync
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: break patches still apply
+        # The faults in the real code that VERIFY.md keeps for the trace
+        # check; a change to runner.py must not leave them behind.
+        run: |
+          for p in "$FORMAL"/breaks/*.patch; do
+            git apply --check "$p"
+          done
+      - name: write trace logs from the real run_plugin
+        run: |
+          pip install cbor2
+          python "$FORMAL/trace_run.py" "$RUNNER_TEMP/send_queue"
+      - uses: jaschadub/skill-formal-proofs@9b0ebed963ab17e50da2fd9b0201962ef097f55a # v0.4.0
+        with:
+          specs: ${{ env.FORMAL }}/SendQueue.tla
+          # The fault table of VERIFY.md, one entry per row.
+          faults: >-
+            ${{ env.FORMAL }}/SendQueue.tla:NoDedup=OneSendPerCorr
+            ${{ env.FORMAL }}/SendQueue.tla:EarlyRelease=OneSendPerCorr
+            ${{ env.FORMAL }}/SendQueue.tla:NoLock=NoStuckCorr
+            ${{ env.FORMAL }}/SendQueue.tla:NoRelease=NoStuckCorr
+            ${{ env.FORMAL }}/SendQueue.tla:ReserveOnFull=NoStuckCorr
+            ${{ env.FORMAL }}/SendQueue.tla:Lifo=InOrder
+            ${{ env.FORMAL }}/SendQueue.tla:Lifo=DrainedAtStop
+            ${{ env.FORMAL }}/SendQueue.tla:StopJumpsQueue=DrainedAtStop
+            ${{ env.FORMAL }}/SendQueue.tla:NoBusy=BusyAnswered
+            ${{ env.FORMAL }}/SendQueue.tla:NoBound=Bounded
+            ${{ env.FORMAL }}/SendQueue.tla:CloseWaits=CloseNeverWaits
+          traces: >-
+            ${{ env.FORMAL }}/SendQueueTrace.tla=${{ runner.temp }}/send_queue/redispatch.log
+            ${{ env.FORMAL }}/SendQueueTrace.tla=${{ runner.temp }}/send_queue/overflow.log
+            ${{ env.FORMAL }}/SendQueueTrace.tla=${{ runner.temp }}/send_queue/free_running.log
+            ${{ env.FORMAL }}/SendQueueTrace.tla=${{ runner.temp }}/send_queue/connection_lost.log
+            ${{ env.FORMAL }}/SendQueueTrace.tla=${{ runner.temp }}/send_queue/join_timeout.log
+            ${{ env.FORMAL }}/SendQueueTrace.tla=${{ runner.temp }}/send_queue/shutdown_when_full.log
 
   audit:
     runs-on: ubuntu-latest

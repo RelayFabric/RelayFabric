@@ -235,6 +235,11 @@ far above its 500 states.
 4. **The tests of the repo.** From `sdk/python`:
    `PYTHONPATH=. python -m unittest tests.test_runner`.
 
+CI runs `drift.sh`, the model check, each row of the fault table, and the trace
+check on every push: the job `formal` in `.github/workflows/ci.yml`. A new fault
+row or a new scenario must be added to that job too. The job also checks that
+each patch in `breaks/` still applies.
+
 ## Steps for a change
 
 These steps are for the author of a change to the covered code, and for a reviewer
