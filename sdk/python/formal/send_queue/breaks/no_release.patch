@@ -1,0 +1,16 @@
+diff --git a/sdk/python/relayfabric_sdk/runner.py b/sdk/python/relayfabric_sdk/runner.py
+index db8701e..caff2f1 100644
+--- a/sdk/python/relayfabric_sdk/runner.py
++++ b/sdk/python/relayfabric_sdk/runner.py
+@@ -195,10 +195,7 @@ def run_plugin(plugin_name, version, bridge_factory, capabilities, *,
+             if item is None:  # shutdown sentinel
+                 return
+             kind, frame = item
+-            try:
+-                _dispatch(kind, frame)
+-            finally:
+-                send_q.release(frame.get("corr") if isinstance(frame, dict) else None)
++            _dispatch(kind, frame)
+ 
+     sender = threading.Thread(target=_sender_loop, name=f"{plugin_name}-sender", daemon=True)
+     sender.start()

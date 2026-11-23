@@ -1,0 +1,13 @@
+diff --git a/sdk/python/relayfabric_sdk/runner.py b/sdk/python/relayfabric_sdk/runner.py
+index db8701e..2558cec 100644
+--- a/sdk/python/relayfabric_sdk/runner.py
++++ b/sdk/python/relayfabric_sdk/runner.py
+@@ -58,7 +58,7 @@ class _SendQueue:
+ 
+     def offer(self, kind, frame):
+         corr = self._key(frame)
+-        with self._lock:
++        if True:
+             if corr is not None and corr in self._pending:
+                 return "duplicate"
+             try:
