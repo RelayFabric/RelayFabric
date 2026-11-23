@@ -1577,7 +1577,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "relayfabric-core"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "chrono",
  "serde",
@@ -1588,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "relayfabric-ipc"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "chrono",
  "ciborium",
@@ -1600,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "relayfabric-mqtt"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "chrono",
  "native-tls",
@@ -1616,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "relayfabric-ui"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "axum",
  "base64",
@@ -2058,7 +2058,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "switchyardctl"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "ciborium",
  "serde_json",
@@ -2067,7 +2067,7 @@ dependencies = [
 
 [[package]]
 name = "switchyardd"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "axum",
  "chrono",

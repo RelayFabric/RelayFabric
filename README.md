@@ -11,7 +11,7 @@ plugins. MeshCore uses the native MIT Companion Radio Protocol (spec §8's
 preferred style), while Meshtastic uses MQTT (licensing favors it). Initial
 target networks: Reticulum/LXMF, Signal, Meshtastic, MeshCore, Bitchat, Nostr.
 
-**Status:** [v0.4.2 released](https://github.com/RelayFabric/RelayFabric/releases/tag/v0.4.2)
+**Status:** [v0.4.3 released](https://github.com/RelayFabric/RelayFabric/releases/tag/v0.4.3)
 — the "trustworthy intermesh" release: core fabric, eight plugins,
 federation + RFDP, sealed routing phase 1, transport-class-aware egress,
 plus per-plugin privilege isolation, passkey-authenticated web UI, a
@@ -49,7 +49,7 @@ its state directory, and the config are created by hand:
 
 ```
 # pick your arch from the release assets
-sudo dpkg -i relayfabric_0.4.2-1_amd64.deb
+sudo dpkg -i relayfabric_0.4.3-1_amd64.deb
 sudo useradd --system --home /var/lib/relayfabric --shell /usr/sbin/nologin relayfabric
 sudo install -d -o relayfabric -g relayfabric -m 0711 /var/lib/relayfabric
 sudo cp /etc/relayfabric/relayfabric.yaml.example /etc/relayfabric/relayfabric.yaml
@@ -67,13 +67,13 @@ Plugins the daemon spawns itself run inside the unit's sandbox (no
 example config:
 
 ```
-tar xzf relayfabric-0.4.2-x86_64-unknown-linux-gnu.tar.gz
+tar xzf relayfabric-0.4.3-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 **Container image** (semver-tagged on GHCR):
 
 ```
-docker run ghcr.io/relayfabric/relayfabric:0.4.2
+docker run ghcr.io/relayfabric/relayfabric:0.4.3
 ```
 
 **Verify** — every tarball and `.deb` is cosign-signed and checksummed;

@@ -28,7 +28,7 @@ Three paths, easiest first.
 The releases page publishes an `arm64` package with the daemon, the CLI, the MQTT plugin, and hardened systemd units.
 
 ```bash
-VER=0.4.2
+VER=0.4.3
 curl -LO "https://github.com/RelayFabric/RelayFabric/releases/download/v${VER}/relayfabric_${VER}-1_arm64.deb"
 sudo dpkg -i "relayfabric_${VER}-1_arm64.deb"
 ```
