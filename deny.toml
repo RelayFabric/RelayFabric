@@ -25,6 +25,14 @@ confidence-threshold = 0.9
 # versions are downgraded to a warning here. If an unmaintained advisory
 # ever has to be carried, add it to `ignore` with a reason and a date.
 yanked = "warn"
+ignore = [
+  # 2026-11-23: chrono is flagged unmaintained and no fixed version exists.
+  # `DateTime<Utc>` is part of the published relayfabric-core/-ipc types
+  # and of the canonical CBOR, so moving to `time` or `jiff` is a wire-
+  # and API-affecting change of its own, not a dependency bump. Carried
+  # until that migration; drop this entry with it.
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; migration tracked separately (carried since 2026-11-23)" },
+]
 
 [bans]
 multiple-versions = "allow"
