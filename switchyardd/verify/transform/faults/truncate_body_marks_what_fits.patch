@@ -1,0 +1,11 @@
+--- a/switchyardd/src/transform.rs
++++ b/switchyardd/src/transform.rs
+@@ -21,7 +21,7 @@
+ pub fn truncate_body(body: &str, max_chars: u32) -> String {
+     let max_chars = max_chars as usize;
+     if body.chars().count() <= max_chars {
+-        return body.to_string();
++        return format!("{body}…");
+     }
+     let budget = max_chars.saturating_sub(1);
+     let mut out: String = body.chars().take(budget).collect();

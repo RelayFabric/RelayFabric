@@ -1,0 +1,13 @@
+diff --git a/switchyardd/src/transform.rs b/switchyardd/src/transform.rs
+index c806fd5..fff6093 100644
+--- a/switchyardd/src/transform.rs
++++ b/switchyardd/src/transform.rs
+@@ -23,7 +23,7 @@ pub fn truncate_body(body: &str, max_chars: u32) -> String {
+     if body.chars().count() <= max_chars {
+         return body.to_string();
+     }
+-    let budget = max_chars.saturating_sub(1);
++    let budget = max_chars;
+     let mut out: String = body.chars().take(budget).collect();
+     out.push('…');
+     out

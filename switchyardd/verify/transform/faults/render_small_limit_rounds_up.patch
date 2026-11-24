@@ -1,0 +1,15 @@
+diff --git a/switchyardd/src/transform.rs b/switchyardd/src/transform.rs
+index c806fd5..dbba7ec 100644
+--- a/switchyardd/src/transform.rs
++++ b/switchyardd/src/transform.rs
+@@ -62,8 +62,8 @@ pub fn render(tag: Option<&str>, body: &str, max_payload: Option<usize>) -> Stri
+     // For limits < 3 (ellipsis size), truncate without ellipsis
+     if limit < 3 {
+         let mut cut = limit;
+-        while cut > 0 && !full.is_char_boundary(cut) {
+-            cut -= 1;
++        while !full.is_char_boundary(cut) {
++            cut += 1;
+         }
+         return full[..cut].to_string();
+     }

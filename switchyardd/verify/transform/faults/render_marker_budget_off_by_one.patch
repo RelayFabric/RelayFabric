@@ -1,0 +1,13 @@
+diff --git a/switchyardd/src/transform.rs b/switchyardd/src/transform.rs
+index c806fd5..271338b 100644
+--- a/switchyardd/src/transform.rs
++++ b/switchyardd/src/transform.rs
+@@ -69,7 +69,7 @@ pub fn render(tag: Option<&str>, body: &str, max_payload: Option<usize>) -> Stri
+     }
+ 
+     // Normal case: truncate to limit-3 bytes + ellipsis
+-    let budget = limit - 3;
++    let budget = limit - 2;
+     let mut cut = budget;
+     while cut > 0 && !full.is_char_boundary(cut) {
+         cut -= 1;

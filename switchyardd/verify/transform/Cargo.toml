@@ -1,0 +1,19 @@
+# Bounded Kani proofs for the truncation limits in switchyardd/src/transform.rs
+# (see VERIFY.md). Not a workspace member: it needs the Kani toolchain and
+# must never burden normal builds. It compiles the daemon's real
+# `transform.rs` by path, so no copy of the code can drift from it.
+[package]
+name = "switchyardd-verify-transform"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[features]
+# Harnesses for a rule that the current code breaks (see VERIFY.md, "Known
+# weaknesses"). Off by default so the committed check passes.
+findings = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[workspace]
