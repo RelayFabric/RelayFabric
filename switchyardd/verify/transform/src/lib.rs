@@ -91,8 +91,8 @@ mod proofs {
 
     /// Rule `payload-limit`: `render` returns at most `max_payload` bytes.
     /// `tag` is `None`, so `body` here is the whole assembled string that
-    /// `render` truncates; see "What the checks do not cover" in VERIFY.md
-    /// for why the solver cannot take the `Some(tag)` arm.
+    /// `render` truncates. The `Some(tag)` arm is taken by the harnesses of
+    /// `render_tagged_fits_limit` below, at smaller sizes.
     fn render_fits_limit<const N: usize>() {
         let buf: [u8; N] = kani::any();
         let full = any_str(&buf);
@@ -174,6 +174,62 @@ mod proofs {
             cut && limit >= 3 && out.len() + 3 == limit,
             "limit of 3 or more: the cut walked back 3 bytes, the most a char allows"
         );
+    }
+
+    /// Stands in for `Arguments::estimated_capacity` in the harnesses that
+    /// take the `Some(tag)` arm of `render`. `format!` sizes its String with
+    /// that function. The solver does not treat its value as a constant, and
+    /// from the second piece of output on it explores formatters that the
+    /// code never calls, so it does not finish. The capacity is only a hint
+    /// for the first allocation: a constant in its place changes no result
+    /// of `render`. The lifetime bound makes the signature match the one
+    /// that Kani expects of a stub for this method.
+    fn no_capacity_hint<'a>(_args: &core::fmt::Arguments<'a>) -> usize
+    where
+        'a: 'a,
+    {
+        0
+    }
+
+    /// Rule `payload-limit` on the `Some(tag)` arm: every tag of exactly `T`
+    /// bytes with every body of exactly `B` bytes and every `max_payload`.
+    /// The assembled string is `"[tag]\nbody"`, `T + B + 3` bytes.
+    fn render_tagged_fits_limit<const T: usize, const B: usize>() {
+        let tag: [u8; T] = kani::any();
+        let body: [u8; B] = kani::any();
+        let limit: usize = kani::any();
+        let out = render(Some(any_str(&tag)), any_str(&body), Some(limit));
+        assert!(
+            out.len() <= limit,
+            "render returned more bytes than max_payload"
+        );
+        // Both outcomes must be reachable, so that the pass is not an empty one.
+        kani::cover!(out.len() < T + B + 3, "render truncated a tagged string");
+        kani::cover!(
+            out.len() == T + B + 3,
+            "render returned a tagged string whole"
+        );
+    }
+
+    // These need `-Z stubbing` on the Kani command line.
+    macro_rules! tagged_harnesses {
+        ($($name:ident: $t:literal, $b:literal;)*) => {$(
+            #[kani::proof]
+            #[kani::unwind(12)]
+            #[kani::stub(std::fmt::Arguments::estimated_capacity, no_capacity_hint)]
+            fn $name() {
+                render_tagged_fits_limit::<$t, $b>()
+            }
+        )*};
+    }
+
+    // Every tag of 1 to 2 bytes with every body of 2 to 3 bytes and every
+    // max_payload.
+    tagged_harnesses! {
+        render_tag_1_body_2_any_limit: 1, 2;
+        render_tag_1_body_3_any_limit: 1, 3;
+        render_tag_2_body_2_any_limit: 2, 2;
+        render_tag_2_body_3_any_limit: 2, 3;
     }
 
     /// FINDING, not a passing check: `truncate_body` breaks rule `body-limit`

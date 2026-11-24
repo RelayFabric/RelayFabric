@@ -7,7 +7,7 @@
 # harness must fail on the code as it is, and pass with the patch in fixes/.
 #
 # usage: sh switchyardd/verify/transform/faults.sh [--no-kani]
-# The working tree is never patched. With Kani the run takes about a minute; --no-kani skips the
+# The working tree is never patched. With Kani the run takes about a minute and a half; --no-kani skips the
 # harnesses, for a machine without cargo-kani, and then shows only that the tests can fail.
 set -eu
 cd "$(dirname "$0")"
@@ -50,7 +50,7 @@ tests_fail() {
 harness_fails() {
   [ -n "$kani" ] || return 0
   # shellcheck disable=SC2086
-  if (cd "$crate" && cargo kani -j2 --output-format=terse $opts --harness "$2" > "$out" 2>&1); then
+  if (cd "$crate" && cargo kani -Z stubbing -j2 --output-format=terse $opts --harness "$2" > "$out" 2>&1); then
     fail "$1: harness $2 passes"
   fi
   grep -qF "$3" "$out" || { cat "$out"; fail "$1: $2 failed, but not on: $3"; }
@@ -64,6 +64,8 @@ slice='SliceIndex<str> for std::ops::RangeTo<usize>>::index'
 fresh faults/render_marker_budget_off_by_one.patch
 tests_fail render_marker_budget_off_by_one render_every_small_string_tag_and_limit long_generated_inputs
 harness_fails render_marker_budget_off_by_one render_4_bytes_any_limit "$payload"
+# The same break must also fail a harness that takes the Some(tag) arm.
+harness_fails render_marker_budget_off_by_one render_tag_1_body_2_any_limit "$payload"
 echo "ok: render_marker_budget_off_by_one breaks payload-limit"
 
 fresh faults/render_small_limit_rounds_up.patch
@@ -99,7 +101,7 @@ fresh fixes/truncate_body_zero_limit_returns_nothing.patch
   || { cat "$out"; fail "the fix does not make the generated tests and the finding test pass"; }
 grep -q '^test result: ok. 4 passed' "$out" || { cat "$out"; fail "with the fix, 4 tests must pass"; }
 if [ -n "$kani" ]; then
-  (cd "$crate" && cargo kani -j2 --output-format=terse --features findings \
+  (cd "$crate" && cargo kani -Z stubbing -j2 --output-format=terse --features findings \
     --harness finding_truncate_body_limit_zero --harness truncate_body_2_bytes_limit_1 > "$out" 2>&1) \
     || { cat "$out"; fail "the fix does not make the finding harness pass"; }
   grep -q 'Complete - 2 successfully verified harnesses, 0 failures, 2 total' "$out" \

@@ -142,15 +142,17 @@ jobs:
         run: |
           cargo install --locked kani-verifier --version 0.68.0
           cargo kani setup
-      - name: proofs (23 harnesses, every branch reached)
+      - name: proofs (27 harnesses, every branch reached)
         run: |
           set -euo pipefail
-          cargo kani -j2 --output-format=terse | tee "$RUNNER_TEMP/kani.out"
+          # -Z stubbing: the harnesses with a tag replace format!'s capacity
+          # hint by a constant (VERIFY.md, "The stub").
+          cargo kani -Z stubbing -j2 --output-format=terse | tee "$RUNNER_TEMP/kani.out"
           # A run that verifies fewer harnesses, or that never reaches a
           # branch, checked less than VERIFY.md says.
-          grep -qx 'Complete - 23 successfully verified harnesses, 0 failures, 23 total.' "$RUNNER_TEMP/kani.out"
+          grep -qx 'Complete - 27 successfully verified harnesses, 0 failures, 27 total.' "$RUNNER_TEMP/kani.out"
           [ "$(grep -c '5 of 5 cover properties satisfied' "$RUNNER_TEMP/kani.out")" = 1 ]
-          [ "$(grep -c '2 of 2 cover properties satisfied' "$RUNNER_TEMP/kani.out")" = 6 ]
+          [ "$(grep -c '2 of 2 cover properties satisfied' "$RUNNER_TEMP/kani.out")" = 10 ]
       - name: each fault still breaks a check
         run: sh faults.sh
 
