@@ -88,6 +88,8 @@ What a pass of check 2 means: the rules held on the inputs that the tests genera
 
 A pass on a verification that no one updated says nothing about a change to the covered code. Run `drift.sh` first, and follow the steps below when it reports a change.
 
+CI runs both checks and `faults.sh` on every push, in the job `kani` of `.github/workflows/ci.yml`, and `drift.sh` in the job `formal`. The `kani` job requires the 23 harnesses and the cover lines named in check 1, so a new harness or a new `kani::cover!` line must be counted there too.
+
 ## Why larger inputs behave the same
 
 No tool checked this argument. The bounded proof stops at 4 and 8 bytes, and the tests stop at the inputs they generate.

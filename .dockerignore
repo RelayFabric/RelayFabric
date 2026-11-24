@@ -12,3 +12,6 @@ docs/superpowers/
 .superpowers/
 *.md
 !docs/relayfabric.example.yaml
+# Verification models and harnesses: checked in CI, never part of an image.
+sdk/python/formal/
+switchyardd/verify/

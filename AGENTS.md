@@ -32,7 +32,7 @@ cargo fmt                                        # CI: cargo fmt --check
 ```
 
 - **Always pass `-j2`** to cargo (build/test) — a repo convention to bound parallelism.
-- CI (`.github/workflows/ci.yml`) enforces `cargo fmt --check`, clippy, workspace tests, Python suites, golden IPC vectors, `cargo deny`, `cargo audit`, and the formal model of the SDK send queue (change `_SendQueue` or the send path of `run_plugin` → follow `sdk/python/formal/send_queue/VERIFY.md` first, or the `formal` job fails). **CI runs on branch pushes, not tags** — a fmt/clippy miss fails it, so run both locally first.
+- CI (`.github/workflows/ci.yml`) enforces `cargo fmt --check`, clippy, workspace tests, Python suites, golden IPC vectors, `cargo deny`, `cargo audit`, and two formal checks, each with a `VERIFY.md` record to follow before changing the code it covers, or its job fails: the model of the SDK send queue (`_SendQueue` and the send path of `run_plugin`; `sdk/python/formal/send_queue/`, job `formal`) and the Kani proofs of the truncation limits (`truncate_body` and `render` in `transform.rs`, and any new caller; `switchyardd/verify/transform/`, job `kani`). **CI runs on branch pushes, not tags** — a fmt/clippy miss fails it, so run both locally first.
 - Python plugin tests: from a plugin dir, `PYTHONPATH=<repo>/sdk/python python -m unittest`. SDK tests: `sdk/python/tests` (`python -m unittest discover -s tests`). Some suites need optional libs (`coincurve`, `paho`); a missing-dep import error is environmental, not a failure.
 - Validate a config: `switchyardd --check-config --config <path>`.
 
